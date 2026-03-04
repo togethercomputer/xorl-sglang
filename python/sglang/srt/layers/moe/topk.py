@@ -984,6 +984,7 @@ def select_experts(
     get_global_experts_capturer().capture(
         layer_id=layer_id,
         topk_ids=topk_ids,
+        topk_weights=topk_weights,
     )
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 

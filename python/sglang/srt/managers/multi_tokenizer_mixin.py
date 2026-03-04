@@ -281,6 +281,9 @@ def _handle_output_by_index(output, i):
             output_routed_experts=_extract_field_by_index(
                 output, "output_routed_experts", i, check_length=False
             ),
+            output_expert_logits=_extract_field_by_index(
+                output, "output_expert_logits", i, check_length=False
+            ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False
             ),

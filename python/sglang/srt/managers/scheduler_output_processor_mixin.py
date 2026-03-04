@@ -71,6 +71,12 @@ class SchedulerOutputProcessorMixin:
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )
+        if req.return_expert_logits:
+            req.expert_logits = get_global_experts_capturer().get_expert_logits(
+                req_pool_idx=req.req_pool_idx,
+                seqlen=req.seqlen,
+                req_to_token_pool=self.req_to_token_pool,
+            )
 
     def maybe_collect_customized_info(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
@@ -856,6 +862,7 @@ class SchedulerOutputProcessorMixin:
         output_hidden_states = None
         load = self.get_load()
         output_routed_experts = None
+        output_expert_logits = None
         customized_info = {}
 
         queue_times = []
@@ -1055,6 +1062,10 @@ class SchedulerOutputProcessorMixin:
                     if output_routed_experts is None:
                         output_routed_experts = []
                     output_routed_experts.append(req.routed_experts)
+                if req.return_expert_logits:
+                    if output_expert_logits is None:
+                        output_expert_logits = []
+                    output_expert_logits.append(req.expert_logits)
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1111,6 +1122,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     output_routed_experts=output_routed_experts,
+                    output_expert_logits=output_expert_logits,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

@@ -510,6 +510,7 @@ class Req:
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        return_expert_logits: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -711,6 +712,9 @@ class Req:
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+        # capture expert routing weights (topk_weights)
+        self.return_expert_logits = return_expert_logits
+        self.expert_logits: Optional[torch.Tensor] = None
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -1071,6 +1075,7 @@ class Req:
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
+        self.expert_logits = None
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
@@ -1327,6 +1332,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return captured experts
     return_routed_experts: bool = False
+    # Whether to return expert routing weights
+    return_expert_logits: bool = False
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
@@ -1376,6 +1383,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
+            return_expert_logits=any(req.return_expert_logits for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_staging_reqs=dllm_staging_reqs,

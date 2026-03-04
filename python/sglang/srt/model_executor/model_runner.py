@@ -610,12 +610,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts,
+                enable=get_global_server_args().enable_return_routed_experts or get_global_server_args().enable_return_expert_logits,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
+                capture_topk_weights=get_global_server_args().enable_return_expert_logits,
             )
         )
 

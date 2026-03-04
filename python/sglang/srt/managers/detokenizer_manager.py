@@ -18,7 +18,7 @@ import logging
 import os
 import signal
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
 import pybase64
@@ -348,6 +348,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             ]
         return output_routed_experts
 
+    def _extract_expert_logits(self, recv_obj: BatchTokenIDOutput) -> Optional[List[str]]:
+        output_expert_logits = None
+        if recv_obj.output_expert_logits is not None:
+            output_expert_logits = [
+                (
+                    pybase64.b64encode(expert_logits.numpy().tobytes()).decode(
+                        "utf-8"
+                    )
+                    if expert_logits is not None
+                    else []
+                )
+                for expert_logits in recv_obj.output_expert_logits
+            ]
+        return output_expert_logits
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
@@ -356,6 +371,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             else []
         )
         output_routed_experts = self._extract_routed_experts(recv_obj)
+        output_expert_logits = self._extract_expert_logits(recv_obj)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -383,6 +399,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
             output_routed_experts=output_routed_experts,
+            output_expert_logits=output_expert_logits,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

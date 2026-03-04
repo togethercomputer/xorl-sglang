@@ -302,10 +302,16 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
+        if get_global_server_args().rl_on_policy_target is not None:
+            router_logits = F.linear(
+                hidden_states.to(torch.float32),
+                self.gate.weight.to(torch.float32),
+            )
+        else:
+            router_logits, _ = self.gate(hidden_states)
 
         if get_global_server_args().rl_on_policy_target is not None:
-            routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
+            routing_weights = F.softmax(router_logits, dim=1)
             routing_weights, selected_experts = torch.topk(
                 routing_weights, self.top_k, dim=-1
             )
@@ -319,6 +325,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             get_global_experts_capturer().capture(
                 layer_id=self.layer_id,
                 topk_ids=selected_experts,
+                topk_weights=routing_weights,
             )
         else:
             topk_output = self.topk(hidden_states, router_logits)
