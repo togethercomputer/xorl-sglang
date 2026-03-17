@@ -302,7 +302,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        if get_global_server_args().rl_on_policy_target is not None:
+        if get_global_server_args().enable_fp32_router:
             router_logits = F.linear(
                 hidden_states.to(torch.float32),
                 self.gate.weight.to(torch.float32),
@@ -586,9 +586,16 @@ class Qwen3MoeAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if get_global_server_args().rl_on_policy_target is not None:
+            hidden_states = hidden_states.bfloat16()
+
         qkv, _ = self.qkv_proj(hidden_states)
 
         q, k, v = self.apply_qk_norm_rope(qkv, positions, forward_batch)
+
+        if get_global_server_args().rl_on_policy_target is not None:
+            q = q.to(torch.bfloat16)
+            k = k.to(torch.bfloat16)
 
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state

@@ -107,14 +107,16 @@ def _extract_field_by_index(
     if isinstance(field, dict):
         new_field = {}
         for k, v in field.items():
-            if len(v) <= index:
+            if v is None or len(v) <= index:
                 new_field[k] = None
+                continue
             new_field[k] = v[index]
         return new_field
 
-    if check_length:
-        if len(field) <= index:
+    if len(field) <= index:
+        if check_length:
             return None
+        return [None]
 
     return [field[index]]
 

@@ -288,6 +288,7 @@ class ServerArgs:
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
     enable_fp32_lm_head: bool = False
+    enable_fp32_router: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
@@ -2757,6 +2758,11 @@ class ServerArgs:
             "--enable-fp32-lm-head",
             action="store_true",
             help="If set, the LM head outputs (logits) are in FP32.",
+        )
+        parser.add_argument(
+            "--enable-fp32-router",
+            action="store_true",
+            help="If set, the MoE router gate computation is done in FP32.",
         )
         parser.add_argument(
             "--modelopt-quant",

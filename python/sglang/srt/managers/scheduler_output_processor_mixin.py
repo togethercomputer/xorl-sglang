@@ -859,10 +859,16 @@ class SchedulerOutputProcessorMixin:
         spec_verify_ct = []
         spec_accepted_tokens = []
         retraction_counts = []
-        output_hidden_states = None
+        output_hidden_states = (
+            [] if any(req.return_hidden_states for req in reqs) else None
+        )
         load = self.get_load()
-        output_routed_experts = None
-        output_expert_logits = None
+        output_routed_experts = (
+            [] if any(req.return_routed_experts for req in reqs) else None
+        )
+        output_expert_logits = (
+            [] if any(req.return_expert_logits for req in reqs) else None
+        )
         customized_info = {}
 
         queue_times = []
@@ -1054,24 +1060,27 @@ class SchedulerOutputProcessorMixin:
                         output_token_ids_logprobs_val.append([])
                         output_token_ids_logprobs_idx.append([])
 
-                if req.return_hidden_states:
-                    if output_hidden_states is None:
-                        output_hidden_states = []
-                    output_hidden_states.append(req.hidden_states)
-                if req.return_routed_experts:
-                    if output_routed_experts is None:
-                        output_routed_experts = []
-                    output_routed_experts.append(req.routed_experts)
-                if req.return_expert_logits:
-                    if output_expert_logits is None:
-                        output_expert_logits = []
-                    output_expert_logits.append(req.expert_logits)
+                if output_hidden_states is not None:
+                    output_hidden_states.append(
+                        req.hidden_states if req.return_hidden_states else None
+                    )
+                if output_routed_experts is not None:
+                    output_routed_experts.append(
+                        req.routed_experts if req.return_routed_experts else None
+                    )
+                if output_expert_logits is not None:
+                    output_expert_logits.append(
+                        req.expert_logits if req.return_expert_logits else None
+                    )
 
-                if req.customized_info is not None:
-                    for k, v in req.customized_info.items():
-                        if k not in customized_info:
-                            customized_info[k] = []
-                        customized_info[k].append(v)
+                req_customized_info = req.customized_info or {}
+                if req_customized_info:
+                    for key in req_customized_info:
+                        if key not in customized_info:
+                            # Backfill previous requests that do not have this key.
+                            customized_info[key] = [None] * (len(rids) - 1)
+                for key, values in customized_info.items():
+                    values.append(req_customized_info.get(key))
 
             if (
                 req.finished()

@@ -1482,6 +1482,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
+        def _safe_get_field_value(field_values, field_name: str, req_index: int, req_id: str):
+            if field_values is None:
+                return None
+            if req_index >= len(field_values):
+                logger.warning(
+                    "Malformed batch metadata: %s length=%d < required_index=%d for rid=%s",
+                    field_name,
+                    len(field_values),
+                    req_index,
+                    req_id,
+                )
+                return None
+            return field_values[req_index]
+
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1531,15 +1545,40 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     }
                 )
 
-            if getattr(recv_obj, "output_hidden_states", None):
-                meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
-            if getattr(recv_obj, "output_routed_experts", None):
-                meta_info["routed_experts"] = recv_obj.output_routed_experts[i]
-            if getattr(recv_obj, "output_expert_logits", None):
-                meta_info["expert_logits"] = recv_obj.output_expert_logits[i]
+            if getattr(state.obj, "return_hidden_states", False):
+                hidden_states = _safe_get_field_value(
+                    getattr(recv_obj, "output_hidden_states", None),
+                    "output_hidden_states",
+                    i,
+                    rid,
+                )
+                if hidden_states is not None:
+                    meta_info["hidden_states"] = hidden_states
+            if getattr(state.obj, "return_routed_experts", False):
+                routed_experts = _safe_get_field_value(
+                    getattr(recv_obj, "output_routed_experts", None),
+                    "output_routed_experts",
+                    i,
+                    rid,
+                )
+                if routed_experts is not None:
+                    meta_info["routed_experts"] = routed_experts
+            if getattr(state.obj, "return_expert_logits", False):
+                expert_logits = _safe_get_field_value(
+                    getattr(recv_obj, "output_expert_logits", None),
+                    "output_expert_logits",
+                    i,
+                    rid,
+                )
+                if expert_logits is not None:
+                    meta_info["expert_logits"] = expert_logits
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
-                    meta_info[k] = v[i]
+                    customized_value = _safe_get_field_value(
+                        v, f"customized_info.{k}", i, rid
+                    )
+                    if customized_value is not None:
+                        meta_info[k] = customized_value
 
             if isinstance(recv_obj, BatchStrOutput):
                 state.text += recv_obj.output_strs[i]
