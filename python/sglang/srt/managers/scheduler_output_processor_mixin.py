@@ -9,6 +9,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
+
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -99,6 +100,12 @@ class SchedulerOutputProcessorMixin:
             seqlen=req.seqlen,
             req_to_token_pool=self.req_to_token_pool,
         )
+        if req.return_expert_logits:
+            req.expert_logits = get_global_experts_capturer().get_expert_logits(
+                req_pool_idx=req.req_pool_idx,
+                seqlen=req.seqlen,
+                req_to_token_pool=self.req_to_token_pool,
+            )
 
     def maybe_collect_customized_info(
         self: Scheduler, i: int, req: Req, logits_output: LogitsProcessorOutput
@@ -906,9 +913,14 @@ class SchedulerOutputProcessorMixin:
         spec_accepted_tokens = []
         spec_acceptance_histogram = []
         retraction_counts = []
-        output_hidden_states = None
+        output_hidden_states = (
+            [] if any(req.return_hidden_states for req in reqs) else None
+        )
         load = self.get_load()
         routed_experts = None
+        output_expert_logits = (
+            [] if any(getattr(req, 'return_expert_logits', False) for req in reqs) else None
+        )
         customized_info = {}
 
         time_stats = []
@@ -1100,6 +1112,10 @@ class SchedulerOutputProcessorMixin:
                     if routed_experts is None:
                         routed_experts = []
                     routed_experts.append(req.routed_experts)
+                if output_expert_logits is not None:
+                    output_expert_logits.append(
+                        req.expert_logits if getattr(req, 'return_expert_logits', False) else None
+                    )
 
                 if req.customized_info is not None:
                     for k, v in req.customized_info.items():
@@ -1155,6 +1171,7 @@ class SchedulerOutputProcessorMixin:
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,
+                    output_expert_logits=output_expert_logits,
                     customized_info=customized_info,
                     placeholder_tokens_idx=None,
                     placeholder_tokens_val=None,

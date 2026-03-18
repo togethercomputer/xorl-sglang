@@ -1824,11 +1824,17 @@ def init_custom_process_group(
     if timeout is None:
         timeout = default_pg_timeout
 
-    # backward compatible API
+    # Use standard rendezvous for distributed coordination
+    # This works across nodes with tcp:// init_method
     if store is None:
+        logger.info(
+            f"Starting rendezvous: init_method={init_method}, rank={rank}, "
+            f"world_size={world_size}, timeout={timeout}"
+        )
         rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
         store, rank, world_size = next(rendezvous_iterator)
         store.set_timeout(timeout)
+        logger.info(f"Rendezvous completed for rank {rank}")
 
         # Use a PrefixStore to avoid accidental overrides of keys used by
         # different systems (e.g. RPC) in case the store is multi-tenant.
@@ -1837,6 +1843,7 @@ def init_custom_process_group(
     # NOTE: The pg_options parameter was renamed into backend_options in PyTorch 2.6.0
     # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
     # We need to determine the appropriate parameter name based on PyTorch version
+    # Use tuple comparison to handle versions like "2.10" correctly (string comparison fails)
     pg_options_param_name = (
         "backend_options" if torch_release >= (2, 6) else "pg_options"
     )

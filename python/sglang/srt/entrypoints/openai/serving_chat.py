@@ -238,6 +238,62 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return None
 
+    def _convert_chat_completion_with_input_ids_to_internal_request(
+        self,
+        request: ChatCompletionRequest,
+        raw_request: Request = None,
+    ) -> tuple[GenerateReqInput, ChatCompletionRequest]:
+
+        # Notice: currently, if input_ids is provided, the stop token is not used.
+        sampling_params = request.to_sampling_params(
+            model_generation_config=self.default_sampling_params
+        )
+
+        prompt_kwargs = {"input_ids": request.input_ids}
+
+         # Extract custom labels from raw request headers
+        custom_labels = self.extract_custom_labels(raw_request)
+
+        # Resolve LoRA adapter from model parameter or explicit lora_path
+        lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        if lora_path:
+            first_adapter = (
+                lora_path
+                if isinstance(lora_path, str)
+                else next((a for a in lora_path if a), None)
+            )
+            if first_adapter:
+                self._validate_lora_enabled(first_adapter)
+
+        logprob_start_len = (
+            request.logprob_start_len if request.logprob_start_len is not None else -1
+        )
+
+        adapted_request = GenerateReqInput(
+            **prompt_kwargs,
+            sampling_params=sampling_params,
+            return_logprob=request.logprobs,
+            logprob_start_len=logprob_start_len,
+            top_logprobs_num=request.top_logprobs or 0,
+            stream=request.stream,
+            return_text_in_logprobs=True,
+            lora_path=lora_path,
+            bootstrap_host=request.bootstrap_host,
+            bootstrap_port=request.bootstrap_port,
+            bootstrap_room=request.bootstrap_room,
+            data_parallel_rank=request.data_parallel_rank,
+            return_hidden_states=request.return_hidden_states,
+            rid=request.rid,
+            extra_key=self._compute_extra_key(request),
+            require_reasoning=self._get_reasoning_from_request(request),
+            priority=request.priority,
+            custom_labels=custom_labels,
+            custom_logit_processor=request.custom_logit_processor,
+        )
+
+        return adapted_request, request
+
+
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -259,13 +315,16 @@ class OpenAIServingChat(OpenAIServingBase):
         """Convert OpenAI chat completion request to internal format"""
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
+        if request.input_ids:
+            return self._convert_chat_completion_with_input_ids_to_internal_request(request, raw_request)
+
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
 
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
-            stop=processed_messages.stop,
             model_generation_config=self.default_sampling_params,
+            stop=processed_messages.stop,
             tool_call_constraint=processed_messages.tool_call_constraint,
         )
 
@@ -288,6 +347,10 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
         lora_path = self._resolve_lora_path(request.model, request.lora_path)
+        logprob_start_len = (
+            request.logprob_start_len if request.logprob_start_len is not None else -1
+        )
+
         img_max_dynamic_patch, vid_max_dynamic_patch = _extract_max_dynamic_patch(
             request
         )
@@ -298,7 +361,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=processed_messages.audio_data,
             sampling_params=sampling_params,
             return_logprob=request.logprobs,
-            logprob_start_len=-1,
+            logprob_start_len=logprob_start_len,
             top_logprobs_num=request.top_logprobs or 0,
             stream=request.stream,
             return_text_in_logprobs=True,
@@ -939,8 +1002,13 @@ class OpenAIServingChat(OpenAIServingBase):
         for idx, ret_item in enumerate(ret):
             # Process logprobs
             choice_logprobs = None
+            input_token_ids = None
             if request.logprobs:
                 choice_logprobs = self._process_response_logprobs(ret_item)
+                input_token_logprobs = ret_item["meta_info"]["input_token_logprobs"]
+                input_token_ids = [
+                    token_id for _, token_id, _ in input_token_logprobs
+                ]
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)
@@ -996,6 +1064,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_calls=tool_calls,
                     reasoning_content=reasoning_text if reasoning_text else None,
                 ),
+                input_token_ids=input_token_ids,
                 logprobs=choice_logprobs,
                 finish_reason=finish_reason["type"] if finish_reason else None,
                 matched_stop=(
@@ -1038,6 +1107,7 @@ class OpenAIServingChat(OpenAIServingBase):
         for token_idx, (token, logprob) in enumerate(
             zip(logprobs.tokens, logprobs.token_logprobs)
         ):
+            token_id = logprobs.token_ids[token_idx]
             token_bytes = list(token.encode("utf-8"))
             top_logprobs = []
             if logprobs.top_logprobs:
@@ -1058,6 +1128,7 @@ class OpenAIServingChat(OpenAIServingBase):
             token_logprobs.append(
                 ChatCompletionTokenLogprob(
                     token=token,
+                    token_id=token_id,
                     bytes=token_bytes,
                     logprob=logprob,
                     top_logprobs=top_logprobs,

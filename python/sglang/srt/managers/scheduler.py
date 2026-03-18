@@ -104,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     GetLoadReqInput,
     GetLoadsReqInput,
     GetWeightsByNameReqInput,
+    ListWeightsReqInput,
     HealthCheckOutput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -116,7 +117,10 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PinPrefixReqInput,
     PinPrefixReqOutput,
+    PrepareWeightsUpdateReqInput,
     ProfileReq,
+    ReceiveWeightsEPScatterReqInput,
+    ReceiveWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -135,6 +139,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    CompleteWeightsUpdateReqInput,
 )
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache, unwrap_shm_features
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -1158,6 +1163,11 @@ class Scheduler(
                     UpdateWeightsFromDistributedReqInput,
                     self.update_weights_from_distributed,
                 ),
+                (PrepareWeightsUpdateReqInput, self.prepare_weights_update),
+                (CompleteWeightsUpdateReqInput, self.complete_weights_update),
+                (ListWeightsReqInput, self.list_weights),
+                (ReceiveWeightsReqInput, self.receive_weights),
+                (ReceiveWeightsEPScatterReqInput, self.receive_weights_ep_scatter),
                 (UpdateWeightsFromTensorReqInput, self.update_weights_from_tensor),
                 (UpdateWeightsFromIPCReqInput, self.update_weights_from_ipc),
                 (GetWeightsByNameReqInput, self.get_weights_by_name),
@@ -1644,6 +1654,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                return_expert_logits=recv_req.return_expert_logits,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2115,8 +2126,7 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        if self.pp_size > 1:
-            res = min(res, self.req_to_token_pool.available_size())
+        res = min(res, self.req_to_token_pool.available_size())
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:

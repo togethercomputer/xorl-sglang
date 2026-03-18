@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import random
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -93,7 +94,7 @@ class SamplingBatchInfo:
                     (
                         r.sampling_params.sampling_seed
                         if r.sampling_params.sampling_seed is not None
-                        else 42
+                        else random.randint(0, 2**63 - 1)
                     )
                     for r in reqs
                 ],

@@ -26,7 +26,7 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -438,6 +438,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # For weight updates
         self._model_update_group = {}
         self._weights_send_group = {}
+        # For two-phase weight update protocol
+        self._pending_weight_update_thread = None
+        self._pending_weight_update_result = None
+        self._pending_weight_update_weights = None
+        self._pending_weight_update_lock = threading.Lock()
+        # Event to signal when recv thread is ready to receive NCCL broadcasts
+        self._pending_weight_update_ready_event = None
 
     def init_mindspore_runner(self):
         # Init the mindspore runner
@@ -596,8 +603,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
-        # Enable batch invariant mode
-        if server_args.enable_deterministic_inference:
+        # Enable batch invariant mode only for targets that need it (fsdp, tomni-batch-invariant)
+        if server_args.rl_on_policy_target in ("fsdp", "tomni-batch-invariant"):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
@@ -612,7 +619,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.maybe_init_ngram_embedding()
 
         # Init routed experts capturer
-        self.init_routed_experts_capturer()
+        if not self.is_draft_worker:
+            self.init_routed_experts_capturer()
 
         if self.device == "cuda" or self.device == "musa":
             self.init_cublas()
@@ -650,12 +658,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts,
+                enable=get_global_server_args().enable_return_routed_experts or get_global_server_args().enable_return_expert_logits,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
+                capture_topk_weights=get_global_server_args().enable_return_expert_logits,
             )
         )
 
@@ -1355,6 +1364,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         try:
+            # Match Tomni's NCCL settings for cross-process communication
+            os.environ["NCCL_CUMEM_ENABLE"] = "0"
+
+            # CRITICAL: Set CUDA device before NCCL process group creation
+            # NCCL needs the correct device context to initialize properly
+            if self.device == "cuda":
+                torch.cuda.set_device(self.gpu_id)
+                logger.info(f"Set CUDA device to {self.gpu_id} before process group creation")
+
+            # IMPORTANT: device_id forces eager NCCL communicator creation.
+            # Tomni's training side also passes device_id, so both sides must
+            # use eager init. Without this, sglang uses lazy init and tomni's
+            # rank 0 hangs in _new_process_group_helper waiting for peers that
+            # never enter the collective. Do NOT remove this without also
+            # changing tomni's nccl_broadcast.py to match.
+            device_id = torch.device(f"cuda:{self.gpu_id}") if self.device == "cuda" else None
+            logger.info(f"Creating process group with device_id={device_id}, NCCL_CUMEM_ENABLE=0")
+
             na = NetworkAddress(master_address, master_port)
             self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
@@ -1362,12 +1389,17 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
+                device_id=device_id,
             )
             return True, "Succeeded to initialize custom process group."
         except Exception as e:
             message = f"Failed to initialize custom process group: {e}."
             logger.error(message)
             return False, message
+
+    def has_weights_update_group(self, group_name: str) -> bool:
+        """Check if a weights update group exists."""
+        return group_name in self._model_update_group
 
     def destroy_weights_update_group(self, group_name):
         try:
@@ -1472,6 +1504,814 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             logger.error(error_msg)
             return False, error_msg
 
+    def ep_scatter_receive(
+        self,
+        weight_names: List[str],
+        group_name: str,
+        training_world_size: int,
+        num_experts_per_rank: int,
+        total_num_experts: int,
+        expert_transfer_plan: Optional[List[Dict]] = None,
+        non_expert_transfer_plan: Optional[List[Dict]] = None,
+        non_expert_batch_size: int = 50,
+    ) -> Tuple[bool, str]:
+        """Receive weights from all EP training ranks directly into param.data.
+
+        TRUE IN-PLACE: No intermediate buffers, no load_weights(). Receives directly
+        into model parameter tensors to preserve CUDA graphs and enable zero-copy.
+
+        When transfer plans are provided (preferred):
+        - Uses exact buffer shapes from per_transfer_shape for NCCL P2P compatibility
+        - Expert weights: receive into param.data[start:end] slices based on expert_ranges
+        - Non-expert weights: receive into param.data from rank 0 (in batches)
+
+        Legacy mode (when transfer plans are None):
+        - Falls back to detecting expert weights by naming patterns
+        - Slices param.data based on num_experts_per_rank
+
+        Args:
+            weight_names: List of parameter names to receive (legacy)
+            group_name: NCCL group name
+            training_world_size: Number of EP training ranks (typically 8)
+            num_experts_per_rank: Number of experts per EP training rank (typically 16)
+            total_num_experts: Total experts = training_world_size * num_experts_per_rank
+            expert_transfer_plan: Structured metadata for expert weight transfers
+            non_expert_transfer_plan: Structured metadata for non-expert weight transfers
+            non_expert_batch_size: Batch size for non-expert transfers (to avoid OOM)
+
+        Returns:
+            Tuple of (success, message)
+        """
+        from torch.distributed import P2POp, batch_isend_irecv
+
+        logger.info(
+            f"[TP{self.tp_rank}] ep_scatter_receive called: {len(weight_names)} weight_names, "
+            f"training_world_size={training_world_size}, num_experts_per_rank={num_experts_per_rank}, "
+            f"total_num_experts={total_num_experts}"
+        )
+        logger.info(
+            f"[TP{self.tp_rank}] Transfer plans: expert_transfer_plan={len(expert_transfer_plan or [])} entries, "
+            f"non_expert_transfer_plan={len(non_expert_transfer_plan or [])} entries"
+        )
+
+        try:
+            torch.cuda.set_device(self.gpu_id)
+
+            if group_name not in self._model_update_group:
+                return False, f"NCCL group {group_name} not initialized"
+            group = self._model_update_group[group_name]
+
+            params_dict = dict(self.model.named_parameters())
+            updated_count = 0
+
+            # Build all P2P receive operations - receive directly into param.data
+            p2p_ops = []
+
+            # Use structured transfer plans if available (preferred)
+            if expert_transfer_plan is not None or non_expert_transfer_plan is not None:
+                # Process expert weights using transfer plan
+                if expert_transfer_plan:
+                    for transfer in expert_transfer_plan:
+                        name = transfer["weight_name"]
+                        if name not in params_dict:
+                            logger.warning(f"[EP_SCATTER] Expert param {name} not found, skipping")
+                            continue
+
+                        param = params_dict[name]
+                        expert_ranges = transfer["expert_ranges"]
+                        per_transfer_shape = transfer["per_transfer_shape"]
+
+                        # Create irecv for each EP rank's portion
+                        for ep_rank_str, range_info in expert_ranges.items():
+                            ep_rank = int(ep_rank_str)  # JSON keys are strings
+                            start = range_info["start"]
+                            end = range_info["end"]
+                            source_rank = range_info["source_nccl_rank"]
+
+                            # Slice param.data to get the exact buffer shape
+                            # param.data shape: [total_experts, dim1, dim2, ...]
+                            # We slice the first dimension (experts) to get [num_local_experts, dim1, dim2, ...]
+                            recv_buffer = param.data[start:end]
+
+                            # Verify shape matches expected per_transfer_shape
+                            expected_shape = per_transfer_shape
+                            actual_shape = list(recv_buffer.shape)
+                            if actual_shape != expected_shape:
+                                logger.warning(
+                                    f"[EP_SCATTER] Shape mismatch for {name} from EP{ep_rank}: "
+                                    f"expected {expected_shape}, got {actual_shape}"
+                                )
+
+                            p2p_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_buffer,
+                                peer=source_rank,
+                                group=group,
+                            ))
+
+                        updated_count += 1
+
+                # Process non-expert weights using transfer plan
+                if non_expert_transfer_plan:
+                    for transfer in non_expert_transfer_plan:
+                        name = transfer["weight_name"]
+                        if name not in params_dict:
+                            logger.warning(f"[EP_SCATTER] Non-expert param {name} not found, skipping")
+                            continue
+
+                        param = params_dict[name]
+                        source_rank = transfer["source_nccl_rank"]
+                        per_transfer_shape = transfer["per_transfer_shape"]
+
+                        # Verify shape matches
+                        actual_shape = list(param.data.shape)
+                        if actual_shape != per_transfer_shape:
+                            logger.warning(
+                                f"[EP_SCATTER] Shape mismatch for {name}: "
+                                f"expected {per_transfer_shape}, got {actual_shape}"
+                            )
+
+                        p2p_ops.append(P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=param.data,
+                            peer=source_rank,
+                            group=group,
+                        ))
+
+                        updated_count += 1
+
+            else:
+                # Legacy mode: detect expert weights by naming patterns
+                for name in weight_names:
+                    if name not in params_dict:
+                        logger.warning(f"[EP_SCATTER] Parameter {name} not found, skipping")
+                        continue
+
+                    param = params_dict[name]
+                    # Detect expert weights by common MoE naming patterns
+                    is_expert = ".experts." in name or "w13_weight" in name or "w2_weight" in name
+
+                    if is_expert:
+                        # Expert weights: receive from ALL EP ranks into slices of param.data
+                        # param.data shape: [total_experts, ...] e.g. [128, 192, 2048]
+                        # Each EP rank sends: [num_experts_per_rank, ...] e.g. [16, 192, 2048]
+                        for ep_rank in range(training_world_size):
+                            expert_start = ep_rank * num_experts_per_rank
+                            expert_end = (ep_rank + 1) * num_experts_per_rank
+
+                            # Receive DIRECTLY into the slice of param.data (zero-copy!)
+                            # param.data[start:end] is a contiguous view for dim-0 slicing
+                            recv_slice = param.data[expert_start:expert_end]
+
+                            p2p_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_slice,
+                                peer=ep_rank,  # Training EP ranks are global ranks 0 to (training_world_size-1)
+                                group=group,
+                            ))
+                    else:
+                        # Non-expert weights: receive from rank 0 directly into param.data
+                        p2p_ops.append(P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=param.data,  # Receive directly into param.data!
+                            peer=0,
+                            group=group,
+                        ))
+
+                    updated_count += 1
+
+            # TWO-PHASE TRANSFER to avoid OOM on sender side:
+            # - Phase 1: Expert weights (received from all EP ranks)
+            # - Phase 2: Non-expert weights (received from rank 0 only)
+            # This matches Tomni's two-phase approach.
+
+            # Build separate op lists for two-phase transfer
+            expert_p2p_ops = []
+            non_expert_p2p_ops = []
+
+            # Classify ops into expert vs non-expert based on transfer plans
+            if expert_transfer_plan is not None or non_expert_transfer_plan is not None:
+                # With transfer plans: already built ops above, but we need to rebuild
+                # separately for each phase. Clear p2p_ops and rebuild.
+                p2p_ops = []  # Clear - we'll rebuild below
+                updated_count = 0
+
+                # Process expert weights using transfer plan -> expert_p2p_ops
+                if expert_transfer_plan:
+                    for transfer in expert_transfer_plan:
+                        name = transfer["weight_name"]
+                        if name not in params_dict:
+                            continue
+
+                        param = params_dict[name]
+                        expert_ranges = transfer["expert_ranges"]
+
+                        for ep_rank_str, range_info in expert_ranges.items():
+                            ep_rank = int(ep_rank_str)
+                            start = range_info["start"]
+                            end = range_info["end"]
+                            source_rank = range_info["source_nccl_rank"]
+
+                            recv_buffer = param.data[start:end]
+                            expert_p2p_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_buffer,
+                                peer=source_rank,
+                                group=group,
+                            ))
+
+                        updated_count += 1
+
+                # Non-expert weights are processed in Phase 2 (batched)
+                # Just count them for now; actual ops are built in Phase 2
+                if non_expert_transfer_plan:
+                    for transfer in non_expert_transfer_plan:
+                        name = transfer["weight_name"]
+                        if name in params_dict:
+                            updated_count += 1
+            else:
+                # Legacy mode: classify based on naming patterns
+                for name in weight_names:
+                    if name not in params_dict:
+                        continue
+
+                    param = params_dict[name]
+                    is_expert = ".experts." in name or "w13_weight" in name or "w2_weight" in name
+
+                    if is_expert:
+                        for ep_rank in range(training_world_size):
+                            expert_start = ep_rank * num_experts_per_rank
+                            expert_end = (ep_rank + 1) * num_experts_per_rank
+                            recv_slice = param.data[expert_start:expert_end]
+                            expert_p2p_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_slice,
+                                peer=ep_rank,
+                                group=group,
+                            ))
+                    else:
+                        non_expert_p2p_ops.append(P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=param.data,
+                            peer=0,
+                            group=group,
+                        ))
+
+                    updated_count += 1
+
+            # ========== PHASE 1: Expert Weights (batched by layer) ==========
+            # CRITICAL: Tomni sends expert weights layer-by-layer (one batch_isend_irecv per layer).
+            # SGLang MUST receive in the same batches to match NCCL P2P operations.
+            # PyTorch's batch_isend_irecv returns a coalesced Work object in NCCL backend,
+            # so if we batch differently, the recv side completes prematurely while Tomni
+            # is still sending subsequent batches, causing a deadlock.
+            if expert_transfer_plan:
+                # Group transfers by layer to match Tomni's batched sending
+                layer_transfers = {}
+                for transfer in expert_transfer_plan:
+                    name = transfer["weight_name"]
+                    if name not in params_dict:
+                        continue
+                    # Extract layer index from name like "model.layers.0.mlp.experts.w13_weight"
+                    if ".layers." in name:
+                        parts = name.split(".")
+                        for i, part in enumerate(parts):
+                            if part == "layers" and i + 1 < len(parts):
+                                try:
+                                    layer_idx = int(parts[i + 1])
+                                    if layer_idx not in layer_transfers:
+                                        layer_transfers[layer_idx] = []
+                                    layer_transfers[layer_idx].append(transfer)
+                                except ValueError:
+                                    pass  # Not a numeric layer index
+                                break
+
+                num_layers = len(layer_transfers)
+                logger.info(f"[TP{self.tp_rank}] PHASE 1: Starting {num_layers} expert layers")
+
+                for layer_idx in sorted(layer_transfers.keys()):
+                    layer_batch = layer_transfers[layer_idx]
+                    layer_ops = []
+
+                    for transfer in layer_batch:
+                        name = transfer["weight_name"]
+                        param = params_dict[name]
+                        expert_ranges = transfer["expert_ranges"]
+
+                        for ep_rank_str, range_info in expert_ranges.items():
+                            start = range_info["start"]
+                            end = range_info["end"]
+                            source_rank = range_info["source_nccl_rank"]
+
+                            recv_buffer = param.data[start:end]
+                            layer_ops.append(P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=recv_buffer,
+                                peer=source_rank,
+                                group=group,
+                            ))
+
+                    if layer_ops:
+                        logger.debug(f"[TP{self.tp_rank}] PHASE 1: Layer {layer_idx}, {len(layer_ops)} recv ops")
+                        reqs = batch_isend_irecv(layer_ops)
+                        for req in reqs:
+                            req.wait()
+
+                logger.info(f"[TP{self.tp_rank}] PHASE 1 complete, starting PHASE 2")
+                torch.cuda.synchronize()
+                logger.info(f"[TP{self.tp_rank}] PHASE 1: Expert weights synchronized")
+
+            elif expert_p2p_ops:
+                # Legacy mode: no transfer plan, use pre-built ops in a single batch
+                logger.debug(f"[TP{self.tp_rank}] PHASE 1 (legacy): Built {len(expert_p2p_ops)} expert recv ops")
+                reqs = batch_isend_irecv(expert_p2p_ops)
+                for req in reqs:
+                    req.wait()
+                torch.cuda.synchronize()
+                logger.debug(f"[TP{self.tp_rank}] PHASE 1 (legacy): Expert weights synchronized")
+
+            # ========== PHASE 2: Non-Expert Weights (in sub-batches) ==========
+            # Process non-expert weights in batches to match Tomni's batched sending.
+            # This must use the same batch size as Tomni to ensure ops match.
+            if non_expert_transfer_plan:
+                # Use transfer plan for batched processing
+                num_non_expert = len(non_expert_transfer_plan)
+                num_batches = (num_non_expert + non_expert_batch_size - 1) // non_expert_batch_size
+                logger.info(f"[TP{self.tp_rank}] PHASE 2: Processing {num_non_expert} non-expert weights in {num_batches} batches")
+
+                for batch_idx in range(num_batches):
+                    start_idx = batch_idx * non_expert_batch_size
+                    end_idx = min(start_idx + non_expert_batch_size, num_non_expert)
+                    batch_transfers = non_expert_transfer_plan[start_idx:end_idx]
+
+                    batch_ops = []
+                    for transfer in batch_transfers:
+                        name = transfer["weight_name"]
+                        if name not in params_dict:
+                            continue
+
+                        param = params_dict[name]
+                        source_rank = transfer["source_nccl_rank"]
+
+                        batch_ops.append(P2POp(
+                            op=torch.distributed.irecv,
+                            tensor=param.data,
+                            peer=source_rank,
+                            group=group,
+                        ))
+
+                    if batch_ops:
+                        reqs = batch_isend_irecv(batch_ops)
+                        for req in reqs:
+                            req.wait()
+                        torch.cuda.synchronize()
+
+                logger.info(f"[TP{self.tp_rank}] PHASE 2: All non-expert batches complete")
+
+            elif non_expert_p2p_ops:
+                # Legacy mode: process pre-built ops in a single batch
+                reqs = batch_isend_irecv(non_expert_p2p_ops)
+                for req in reqs:
+                    req.wait()
+                logger.debug(f"[TP{self.tp_rank}] PHASE 2 (legacy): All ops complete, synchronizing...")
+                torch.cuda.synchronize()
+
+            logger.info(f"[TP{self.tp_rank}] ep_scatter_receive complete: Updated {updated_count} params")
+            return True, f"Updated {updated_count} params in-place from {training_world_size} EP ranks (2-phase batched)"
+
+        except Exception as e:
+            logger.error(f"EP scatter receive failed: {e}", exc_info=True)
+            return False, str(e)
+
+    def prepare_weights_update(
+        self,
+        buckets,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
+        """Phase 1 of two-phase weight update protocol.
+
+        This starts background recv threads that are ready to receive NCCL broadcasts.
+        Returns only AFTER the recv thread has entered the NCCL broadcast call,
+        ensuring it's actually ready to receive.
+
+        This method is designed to fix race conditions in RL training pipelines where
+        the training side (e.g., Slime) starts NCCL broadcasts before SGLang's recv
+        is ready.
+
+        Args:
+            buckets: List of WeightBucket objects, each containing names, dtypes, shapes
+            group_name: NCCL group name
+            load_format: Optional format specification for loading
+
+        Usage:
+            1. Call prepare_weights_update() - starts background recv threads
+            2. Perform NCCL broadcast from training side
+            3. Call complete_weights_update() - waits for recv and applies weights
+        """
+        assert group_name in self._model_update_group, (
+            f"Group {group_name} not in {list(self._model_update_group.keys())}. "
+            "Please call `init_weights_update_group` first."
+        )
+
+        with self._pending_weight_update_lock:
+            if self._pending_weight_update_thread is not None:
+                return (
+                    False,
+                    "A weight update is already in progress. "
+                    "Call complete_weights_update first.",
+                )
+
+            # Reset state
+            self._pending_weight_update_result = None
+            self._pending_weight_update_weights = None
+
+            num_buckets = len(buckets)
+            logger.info(
+                f"Starting weight update with {num_buckets} bucket(s) "
+                f"on group {group_name}"
+            )
+
+            # Create event for the background thread to signal when it's ready
+            self._pending_weight_update_ready_event = threading.Event()
+
+            # Start background thread to receive weights
+            self._pending_weight_update_thread = threading.Thread(
+                target=self._recv_weights_background,
+                args=(buckets, group_name, load_format),
+                daemon=True,
+            )
+            self._pending_weight_update_thread.start()
+
+        # Wait for the background thread to signal it's ready to receive
+        # This ensures NCCL recv is actually waiting before we return "ready"
+        ready_timeout = 60  # seconds
+        if not self._pending_weight_update_ready_event.wait(timeout=ready_timeout):
+            logger.error(
+                f"Background recv thread did not become ready within {ready_timeout}s"
+            )
+            return (
+                False,
+                f"Timeout waiting for recv thread to become ready after {ready_timeout}s",
+            )
+
+        logger.info(
+            f"Weight update recv thread is now waiting for NCCL broadcasts "
+            f"({num_buckets} bucket(s))"
+        )
+
+        return (
+            True,
+            f"Weight update recv threads started for {num_buckets} bucket(s). "
+            "Ready to receive broadcasts.",
+        )
+
+    def _recv_weights_background(
+        self,
+        buckets,
+        group_name,
+        load_format: Optional[str] = None,
+    ):
+        """Background thread that receives weights via NCCL broadcast.
+
+        This runs in a separate thread so that the main scheduler event loop
+        can return immediately after prepare_weights_update.
+
+        Args:
+            buckets: List of WeightBucket objects
+            group_name: NCCL group name
+            load_format: Optional format specification
+        """
+        try:
+            all_weights = []
+            is_first_bucket = True
+
+            # Process each bucket - one NCCL broadcast per bucket
+            for bucket_idx, bucket in enumerate(buckets):
+                names = bucket.names
+                dtypes = bucket.dtypes
+                shapes = bucket.shapes
+
+                logger.debug(
+                    f"Receiving bucket {bucket_idx + 1}/{len(buckets)} "
+                    f"with {len(names)} weights"
+                )
+
+                if load_format == "flattened_bucket":
+                    # Receive as flattened bucket (single broadcast per bucket)
+                    bucket_weights = self._recv_single_bucket_flattened(
+                        names,
+                        dtypes,
+                        shapes,
+                        group_name,
+                        signal_ready=is_first_bucket,
+                    )
+                else:
+                    # Receive individual weights (one broadcast per weight)
+                    bucket_weights = self._recv_single_bucket_individual(
+                        names,
+                        dtypes,
+                        shapes,
+                        group_name,
+                        signal_ready=is_first_bucket,
+                    )
+
+                is_first_bucket = False
+                all_weights.extend(bucket_weights)
+
+            with self._pending_weight_update_lock:
+                self._pending_weight_update_weights = all_weights
+                self._pending_weight_update_result = (
+                    True,
+                    f"Received {len(all_weights)} weights from {len(buckets)} bucket(s).",
+                )
+
+        except Exception as e:
+            error_msg = f"Failed to receive weights in background: {e}"
+            logger.error(error_msg)
+            # Make sure we signal ready even on error so prepare_weights_update doesn't hang
+            if self._pending_weight_update_ready_event is not None:
+                self._pending_weight_update_ready_event.set()
+            with self._pending_weight_update_lock:
+                self._pending_weight_update_result = (False, error_msg)
+
+    def _recv_single_bucket_flattened(
+        self, names, dtypes, shapes, group_name, signal_ready=False
+    ):
+        """Receive a single bucket as a flattened tensor."""
+        # Use explicit device based on gpu_id for NCCL compatibility
+        explicit_device = f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        named_tensors = []
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            named_tensors.append(
+                (name, torch.empty(shape, dtype=target_dtype, device=explicit_device))
+            )
+
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        flattened_tensor = bucket.get_flattened_tensor()
+
+        # Signal ready BEFORE entering the blocking NCCL broadcast
+        # This tells the caller we're about to wait for the broadcast
+        if signal_ready and self._pending_weight_update_ready_event is not None:
+            # First, barrier across all TP ranks to ensure they're all ready
+            # This prevents returning "ready" before all TP ranks are waiting
+            # NOTE: Use cpu_group for barrier, NOT device_group! NCCL barrier
+            # creates internal GPU tensors which can mess up device context.
+            tp_group = get_tp_group()
+            if tp_group is not None and tp_group.world_size > 1:
+                logger.debug(
+                    f"TP rank {tp_group.rank} waiting at barrier before signaling ready"
+                )
+                torch.distributed.barrier(group=tp_group.cpu_group)
+                logger.debug(f"TP rank {tp_group.rank} passed barrier")
+
+            logger.debug("Signaling ready before NCCL broadcast (flattened bucket)")
+            self._pending_weight_update_ready_event.set()
+
+        torch.distributed.broadcast(
+            flattened_tensor,
+            src=0,
+            group=self._model_update_group[group_name],
+        )
+        return bucket.reconstruct_tensors()
+
+    def _recv_single_bucket_individual(
+        self, names, dtypes, shapes, group_name, signal_ready=False
+    ):
+        """Receive a single bucket with individual broadcasts per weight."""
+        weights = []
+        handles = []
+
+        # Allocate all tensors first
+        # Use explicit device based on gpu_id for NCCL compatibility
+        explicit_device = f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            weight = torch.empty(shape, dtype=target_dtype, device=explicit_device)
+            weights.append((name, weight))
+
+        # Signal ready BEFORE entering the blocking NCCL broadcasts
+        # This tells the caller we're about to wait for the broadcasts
+        if signal_ready and self._pending_weight_update_ready_event is not None:
+            # First, barrier across all TP ranks to ensure they're all ready
+            # This prevents returning "ready" before all TP ranks are waiting
+            # NOTE: Use cpu_group for barrier, NOT device_group! NCCL barrier
+            # creates internal GPU tensors which can mess up device context.
+            tp_group = get_tp_group()
+            if tp_group is not None and tp_group.world_size > 1:
+                logger.debug(
+                    f"TP rank {tp_group.rank} waiting at barrier before signaling ready"
+                )
+                torch.distributed.barrier(group=tp_group.cpu_group)
+                logger.debug(f"TP rank {tp_group.rank} passed barrier")
+
+            logger.debug("Signaling ready before NCCL broadcast (individual)")
+            self._pending_weight_update_ready_event.set()
+
+        # Ensure we're on the correct CUDA device before NCCL operations
+        if self.device == "cuda":
+            torch.cuda.set_device(self.gpu_id)
+
+        # Start all broadcasts
+        for name, weight in weights:
+            handles.append(
+                torch.distributed.broadcast(
+                    weight,
+                    src=0,
+                    group=self._model_update_group[group_name],
+                    async_op=True,
+                )
+            )
+
+        # Wait for all broadcasts in this bucket to complete
+        for handle in handles:
+            handle.wait()
+
+        return weights
+
+    def complete_weights_update(self, group_name):
+        """Phase 2 of two-phase weight update protocol.
+
+        This waits for the background recv threads to complete and applies the weights.
+        Should be called after the NCCL broadcast has completed on the sender side.
+
+        Args:
+            group_name: The NCCL group name (for validation)
+
+        Returns:
+            Tuple[bool, str]: (success, message)
+        """
+        # Default timeout of 300 seconds for the recv thread to complete
+        timeout = 300
+
+        with self._pending_weight_update_lock:
+            if self._pending_weight_update_thread is None:
+                return (
+                    False,
+                    "No weight update in progress. Call prepare_weights_update first.",
+                )
+            thread = self._pending_weight_update_thread
+
+        # Wait for the background thread to complete
+        thread.join(timeout=timeout)
+
+        with self._pending_weight_update_lock:
+            if thread.is_alive():
+                # Thread timed out
+                error_msg = (
+                    f"Weight update timed out after {timeout}s. "
+                    "The NCCL broadcast may not have been initiated by the sender."
+                )
+                logger.error(error_msg)
+                # Reset state - thread will eventually die or complete
+                self._pending_weight_update_thread = None
+                self._pending_weight_update_result = None
+                self._pending_weight_update_weights = None
+                return False, error_msg
+
+            # Get the result
+            result = self._pending_weight_update_result
+            weights = self._pending_weight_update_weights
+
+            # Reset state
+            self._pending_weight_update_thread = None
+            self._pending_weight_update_result = None
+            self._pending_weight_update_weights = None
+
+        if result is None:
+            return False, "Weight update failed: no result available."
+
+        success, message = result
+        if not success:
+            return success, message
+
+        # Apply the received weights
+        try:
+            self.model.load_weights(weights)
+            return True, "Succeeded to update weights via two-phase protocol."
+        except Exception as e:
+            error_msg = (
+                f"Failed to load weights: {e}. "
+                f"The weights were received but could not be applied."
+            )
+            logger.error(error_msg)
+            return False, error_msg
+
+    def receive_weights(
+        self,
+        num_buckets: int,
+        buckets: list,
+        group_name: str = "weight_update_group",
+        flush_cache: bool = False,
+        recapture_cuda_graph: bool = True,
+    ):
+        """Receive weights via NCCL broadcast from an existing process group.
+
+        This is the main method for the pause/broadcast/resume weight sync protocol.
+        It receives weights synchronously via NCCL broadcast and applies them.
+
+        Args:
+            num_buckets: Number of weight buckets to receive
+            buckets: List of bucket metadata dicts with 'names', 'dtypes', 'shapes'
+            group_name: The NCCL group name (must already be initialized)
+            flush_cache: Whether to flush KV cache after applying weights
+
+        Returns:
+            Tuple[bool, str]: (success, message)
+        """
+        logger.info(f"receive_weights: receiving {num_buckets} buckets via group '{group_name}'")
+
+        # Get the NCCL group
+        if group_name not in self._model_update_group:
+            error_msg = f"NCCL group '{group_name}' not found. Call init_weights_update_group first."
+            logger.error(error_msg)
+            return False, error_msg
+
+        group = self._model_update_group[group_name]
+
+        # Map dtype strings to torch dtypes
+        dtype_map = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "int8": torch.int8,
+            "int32": torch.int32,
+            "int64": torch.int64,
+        }
+
+        all_weights = []
+
+        try:
+            # Receive each bucket
+            for bucket_idx, bucket in enumerate(buckets):
+                names = bucket["names"]
+                dtypes = bucket["dtypes"]
+                shapes = bucket["shapes"]
+
+                logger.info(
+                    f"receive_weights: receiving bucket {bucket_idx+1}/{num_buckets} "
+                    f"({len(names)} params)"
+                )
+
+                # Receive each weight in the bucket
+                for name, dtype_str, shape in zip(names, dtypes, shapes):
+                    dtype = dtype_map.get(dtype_str)
+                    if dtype is None:
+                        error_msg = f"Unknown dtype: {dtype_str}"
+                        logger.error(error_msg)
+                        return False, error_msg
+
+                    # Allocate receive buffer
+                    recv_buffer = torch.empty(shape, dtype=dtype, device=self.device)
+
+                    # NCCL broadcast recv (src=0 is training)
+                    torch.distributed.broadcast(recv_buffer, src=0, group=group)
+
+                    all_weights.append((name, recv_buffer))
+
+            # Ensure use_presharded_weights=False for NCCL weight sync
+            # NCCL sync sends FULL weights that need to be sharded per TP rank
+            for module in self.model.modules():
+                if hasattr(module, 'use_presharded_weights'):
+                    if module.use_presharded_weights:
+                        module.use_presharded_weights = False
+
+            # Apply the received weights
+            self.model.load_weights(all_weights)
+
+            # Re-establish tied embeddings if necessary (defensive fix)
+            has_tied_embeddings = getattr(self.model_config.hf_config, 'tie_word_embeddings', False)
+            if has_tied_embeddings:
+                try:
+                    if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                        embed_weight = self.model.model.embed_tokens.weight
+                        if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
+                            if embed_weight.data_ptr() != self.model.lm_head.weight.data_ptr():
+                                logger.warning("receive_weights: tied embeddings aliasing broken, re-establishing...")
+                                self.model.lm_head.weight = embed_weight
+                except Exception as e:
+                    logger.warning(f"receive_weights: could not verify/fix tied embeddings: {e}")
+
+            # CRITICAL: Synchronize CUDA to ensure all weight updates are complete
+            torch.cuda.synchronize()
+
+            # CRITICAL: Recapture CUDA graphs after weight update
+            # CUDA graphs capture memory pointers at capture time - must recapture when weights change
+            if recapture_cuda_graph and self.device == "cuda" and not self.server_args.disable_cuda_graph:
+                self.init_device_graphs()
+
+            return True, f"Received and applied {len(all_weights)} weights"
+
+        except Exception as e:
+            error_msg = f"Failed to receive weights: {e}"
+            logger.error(error_msg, exc_info=True)
+            return False, error_msg
+
     def update_weights_from_tensor(
         self,
         named_tensors: List[Tuple[str, Union[torch.Tensor, "LocalSerializedTensor"]]],
@@ -1551,6 +2391,50 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         except Exception as e:
             logger.error(f"Error when getting parameter {name}: {e}")
             return None
+
+    def get_remote_instance_transfer_engine_info(self):
+        """Get transfer engine info for remote instance weight loading."""
+        if self.remote_instance_transfer_engine_weight_info is None:
+            return "", {}
+        return (
+            self.remote_instance_transfer_engine_session_id,
+            self.remote_instance_transfer_engine_weight_info,
+        )
+
+    def list_weights(self, prefix: str = None):
+        """List all weight names in the model.
+
+        Used to verify weight name mapping between training and inference servers.
+
+        Args:
+            prefix: Optional filter prefix (e.g., "model.layers.0")
+
+        Returns:
+            Dict with success, weights list [{name, shape, data_ptr}].
+        """
+        try:
+            weights = []
+            for param_name, param in self.model.named_parameters():
+                if prefix is None or param_name.startswith(prefix):
+                    weights.append({
+                        "name": param_name,
+                        "shape": list(param.shape),
+                        "data_ptr": param.data.data_ptr(),
+                    })
+
+            return {
+                "success": True,
+                "message": f"Found {len(weights)} weights",
+                "weights": weights,
+            }
+
+        except Exception as e:
+            logger.error(f"list_weights failed: {e}")
+            return {
+                "success": False,
+                "message": str(e),
+                "weights": [],
+            }
 
     def init_lora_manager(self):
         self.lora_manager = LoRAManager(
@@ -2534,11 +3418,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
-        get_global_experts_capturer().on_forward_end(
-            forward_batch=forward_batch,
-            can_run_graph=output.can_run_graph,
-            cuda_graph_batch=getattr(self.graph_runner, "bs", None),
-        )
+        if not self.is_draft_worker:
+            get_global_experts_capturer().on_forward_end(
+                forward_batch=forward_batch,
+                can_run_graph=output.can_run_graph,
+                cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+            )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()

@@ -54,6 +54,7 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
+    CompleteWeightsUpdateReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
@@ -63,6 +64,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
+    PrepareWeightsUpdateReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
@@ -72,6 +74,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    WeightBucket,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
 from sglang.srt.managers.scheduler import run_scheduler_process
@@ -833,6 +836,63 @@ class Engine(EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.update_weights_from_distributed(obj, None)
+        )
+
+    def prepare_weights_update(
+        self,
+        names: Optional[list[str]] = None,
+        dtypes: Optional[list[str]] = None,
+        shapes: Optional[list[list[int]]] = None,
+        buckets: Optional[List[WeightBucket]] = None,
+        num_buckets: Optional[int] = None,
+        group_name: str = "weight_update_group",
+        load_format: Optional[str] = None,
+    ):
+        """Phase 1 of two-phase weight update protocol.
+
+        This starts background recv threads that are ready to receive NCCL broadcasts.
+        Returns immediately once the recv threads are started and ready.
+
+        Supports two formats:
+        1. Batched format (preferred): buckets array with num_buckets
+        2. Flat format (legacy): names, dtypes, shapes at top level
+
+        Usage:
+            1. Call prepare_weights_update() - starts background recv threads
+            2. Perform NCCL broadcast from training side
+            3. Call complete_weights_update() - waits for recv and applies weights
+        """
+        obj = PrepareWeightsUpdateReqInput(
+            names=names,
+            dtypes=dtypes,
+            shapes=shapes,
+            buckets=buckets,
+            num_buckets=num_buckets,
+            group_name=group_name,
+            load_format=load_format,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.prepare_weights_update(obj, None)
+        )
+
+    def complete_weights_update(
+        self,
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
+        weight_version: Optional[str] = None,
+    ):
+        """Phase 2 of two-phase weight update protocol.
+
+        This waits for the background recv threads to complete and applies the weights.
+        Should be called after the NCCL broadcast has completed on the sender side.
+        """
+        obj = CompleteWeightsUpdateReqInput(
+            group_name=group_name,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.complete_weights_update(obj, None)
         )
 
     def update_weights_from_tensor(

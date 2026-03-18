@@ -17,18 +17,23 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.managers.io_struct import (
+    CompleteWeightsUpdateReqInput,
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    ListWeightsReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    PrepareWeightsUpdateReqInput,
+    ReceiveWeightsEPScatterReqInput,
+    ReceiveWeightsReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -153,6 +158,68 @@ class BaseTpWorker(ABC):
             recv_req.load_format,
         )
         return success, message
+
+    def prepare_weights_update(self, recv_req: PrepareWeightsUpdateReqInput):
+        """Phase 1 of two-phase weight update protocol.
+
+        This starts background recv threads that are ready to receive NCCL broadcasts.
+        """
+        # Get buckets (handles both batched and flat formats)
+        buckets = recv_req.get_buckets()
+        success, message = self.model_runner.prepare_weights_update(
+            buckets=buckets,
+            group_name=recv_req.group_name,
+            load_format=recv_req.load_format,
+        )
+        return success, message
+
+    def complete_weights_update(self, recv_req: CompleteWeightsUpdateReqInput):
+        """Phase 2 of two-phase weight update protocol.
+
+        This waits for the background recv threads to complete and applies the weights.
+        """
+        success, message = self.model_runner.complete_weights_update(
+            recv_req.group_name,
+        )
+        return success, message
+
+    def list_weights(self, recv_req):
+        """List all weight names in the model."""
+        return self.model_runner.list_weights(prefix=recv_req.prefix)
+
+    def get_remote_instance_transfer_engine_info(self):
+        """Get RDMA transfer engine info for remote instance weight loading."""
+        return self.model_runner.get_remote_instance_transfer_engine_info()
+
+    def receive_weights(self, recv_req: ReceiveWeightsReqInput):
+        """Receive weights via NCCL broadcast from an existing process group.
+
+        This is used as part of the pause/broadcast/resume weight sync protocol.
+        Assumes inference is already paused and NCCL group is initialized.
+        """
+        success, message = self.model_runner.receive_weights(
+            num_buckets=recv_req.num_buckets,
+            buckets=recv_req.buckets,
+            group_name=recv_req.group_name,
+            flush_cache=recv_req.flush_cache,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
+        )
+        return success, message
+
+    def receive_weights_ep_scatter(
+        self, recv_req: "ReceiveWeightsEPScatterReqInput"
+    ) -> Tuple[bool, str]:
+        """Receive weights from EP ranks via P2P scatter."""
+        return self.model_runner.ep_scatter_receive(
+            recv_req.weight_names,
+            recv_req.group_name,
+            recv_req.training_world_size,
+            recv_req.num_experts_per_rank,
+            recv_req.total_num_experts,
+            expert_transfer_plan=recv_req.expert_transfer_plan,
+            non_expert_transfer_plan=recv_req.non_expert_transfer_plan,
+            non_expert_batch_size=recv_req.non_expert_batch_size,
+        )
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
 

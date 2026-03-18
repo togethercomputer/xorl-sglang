@@ -139,10 +139,13 @@ def register_memory_region_v1(model, transfer_engine):
             raise RuntimeError(
                 f"register memory failed for weight {name}, error: {ret}"
             )
+        # Store 5 elements: data_ptr, numel, element_size, shape, dtype
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),
             weight.element_size(),
+            list(weight.shape),
+            str(weight.dtype).replace("torch.", ""),
         )
 
     end_tic = time.time()
@@ -156,10 +159,13 @@ def register_memory_region_v2(model, transfer_engine):
     weight_mr_dict = {}
     weight_addr_set = set()
     for name, weight in model.named_parameters():
+        # Store 5 elements: data_ptr, numel, element_size, shape, dtype
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),
             weight.element_size(),
+            list(weight.shape),
+            str(weight.dtype).replace("torch.", ""),
         )
         weight_addr_set.add(weight.data_ptr())
 

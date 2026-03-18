@@ -112,6 +112,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    CompleteWeightsUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -119,6 +120,7 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
+    ListWeightsReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
@@ -127,7 +129,10 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PinPrefixReqInput,
+    PrepareWeightsUpdateReqInput,
     ProfileReqInput,
+    ReceiveWeightsEPScatterReqInput,
+    ReceiveWeightsReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -494,6 +499,10 @@ async def health_generate(request: Request) -> Response:
     If the server is running something, this request will be ignored, so it creates zero overhead.
     If the server is not running anything, this request will be run, so we know whether the server is healthy.
     """
+
+    # Skip health check during weight updates - server is intentionally busy with NCCL operations
+    if getattr(_global_state.tokenizer_manager, "_weight_update_in_progress", False):
+        return Response(status_code=200)
 
     if _global_state.tokenizer_manager.gracefully_exit:
         logger.info("Health check request received during shutdown. Returning 503.")
@@ -1048,6 +1057,33 @@ async def get_remote_instance_transfer_engine_info(rank: int = None):
         return Response(status_code=HTTPStatus.BAD_REQUEST)
 
 
+@app.get("/list_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def list_weights(prefix: str = None, rank: int = 0):
+    """List all weight names in the model.
+
+    Used to verify weight name mapping between training and inference servers.
+
+    Args:
+        prefix: Optional filter prefix (e.g., "model.layers.0")
+        rank: The TP rank to get info from (default 0)
+
+    Returns:
+        JSON with list of weights: [{name, shape, data_ptr}].
+    """
+    try:
+        result = await _global_state.tokenizer_manager.list_weights(
+            ListWeightsReqInput(prefix=prefix), rank
+        )
+        return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"list_weights failed: {e}")
+        return ORJSONResponse(
+            {"success": False, "message": str(e)},
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+        )
+
+
 @app.post("/init_weights_update_group")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def init_weights_update_group(
@@ -1111,6 +1147,96 @@ async def update_weights_from_distributed(
         await _global_state.tokenizer_manager.update_weights_from_distributed(
             obj, request
         )
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/receive_weights_ep_scatter")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def receive_weights_ep_scatter(
+    obj: ReceiveWeightsEPScatterReqInput, request: Request
+):
+    """Receive weights from multiple EP training ranks via NCCL P2P scatter.
+
+    This endpoint enables parallel weight transfer where all EP training ranks
+    simultaneously send their local expert weights to all TP inference ranks.
+    """
+    success, message = (
+        await _global_state.tokenizer_manager.receive_weights_ep_scatter(obj, request)
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/prepare_weights_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_weights_update(
+    obj: PrepareWeightsUpdateReqInput, request: Request
+):
+    """Phase 1 of two-phase weight update protocol.
+
+    This starts background recv threads that are ready to receive NCCL broadcasts.
+    The caller should wait for this to return before starting the NCCL broadcast.
+
+    Usage:
+        1. Call /prepare_weights_update to start recv threads (this endpoint)
+        2. Perform NCCL broadcast from the training side
+        3. Call /complete_weights_update to apply the received weights
+    """
+    success, message = (
+        await _global_state.tokenizer_manager.prepare_weights_update(obj, request)
+    )
+
+    if success:
+        content = {"status": "ready", "success": success, "message": message}
+        return ORJSONResponse(content, status_code=200)
+    else:
+        content = {"status": "error", "success": success, "message": message}
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/complete_weights_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def complete_weights_update(
+    obj: CompleteWeightsUpdateReqInput, request: Request
+):
+    """Phase 2 of two-phase weight update protocol.
+
+    This waits for the background recv threads to complete and applies the weights.
+    Should be called after the NCCL broadcast has completed on the sender side.
+    """
+    success, message = (
+        await _global_state.tokenizer_manager.complete_weights_update(obj, request)
+    )
+
+    content = {"success": success, "message": message}
+    if success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
+@app.post("/receive_weights")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def receive_weights(obj: ReceiveWeightsReqInput, request: Request):
+    """Receive weights via NCCL broadcast from an existing process group.
+
+    This endpoint is used as part of the pause/broadcast/resume weight sync protocol:
+    1. Call /pause_generation to pause inference
+    2. Call /receive_weights to start NCCL recv and apply weights (this endpoint)
+    3. Call /continue_generation to resume inference
+
+    The NCCL group must already be initialized via /init_weights_update_group.
+    """
+    success, message = await _global_state.tokenizer_manager.receive_weights(
+        obj, request
     )
 
     content = {"success": success, "message": message}

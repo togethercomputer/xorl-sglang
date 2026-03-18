@@ -247,13 +247,8 @@ def _matmul_persistent_deepgemm(
 
     try:
         deep_gemm.bf16_gemm_nn(a, b, out)
-    except RuntimeError as e:
-        raise RuntimeError(
-            f"DeepGEMM failed for matrix shapes M={M}, N={N}, K={K}. "
-            f"This typically occurs when dimensions are too small for DeepGEMM's TMA descriptors. "
-            f"Consider increasing MIN_DEEPGEMM_DIM in matmul_persistent() or disabling DeepGEMM "
-            f"for small matrices. Original error: {e}"
-        ) from e
+    except RuntimeError:
+        return None
 
     # TODO can this be put in DeepGEMM's `c`?
     if bias is not None:
@@ -282,19 +277,18 @@ def matmul_persistent(
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
             out_deepgemm = _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
-            diff = calc_diff(out_triton, out_deepgemm)
-            assert diff < 0.0001, f"{diff=} {out_triton=} {out_deepgemm=}"
-            # can be enabled for debugging
-            # print(
-            #     f"{diff=} "
-            #     f"{(out_triton - out_deepgemm).abs().mean()=} "
-            #     f"{(out_triton - out_deepgemm).abs().sum()=} "
-            #     f"{torch.sum(out_triton != out_deepgemm)=} "
-            # )
-            # print(f"{a=} {b=} {bias=} {out_triton=} {out_deepgemm=}")
-            return out_deepgemm
+            if out_deepgemm is not None:
+                diff = calc_diff(out_triton, out_deepgemm)
+                assert diff < 0.0001, f"{diff=} {out_triton=} {out_deepgemm=}"
+                return out_deepgemm
+            # DeepGEMM failed, use Triton result
+            return out_triton
 
-        return _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        result = _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
+        if result is not None:
+            return result
+        # DeepGEMM failed (e.g. dimensions too small for TMA descriptors),
+        # fall through to batch-invariant Triton persistent kernel
 
     if _ENABLE_MM_FALLBACK_VARIANT:
         out = torch.einsum("ik,kj->ij", a, b)

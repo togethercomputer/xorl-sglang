@@ -32,6 +32,8 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
     FreezeGCReq,
+    WeightUpdatePauseReq,
+    WeightUpdateResumeReq,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -124,6 +126,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         self.is_tool_call_parser_gpt_oss = server_args.tool_call_parser == "gpt-oss"
         self.disable_tokenizer_batch_decode = server_args.disable_tokenizer_batch_decode
 
+        # Track weight update pause state
+        self._weight_update_paused = False
+
         self.soft_watchdog = Watchdog.create(
             debug_name="DetokenizerManager",
             watchdog_timeout=server_args.soft_watchdog_timeout,
@@ -138,6 +143,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 (BatchTokenIDOutput, self.handle_batch_token_id_out),
                 (BatchMultimodalDecodeReq, self.handle_multimodal_decode_req),
                 (FreezeGCReq, self.handle_freeze_gc_req),
+                (WeightUpdatePauseReq, self._handle_weight_update_pause),
+                (WeightUpdateResumeReq, self._handle_weight_update_resume),
             ]
         )
 
@@ -357,6 +364,21 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             ]
         return routed_experts
 
+    def _extract_expert_logits(self, recv_obj: BatchTokenIDOutput) -> Optional[List[str]]:
+        output_expert_logits = None
+        if recv_obj.output_expert_logits is not None:
+            output_expert_logits = [
+                (
+                    pybase64.b64encode(expert_logits.numpy().tobytes()).decode(
+                        "utf-8"
+                    )
+                    if expert_logits is not None
+                    else []
+                )
+                for expert_logits in recv_obj.output_expert_logits
+            ]
+        return output_expert_logits
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
@@ -365,6 +387,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             else []
         )
         routed_experts = self._extract_routed_experts(recv_obj)
+        output_expert_logits = self._extract_expert_logits(recv_obj)
 
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -394,6 +417,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
+            output_expert_logits=output_expert_logits,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
@@ -406,6 +430,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     def handle_multimodal_decode_req(self, recv_obj: BatchMultimodalDecodeReq):
         raise NotImplementedError()
+
+    def _handle_weight_update_pause(self, req: WeightUpdatePauseReq):
+        """Handle weight update pause signal from scheduler."""
+        self._weight_update_paused = True
+        self.soft_watchdog.pause()  # Disable watchdog monitoring
+        return None  # No response needed
+
+    def _handle_weight_update_resume(self, req: WeightUpdateResumeReq):
+        """Handle weight update resume signal from scheduler."""
+        self._weight_update_paused = False
+        self.soft_watchdog.resume()  # Re-enable watchdog monitoring
+        return None  # No response needed
 
     def handle_freeze_gc_req(self, recv_req: FreezeGCReq):
         freeze_gc("Detokenizer Manager")

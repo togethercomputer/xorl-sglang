@@ -159,6 +159,8 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return expert routing weights (topk_weights)
+    return_expert_logits: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
 
@@ -613,6 +615,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_expert_logits=self.return_expert_logits,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -681,6 +684,8 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return expert routing weights (topk_weights)
+    return_expert_logits: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
 
@@ -982,6 +987,8 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The routed experts for each token, including both input and output tokens
     # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
     routed_experts: List[Optional[torch.Tensor]]
+    # The expert routing weights (topk_weights) for each output token
+    output_expert_logits: Optional[List[torch.Tensor]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1075,6 +1082,8 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The routed experts for each token, including both input and output tokens
     # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
     routed_experts: List[Optional[torch.Tensor]]
+    # The expert routing weights (topk_weights) for each output token
+    output_expert_logits: Optional[List[str]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
@@ -1327,10 +1336,93 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Whether to free KV cache memory before receiving weights (to avoid OOM)
+    # The KV cache buffers will be recreated after weights are received
+    free_kv_cache_before_recv: bool = False
 
 
 @dataclass
 class UpdateWeightsFromDistributedReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class WeightBucket:
+    """A single bucket of weights for batched weight updates."""
+
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+
+
+@dataclass
+class PrepareWeightsUpdateReqInput(BaseReq):
+    """Phase 1 of two-phase weight update protocol.
+
+    This starts background recv threads that are ready to receive NCCL broadcasts.
+    The caller should wait for this to return before starting the NCCL broadcast.
+
+    Supports two formats:
+    1. Batched format (preferred): buckets array with num_buckets
+    2. Flat format (legacy): names, dtypes, shapes at top level
+    """
+
+    # Batched format - array of buckets
+    buckets: Optional[List[WeightBucket]] = None
+    num_buckets: Optional[int] = None
+
+    # Flat format (legacy) - single set of weights
+    names: Optional[List[str]] = None
+    dtypes: Optional[List[str]] = None
+    shapes: Optional[List[List[int]]] = None
+
+    # The group name
+    group_name: str = "weight_update_group"
+    # Optional format specification for loading
+    load_format: Optional[str] = None
+
+    def get_buckets(self) -> List[WeightBucket]:
+        """Return buckets in a normalized format."""
+        if self.buckets is not None:
+            return self.buckets
+        elif self.names is not None:
+            # Convert flat format to single bucket
+            return [
+                WeightBucket(
+                    names=self.names, dtypes=self.dtypes, shapes=self.shapes
+                )
+            ]
+        else:
+            raise ValueError(
+                "PrepareWeightsUpdateReqInput must have either 'buckets' or 'names/dtypes/shapes'"
+            )
+
+
+@dataclass
+class PrepareWeightsUpdateReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class CompleteWeightsUpdateReqInput(BaseReq):
+    """Phase 2 of two-phase weight update protocol.
+
+    This waits for the background recv threads to complete and applies the weights.
+    Should be called after the NCCL broadcast has completed on the sender side.
+    """
+
+    # The group name (must match the one used in prepare)
+    group_name: str = "weight_update_group"
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+
+
+@dataclass
+class CompleteWeightsUpdateReqOutput(BaseReq):
     success: bool
     message: str
 
@@ -1358,6 +1450,92 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
 
 @dataclass
 class UpdateWeightsFromTensorReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class ReceiveWeightsReqInput(BaseReq):
+    """Request to receive weights via NCCL broadcast from an existing process group.
+
+    This is used after pause_generation to receive new weights from the training server.
+    The NCCL group must already be initialized via init_weights_update_group.
+    """
+
+    # Number of buckets of weights to receive
+    num_buckets: int
+    # Bucket metadata - list of dicts with 'names', 'dtypes', 'shapes'
+    buckets: List[Dict[str, Any]]
+    # The NCCL group name (must match the one used in init_weights_update_group)
+    group_name: str = "weight_update_group"
+    # Whether to flush KV cache after applying weights
+    flush_cache: bool = False
+    # Whether to free KV cache memory before receiving weights (to avoid OOM)
+    # The KV cache buffers will be recreated after weights are received
+    free_kv_cache_before_recv: bool = False
+    # Whether to recapture CUDA graphs after weight update (default True for safety)
+    # CUDA graphs capture memory pointers - must recapture when weights change
+    recapture_cuda_graph: bool = True
+
+
+@dataclass
+class ReceiveWeightsReqOutput(BaseReq):
+    success: bool
+    message: str
+
+
+@dataclass
+class ReceiveWeightsEPScatterReqInput(BaseReq):
+    """Receive weights from multiple EP training ranks via NCCL batch_isend_irecv.
+
+    Unlike scatter (single sender), this receives from ALL training ranks in parallel.
+    Each EP rank sends its local expert weights to all TP inference ranks.
+
+    The transfer plans provide exact buffer shapes for NCCL P2P, which requires
+    sender and receiver buffers to have identical shapes.
+    """
+
+    weight_names: List[str]  # Unique weight names to receive (legacy, for compatibility)
+    group_name: str = "ep_scatter_group"
+    training_world_size: int = 8  # Number of EP training ranks
+    num_experts_per_rank: int = 16  # Experts per training rank
+    total_num_experts: int = 128  # Total experts = training_world_size * num_experts_per_rank
+    inference_tp_size: int = 8  # TP size on inference side
+    flush_cache: bool = True
+    free_kv_cache_before_recv: bool = False
+    recapture_cuda_graph: bool = False
+    # Skip flush_cache and use lightweight synchronize() instead.
+    # This is safe for in-place weight updates where tensor addresses are preserved.
+    # Avoids expensive torch.cuda.empty_cache() (~30s overhead).
+    skip_flush_cache: bool = False
+    # NCCL group initialization params (passed from training rank 0)
+    master_address: Optional[str] = None  # Training master IP for rendezvous
+    master_port: Optional[int] = None  # TCP port for rendezvous
+    # Structured transfer plans with exact buffer shapes
+    # expert_transfer_plan: List of dicts with keys:
+    #   - weight_name: str
+    #   - is_expert_weight: bool
+    #   - transfers_per_weight: int (number of EP ranks sending this weight)
+    #   - per_transfer_shape: List[int] (exact shape of each partial send)
+    #   - expert_ranges: Dict[int, Dict] mapping ep_rank to {"start", "end", "source_nccl_rank"}
+    expert_transfer_plan: Optional[List[Dict]] = None
+    # non_expert_transfer_plan: List of dicts with keys:
+    #   - weight_name: str
+    #   - is_expert_weight: bool
+    #   - transfers_per_weight: int (always 1)
+    #   - source_nccl_rank: int (always 0)
+    #   - per_transfer_shape: List[int] (TP-sharded shape)
+    non_expert_transfer_plan: Optional[List[Dict]] = None
+    # Batch size for non-expert weight transfers (to avoid OOM by processing in chunks)
+    non_expert_batch_size: int = 50
+    # Multi-endpoint support: rank offset for this endpoint in the global NCCL group
+    rank_offset: Optional[int] = None
+    # Total inference world size across all endpoints (for correct NCCL group init)
+    total_inference_world_size: Optional[int] = None
+
+
+@dataclass
+class ReceiveWeightsEPScatterReqOutput(BaseReq):
     success: bool
     message: str
 
@@ -1462,6 +1640,20 @@ class DestroyWeightsUpdateGroupReqInput(BaseReq):
 class DestroyWeightsUpdateGroupReqOutput(BaseReq):
     success: bool
     message: str
+
+
+@dataclass
+class WeightUpdatePauseReq(BaseReq):
+    """Signal to detokenizer that a blocking weight update operation is starting."""
+
+    pass
+
+
+@dataclass
+class WeightUpdateResumeReq(BaseReq):
+    """Signal to detokenizer that a blocking weight update operation has completed."""
+
+    pass
 
 
 @dataclass
@@ -1977,6 +2169,29 @@ class LazyDumpTensorsReqInput(BaseReq):
 @dataclass
 class LazyDumpTensorsReqOutput(BaseReq):
     success: bool
+
+
+@dataclass
+class ListWeightsReqInput(BaseReq):
+    """Request to list all weight names in the model.
+
+    Used to verify weight name mapping between training and inference servers.
+    """
+
+    # Optional filter prefix (e.g., "model.layers.0" to only list layer 0 weights)
+    prefix: Optional[str] = None
+
+
+@dataclass
+class ListWeightsReqOutput(BaseReq):
+    """Response containing list of all weights in the model."""
+
+    success: bool
+    message: str = ""
+    # List of weight info: [{name, shape, data_ptr}]
+    weights: List[Dict[str, Any]] = field(default_factory=list)
+    # TP rank this response is from
+    tp_rank: int = 0
 
 
 @dataclass

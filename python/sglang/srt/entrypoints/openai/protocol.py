@@ -81,6 +81,7 @@ class LogProbs(BaseModel):
     text_offset: List[int] = Field(default_factory=list)
     token_logprobs: List[Optional[float]] = Field(default_factory=list)
     tokens: List[str] = Field(default_factory=list)
+    token_ids: List[int] = Field(default_factory=list)
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
@@ -92,6 +93,7 @@ class TopLogprob(BaseModel):
 
 class ChatCompletionTokenLogprob(BaseModel):
     token: str
+    token_id: int
     bytes: List[int]
     logprob: float
     top_logprobs: List[TopLogprob]
@@ -601,6 +603,7 @@ class ChatCompletionRequest(BaseModel):
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     min_tokens: int = 0
+    logprob_start_len: Optional[int] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
@@ -644,6 +647,9 @@ class ChatCompletionRequest(BaseModel):
     disagg_prefill_dp_rank: Optional[int] = None
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
+
+    # Input ids, if provided, it will override the message input.
+    input_ids: Optional[Union[List[List[int]], List[int]]] = None
 
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -740,8 +746,8 @@ class ChatCompletionRequest(BaseModel):
 
     def to_sampling_params(
         self,
-        stop: List[str],
         model_generation_config: Dict[str, Any],
+        stop: Optional[List[str]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """
@@ -836,6 +842,7 @@ class ChatMessage(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
+    input_token_ids: Optional[List[int]] = None
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[

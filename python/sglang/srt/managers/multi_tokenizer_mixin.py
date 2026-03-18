@@ -108,14 +108,16 @@ def _extract_field_by_index(
     if isinstance(field, dict):
         new_field = {}
         for k, v in field.items():
-            if len(v) <= index:
+            if v is None or len(v) <= index:
                 new_field[k] = None
+                continue
             new_field[k] = v[index]
         return new_field
 
-    if check_length:
-        if len(field) <= index:
+    if len(field) <= index:
+        if check_length:
             return None
+        return [None]
 
     return [field[index]]
 
@@ -270,6 +272,9 @@ def _handle_output_by_index(output, i):
             ),
             routed_experts=_extract_field_by_index(
                 output, "routed_experts", i, check_length=False
+            ),
+            output_expert_logits=_extract_field_by_index(
+                output, "output_expert_logits", i, check_length=False
             ),
             customized_info=_extract_field_by_index(
                 output, "customized_info", i, check_length=False

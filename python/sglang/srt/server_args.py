@@ -172,7 +172,7 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "tomni", "tomni-batch-invariant"]
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -325,6 +325,7 @@ class ServerArgs:
     quantization_param_path: Optional[str] = None
     kv_cache_dtype: str = "auto"
     enable_fp32_lm_head: bool = False
+    enable_fp32_router: bool = False
     modelopt_quant: Optional[Union[str, Dict]] = None
     modelopt_checkpoint_restore_path: Optional[str] = None
     modelopt_checkpoint_save_path: Optional[str] = None
@@ -601,6 +602,7 @@ class ServerArgs:
     cuda_graph_max_bs: Optional[int] = None
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
+
     disable_cuda_graph_padding: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
@@ -652,6 +654,7 @@ class ServerArgs:
     keep_mm_feature_on_device: bool = False
     enable_return_hidden_states: bool = False
     enable_return_routed_experts: bool = False
+    enable_return_expert_logits: bool = False
     scheduler_recv_interval: int = 1
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
@@ -3567,6 +3570,11 @@ class ServerArgs:
             help="If set, the LM head outputs (logits) are in FP32.",
         )
         parser.add_argument(
+            "--enable-fp32-router",
+            action="store_true",
+            help="If set, the MoE router gate computation is done in FP32.",
+        )
+        parser.add_argument(
             "--modelopt-quant",
             type=str,
             default=ServerArgs.modelopt_quant,
@@ -5046,6 +5054,7 @@ class ServerArgs:
             action="store_true",
             help="Disable cuda graph.",
         )
+
         parser.add_argument(
             "--disable-cuda-graph-padding",
             action="store_true",
@@ -5310,6 +5319,11 @@ class ServerArgs:
             help="Enable returning routed experts of each layer with responses.",
         )
         parser.add_argument(
+            "--enable-return-expert-logits",
+            action="store_true",
+            help="Enable returning expert routing weights (topk_weights) of each layer with responses.",
+        )
+        parser.add_argument(
             "--scheduler-recv-interval",
             type=int,
             default=ServerArgs.scheduler_recv_interval,
@@ -5533,6 +5547,11 @@ class ServerArgs:
             "--remote-instance-weight-loader-start-seed-via-transfer-engine",
             action="store_true",
             help="Start seed server via transfer engine backend for remote instance weight loader.",
+        )
+        parser.add_argument(
+            "--enable-rdma-weight-updates",
+            action="store_true",
+            help="Enable RDMA direct weight updates. When enabled, training can push weights directly to inference GPU memory via RDMA writes.",
         )
 
         # For PD-Multiplexing

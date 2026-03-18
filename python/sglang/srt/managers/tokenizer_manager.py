@@ -384,6 +384,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         self.is_pause = False
         self.is_pause_cond = asyncio.Condition()
 
+        # Flag to track when weight updates are in progress (for health check skipping)
+        self._weight_update_in_progress: bool = False
+
     def init_lora(self):
         # LoRA
         # Initialize the `LoRARegistry` with initial LoRA adapter paths provided in `server_args`.
@@ -977,6 +980,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                return_expert_logits=getattr(obj, 'return_expert_logits', False),
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
@@ -1510,6 +1514,20 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
+        def _safe_get_field_value(field_values, field_name: str, req_index: int, req_id: str):
+            if field_values is None:
+                return None
+            if req_index >= len(field_values):
+                logger.warning(
+                    "Malformed batch metadata: %s length=%d < required_index=%d for rid=%s",
+                    field_name,
+                    len(field_values),
+                    req_index,
+                    req_id,
+                )
+                return None
+            return field_values[req_index]
+
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -1564,6 +1582,8 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
                 meta_info["routed_experts"] = recv_obj.routed_experts[i]
+            if getattr(recv_obj, "output_expert_logits", None):
+                meta_info["expert_logits"] = recv_obj.output_expert_logits[i]
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
@@ -1770,16 +1790,14 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         if recv_obj.input_token_logprobs_val is None:
             return
 
-        if (
-            len(recv_obj.input_token_logprobs_val) > 0
-            and recv_obj.input_token_logprobs_val[recv_obj_index] is not None
-        ):
-            state.input_token_logprobs_val.extend(
-                recv_obj.input_token_logprobs_val[recv_obj_index]
-            )
-            state.input_token_logprobs_idx.extend(
-                recv_obj.input_token_logprobs_idx[recv_obj_index]
-            )
+        if len(recv_obj.input_token_logprobs_val) > 0:
+            if recv_obj.input_token_logprobs_val[recv_obj_index]:
+                state.input_token_logprobs_val.extend(
+                    recv_obj.input_token_logprobs_val[recv_obj_index]
+                )
+                state.input_token_logprobs_idx.extend(
+                    recv_obj.input_token_logprobs_idx[recv_obj_index]
+                )
         state.output_token_logprobs_val.extend(
             recv_obj.output_token_logprobs_val[recv_obj_index]
         )

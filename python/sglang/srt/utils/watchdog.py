@@ -42,6 +42,14 @@ class Watchdog:
     def disable(self):
         yield
 
+    def pause(self):
+        """Pause watchdog monitoring during expected blocking operations."""
+        pass
+
+    def resume(self):
+        """Resume watchdog monitoring after blocking operations complete."""
+        pass
+
 
 class _WatchdogReal(Watchdog):
     def __init__(
@@ -53,12 +61,13 @@ class _WatchdogReal(Watchdog):
     ):
         self._counter = 0
         self._active = True
+        self._paused = False
         self._test_stuck_time = test_stuck_time
         self._test_stuck_triggered = False
         self._raw = WatchdogRaw(
             debug_name=debug_name,
             get_counter=lambda: self._counter,
-            is_active=lambda: self._active,
+            is_active=lambda: self._active and not self._paused,
             watchdog_timeout=watchdog_timeout,
             soft=soft,
         )
@@ -92,6 +101,17 @@ class _WatchdogReal(Watchdog):
         finally:
             assert not self._active
             self._active = True
+
+    def pause(self):
+        """Pause watchdog monitoring during expected blocking operations."""
+        self._paused = True
+        logger.debug(f"Watchdog {self._raw.debug_name} paused")
+
+    def resume(self):
+        """Resume watchdog monitoring after blocking operations complete."""
+        self._paused = False
+        self._counter += 1  # Reset the counter to prevent immediate timeout
+        logger.debug(f"Watchdog {self._raw.debug_name} resumed")
 
 
 class _WatchdogNoop(Watchdog):

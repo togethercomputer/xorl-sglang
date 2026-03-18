@@ -30,6 +30,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CompleteWeightsUpdateReqInput,
+    CompleteWeightsUpdateReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -53,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     InitWeightsSendGroupForRemoteInstanceReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    ListWeightsReqInput,
+    ListWeightsReqOutput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
@@ -61,9 +65,15 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PinPrefixReqInput,
     PinPrefixReqOutput,
+    PrepareWeightsUpdateReqInput,
+    PrepareWeightsUpdateReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
+    ReceiveWeightsEPScatterReqInput,
+    ReceiveWeightsEPScatterReqOutput,
+    ReceiveWeightsReqInput,
+    ReceiveWeightsReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -177,6 +187,18 @@ class TokenizerCommunicatorMixin:
         self.update_weights_from_distributed_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
+        self.prepare_weights_update_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.complete_weights_update_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.receive_weights_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.receive_weights_ep_scatter_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
         self.init_weights_send_group_for_remote_instance_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
@@ -199,6 +221,9 @@ class TokenizerCommunicatorMixin:
             self.send_to_scheduler, server_args.dp_size
         )
         self.check_weights_communicator = _Communicator(
+            self.send_to_scheduler, server_args.dp_size
+        )
+        self.list_weights_communicator = _Communicator(
             self.send_to_scheduler, server_args.dp_size
         )
         self.slow_down_communicator = _Communicator(
@@ -262,6 +287,22 @@ class TokenizerCommunicatorMixin:
                     self.update_weights_from_distributed_communicator.handle_recv,
                 ),
                 (
+                    PrepareWeightsUpdateReqOutput,
+                    self.prepare_weights_update_communicator.handle_recv,
+                ),
+                (
+                    CompleteWeightsUpdateReqOutput,
+                    self.complete_weights_update_communicator.handle_recv,
+                ),
+                (
+                    ReceiveWeightsReqOutput,
+                    self.receive_weights_communicator.handle_recv,
+                ),
+                (
+                    ReceiveWeightsEPScatterReqOutput,
+                    self.receive_weights_ep_scatter_communicator.handle_recv,
+                ),
+                (
                     InitWeightsSendGroupForRemoteInstanceReqOutput,
                     self.init_weights_send_group_for_remote_instance_communicator.handle_recv,
                 ),
@@ -292,6 +333,10 @@ class TokenizerCommunicatorMixin:
                 (
                     CheckWeightsReqOutput,
                     self.check_weights_communicator.handle_recv,
+                ),
+                (
+                    ListWeightsReqOutput,
+                    self.list_weights_communicator.handle_recv,
                 ),
                 (
                     SlowDownReqOutput,
@@ -502,8 +547,12 @@ class TokenizerCommunicatorMixin:
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
         ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
 
-        results = await self.init_weights_update_group_communicator(obj)
-        return _Communicator.merge_results(results)
+        self._weight_update_in_progress = True
+        try:
+            results = await self.init_weights_update_group_communicator(obj)
+            return _Communicator.merge_results(results)
+        finally:
+            self._weight_update_in_progress = False
 
     async def destroy_weights_update_group(
         self: TokenizerManager,
@@ -538,15 +587,175 @@ class TokenizerCommunicatorMixin:
         lock_context = (
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
-        async with lock_context:
-            results = await self.update_weights_from_distributed_communicator(obj)
+        self._weight_update_in_progress = True
+        try:
+            async with lock_context:
+                results = await self.update_weights_from_distributed_communicator(obj)
 
-        success, message = _Communicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            success, message = _Communicator.merge_results(results)
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
 
-        return success, message
+            return success, message
+        finally:
+            self._weight_update_in_progress = False
+
+    async def prepare_weights_update(
+        self: TokenizerManager,
+        obj: PrepareWeightsUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Phase 1 of two-phase weight update protocol.
+
+        This starts background recv threads that are ready to receive NCCL broadcasts.
+        Returns immediately once the recv threads are started and ready.
+        """
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+
+        # Set the flag to indicate weight update is in progress
+        # This flag spans both phases of the two-phase protocol
+        self._weight_update_in_progress = True
+
+        try:
+            results = await self.prepare_weights_update_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+
+            if not success:
+                # If prepare failed, reset the flag
+                self._weight_update_in_progress = False
+
+            return success, message
+        except Exception as e:
+            self._weight_update_in_progress = False
+            raise e
+
+    async def complete_weights_update(
+        self: TokenizerManager,
+        obj: CompleteWeightsUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Phase 2 of two-phase weight update protocol.
+
+        This waits for the background recv threads to complete and applies the weights.
+        Should be called after the NCCL broadcast has completed on the sender side.
+        """
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for update weights from distributed"
+
+        try:
+            results = await self.complete_weights_update_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+
+            return success, message
+        finally:
+            # Reset the flag after the complete phase
+            self._weight_update_in_progress = False
+
+    async def list_weights(
+        self: TokenizerManager,
+        obj: ListWeightsReqInput,
+        rank: int = 0,
+    ) -> Dict[str, Any]:
+        """List all weight names in the model.
+
+        Used to verify weight name mapping between training and inference servers.
+
+        Args:
+            obj: Request input with optional prefix filter
+            rank: The TP rank to get info from (0 to tp_size-1)
+
+        Returns:
+            Dict with success, weights list [{name, shape, data_ptr}].
+        """
+        self.auto_create_handle_loop()
+
+        results = await self.list_weights_communicator(obj)
+
+        if not results or len(results) == 0:
+            return {
+                "success": False,
+                "message": "No response from scheduler",
+                "weights": [],
+            }
+
+        # Filter results by the requested tp_rank
+        for result in results:
+            if hasattr(result, "success") and result.success:
+                if hasattr(result, "tp_rank") and result.tp_rank == rank:
+                    return {
+                        "success": result.success,
+                        "message": result.message,
+                        "weights": result.weights,
+                    }
+
+        # If no exact rank match, return first successful result
+        for result in results:
+            if hasattr(result, "success") and result.success:
+                return {
+                    "success": result.success,
+                    "message": result.message,
+                    "weights": result.weights,
+                }
+
+        # All results failed
+        result = results[0]
+        return {
+            "success": result.success,
+            "message": result.message,
+            "weights": [],
+        }
+
+    async def receive_weights(
+        self: TokenizerManager,
+        obj: ReceiveWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Receive weights via NCCL broadcast from an existing process group.
+
+        This is used as part of the pause/broadcast/resume weight sync protocol.
+        The NCCL group must already be initialized via init_weights_update_group.
+        """
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for receive weights"
+
+        try:
+            results = await self.receive_weights_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+            return success, message
+        except Exception as e:
+            logger.error(f"receive_weights failed: {e}")
+            return False, str(e)
+
+    async def receive_weights_ep_scatter(
+        self: TokenizerManager,
+        obj: ReceiveWeightsEPScatterReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Receive weights from EP ranks via P2P scatter."""
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), "dp_size must be 1 or dp attention must be enabled for receive weights"
+
+        try:
+            results = await self.receive_weights_ep_scatter_communicator(obj)
+            success, message = _Communicator.merge_results(results)
+            return success, message
+        except Exception as e:
+            logger.error(f"receive_weights_ep_scatter failed: {e}")
+            return False, str(e)
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,
@@ -596,15 +805,19 @@ class TokenizerCommunicatorMixin:
         lock_context = (
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
-        async with lock_context:
-            results = await self.update_weights_from_tensor_communicator(obj)
+        self._weight_update_in_progress = True
+        try:
+            async with lock_context:
+                results = await self.update_weights_from_tensor_communicator(obj)
 
-        success, message = _Communicator.merge_results(results)
-        if success and obj.weight_version is not None:
-            self._update_weight_version_if_provided(obj.weight_version)
-            message += f" Weight version updated to {obj.weight_version}."
+            success, message = _Communicator.merge_results(results)
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
 
-        return success, message
+            return success, message
+        finally:
+            self._weight_update_in_progress = False
 
     async def update_weights_from_ipc(
         self: TokenizerManager,
@@ -840,12 +1053,16 @@ class TokenizerCommunicatorMixin:
         request: Optional[fastapi.Request] = None,
     ):
         self.auto_create_handle_loop()
-        results = await self.get_weights_by_name_communicator(obj)
-        all_parameters = [r.parameter for r in results]
-        if self.server_args.dp_size == 1:
-            return all_parameters[0]
-        else:
-            return all_parameters
+        self._weight_update_in_progress = True
+        try:
+            results = await self.get_weights_by_name_communicator(obj)
+            all_parameters = [r.parameter for r in results]
+            if self.server_args.dp_size == 1:
+                return all_parameters[0]
+            else:
+                return all_parameters
+        finally:
+            self._weight_update_in_progress = False
 
     async def release_memory_occupation(
         self: TokenizerManager,
