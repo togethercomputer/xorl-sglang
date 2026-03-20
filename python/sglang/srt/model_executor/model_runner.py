@@ -603,8 +603,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
-        # Enable batch invariant mode only for targets that need it (fsdp, tomni-batch-invariant)
-        if server_args.rl_on_policy_target in ("fsdp", "tomni-batch-invariant"):
+        # Enable batch invariant mode only for targets that need it (fsdp, xorl-batch-invariant)
+        if server_args.rl_on_policy_target in ("fsdp", "xorl-batch-invariant"):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
@@ -1374,11 +1374,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 logger.info(f"Set CUDA device to {self.gpu_id} before process group creation")
 
             # IMPORTANT: device_id forces eager NCCL communicator creation.
-            # Tomni's training side also passes device_id, so both sides must
-            # use eager init. Without this, sglang uses lazy init and tomni's
+            # xorl's training side also passes device_id, so both sides must
+            # use eager init. Without this, sglang uses lazy init and xorl's
             # rank 0 hangs in _new_process_group_helper waiting for peers that
             # never enter the collective. Do NOT remove this without also
-            # changing tomni's nccl_broadcast.py to match.
+            # changing xorl's nccl_broadcast.py to match.
             device_id = torch.device(f"cuda:{self.gpu_id}") if self.device == "cuda" else None
             logger.info(f"Creating process group with device_id={device_id}, NCCL_CUMEM_ENABLE=0")
 
