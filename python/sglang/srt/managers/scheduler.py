@@ -2073,6 +2073,9 @@ class Scheduler(
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
+                    self.running_batch.is_prefill_only = all(
+                        r.is_prefill_only for r in self.running_batch.reqs
+                    )
                 else:
                     # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
