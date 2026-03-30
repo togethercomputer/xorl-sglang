@@ -4,10 +4,18 @@ from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 import torch
 
 from sglang.srt.distributed import divide
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.moe import (
+    MOE_DOWN_A,
+    MOE_DOWN_B,
+    MOE_GATE_B,
+    MOE_GATE_UP_A,
+    MOE_UP_B,
+)
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
@@ -86,6 +94,13 @@ class LoRAMemoryPool:
         self.lm_head_A_buffer: Dict[str, torch.Tensor] = {}
         self.lm_head_B_buffer: Dict[str, torch.Tensor] = {}
         self.new_embeddings_buffer: Dict[str, torch.Tensor] = {}
+        self.moe_layer_specs: Dict[int, FusedMoE] = {}
+        self.moe_gate_up_A_buffer: Dict[int, torch.Tensor] = {}
+        self.moe_gate_B_buffer: Dict[int, torch.Tensor] = {}
+        self.moe_up_B_buffer: Dict[int, torch.Tensor] = {}
+        self.moe_down_A_buffer: Dict[int, torch.Tensor] = {}
+        self.moe_down_B_buffer: Dict[int, torch.Tensor] = {}
+        self.moe_present_buffer: Dict[int, torch.Tensor] = {}
 
         self.embedding_dim: int = self.base_hf_config.hidden_size
 
@@ -203,6 +218,11 @@ class LoRAMemoryPool:
 
     def init_buffers(self, base_model: torch.nn.Module):
         device = next(base_model.parameters()).device
+        self.moe_layer_specs = {
+            module.layer_id: module
+            for _, module in base_model.named_modules()
+            if isinstance(module, FusedMoE)
+        }
 
         def init_buffer(
             buffer: Dict[str, List[torch.Tensor]],
@@ -291,6 +311,65 @@ class LoRAMemoryPool:
             self.target_modules,
             self.get_lora_B_shape,
         )
+
+        for layer_id, moe_layer in self.moe_layer_specs.items():
+            if (
+                "gate_up_proj" in self.target_modules
+                or "down_proj" in self.target_modules
+            ):
+                self.moe_present_buffer[layer_id] = torch.zeros(
+                    (self.max_loras_per_batch,), dtype=torch.bool, device=device
+                )
+            if "gate_up_proj" in self.target_modules:
+                self.moe_gate_up_A_buffer[layer_id] = torch.empty(
+                    (
+                        self.max_loras_per_batch,
+                        2 * self.max_lora_rank,
+                        moe_layer.hidden_size,
+                    ),
+                    dtype=self.dtype,
+                    device=device,
+                )
+                self.moe_gate_B_buffer[layer_id] = torch.empty(
+                    (
+                        moe_layer.num_local_experts,
+                        self.max_loras_per_batch,
+                        moe_layer.intermediate_size_per_partition,
+                        self.max_lora_rank,
+                    ),
+                    dtype=self.dtype,
+                    device=device,
+                )
+                self.moe_up_B_buffer[layer_id] = torch.empty(
+                    (
+                        moe_layer.num_local_experts,
+                        self.max_loras_per_batch,
+                        moe_layer.intermediate_size_per_partition,
+                        self.max_lora_rank,
+                    ),
+                    dtype=self.dtype,
+                    device=device,
+                )
+            if "down_proj" in self.target_modules:
+                self.moe_down_A_buffer[layer_id] = torch.empty(
+                    (
+                        moe_layer.num_local_experts,
+                        self.max_loras_per_batch,
+                        self.max_lora_rank,
+                        moe_layer.intermediate_size_per_partition,
+                    ),
+                    dtype=self.dtype,
+                    device=device,
+                )
+                self.moe_down_B_buffer[layer_id] = torch.empty(
+                    (
+                        self.max_loras_per_batch,
+                        moe_layer.hidden_size,
+                        self.max_lora_rank,
+                    ),
+                    dtype=self.dtype,
+                    device=device,
+                )
 
     def prepare_lora_batch(
         self,
@@ -405,12 +484,23 @@ class LoRAMemoryPool:
 
             for k in self.lm_head_A_buffer.keys():
                 self.lm_head_A_buffer[k][buffer_id] = 0
+            for layer_id, target_buffer in self.moe_gate_up_A_buffer.items():
+                target_buffer[buffer_id] = 0
+                self.moe_gate_B_buffer[layer_id][:, buffer_id] = 0
+                self.moe_up_B_buffer[layer_id][:, buffer_id] = 0
+                self.moe_present_buffer[layer_id][buffer_id] = False
+            for layer_id, target_buffer in self.moe_down_B_buffer.items():
+                target_buffer[buffer_id] = 0
+                self.moe_down_A_buffer[layer_id][:, buffer_id] = 0
+                if layer_id in self.moe_present_buffer:
+                    self.moe_present_buffer[layer_id][buffer_id] = False
             return
 
         assert lora_adapter is not None
         lora_rank = lora_adapter.config.r
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
+            layer_moe_weights = lora_adapter.layers[layer_id].moe_weights
             temp_A_buffer: Dict[str, Optional[torch.Tensor]] = {
                 target_module: None for target_module in self.A_buffer
             }
@@ -452,6 +542,33 @@ class LoRAMemoryPool:
                 target_buffer = self.B_buffer[name][layer_id]
                 buffer_view = target_buffer[buffer_id, :, :lora_rank]
                 load_lora_weight_tensor(buffer_view, weights)
+
+            if layer_id in self.moe_gate_up_A_buffer:
+                self.moe_present_buffer[layer_id][buffer_id] = bool(layer_moe_weights)
+                load_lora_weight_tensor(
+                    self.moe_gate_up_A_buffer[layer_id][buffer_id, : 2 * lora_rank, :],
+                    layer_moe_weights.get(MOE_GATE_UP_A),
+                )
+                load_lora_weight_tensor(
+                    self.moe_gate_B_buffer[layer_id][:, buffer_id, :, :lora_rank],
+                    layer_moe_weights.get(MOE_GATE_B),
+                )
+                load_lora_weight_tensor(
+                    self.moe_up_B_buffer[layer_id][:, buffer_id, :, :lora_rank],
+                    layer_moe_weights.get(MOE_UP_B),
+                )
+
+            if layer_id in self.moe_down_B_buffer:
+                if layer_id in self.moe_present_buffer:
+                    self.moe_present_buffer[layer_id][buffer_id] = bool(layer_moe_weights)
+                load_lora_weight_tensor(
+                    self.moe_down_A_buffer[layer_id][:, buffer_id, :lora_rank, :],
+                    layer_moe_weights.get(MOE_DOWN_A),
+                )
+                load_lora_weight_tensor(
+                    self.moe_down_B_buffer[layer_id][buffer_id, :, :lora_rank],
+                    layer_moe_weights.get(MOE_DOWN_B),
+                )
 
         if lora_adapter.embedding_layers:
 
@@ -549,6 +666,16 @@ class LoRAMemoryPool:
                 and "input_embeddings" in self.new_embeddings_buffer
             ):
                 self.new_embeddings_buffer["input_embeddings"][buffer_id].zero_()
+            for layer_id in self.moe_gate_up_A_buffer:
+                self.moe_gate_up_A_buffer[layer_id][buffer_id].zero_()
+                self.moe_gate_B_buffer[layer_id][:, buffer_id].zero_()
+                self.moe_up_B_buffer[layer_id][:, buffer_id].zero_()
+                self.moe_present_buffer[layer_id][buffer_id] = False
+            for layer_id in self.moe_down_B_buffer:
+                self.moe_down_A_buffer[layer_id][:, buffer_id].zero_()
+                self.moe_down_B_buffer[layer_id][buffer_id].zero_()
+                if layer_id in self.moe_present_buffer:
+                    self.moe_present_buffer[layer_id][buffer_id] = False
 
     def get_embedding_tensor(
         self, target_module: str, lora_type: LoRAType
@@ -593,6 +720,16 @@ class LoRAMemoryPool:
             return self.A_buffer[target_module][layer_id]
 
         return self.B_buffer[target_module][layer_id]
+
+    def get_moe_tensors(self, layer_id: int) -> Dict[str, Optional[torch.Tensor]]:
+        return {
+            MOE_GATE_UP_A: self.moe_gate_up_A_buffer.get(layer_id),
+            MOE_GATE_B: self.moe_gate_B_buffer.get(layer_id),
+            MOE_UP_B: self.moe_up_B_buffer.get(layer_id),
+            MOE_DOWN_A: self.moe_down_A_buffer.get(layer_id),
+            MOE_DOWN_B: self.moe_down_B_buffer.get(layer_id),
+            "present": self.moe_present_buffer.get(layer_id),
+        }
 
     def get_buffer_id(self, lora_uid: str):
         return self.uid_to_buffer_id[lora_uid]

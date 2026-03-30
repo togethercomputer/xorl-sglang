@@ -410,6 +410,13 @@ class PiecewiseCudaGraphRunner:
         return torch.int64 if not is_npu() else torch.int32
 
     def can_run(self, forward_batch: ForwardBatch):
+        if (
+            self.model_runner.server_args.enable_lora
+            and self.model_runner.lora_manager is not None
+            and self.model_runner.lora_manager.has_active_moe_lora_batch(forward_batch)
+        ):
+            return False
+
         # Disable piecewise cuda graph for input embeddings
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:

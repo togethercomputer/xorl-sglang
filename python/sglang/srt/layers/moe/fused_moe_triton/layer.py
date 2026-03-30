@@ -2,7 +2,7 @@
 
 import logging
 from enum import Enum
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import torch
 
@@ -311,6 +311,13 @@ class FusedMoE(torch.nn.Module):
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
         self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self.moe_lora_gate_up_A = None
+        self.moe_lora_gate_B = None
+        self.moe_lora_up_B = None
+        self.moe_lora_down_A = None
+        self.moe_lora_down_B = None
+        self.moe_lora_present = None
+        self.moe_lora_backend: Any = None
 
         self.should_fuse_routed_scaling_factor_in_topk = isinstance(
             self.quant_method, ModelOptNvFp4FusedMoEMethod
@@ -1036,10 +1043,57 @@ class FusedMoE(torch.nn.Module):
 
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
+        if self.has_active_moe_lora():
+            from sglang.srt.layers.quantization.unquant import (
+                UnquantizedFusedMoEMethod,
+            )
+
+            if not isinstance(self.quant_method, UnquantizedFusedMoEMethod):
+                raise NotImplementedError(
+                    "MoE LoRA is only implemented for the unquantized Triton MoE backend."
+                )
         return self.quant_method.apply(
             layer=self,
             dispatch_output=dispatch_output,
         )
+
+    def has_active_moe_lora(self, num_tokens: Optional[int] = None) -> bool:
+        if self.moe_lora_backend is None or self.moe_lora_present is None:
+            return False
+        active_indices = getattr(self.moe_lora_backend, "active_moe_weight_indices", ())
+        if not active_indices:
+            return False
+        batch_info = getattr(self.moe_lora_backend, "batch_info", None)
+        if (
+            num_tokens is not None
+            and batch_info is not None
+            and batch_info.token_weight_indices is not None
+        ):
+            token_weight_indices = batch_info.token_weight_indices[:num_tokens].to(
+                torch.long
+            )
+            if token_weight_indices.numel() == 0:
+                return False
+            return bool(self.moe_lora_present[token_weight_indices].any().item())
+        return any(bool(self.moe_lora_present[idx].item()) for idx in active_indices)
+
+    def set_moe_lora_info(
+        self,
+        gate_up_A: Optional[torch.Tensor],
+        gate_B: Optional[torch.Tensor],
+        up_B: Optional[torch.Tensor],
+        down_A: Optional[torch.Tensor],
+        down_B: Optional[torch.Tensor],
+        present: Optional[torch.Tensor],
+        lora_backend: Any,
+    ) -> None:
+        self.moe_lora_gate_up_A = gate_up_A
+        self.moe_lora_gate_B = gate_B
+        self.moe_lora_up_B = up_B
+        self.moe_lora_down_A = down_A
+        self.moe_lora_down_B = down_B
+        self.moe_lora_present = present
+        self.moe_lora_backend = lora_backend
 
     @classmethod
     def make_expert_params_mapping(

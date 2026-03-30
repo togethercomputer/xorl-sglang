@@ -29,6 +29,7 @@ from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import LORA_SUPPORTED_BACKENDS
 from sglang.srt.lora.lora_config import LoRAConfig
+from sglang.srt.lora.moe import is_moe_lora_weight_name, normalize_moe_lora_weights
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
 
@@ -43,6 +44,7 @@ class LoRALayer(nn.Module):
 
         # lora weights in cpu. The weights are loaded from checkpoint.
         self.weights: Dict[str, torch.Tensor] = {}
+        self.moe_weights: Dict[str, torch.Tensor] = {}
 
 
 class LoRAAdapter(nn.Module):
@@ -73,6 +75,10 @@ class LoRAAdapter(nn.Module):
 
         self.embedding_layers: Dict[str, torch.Tensor] = {}
         self.added_tokens_embeddings: Dict[str, torch.Tensor] = {}
+
+    @property
+    def has_moe_weights(self) -> bool:
+        return any(layer.moe_weights for layer in self.layers)
 
     def initialize_weights(self):
         model_path = self.config.path
@@ -109,7 +115,10 @@ class LoRAAdapter(nn.Module):
 
         layer_id = get_layer_id(name)
         if layer_id is not None:
-            self.layers[layer_id].weights[name] = loaded_weight.cpu()
+            if is_moe_lora_weight_name(name):
+                self.layers[layer_id].moe_weights[name] = loaded_weight.cpu()
+            else:
+                self.layers[layer_id].weights[name] = loaded_weight.cpu()
         elif "embed_tokens" in name or "lm_head" in name:
             # Check if this module is declared in target_modules before loading.
             # When normalized_target_modules is {"all"} (e.g. target_modules was
@@ -139,6 +148,7 @@ class LoRAAdapter(nn.Module):
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_gate_up_proj(weight_names, layer.weights)
+            layer.moe_weights = normalize_moe_lora_weights(layer.moe_weights)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -224,6 +234,8 @@ class LoRAAdapter(nn.Module):
         for layer in self.layers:
             for name, weight in layer.weights.items():
                 layer.weights[name] = weight.pin_memory()
+            for name, weight in layer.moe_weights.items():
+                layer.moe_weights[name] = weight.pin_memory()
 
         for name, weight in self.embedding_layers.items():
             self.embedding_layers[name] = weight.pin_memory()

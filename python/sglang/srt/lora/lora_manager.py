@@ -21,6 +21,7 @@ from typing import Dict, Iterable, List, Optional
 import torch
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -33,6 +34,13 @@ from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.lora.moe import (
+    MOE_DOWN_A,
+    MOE_DOWN_B,
+    MOE_GATE_B,
+    MOE_GATE_UP_A,
+    MOE_UP_B,
+)
 from sglang.srt.lora.utils import (
     LoRAType,
     get_normalized_target_modules,
@@ -275,12 +283,18 @@ class LoRAManager:
         weight_indices = [0] * len(forward_batch.lora_ids)
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
+        active_moe_weight_indices = set()
         for i, uid in enumerate(forward_batch.lora_ids):
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
                 lora = self.loras[uid]
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
+                if lora.has_moe_weights:
+                    active_moe_weight_indices.add(weight_indices[i])
+        self.lora_backend.active_moe_weight_indices = tuple(
+            sorted(active_moe_weight_indices)
+        )
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
         # could use CUDA graph.
         self.lora_backend.prepare_lora_batch(
@@ -312,6 +326,18 @@ class LoRAManager:
                         lora_type=LoRAType.LORA_B,
                     ),
                 )
+
+        for layer_id, module in self.moe_modules.items():
+            moe_tensors = self.memory_pool.get_moe_tensors(layer_id)
+            module.set_moe_lora_info(
+                gate_up_A=moe_tensors[MOE_GATE_UP_A],
+                gate_B=moe_tensors[MOE_GATE_B],
+                up_B=moe_tensors[MOE_UP_B],
+                down_A=moe_tensors[MOE_DOWN_A],
+                down_B=moe_tensors[MOE_DOWN_B],
+                present=moe_tensors["present"],
+                lora_backend=self.lora_backend,
+            )
 
         # Update embedding layer if present - gotta merge (refer to PR codebase)
         if self.embed_tokens_module is not None:
@@ -564,6 +590,7 @@ class LoRAManager:
         self.lora_modules: List[Dict[str, BaseLayerWithLoRA]] = [
             {} for _ in range(self.base_hf_config.num_hidden_layers)
         ]
+        self.moe_modules: Dict[int, FusedMoE] = {}
 
         self.embed_tokens_module: Optional[BaseLayerWithLoRA] = None
         self.lm_head_module: Optional[BaseLayerWithLoRA] = None
@@ -631,9 +658,28 @@ class LoRAManager:
                     self.lm_head_module = lora_module
                     continue
 
+            if isinstance(module, FusedMoE) and (
+                "gate_up_proj" in self.target_modules
+                or "down_proj" in self.target_modules
+            ):
+                layer_id = get_layer_id(module_name)
+                if layer_id is not None:
+                    self.moe_modules[layer_id] = module
+                continue
+
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:
                 layer_id = get_layer_id(module_name)
                 self.lora_modules[layer_id][module_name] = self.set_lora_module(
                     module_name, module
                 )
+
+    def has_active_moe_lora_batch(self, forward_batch: ForwardBatch) -> bool:
+        if not self.moe_modules or forward_batch.lora_ids is None:
+            return False
+        return any(
+            lora_id is not None
+            and lora_id in self.loras
+            and self.loras[lora_id].has_moe_weights
+            for lora_id in forward_batch.lora_ids
+        )

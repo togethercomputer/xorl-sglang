@@ -1,11 +1,15 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
 @dataclass
@@ -39,6 +43,10 @@ class LoRABatchInfo:
 
     # The logical (re)ordering of input rows (tokens), in shape (num_tokens,)
     permutation: Optional[torch.Tensor]
+
+    # Optional per-token adapter indices in original token order.
+    # MoE LoRA uses this to recover adapter ids for decode and extend/prefill.
+    token_weight_indices: Optional[torch.Tensor] = None
 
     # Total number of tokens this batch info expects (host-side int).
     # Used by lm_head LoRA to validate input shape without GPU sync.
@@ -122,8 +130,17 @@ def get_normalized_target_modules(
         "q_proj": "qkv_proj",
         "k_proj": "qkv_proj",
         "v_proj": "qkv_proj",
+        "w1": "gate_up_proj",
+        "w3": "gate_up_proj",
+        "w13": "gate_up_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "gate_up_a": "gate_up_proj",
+        "gate_b": "gate_up_proj",
+        "up_b": "gate_up_proj",
+        "w2": "down_proj",
+        "down_a": "down_proj",
+        "down_b": "down_proj",
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
         "embeddings": "embed_tokens",
@@ -197,6 +214,20 @@ def generate_sequence_lengths(
         else:
             raise ValueError(f"Unsupported forward mode: {forward_batch.forward_mode}")
     return seg_lens
+
+
+def expand_sequence_weight_indices(
+    weight_indices: List[int],
+    forward_batch: ForwardBatch,
+    device: Optional[torch.device] = None,
+) -> torch.Tensor:
+    """Expand per-sequence adapter indices to per-token adapter indices."""
+
+    device = torch.get_default_device() if device is None else device
+    seg_lens = generate_sequence_lengths(forward_batch, device=device)
+    with torch.device(device):
+        seq_weight_indices = torch.tensor(weight_indices, dtype=torch.int32)
+    return torch.repeat_interleave(seq_weight_indices, seg_lens)
 
 
 def get_lm_head_pruned_lens(

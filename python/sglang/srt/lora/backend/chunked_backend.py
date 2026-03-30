@@ -11,7 +11,7 @@ from sglang.srt.lora.triton_ops import (
 )
 from sglang.srt.lora.utils import (
     LoRABatchInfo,
-    generate_sequence_lengths,
+    expand_sequence_weight_indices,
     get_lm_head_pruned_lens,
     merge_and_chunk_segments,
 )
@@ -222,6 +222,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 scalings=torch.zeros(self.max_loras_per_batch, dtype=torch.float),
                 num_segments=None,  # Set per batch
                 max_len=None,  # Not used in CSGMV backend
+                token_weight_indices=torch.zeros(max_num_tokens, dtype=torch.int32),
             )
 
     def prepare_lora_batch(
@@ -234,9 +235,15 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
     ):
         chunk_size = self._determine_chunk_size(forward_batch)
 
+        token_weight_indices = expand_sequence_weight_indices(
+            weight_indices,
+            forward_batch,
+            device="cpu",
+        )
         permutation, weight_indices_reordered = ChunkedSgmvLoRABackend._get_permutation(
             seq_weight_indices=weight_indices,
             forward_batch=forward_batch,
+            row_weight_indices=token_weight_indices,
         )
 
         seg_weight_indices, seg_indptr = self._get_segments_info(
@@ -275,6 +282,11 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 ),
                 # Not used in chunked kernels
                 seg_lens=None,
+                token_weight_indices=torch.empty(
+                    (len(token_weight_indices),),
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
             )
         else:
             batch_info = self.cuda_graph_batch_info
@@ -294,6 +306,10 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
         batch_info.seg_indptr[: num_segments + 1].copy_(seg_indptr, non_blocking=True)
         batch_info.permutation[: len(permutation)].copy_(permutation, non_blocking=True)
+        token_weight_indices = token_weight_indices.pin_memory()
+        batch_info.token_weight_indices[: len(token_weight_indices)].copy_(
+            token_weight_indices, non_blocking=True
+        )
 
         self.batch_info = batch_info
         self.lm_head_batch_info, self.lm_head_pass_batch_infos = (
@@ -377,7 +393,11 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         )
 
     @staticmethod
-    def _get_permutation(seq_weight_indices, forward_batch: ForwardBatch):
+    def _get_permutation(
+        seq_weight_indices,
+        forward_batch: ForwardBatch,
+        row_weight_indices: Optional[torch.Tensor] = None,
+    ):
         """
         Computes permutation indices for reordering tokens by their LoRA adapter assignments.
 
@@ -404,12 +424,12 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
                 - weights_reordered: Sorted adapter indices for each token
         """
         with torch.device("cpu"):
-            seq_weight_indices = torch.tensor(seq_weight_indices, dtype=torch.int32)
-            seg_lens_cpu = generate_sequence_lengths(forward_batch)
-
-            row_weight_indices = torch.repeat_interleave(
-                seq_weight_indices, seg_lens_cpu
-            )
+            if row_weight_indices is None:
+                row_weight_indices = expand_sequence_weight_indices(
+                    seq_weight_indices,
+                    forward_batch,
+                    device="cpu",
+                )
             permutation = torch.empty(
                 (len(row_weight_indices),), dtype=torch.long, pin_memory=True
             )
