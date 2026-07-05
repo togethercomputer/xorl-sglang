@@ -488,6 +488,19 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if is_batch_invariant_mode_enabled():
+            # Qwen3.5 uses zero-centered (Gemma-style) norms. Folding the
+            # implicit 1 into fp32 weights selects the same non-residual
+            # family as xorl's scoring path.
+            if residual is None:
+                orig_dtype = x.dtype
+                out = rms_norm_batch_invariant(
+                    x.float(),
+                    1.0 + self.weight.data.float(),
+                    self.variance_epsilon,
+                )
+                return out.to(orig_dtype)
+            return self.forward_native(x, residual, post_residual_addition)
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_cpu(

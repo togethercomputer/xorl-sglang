@@ -25,9 +25,12 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_cpu
 
 if not is_cpu():
+    from sglang.srt.layers.attention.fla.bi_gdn_prefill import BI_GDN_PREFILL_ENABLED
     from sglang.srt.layers.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
+else:
+    BI_GDN_PREFILL_ENABLED = False
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +164,10 @@ class MambaAttnBackendBase(AttentionBackend):
         track_ssm_h_dst = None
         track_ssm_final_src = None
         track_ssm_final_dst = None
+        bi_ckpt_batch_rows = None
+        bi_ckpt_token_starts = None
+        bi_ckpt_lens = None
+        bi_ckpt_dst_indices = None
 
         mamba_cache_indices = self.req_to_token_pool.get_mamba_indices(
             forward_batch.req_pool_indices
@@ -214,8 +221,21 @@ class MambaAttnBackendBase(AttentionBackend):
                         track_ssm_final_src,
                         track_ssm_final_dst,
                     ) = self._init_track_ssm_indices(mamba_cache_indices, forward_batch)
+
+                    if BI_GDN_PREFILL_ENABLED:
+                        (
+                            bi_ckpt_batch_rows,
+                            bi_ckpt_token_starts,
+                            bi_ckpt_lens,
+                            bi_ckpt_dst_indices,
+                        ) = self._init_bi_gdn_ckpt_indices(forward_batch)
         else:
             raise ValueError(f"Invalid forward mode: {forward_batch.forward_mode=}")
+
+        has_mamba_track_mask = bool(
+            forward_batch.mamba_track_mask is not None
+            and forward_batch.mamba_track_mask.any()
+        )
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
@@ -228,6 +248,11 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst=track_ssm_h_dst,
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
+            bi_ckpt_batch_rows=bi_ckpt_batch_rows,
+            bi_ckpt_token_starts=bi_ckpt_token_starts,
+            bi_ckpt_lens=bi_ckpt_lens,
+            bi_ckpt_dst_indices=bi_ckpt_dst_indices,
+            has_mamba_track_mask=has_mamba_track_mask,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
@@ -353,6 +378,29 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_h_dst.to(self.device, non_blocking=True),
             track_ssm_final_src.to(self.device, non_blocking=True),
             track_ssm_final_dst.to(self.device, non_blocking=True),
+        )
+
+    def _init_bi_gdn_ckpt_indices(self, forward_batch: ForwardBatch):
+        """Build fp32 chunk-boundary checkpoint metadata for BI GDN prefill."""
+        mamba_track_mask = forward_batch.mamba_track_mask.cpu()
+        extend_seq_lens = forward_batch.extend_seq_lens.cpu()
+        mamba_track_indices = forward_batch.mamba_track_indices.cpu()
+        mamba_track_seqlens = forward_batch.mamba_track_seqlens.cpu()
+        prefix_lens = forward_batch.extend_prefix_lens.cpu()
+
+        token_starts = torch.zeros_like(extend_seq_lens)
+        token_starts[1:] = torch.cumsum(extend_seq_lens[:-1], dim=0)
+
+        lens_to_track = mamba_track_seqlens - prefix_lens
+        not_aligned = mamba_track_mask & ((lens_to_track % FLA_CHUNK_SIZE) != 0)
+        batch_rows = not_aligned.nonzero(as_tuple=True)[0]
+        aligned_lens = (lens_to_track[batch_rows] // FLA_CHUNK_SIZE) * FLA_CHUNK_SIZE
+
+        return (
+            batch_rows.to(self.device, non_blocking=True),
+            token_starts[batch_rows].tolist(),
+            aligned_lens.tolist(),
+            mamba_track_indices[batch_rows].to(self.device, non_blocking=True),
         )
 
     def init_forward_metadata_capture_cuda_graph(

@@ -26,7 +26,13 @@ if not is_cpu():
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
 
+BI_GDN_PREFILL_ENABLED = False
+
 if is_cuda():
+    from sglang.srt.layers.attention.fla.bi_gdn_prefill import (
+        BI_GDN_PREFILL_ENABLED,
+        bi_chunk_gated_delta_rule_prefill,
+    )
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
     )
@@ -216,6 +222,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
+        if BI_GDN_PREFILL_ENABLED and not prefill_backend.is_triton():
+            raise RuntimeError(
+                "SGLANG_BI_GDN_PREFILL=1 contracts the triton chunked-prefill path only; "
+                f"got --linear-attn-prefill-backend {prefill_backend} (XORL-245)."
+            )
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
 
     def forward_decode(
@@ -389,6 +400,36 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if BI_GDN_PREFILL_ENABLED:
+                # XORL-245 GDN prefill contract: run the trainer's exact scan
+                # composition; chunk checkpoints come from the fp32 final-state
+                # chain instead of the bf16 h buffer.
+                core_attn_out = bi_chunk_gated_delta_rule_prefill(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states,
+                    cache_indices=cache_indices,
+                    cu_seqlens=query_start_loc,
+                    scale=layer.head_k_dim**-0.5,
+                    ckpt_batch_rows=forward_metadata.bi_ckpt_batch_rows,
+                    ckpt_token_starts=forward_metadata.bi_ckpt_token_starts,
+                    ckpt_lens=forward_metadata.bi_ckpt_lens,
+                    ckpt_dst_indices=forward_metadata.bi_ckpt_dst_indices,
+                )
+                if (
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_final_src.numel() > 0
+                ):
+                    # aligned tracked requests: fp32 final-state slot copy,
+                    # same as the default path.
+                    ssm_states[forward_metadata.track_ssm_final_dst] = ssm_states[
+                        forward_metadata.track_ssm_final_src
+                    ]
+                return core_attn_out
+
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
