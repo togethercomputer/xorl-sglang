@@ -1013,6 +1013,18 @@ def chunk_gated_delta_rule_fwd_h(
 
 # --- vendored from xorl ops/linear_attention/ops/common/chunk_o.py -----------
 
+# BK/BV/num_warps are bit-relevant axes of chunk_fwd_kernel_o and their bits flip across triton 3.5->3.7;
+# BK128/BV128/w4 reproduces the triton-3.5.1 anchor bits on both (K<=128), so it is pinned by default.
+_FWD_O_CONFIGS = (
+    [
+        triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
+    ]
+    if os.environ.get("SGLANG_BI_FWD_O_AUTOTUNE", "0") == "1"
+    else [triton.Config({"BK": 128, "BV": 128}, num_warps=4, num_stages=3)]
+)
+
 
 @triton.heuristics(
     {
@@ -1022,11 +1034,7 @@ def chunk_gated_delta_rule_fwd_h(
     }
 )
 @triton.autotune(
-    configs=[
-        triton.Config({"BK": 128, "BV": 128}, num_warps=8, num_stages=3),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=3),
-        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=3),
-    ],
+    configs=_FWD_O_CONFIGS,
     key=["H", "K", "V", "BT"],
     **autotune_cache_kwargs,
 )

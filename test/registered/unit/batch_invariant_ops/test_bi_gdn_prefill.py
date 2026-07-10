@@ -257,6 +257,48 @@ class TestBIGDNPrefill(CustomTestCase):
                 self.assertEqual(cfg.num_warps, 2)
 
 
+class TestFwdOConfigPin(CustomTestCase):
+    """chunk_fwd_kernel_o BK/BV/num_warps are bit-relevant and flip across
+    triton 3.5->3.7 under stock autotune; the BK128/BV128/w4 pin reproduces the
+    triton-3.5.1 anchor bits on both. Golden frozen 2026-07-09 on H100 under
+    torch 2.9.1/triton 3.5.1 AND torch 2.12.1/triton 3.7.1 (bitwise equal)."""
+
+    GOLDEN_O = "d1398cef77be3272b3176dce4f5fc54b27ef8bcb521e91de99c0e966dde73d71"
+
+    def test_fwd_o_default_config_is_pinned(self):
+        import os
+
+        if os.environ.get("SGLANG_BI_FWD_O_AUTOTUNE", "0") == "1":
+            self.skipTest("autotune escape hatch enabled")
+        configs = bi_gdn_prefill.chunk_fwd_kernel_o.fn.configs
+        self.assertEqual(len(configs), 1)
+        self.assertEqual(configs[0].kwargs, {"BK": 128, "BV": 128})
+        self.assertEqual(configs[0].num_warps, 4)
+
+    def test_fwd_o_matches_frozen_golden(self):
+        import hashlib
+
+        gen = torch.Generator(device="cpu").manual_seed(20260709)
+        B, T, H, DKq, DVv, NT = 1, 512, 4, 128, 128, 8
+        q = F.normalize(torch.randn(B, T, H, DKq, generator=gen), p=2, dim=-1).to(torch.bfloat16)
+        k = F.normalize(torch.randn(B, T, H, DKq, generator=gen), p=2, dim=-1).to(torch.bfloat16)
+        v = (torch.randn(B, T, H, DVv, generator=gen) * 0.5).to(torch.bfloat16)
+        h = (torch.randn(B, NT, H, DKq, DVv, generator=gen) * 0.2).to(torch.bfloat16)
+        g = F.logsigmoid(torch.randn(B, T, H, generator=gen) * 2.0)
+        cu = torch.tensor([0, 320, 512], dtype=torch.long)
+        o = bi_gdn_prefill.chunk_fwd_o(
+            q=q.cuda(),
+            k=k.cuda(),
+            v=v.cuda(),
+            h=h.cuda(),
+            g=g.cuda(),
+            scale=DKq**-0.5,
+            cu_seqlens=cu.cuda(),
+        )
+        got = hashlib.sha256(o.contiguous().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()
+        self.assertEqual(got, self.GOLDEN_O)
+
+
 class TestGemmaRMSNormBatchInvariant(CustomTestCase):
     def _norm_and_input(self, rows=512, hidden=1024, seed=0):
         gen = torch.Generator(device="cuda").manual_seed(seed)
