@@ -8,6 +8,8 @@
 
 from functools import lru_cache
 
+import os
+
 import torch
 import torch.nn.functional as F
 import triton
@@ -42,7 +44,6 @@ def rms_norm_ref(
     upcast=True,
 ):
     dtype = x.dtype
-    N = x.shape[-1]
     weight = weight.float()
     bias = bias.float() if bias is not None else None
     if upcast:
@@ -177,6 +178,13 @@ def _get_sm_count(device: torch.device) -> int:
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
+    # XORL-245 K3 lane: ROWS_PER_BLOCK is launch-config, but per-row numerics
+    # are NOT tiling-invariant at rare value edges (measured), and M differs
+    # between decode (bs*HV rows) and teacher-forced prefill (T*HV rows) —
+    # a decode-vs-prefill 1-ULP surface. Pin it for bitwise mode parity.
+    pinned = os.environ.get("SGLANG_GDN_NORM_ROWS_PER_BLOCK")
+    if pinned:
+        return int(pinned)
     # When piecewise cuda graph is enabled, use a constant value to avoid
     # torch.compile creating guards on the dynamic batch dimension.
     try:

@@ -332,5 +332,55 @@ class TestSSLArgs(unittest.TestCase):
         self.assertTrue(server_args.enable_ssl_refresh)
 
 
+class TestQwen35GDNContractDefaults(CustomTestCase):
+    contract_envs = (
+        "SGLANG_BI_GDN_DECODE",
+        "SGLANG_BI_GDN_PREFILL",
+        "SGLANG_GDN_NORM_ROWS_PER_BLOCK",
+        "SGLANG_BI_LM_HEAD",
+        "SGLANG_BI_LM_HEAD_DECODE",
+        "SGLANG_FAMILIES_V2",
+    )
+
+    def _resolve(self, *, target="xorl", arch="Qwen3_5ForConditionalGeneration", env=None):
+        args = ServerArgs(model_path="dummy")
+        args.rl_on_policy_target = target
+        with patch.dict("os.environ", env or {}, clear=False):
+            for name in self.contract_envs:
+                if not env or name not in env:
+                    os.environ.pop(name, None)
+            args._handle_qwen35_gdn_contract(arch)
+            resolved = {name: os.environ.get(name) for name in self.contract_envs}
+        return args, resolved
+
+    def test_dense_qwen35_xorl_defaults_exact_gdn(self):
+        args, resolved = self._resolve()
+        self.assertEqual(resolved["SGLANG_BI_GDN_DECODE"], "1")
+        self.assertEqual(resolved["SGLANG_BI_GDN_PREFILL"], "1")
+        self.assertEqual(resolved["SGLANG_GDN_NORM_ROWS_PER_BLOCK"], "4")
+        self.assertEqual(resolved["SGLANG_BI_LM_HEAD"], "1")
+        self.assertEqual(resolved["SGLANG_BI_LM_HEAD_DECODE"], "1")
+        self.assertEqual(resolved["SGLANG_FAMILIES_V2"], "0")
+        self.assertTrue(args.disable_cuda_graph)
+        self.assertTrue(args.disable_radix_cache)
+        self.assertEqual(args.linear_attn_prefill_backend, "triton")
+
+    def test_decode_kill_switch_preserves_fast_path(self):
+        args, resolved = self._resolve(env={"SGLANG_BI_GDN_DECODE": "0"})
+        self.assertEqual(resolved["SGLANG_BI_GDN_DECODE"], "0")
+        self.assertIsNone(resolved["SGLANG_BI_GDN_PREFILL"])
+        self.assertFalse(args.disable_cuda_graph)
+        self.assertIsNone(args.linear_attn_prefill_backend)
+
+    def test_non_xorl_and_moe_are_unchanged(self):
+        for target, arch in (
+            (None, "Qwen3_5ForConditionalGeneration"),
+            ("xorl", "Qwen3_5MoeForConditionalGeneration"),
+        ):
+            args, resolved = self._resolve(target=target, arch=arch)
+            self.assertTrue(all(value is None for value in resolved.values()))
+            self.assertFalse(args.disable_cuda_graph)
+
+
 if __name__ == "__main__":
     unittest.main()

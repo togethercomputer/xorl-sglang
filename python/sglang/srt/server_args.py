@@ -1403,6 +1403,37 @@ class ServerArgs:
             f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
         )
 
+    def _handle_qwen35_gdn_contract(self, model_arch: str):
+        """Select the paired exact GDN path for dense Qwen3.5 XORL serving."""
+        dense_qwen35_arches = {
+            "Qwen3_5ForCausalLM",
+            "Qwen3_5TextForCausalLM",
+            "Qwen3_5ForConditionalGeneration",
+        }
+        if self.rl_on_policy_target != "xorl" or model_arch not in dense_qwen35_arches:
+            return
+
+        os.environ.setdefault("SGLANG_BI_LM_HEAD", "1")
+        os.environ.setdefault("SGLANG_BI_LM_HEAD_DECODE", "1")
+        os.environ.setdefault("SGLANG_FAMILIES_V2", "0")
+        os.environ.setdefault("SGLANG_BI_GDN_DECODE", "1")
+        if not get_bool_env_var("SGLANG_BI_GDN_DECODE"):
+            logger.warning(
+                "Dense Qwen3.5 exact GDN decode is disabled; zero K3 is not guaranteed."
+            )
+            return
+
+        os.environ.setdefault("SGLANG_BI_GDN_PREFILL", "1")
+        os.environ.setdefault("SGLANG_GDN_NORM_ROWS_PER_BLOCK", "4")
+        self.disable_radix_cache = True
+        self.disable_cuda_graph = True
+        if self.linear_attn_prefill_backend is None:
+            self.linear_attn_prefill_backend = "triton"
+        logger.info(
+            "Dense Qwen3.5 exact GDN contract enabled: partial-chunk rescan, "
+            "paired BI prefill/head, eager decode, no radix cache."
+        )
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
 
@@ -1411,6 +1442,8 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+
+        self._handle_qwen35_gdn_contract(model_arch)
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
