@@ -1,4 +1,4 @@
-"""XORL-245 GDN decode contract, serving side: partial-chunk-rescan decode.
+"""GDN decode contract, serving side: partial-chunk-rescan decode.
 
 Serving's stock GDN decode (per-token step recurrence) computes a DIFFERENT
 composition from the chunked prefill the trainer scores with — the measured
@@ -37,7 +37,9 @@ from __future__ import annotations
 
 import torch
 
-from sglang.srt.layers.attention.fla.bi_gdn_prefill import bi_chunk_gated_delta_rule_prefill
+from sglang.srt.layers.attention.fla.bi_gdn_prefill import (
+    bi_chunk_gated_delta_rule_prefill,
+)
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE
 from sglang.srt.utils import get_bool_env_var
 
@@ -61,15 +63,28 @@ class BIGDNDecodeCache:
         self.k = head_k_dim
         self.v = head_v_dim
         self.boundary = torch.zeros(
-            num_slots, num_v_heads, head_v_dim, head_k_dim, dtype=torch.float32, device=device
+            num_slots,
+            num_v_heads,
+            head_v_dim,
+            head_k_dim,
+            dtype=torch.float32,
+            device=device,
         )
         self.scratch = torch.zeros_like(self.boundary)
-        self.rows_qkv = torch.zeros(num_slots, CHUNK_SIZE, qkv_dim, dtype=torch.bfloat16, device=device)
-        self.rows_g = torch.zeros(num_slots, CHUNK_SIZE, num_v_heads, dtype=torch.float32, device=device)
-        self.rows_beta = torch.zeros(num_slots, CHUNK_SIZE, num_v_heads, dtype=torch.float32, device=device)
+        self.rows_qkv = torch.zeros(
+            num_slots, CHUNK_SIZE, qkv_dim, dtype=torch.bfloat16, device=device
+        )
+        self.rows_g = torch.zeros(
+            num_slots, CHUNK_SIZE, num_v_heads, dtype=torch.float32, device=device
+        )
+        self.rows_beta = torch.zeros(
+            num_slots, CHUNK_SIZE, num_v_heads, dtype=torch.float32, device=device
+        )
         self.suffix_len = [0] * num_slots
 
-    def _split(self, rows: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _split(
+        self, rows: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """[T, qkv_dim] packed q|k|v -> ([1,T,H,K], [1,T,H,K], [1,T,HV,V])."""
         h = (self.qkv_dim - self.hv * self.v) // (2 * self.k)
         q, k, v = torch.split(rows, [h * self.k, h * self.k, self.hv * self.v], dim=-1)
@@ -99,7 +114,7 @@ class BIGDNDecodeCache:
         """
         if prefix_len % CHUNK_SIZE != 0:
             raise RuntimeError(
-                f"SGLANG_BI_GDN_DECODE requires {CHUNK_SIZE}-aligned extend prefixes; got {prefix_len} (XORL-245)."
+                f"SGLANG_BI_GDN_DECODE requires {CHUNK_SIZE}-aligned extend prefixes; got {prefix_len}."
             )
         t_pass = qkv_rows.shape[0]
         total = prefix_len + t_pass
@@ -113,16 +128,22 @@ class BIGDNDecodeCache:
                 self.boundary[slot] = pre_scan_state
             else:
                 # rescan the aligned prefix of this pass from the pre-pass state;
-                # fp32 chunk-boundary chaining is exact (XORL-245 certified)
+                # fp32 chunk-boundary chaining is exact
                 self.scratch[slot] = pre_scan_state
                 q, k, v = self._split(qkv_rows[:bnd_in_pass])
                 bi_chunk_gated_delta_rule_prefill(
-                    q=q, k=k, v=v,
+                    q=q,
+                    k=k,
+                    v=v,
                     g=g_rows[:bnd_in_pass].view(1, bnd_in_pass, self.hv),
                     beta=beta_rows[:bnd_in_pass].view(1, bnd_in_pass, self.hv),
                     ssm_states=self.scratch,
-                    cache_indices=torch.tensor([slot], dtype=torch.int32, device=qkv_rows.device),
-                    cu_seqlens=torch.tensor([0, bnd_in_pass], dtype=torch.int32, device=qkv_rows.device),
+                    cache_indices=torch.tensor(
+                        [slot], dtype=torch.int32, device=qkv_rows.device
+                    ),
+                    cu_seqlens=torch.tensor(
+                        [0, bnd_in_pass], dtype=torch.int32, device=qkv_rows.device
+                    ),
                     scale=self.k**-0.5,
                 )
                 self.boundary[slot] = self.scratch[slot]
@@ -159,12 +180,16 @@ class BIGDNDecodeCache:
                 self.scratch[s] = self.boundary[s]
                 q1, k1, v1 = self._split(self.rows_qkv[s, :CHUNK_SIZE])
                 bi_chunk_gated_delta_rule_prefill(
-                    q=q1, k=k1, v=v1,
+                    q=q1,
+                    k=k1,
+                    v=v1,
                     g=self.rows_g[s, :CHUNK_SIZE].view(1, CHUNK_SIZE, self.hv),
                     beta=self.rows_beta[s, :CHUNK_SIZE].view(1, CHUNK_SIZE, self.hv),
                     ssm_states=self.scratch,
                     cache_indices=torch.tensor([s], dtype=torch.int32, device=device),
-                    cu_seqlens=torch.tensor([0, CHUNK_SIZE], dtype=torch.int32, device=device),
+                    cu_seqlens=torch.tensor(
+                        [0, CHUNK_SIZE], dtype=torch.int32, device=device
+                    ),
                     scale=self.k**-0.5,
                 )
                 self.boundary[s] = self.scratch[s]
@@ -175,9 +200,13 @@ class BIGDNDecodeCache:
             self.rows_beta[s, pos] = beta_rows[i]
             self.suffix_len[s] = pos + 1
             seg_lens.append(pos + 1)
-        cat_qkv = torch.cat([self.rows_qkv[s, : self.suffix_len[s]] for s in slots], dim=0)
+        cat_qkv = torch.cat(
+            [self.rows_qkv[s, : self.suffix_len[s]] for s in slots], dim=0
+        )
         cat_g = torch.cat([self.rows_g[s, : self.suffix_len[s]] for s in slots], dim=0)
-        cat_beta = torch.cat([self.rows_beta[s, : self.suffix_len[s]] for s in slots], dim=0)
+        cat_beta = torch.cat(
+            [self.rows_beta[s, : self.suffix_len[s]] for s in slots], dim=0
+        )
         cu = torch.zeros(bs + 1, dtype=torch.int32, device=device)
         cu[1:] = torch.tensor(seg_lens, dtype=torch.int32, device=device).cumsum(0)
         slot_idx = torch.tensor(slots, dtype=torch.int32, device=device)
@@ -185,7 +214,9 @@ class BIGDNDecodeCache:
         self.scratch[slot_idx] = self.boundary[slot_idx]
         q, k, v = self._split(cat_qkv)
         o = bi_chunk_gated_delta_rule_prefill(
-            q=q, k=k, v=v,
+            q=q,
+            k=k,
+            v=v,
             g=cat_g.view(1, -1, self.hv),
             beta=cat_beta.view(1, -1, self.hv),
             ssm_states=self.scratch,

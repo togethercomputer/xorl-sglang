@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
@@ -342,7 +343,9 @@ class TestQwen35GDNContractDefaults(CustomTestCase):
         "SGLANG_FAMILIES_V2",
     )
 
-    def _resolve(self, *, target="xorl", arch="Qwen3_5ForConditionalGeneration", env=None):
+    def _resolve(
+        self, *, target="xorl", arch="Qwen3_5ForConditionalGeneration", env=None
+    ):
         args = ServerArgs(model_path="dummy")
         args.rl_on_policy_target = target
         with patch.dict("os.environ", env or {}, clear=False):

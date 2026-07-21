@@ -37,7 +37,7 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
-    # SGLANG_BI_GDN_PREFILL (XORL-245): fp32 chunk-boundary checkpoint sourcing
+    # SGLANG_BI_GDN_PREFILL: fp32 chunk-boundary checkpoint sourcing
     # for tracked requests that do not end on a chunk boundary. Parallel over
     # those requests: batch row, token start in the packed batch, chunk-aligned
     # prefix length (0 = copy the pre-scan state), destination pool row.

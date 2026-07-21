@@ -230,7 +230,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if BI_GDN_PREFILL_ENABLED and not prefill_backend.is_triton():
             raise RuntimeError(
                 "SGLANG_BI_GDN_PREFILL=1 contracts the triton chunked-prefill path only; "
-                f"got --linear-attn-prefill-backend {prefill_backend} (XORL-245)."
+                f"got --linear-attn-prefill-backend {prefill_backend}."
             )
         if BI_GDN_DECODE_ENABLED:
             if not BI_GDN_PREFILL_ENABLED:
@@ -318,9 +318,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if BI_GDN_DECODE_ENABLED:
             num_tokens = mixed_qkv.shape[0]
             if num_tokens == 0:
-                return mixed_qkv.new_empty(
-                    1, 0, layer.num_v_heads, layer.head_v_dim
-                )
+                return mixed_qkv.new_empty(1, 0, layer.num_v_heads, layer.head_v_dim)
             slots = cache_indices.tolist()
             if len(set(slots)) != len(slots):
                 raise RuntimeError(
@@ -331,13 +329,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "SGLANG_BI_GDN_DECODE does not support padded cache slots"
                 )
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            core_attn_out = self._bi_decode_cache(layer, ssm_states).step(
-                slots=slots,
-                qkv_rows=mixed_qkv,
-                g_rows=g.view(num_tokens, -1),
-                beta_rows=beta.view(num_tokens, -1),
-                ssm_states=ssm_states,
-            ).unsqueeze(0)
+            core_attn_out = (
+                self._bi_decode_cache(layer, ssm_states)
+                .step(
+                    slots=slots,
+                    qkv_rows=mixed_qkv,
+                    g_rows=g.view(num_tokens, -1),
+                    beta_rows=beta.view(num_tokens, -1),
+                    ssm_states=ssm_states,
+                )
+                .unsqueeze(0)
+            )
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices
             )
@@ -490,7 +492,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
             if BI_GDN_PREFILL_ENABLED:
-                # XORL-245 GDN prefill contract: run the trainer's exact scan
+                # GDN prefill contract: run the trainer's exact scan
                 # composition; chunk checkpoints come from the fp32 final-state
                 # chain instead of the bf16 h buffer.
                 bi_decode_pre_states = (

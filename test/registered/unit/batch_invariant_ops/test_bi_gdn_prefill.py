@@ -1,4 +1,4 @@
-"""Unit gate for the K3 GDN prefill contract (XORL-245, SGLANG_BI_GDN_PREFILL).
+"""Unit gate for the K3 GDN prefill contract (SGLANG_BI_GDN_PREFILL).
 
 Checks that ``bi_chunk_gated_delta_rule_prefill`` (the trainer-composition
 chunked scan) is deterministic, batch-invariant, chains bitwise through the
@@ -7,8 +7,7 @@ to the default fused path, and fails loudly on unverified pools. Also covers
 the GemmaRMSNorm batch-invariant arm and the vendored solve_tril num_warps pin
 (the tl.sum forward substitution reassociates with warp count).
 
-The cross-engine bitwise gate against the xorl trainer lives in
-xorl experiments/k3_tests/gdn_term/gdn_prefill_contract_gate.py.
+The cross-engine bitwise gate against the xorl trainer lives on the trainer side.
 """
 
 import unittest
@@ -19,6 +18,7 @@ import torch.nn.functional as F
 from sglang.srt.batch_invariant_ops import set_batch_invariant_mode
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import rms_norm_batch_invariant
 from sglang.srt.layers.attention.fla import bi_gdn_prefill
+from sglang.srt.layers.attention.fla.bi_gdn_decode import BIGDNDecodeCache
 from sglang.srt.layers.attention.fla.bi_gdn_prefill import (
     bi_chunk_gated_delta_rule_prefill,
 )
@@ -257,10 +257,81 @@ class TestBIGDNPrefill(CustomTestCase):
                 self.assertEqual(cfg.num_warps, 2)
 
 
+class TestBIGDNDecodeRescan(CustomTestCase):
+    def test_partial_chunk_rescan_matches_full_prefill_across_boundary(self):
+        prompt_len, total = 45, 70
+        q, k, v, g, beta = make_inputs(total, seed=17)
+        idx = torch.tensor([0], device="cuda", dtype=torch.int32)
+
+        full_pool = torch.zeros(1, HV, DV, DK, device="cuda", dtype=torch.float32)
+        full = run_bi(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            full_pool,
+            idx,
+            torch.tensor([0, total], device="cuda", dtype=torch.int32),
+        )
+
+        live_pool = torch.zeros_like(full_pool)
+        run_bi(
+            q[:, :prompt_len],
+            k[:, :prompt_len],
+            v[:, :prompt_len],
+            g[:, :prompt_len],
+            beta[:, :prompt_len],
+            live_pool,
+            idx,
+            torch.tensor([0, prompt_len], device="cuda", dtype=torch.int32),
+        )
+        packed = torch.cat(
+            (
+                q.reshape(total, -1),
+                k.reshape(total, -1),
+                v.reshape(total, -1),
+            ),
+            dim=-1,
+        )
+        cache = BIGDNDecodeCache(
+            num_slots=1,
+            qkv_dim=packed.shape[-1],
+            num_v_heads=HV,
+            head_k_dim=DK,
+            head_v_dim=DV,
+            device=packed.device,
+        )
+        cache.seed_from_extend(
+            slot=0,
+            pre_scan_state=torch.zeros_like(live_pool[0]),
+            qkv_rows=packed[:prompt_len],
+            g_rows=g.reshape(total, HV)[:prompt_len],
+            beta_rows=beta.reshape(total, HV)[:prompt_len],
+            prefix_len=0,
+            ssm_states=live_pool,
+        )
+
+        decoded = []
+        for pos in range(prompt_len, total):
+            decoded.append(
+                cache.step(
+                    slots=[0],
+                    qkv_rows=packed[pos : pos + 1],
+                    g_rows=g.reshape(total, HV)[pos : pos + 1],
+                    beta_rows=beta.reshape(total, HV)[pos : pos + 1],
+                    ssm_states=live_pool,
+                )
+            )
+
+        self.assertTrue(torch.equal(torch.cat(decoded, dim=0), full[0, prompt_len:]))
+        self.assertTrue(torch.equal(live_pool, full_pool))
+
+
 class TestFwdOConfigPin(CustomTestCase):
     """chunk_fwd_kernel_o BK/BV/num_warps are bit-relevant and flip across
     triton 3.5->3.7 under stock autotune; the BK128/BV128/w4 pin reproduces the
-    triton-3.5.1 anchor bits on both. Golden frozen 2026-07-09 on H100 under
+    triton-3.5.1 anchor bits on both. Golden frozen on H100 under
     torch 2.9.1/triton 3.5.1 AND torch 2.12.1/triton 3.7.1 (bitwise equal)."""
 
     GOLDEN_O = "d1398cef77be3272b3176dce4f5fc54b27ef8bcb521e91de99c0e966dde73d71"
@@ -280,8 +351,12 @@ class TestFwdOConfigPin(CustomTestCase):
 
         gen = torch.Generator(device="cpu").manual_seed(20260709)
         B, T, H, DKq, DVv, NT = 1, 512, 4, 128, 128, 8
-        q = F.normalize(torch.randn(B, T, H, DKq, generator=gen), p=2, dim=-1).to(torch.bfloat16)
-        k = F.normalize(torch.randn(B, T, H, DKq, generator=gen), p=2, dim=-1).to(torch.bfloat16)
+        q = F.normalize(torch.randn(B, T, H, DKq, generator=gen), p=2, dim=-1).to(
+            torch.bfloat16
+        )
+        k = F.normalize(torch.randn(B, T, H, DKq, generator=gen), p=2, dim=-1).to(
+            torch.bfloat16
+        )
         v = (torch.randn(B, T, H, DVv, generator=gen) * 0.5).to(torch.bfloat16)
         h = (torch.randn(B, NT, H, DKq, DVv, generator=gen) * 0.2).to(torch.bfloat16)
         g = F.logsigmoid(torch.randn(B, T, H, generator=gen) * 2.0)
@@ -295,7 +370,9 @@ class TestFwdOConfigPin(CustomTestCase):
             scale=DKq**-0.5,
             cu_seqlens=cu.cuda(),
         )
-        got = hashlib.sha256(o.contiguous().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()
+        got = hashlib.sha256(
+            o.contiguous().cpu().view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
         self.assertEqual(got, self.GOLDEN_O)
 
 

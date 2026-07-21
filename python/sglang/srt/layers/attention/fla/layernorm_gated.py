@@ -6,9 +6,8 @@
 # The models we train have hidden dim up to 8k anyway (e.g. Llama 70B), so this is fine.
 
 
-from functools import lru_cache
-
 import os
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -178,7 +177,7 @@ def _get_sm_count(device: torch.device) -> int:
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
-    # XORL-245 K3 lane: ROWS_PER_BLOCK is launch-config, but per-row numerics
+    # K3 lane: ROWS_PER_BLOCK is launch-config, but per-row numerics
     # are NOT tiling-invariant at rare value edges (measured), and M differs
     # between decode (bs*HV rows) and teacher-forced prefill (T*HV rows) —
     # a decode-vs-prefill 1-ULP surface. Pin it for bitwise mode parity.

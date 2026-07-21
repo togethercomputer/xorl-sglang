@@ -1,4 +1,4 @@
-# The K3 GDN prefill contract (XORL-245), vendored from xorl-internal.
+# The K3 GDN prefill contract, vendored from xorl.
 #
 # Under SGLANG_BI_GDN_PREFILL=1 the chunked GDN prefill scan runs the trainer's
 # exact stage composition so chunked-prefill outputs and fp32 final states are
@@ -1237,11 +1237,11 @@ def bi_chunk_gated_delta_rule_prefill(
     """
     if ssm_states.dtype != torch.float32:
         raise RuntimeError(
-            f"SGLANG_BI_GDN_PREFILL requires an fp32 SSM state pool; got {ssm_states.dtype} (XORL-245)."
+            f"SGLANG_BI_GDN_PREFILL requires an fp32 SSM state pool; got {ssm_states.dtype}."
         )
     if q.dtype != torch.bfloat16:
         raise RuntimeError(
-            f"SGLANG_BI_GDN_PREFILL is a bf16 contract; got q dtype {q.dtype} (XORL-245)."
+            f"SGLANG_BI_GDN_PREFILL is a bf16 contract; got q dtype {q.dtype}."
         )
     # serving hands over non-contiguous split views; the FLA kernels assume
     # dense [B, T, H, D] strides (the default path gets this from input_guard)
