@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.nn as nn
@@ -15,8 +15,8 @@ from sglang.srt.server_args import (
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-test-small-1-gpu")
-register_amd_ci(est_time=15, suite="stage-b-test-small-1-gpu-amd")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
+register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
 
 
 class LMHeadStub(nn.Module):
@@ -112,6 +112,38 @@ class TestLMHeadFP32(unittest.TestCase):
         self._run_case(
             torch.bfloat16, False, torch.bfloat16, torch.bfloat16, torch.bfloat16
         )
+
+    def test_cache_refreshes_in_place_after_inplace_weight_write(self):
+        device = get_device()
+        head = LMHeadStub(128, 64, dtype=torch.bfloat16, device=device)
+        lp = self._make_logprocessor(128, True)
+        if not lp.cache_fp32_lm_head:
+            raise unittest.SkipTest("SGLANG_CACHE_FP32_LM_HEAD disabled in env")
+        buf = lp._get_fp32_lm_head_weight(head.weight)
+        ptr = buf.data_ptr()
+        with torch.no_grad():
+            # In-place write with no tensor-identity change, like a P2P/RDMA sync.
+            head.weight.copy_(torch.randn_like(head.weight))
+        stale = lp._get_fp32_lm_head_weight(head.weight)
+        self.assertEqual(stale.data_ptr(), ptr)
+        self.assertFalse(torch.equal(stale, head.weight.detach().to(torch.float32)))
+        lp.clear_fp32_lm_head_cache()
+        fresh = lp._get_fp32_lm_head_weight(head.weight)
+        # Refresh must be in place (captured decode graphs keep reading ptr) and lossless.
+        self.assertEqual(fresh.data_ptr(), ptr)
+        self.assertTrue(torch.equal(fresh, head.weight.detach().to(torch.float32)))
+
+    def test_complete_weights_update_p2p_refreshes_fp32_cache(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        fake = SimpleNamespace(
+            _pending_p2p_update_state={"grp": {"session_id": "s"}},
+            _clear_fp32_lm_head_cache=MagicMock(),
+        )
+        with patch.dict("os.environ", {"XORL_P2P_RECV_SNIFF": "0"}):
+            ok, _ = ModelRunner.complete_weights_update_p2p(fake, "grp")
+        self.assertTrue(ok)
+        fake._clear_fp32_lm_head_cache.assert_called_once()
 
 
 if __name__ == "__main__":

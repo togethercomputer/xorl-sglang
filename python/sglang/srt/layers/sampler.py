@@ -31,9 +31,20 @@ if is_npu():
     import torch_npu
 
 logger = logging.getLogger(__name__)
+_SEED_SHAPE_REPAIR_WARNED = False
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+# K3 lm-head contract, decode extension (see logits_processor.py): the sampled
+# token's returned logprob is rescored through the contract's chunk-stats +
+# pinned-order LSE merge over the same BI logits the token was sampled from,
+# bitwise identical to bi_lm_head_selected_logprob on the same
+# hidden/weight/temperature (and so to the trainer's ce_mode='bi_fused' twin).
+# Top-k/token-ids diagnostics keep the stock log_softmax path. Default off.
+SGLANG_BI_LM_HEAD_DECODE = get_bool_env_var("SGLANG_BI_LM_HEAD_DECODE")
+# One-time coverage marker so live runs can verify from logs that returned
+# output_token_logprobs are contract rescores.
+_bi_decode_rescore_logged = False
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
@@ -123,10 +134,13 @@ class Sampler(nn.Module):
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
             if self.rl_on_policy_target is not None:
+                # xorl's trainer computes logprobs in fp32 (lm_head_fp32 + fp32
+                # cross-entropy). Keep temperature scaling and log_softmax in
+                # fp32 to match it. (The removed fsdp target used a bf16
+                # downcast here, which injects a fixed bf16-rounding K3 gap at
+                # temp>0 against fp32 trainers.)
                 # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
+                logits_div_temperature = logits.float().div(sampling_info.temperatures)
                 logprobs_via_logsoftmax_kernel = torch.log_softmax(
                     logits_div_temperature, dim=-1
                 )
@@ -181,6 +195,18 @@ class Sampler(nn.Module):
                 sampling_info,
                 batch_next_token_ids,
             )
+            if SGLANG_BI_LM_HEAD_DECODE:
+                logits_output.next_token_logprobs = self._bi_contract_sampled_logprob(
+                    logits_output.next_token_logits,
+                    batch_next_token_ids,
+                    sampling_info,
+                )
+                global _bi_decode_rescore_logged
+                if not _bi_decode_rescore_logged:
+                    _bi_decode_rescore_logged = True
+                    logger.info(
+                        "BI decode rescore active: output_token_logprobs are contract values"
+                    )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 
@@ -253,9 +279,34 @@ class Sampler(nn.Module):
         assert (
             sampling_info.sampling_seed is not None
         ), "sampling_seed is required for sampling from logprobs"
-        sampled_index = multinomial_with_seed(
-            logprobs, sampling_info.sampling_seed, positions
-        )
+        sampling_seed = sampling_info.sampling_seed
+        if sampling_seed.shape != positions.shape:
+            # DP-attention / mixed-batch bookkeeping can desync the per-row seed
+            # tensor from the forward rows (row counts diverge when DP ranks carry
+            # unequal batches). For all-default workloads (no per-request
+            # sampling_seed) every row's correct seed IS the constructor default
+            # (42), so repair instead of crashing. Per-request seeds would need the
+            # upstream bookkeeping fixed first.
+            if not bool(torch.all(sampling_seed == 42).item()):
+                raise AssertionError(
+                    "sampling_seed shape "
+                    f"{tuple(sampling_seed.shape)} != positions shape "
+                    f"{tuple(positions.shape)} and contains non-default seeds; "
+                    "cannot safely repair per-request deterministic seeds"
+                )
+            global _SEED_SHAPE_REPAIR_WARNED
+            if not _SEED_SHAPE_REPAIR_WARNED:
+                logger.warning(
+                    "sampling_seed shape %s != positions shape %s; refilling with "
+                    "default seed 42 (safe only for seedless requests)",
+                    tuple(sampling_seed.shape),
+                    tuple(positions.shape),
+                )
+                _SEED_SHAPE_REPAIR_WARNED = True
+            sampling_seed = torch.full(
+                positions.shape, 42, dtype=torch.int64, device=positions.device
+            )
+        sampled_index = multinomial_with_seed(logprobs, sampling_seed, positions)
         return sampled_index.view(-1).to(torch.int32)
 
     def _sample_from_logits(
@@ -310,6 +361,82 @@ class Sampler(nn.Module):
             logprobs = torch.log_softmax(logits, dim=-1)
         return batch_next_token_ids, logprobs
 
+    def _bi_contract_sampled_logprob(
+        self,
+        logits: torch.Tensor,
+        batch_next_token_ids: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> torch.Tensor:
+        """SGLANG_BI_LM_HEAD_DECODE=1: rescore the sampled token through the
+        contract's chunk-stats + pinned-order LSE merge over the (unmutated)
+        BI sampling logits. Explicit opt-in, so configurations that mutate or
+        bypass the contract logits error loudly instead of silently returning
+        non-contract logprobs."""
+        from sglang.srt.batch_invariant_ops import (
+            bi_lm_head_selected_logprob_from_logits,
+            families_v2_enabled,
+            head_v2_selected_logprob_from_logits,
+        )
+
+        if self.use_ascend_backend:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 does not support the ascend sampling backend"
+            )
+        if SGLANG_RETURN_ORIGINAL_LOGPROB:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 does not support SGLANG_RETURN_ORIGINAL_LOGPROB"
+            )
+        if self.use_nan_detection:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 does not support --enable-nan-detection "
+                "(it substitutes the logits between sampling and the contract rescore)"
+            )
+        if (
+            sampling_info.has_custom_logit_processor
+            or sampling_info.logit_bias is not None
+            or sampling_info.grammars
+            or sampling_info.vocab_mask is not None
+            or sampling_info.acc_additive_penalties is not None
+            or sampling_info.acc_scaling_penalties is not None
+            or (
+                sampling_info.penalizer_orchestrator is not None
+                and sampling_info.penalizer_orchestrator.is_required
+            )
+        ):
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 does not support logit bias, penalties, grammar "
+                "masks, or custom logit processors: they mutate the sampling logits in place, "
+                "so the contract rescore would not describe the trainer-reproducible distribution"
+            )
+        temperature = None
+        if not sampling_info.is_all_greedy:
+            # Only the RL on-policy deterministic lane keeps the sampling
+            # logits unmutated (other lanes temperature-scale them in place
+            # before this rescore runs).
+            if not (
+                self.use_log_softmax_logprob
+                and self.enable_deterministic
+                and not sampling_info.need_top_p_sampling
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_min_p_sampling
+            ):
+                raise ValueError(
+                    "SGLANG_BI_LM_HEAD_DECODE=1 requires all-greedy or the RL on-policy "
+                    "deterministic sampling lane (--rl-on-policy-target, no top-k/top-p/min-p)"
+                )
+            temperature = sampling_info.temperatures.reshape(-1)
+        if families_v2_enabled():
+            # families-v2: same rescore contract, v2 stats/merge tree (bitwise
+            # == the head-v2 scoring path on the same logits/temperature).
+            logprob, _, _ = head_v2_selected_logprob_from_logits(
+                logits, batch_next_token_ids, temperature=temperature
+            )
+            return logprob
+        logprob, _, _ = bi_lm_head_selected_logprob_from_logits(
+            logits, batch_next_token_ids, temperature=temperature
+        )
+        return logprob
+
     def _attach_logprobs_to_output(
         self,
         logits_output: LogitsProcessorOutput,
@@ -327,13 +454,15 @@ class Sampler(nn.Module):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums)
+            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
         if any(x is not None for x in token_ids_logprobs):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
+            ) = get_token_ids_logprobs(
+                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+            )
 
         logits_output.next_token_logprobs = logprobs[
             torch.arange(len(batch_next_token_ids), device=sampling_info.device),
@@ -397,7 +526,7 @@ class Sampler(nn.Module):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums)
+            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:
@@ -582,6 +711,15 @@ def multinomial_with_seed(
 
     # add gumbel noise to logprobs
     x.add_(logprobs.to(torch.float64))
+
+    # Guard the hash==0xFFFFFFFF edge: x==1 -> -log(-log(1)) == +inf gumbel, and
+    # +inf + (-inf from a top-p/top-k zeroed logprob) == NaN. torch.argmax then returns the
+    # NaN index -> an OUT-OF-NUCLEUS token is sampled, whose returned logprob (~ -18) blows up
+    # the IS ratio (per-rollout-seed k3 explosion, ~56 hits/step at 150k vocab). Map NaN/-inf
+    # to a finite floor so a zeroed token can never win the argmax. (compile-safe)
+    x = torch.nan_to_num(
+        x, nan=torch.finfo(torch.float64).min, neginf=torch.finfo(torch.float64).min
+    )
 
     return torch.argmax(x, dim=1, keepdim=True)
 

@@ -55,11 +55,41 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import is_npu, use_intel_amx_backend
+from sglang.srt.utils.common import get_bool_env_var, is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+# The fp32 lm-head runs inside the decode CUDA graph. With this off, the graph
+# captures a full weight.to(float32) convert (~1.2 GB for a 150k-vocab head) that
+# re-executes on every replay. Caching materializes the fp32 weight once and keeps
+# only the matmul in the graph (measured 1343 -> 399 us/step at vocab=151936,
+# hidden=2048), bit-identically. Default on; set SGLANG_CACHE_FP32_LM_HEAD=0 to
+# fall back to the per-step convert (e.g. for A/B or extreme-vocab memory limits).
+SGLANG_CACHE_FP32_LM_HEAD = get_bool_env_var(
+    "SGLANG_CACHE_FP32_LM_HEAD", default="true"
+)
+
+# K3 lm-head contract: score input-token logprobs through the vendored
+# batch-invariant fused lm-head kernel (batch_invariant_ops), bitwise identical
+# to the xorl trainer's ce_mode='bi_fused' from bit-exact hidden states. The
+# bf16 weight stays resident (no fp32 lm-head copy on this path). Overrides
+# only input_token_logprobs; top-k/token-ids diagnostics keep the stock path.
+# Default off.
+SGLANG_BI_LM_HEAD = get_bool_env_var("SGLANG_BI_LM_HEAD")
+
+# K3 lm-head contract, decode extension: with SGLANG_BI_LM_HEAD_DECODE=1 the
+# next-token sampling logits are computed through the contract's chunked
+# fixed-tile BI GEMM (fp32, full vocab) instead of the fp32 lm-head matmul, and
+# the sampler rescores the sampled token through the contract's chunk-stats +
+# pinned-order LSE merge over those same logits (sampler.py). Sampling then
+# draws from the exact distribution the trainer's ce_mode='bi_fused' twin
+# scores, so live behavior-K3 can be 0 — but sampled outputs change bitwise vs
+# the fp32-head path. Launch shapes are static per captured batch size, so the
+# GEMM captures into the decode CUDA graph. Requires SGLANG_BI_LM_HEAD=1 and
+# its config (fp32-class lm head, bf16 weight, no vocab/DP-parallel gathers,
+# no LoRA lm_head); unsupported configs raise loudly. Default off.
+SGLANG_BI_LM_HEAD_DECODE = get_bool_env_var("SGLANG_BI_LM_HEAD_DECODE")
 
 
 @dataclasses.dataclass
@@ -73,7 +103,9 @@ class LogitsProcessorOutput:
     hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
-    # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
+    # The log probs of output tokens. With SGLANG_RETURN_ORIGINAL_LOGPROB=1 these are
+    # pre-temperature log probs; otherwise post-temperature. With
+    # SGLANG_BI_LM_HEAD_DECODE=1 they are the contract rescores of the sampled tokens.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
@@ -105,6 +137,14 @@ class LogitsProcessorOutput:
     customized_info: Optional[Dict[str, List[Any]]] = None
 
     mm_input_embeds: Optional[torch.Tensor] = None
+    # MTP decode internals: committed tokens (for output) and pending tokens (for next step).
+    mtp_committed_token_ids: Optional[Union[torch.Tensor, List[List[int]]]] = None
+    mtp_pending_token_ids: Optional[torch.Tensor] = None
+    mtp_effective_k_per_req: Optional[torch.Tensor] = None
+    # Verified (draft-prefix-matched) commit length per request; commit slots
+    # beyond this were conditioned on rejected drafts and must not enter the
+    # output stream.
+    mtp_commit_len_runtime: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass
@@ -282,6 +322,59 @@ class LogitsProcessor(nn.Module):
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
         # chunk size for logprobs processing
         self.logprobs_chunk_size = envs.SGLANG_LOGITS_PROCESSER_CHUNK_SIZE.get()
+        self.cache_fp32_lm_head = self.use_fp32_lm_head and SGLANG_CACHE_FP32_LM_HEAD
+        # Persistent fp32 copy of the lm-head weight and a reference to the source
+        # (bf16) parameter it was materialized from. The buffer address is kept
+        # stable across weight updates (refreshed in place) so a captured CUDA
+        # graph that reads it stays valid without a recapture.
+        self._fp32_lm_head_weight_cache: Optional[torch.Tensor] = None
+        self._fp32_lm_head_src_weight: Optional[torch.Tensor] = None
+
+    def clear_fp32_lm_head_cache(self) -> None:
+        # Called eagerly right after an in-place weight load (see
+        # ModelRunner._clear_fp32_lm_head_cache). Refresh the persistent fp32
+        # buffer in place from the (now updated) source weight instead of freeing
+        # it: freeing would leave any captured decode graph reading a dangling
+        # address, and reallocating a new buffer would make the graph read stale
+        # weights. copy_ from bf16->fp32 is a lossless upcast, bit-identical to
+        # weight.to(float32), so K3 is preserved across weight sync.
+        buf = self._fp32_lm_head_weight_cache
+        src = self._fp32_lm_head_src_weight
+        if (
+            buf is not None
+            and src is not None
+            and src.dtype != torch.float32
+            and buf.shape == src.shape
+            and buf.device == src.device
+        ):
+            buf.copy_(src)
+        else:
+            # Nothing materialized yet, or the source weight changed shape/device:
+            # drop and let the next eager forward re-materialize.
+            self._fp32_lm_head_weight_cache = None
+            self._fp32_lm_head_src_weight = None
+
+    def _get_fp32_lm_head_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        if weight.dtype == torch.float32:
+            return weight
+        if not self.cache_fp32_lm_head:
+            return weight.to(torch.float32)
+
+        # (Re)materialize only when there is no buffer yet or the source weight
+        # tensor identity/shape/device changed. This path runs in eager context
+        # (the warmup forward before CUDA graph capture), so the allocation lives
+        # outside the graph and the returned address stays fixed for every replay.
+        buf = self._fp32_lm_head_weight_cache
+        if (
+            buf is None
+            or self._fp32_lm_head_src_weight is not weight
+            or buf.shape != weight.shape
+            or buf.device != weight.device
+        ):
+            buf = weight.detach().to(torch.float32)
+            self._fp32_lm_head_weight_cache = buf
+            self._fp32_lm_head_src_weight = weight
+        return buf
 
     def forward(
         self,
@@ -307,6 +400,10 @@ class LogitsProcessor(nn.Module):
 
         # Diffusion LLM only.
         if logits_metadata.forward_mode.is_dllm_extend():
+            if SGLANG_BI_LM_HEAD_DECODE:
+                raise ValueError(
+                    "SGLANG_BI_LM_HEAD_DECODE=1 does not support diffusion-LLM decoding"
+                )
             return self._get_dllm_logits(hidden_states, lm_head, logits_metadata)
 
         # Get the last hidden states and last logits for the next token prediction
@@ -338,7 +435,12 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            if self._bi_lm_head_decode_active(logits_metadata):
+                logits = self._bi_lm_head_next_token_logits(
+                    pruned_states, lm_head, logits_metadata
+                )
+            else:
+                logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -365,7 +467,20 @@ class LogitsProcessor(nn.Module):
             or self.do_tensor_parallel_all_gather_dp_attn
         )
 
-        if should_skip_chunking:
+        # The BI contract branches below overwrite both returned tensors, so with
+        # no top-k/token-ids extras the fp32 head pass is dead work — skip it
+        # (and the fp32 lm-head weight cache it materializes).
+        bi_covers_all_outputs = (
+            SGLANG_BI_LM_HEAD
+            and self._bi_lm_head_decode_active(logits_metadata)
+            and not logits_metadata.extend_return_top_logprob
+            and not logits_metadata.extend_token_ids_logprob
+        )
+
+        if bi_covers_all_outputs:
+            logprobs_result = InputLogprobsResult(input_token_logprobs=None)
+            sampled_logits = None
+        elif should_skip_chunking:
             # Compute logits for both input and sampled tokens.
             logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
@@ -381,6 +496,27 @@ class LogitsProcessor(nn.Module):
                 sample_indices,
                 input_logprob_indices,
                 token_to_seq_idx,
+                lm_head,
+                logits_metadata,
+            )
+
+        if SGLANG_BI_LM_HEAD:
+            logprobs_result.input_token_logprobs = (
+                self._bi_lm_head_input_token_logprobs(
+                    pruned_states, input_logprob_indices, lm_head, logits_metadata
+                )
+            )
+
+        if self._bi_lm_head_decode_active(logits_metadata):
+            # The prefill-sampled token (position 0 of every rollout) must also
+            # be drawn from and scored against the contract distribution, or
+            # live behavior-K3 keeps one non-contract term per sequence.
+            sampled_logits = self._bi_lm_head_next_token_logits(
+                (
+                    pruned_states[sample_indices]
+                    if sample_indices is not None
+                    else pruned_states
+                ),
                 lm_head,
                 logits_metadata,
             )
@@ -475,6 +611,11 @@ class LogitsProcessor(nn.Module):
             input_logprob_indices_pt = 0
             input_logprob_indices = []
             pt, pruned_states_list, pruned_states_before_norm_list = 0, [], []
+            aux_pruned_states_lists = (
+                [[] for _ in aux_hidden_states]
+                if aux_hidden_states is not None
+                else None
+            )
 
             for idx, (extend_logprob_start_len, extend_len) in enumerate(
                 zip(
@@ -499,6 +640,11 @@ class LogitsProcessor(nn.Module):
                     pruned_states_before_norm_list.append(
                         hidden_states_before_norm[pt + start_len : pt + extend_len]
                     )
+                if aux_pruned_states_lists is not None:
+                    for j, hidden in enumerate(aux_hidden_states):
+                        aux_pruned_states_lists[j].append(
+                            hidden[pt + start_len : pt + extend_len]
+                        )
                 # Map each token to its sequence index, for chunked computation
                 # of input logprobs
                 token_to_seq_idx.extend([idx] * (extend_len - start_len))
@@ -518,6 +664,8 @@ class LogitsProcessor(nn.Module):
             pruned_states = torch.cat(pruned_states_list)
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = torch.cat(pruned_states_before_norm_list)
+            if aux_pruned_states_lists is not None:
+                aux_pruned_states = [torch.cat(lst) for lst in aux_pruned_states_lists]
             sample_indices = torch.tensor(
                 sample_indices, device=pruned_states.device, dtype=torch.int64
             )
@@ -876,7 +1024,8 @@ class LogitsProcessor(nn.Module):
             # Normal linear layer
             if self.use_fp32_lm_head:
                 logits = torch.matmul(
-                    hidden_states.to(torch.float32), lm_head.weight.to(torch.float32).T
+                    hidden_states.to(torch.float32),
+                    self._get_fp32_lm_head_weight(lm_head.weight).T,
                 )
             elif use_intel_amx_backend(lm_head):
                 logits = torch.ops.sgl_kernel.weight_packed_linear(
@@ -902,6 +1051,155 @@ class LogitsProcessor(nn.Module):
                     lm_head, hidden_states, embedding_bias
                 )
         return logits
+
+    def _bi_lm_head_input_token_logprobs(
+        self,
+        pruned_states: torch.Tensor,
+        input_logprob_indices: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        """SGLANG_BI_LM_HEAD=1: input-token logprobs through the vendored
+        batch-invariant lm-head contract. Explicit opt-in, so unsupported
+        configurations error loudly instead of silently falling back."""
+        from sglang.srt.batch_invariant_ops import (
+            bi_lm_head_selected_logprob,
+            families_v2_enabled,
+            head_v2_selected_logprob,
+        )
+
+        if not self.use_fp32_lm_head:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD=1 requires --enable-fp32-lm-head (the contract is the fp32-class lm head)"
+            )
+        if (
+            self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+        ):
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD=1 does not support vocab/DP-parallel lm-head gathers yet"
+            )
+        if logits_metadata.top_p_normalized_logprobs:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD=1 does not support top-p normalized logprobs"
+            )
+        # Per-row temperatures (already expanded to pruned logprob rows by
+        # _expand_metadata_for_logprobs) ride into the contract kernel, which
+        # applies the 1/t scale in-kernel — bitwise-matching a trainer that
+        # passes the same fp32 temperatures.
+        temperature = None
+        if (
+            logits_metadata.temp_scaled_logprobs
+            and logits_metadata.temperature is not None
+        ):
+            temperature = logits_metadata.temperature.reshape(-1).to(torch.float32)
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD=1 does not support LoRA-wrapped lm_head modules"
+            )
+        if not hasattr(lm_head, "weight"):
+            raise ValueError("SGLANG_BI_LM_HEAD=1 requires a plain lm_head weight")
+        weight = lm_head.weight.data
+        hidden = pruned_states[input_logprob_indices]
+        if weight.dtype != torch.bfloat16 or hidden.dtype != torch.bfloat16:
+            raise ValueError(
+                f"SGLANG_BI_LM_HEAD=1 requires bf16 hidden/weight, got {hidden.dtype}/{weight.dtype}"
+            )
+        if families_v2_enabled():
+            # families-v2: epilogue-stats online LSE (logits never materialize);
+            # trainer's bi_fused v2 shares this exact tree.
+            logprob, _, _ = head_v2_selected_logprob(
+                hidden.contiguous(),
+                weight,
+                logits_metadata.extend_input_logprob_token_ids_gpu,
+                temperature=temperature,
+            )
+            return logprob
+        logprob, _, _ = bi_lm_head_selected_logprob(
+            hidden.contiguous(),
+            weight,
+            logits_metadata.extend_input_logprob_token_ids_gpu,
+            temperature=temperature,
+        )
+        return logprob
+
+    def _bi_lm_head_decode_active(self, logits_metadata: LogitsMetadata) -> bool:
+        """Whether next-token sampling logits must go through the contract GEMM.
+        Explicit opt-in, so unsupported forward modes error loudly instead of
+        silently sampling outside the contract."""
+        if not SGLANG_BI_LM_HEAD_DECODE:
+            return False
+        if not SGLANG_BI_LM_HEAD:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 requires SGLANG_BI_LM_HEAD=1 "
+                "(the decode extension samples from the distribution the prefill contract scores)"
+            )
+        mode = logits_metadata.forward_mode
+        if mode in (
+            ForwardMode.DECODE,
+            ForwardMode.IDLE,
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            return True
+        raise ValueError(
+            f"SGLANG_BI_LM_HEAD_DECODE=1 does not support forward mode {mode.name} "
+            "(speculative/draft paths sample outside the contract)"
+        )
+
+    def _bi_lm_head_next_token_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        """SGLANG_BI_LM_HEAD_DECODE=1: next-token sampling logits through the
+        contract's chunked fixed-tile BI GEMM. Bitwise identical, row for row,
+        to the chunk logits inside bi_lm_head_selected_logprob on the same
+        hidden/weight, so the sampler's contract rescore of the sampled token
+        (sampler.py) equals the fused contract — and the trainer twin. Static
+        launch shapes; captures into the decode CUDA graph."""
+        from sglang.srt.batch_invariant_ops import bi_lm_head_full_logits
+
+        if not self.use_fp32_lm_head:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 requires --enable-fp32-lm-head (the contract is the fp32-class lm head)"
+            )
+        if (
+            self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+        ):
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 does not support vocab/DP-parallel lm-head gathers yet"
+            )
+        if self.logit_scale is not None:
+            raise ValueError("SGLANG_BI_LM_HEAD_DECODE=1 does not support logit_scale")
+        if self.final_logit_softcapping:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 does not support final_logit_softcapping"
+            )
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 does not support LoRA-wrapped lm_head modules"
+            )
+        if not hasattr(lm_head, "weight"):
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 requires a plain lm_head weight"
+            )
+        weight = lm_head.weight.data
+        if weight.dtype != torch.bfloat16 or hidden_states.dtype != torch.bfloat16:
+            raise ValueError(
+                f"SGLANG_BI_LM_HEAD_DECODE=1 requires bf16 hidden/weight, got {hidden_states.dtype}/{weight.dtype}"
+            )
+        if weight.shape[0] != self.vocab_size:
+            raise ValueError(
+                "SGLANG_BI_LM_HEAD_DECODE=1 does not support padded lm-head vocab "
+                f"({weight.shape[0]} weight rows vs vocab_size {self.vocab_size}): the sampler "
+                "rescore must see every GEMM column or the LSE diverges from the contract"
+            )
+        logits = bi_lm_head_full_logits(hidden_states, weight)
+        # fp32 -> fp32 copy into the CUDA-graph output buffer is bitwise.
+        return self._copy_logits_to_buffer(logits, logits_metadata)
 
     def _gather_dp_attn_hidden_states(
         self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
