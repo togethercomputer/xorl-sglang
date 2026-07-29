@@ -1,15 +1,28 @@
 # Adapted from https://github.com/thinking-machines-lab/batch_invariant_ops/blob/main/batch_invariant_ops/__init__.py
 
 from .batch_invariant_ops import (
+    RMS_NORM_FAMILIES,
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
     AttentionBlockSize,
+    RMSNormFamily,
+    bi_fused_add_rms_norm,
+    bi_lm_head_full_logits,
+    bi_lm_head_selected_logprob,
+    bi_lm_head_selected_logprob_from_logits,
+    bi_rms_norm,
     disable_batch_invariant_mode,
     enable_batch_invariant_mode,
+    fused_add_rms_norm_batch_invariant,
     get_batch_invariant_attention_block_size,
+    get_batch_invariant_ops,
     is_batch_invariant_mode_enabled,
+    is_batch_invariant_op_enabled,
     log_softmax,
     matmul_persistent,
     mean_dim,
     rms_norm_batch_invariant,
+    rms_norm_residual_tree_batch_invariant,
     set_batch_invariant_mode,
 )
 
@@ -18,6 +31,8 @@ __version__ = "0.1.0"
 __all__ = [
     "set_batch_invariant_mode",
     "is_batch_invariant_mode_enabled",
+    "is_batch_invariant_op_enabled",
+    "get_batch_invariant_ops",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
     "matmul_persistent",
@@ -26,4 +41,15 @@ __all__ = [
     "get_batch_invariant_attention_block_size",
     "AttentionBlockSize",
     "rms_norm_batch_invariant",
+    "bi_lm_head_full_logits",
+    "bi_lm_head_selected_logprob",
+    "bi_lm_head_selected_logprob_from_logits",
+    "fused_add_rms_norm_batch_invariant",
+    "rms_norm_residual_tree_batch_invariant",
+    "RMSNormFamily",
+    "RMS_NORM_FAMILY_NO_RESIDUAL",
+    "RMS_NORM_FAMILY_RESIDUAL_TREE",
+    "RMS_NORM_FAMILIES",
+    "bi_rms_norm",
+    "bi_fused_add_rms_norm",
 ]
