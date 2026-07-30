@@ -1,20 +1,30 @@
-# Families v2 — redefined frozen reduction trees for the K3 BI contract.
+# Families v2 — the redefined frozen reduction trees for the batch-invariance
+# contract (hidden-dim RMSNorm, qk-norm, and the final projection).
 #
-# VENDORED BYTE-IDENTICAL into xorl/ops/ and sglang/srt/batch_invariant_ops/
-# (CI hash-gates the two copies). Self-contained: torch + triton only — no
-# engine imports, so the same file runs under either engine and any venv.
+# VENDORED BYTE-IDENTICAL into the trainer (xorl/ops/) and the serving engine
+# (sglang/srt/batch_invariant_ops/). Both suites pin the same sha256 of this
+# file, so neither copy can be edited without the other. Self-contained: torch
+# + triton only, no engine imports, so the same bytes run under either engine
+# and any venv.
 #
 # Rule A: every bit-relevant reduction is written explicitly — an
 # adjacent-pairwise balanced binary tree within a block (tl.split + one add
 # per level; a 2-element reduction has exactly one association, so the
 # compiler owns no tree choice) and a sequential scalar chain across chunks
 # in index order. tl.sum over >2 elements is banned in bit-relevant positions.
-# Rule B: golden-value gates pin the bits on both venvs.
+# Rule B: golden-value gates pin the bits under both engines' venvs.
 #
-# Status: DEFAULT ON inside an engaged BI contract lane since the v2 re-anchor
-# Stock lanes do not call these trees. Setting either
-# XORL_FAMILIES_V2=0 or SGLANG_FAMILIES_V2=0 is a paired rollback kill switch;
-# a mixed engine setting invalidates the contract. v1 kernels stay available.
+# These trees are DEFAULT ON inside an engaged contract lane; stock lanes never
+# reach them. XORL_FAMILIES_V2=0 or SGLANG_FAMILIES_V2=0 is the rollback kill
+# switch, and it applies to BOTH engines at once: the trainer and the sampler
+# must evaluate the same tree, so a mixed setting is invalid. Rolling back
+# selects the v1 kernels, which stay available.
+#
+# Migration: v1 and v2 are two different trees, and both hold the trainer and
+# the sampler bitwise equal — that is the contract, and v2 satisfies it. The
+# reported values do move between the two, so goldens and frozen anchors
+# recorded under v1 must be re-taken under v2, and both engines must flip
+# together.
 
 import os
 
@@ -23,22 +33,24 @@ import triton
 import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
+
+def families_v2_enabled() -> bool:
+    """True unless the kill switch is set — families v2 is default on.
+
+    Set XORL_FAMILIES_V2=0 or SGLANG_FAMILIES_V2=0 to roll back to the v1
+    trees. Call sites gate on the contract lane as well, so stock lanes never
+    see these trees. Both engines must agree: a mixed setting puts the trainer
+    and the sampler on different trees, which the contract does not allow.
+    """
+    return not any(os.getenv(v, "1").lower() in _V2_OFF for v in FAMILIES_V2_ENV_VARS)
+
+
 # Contract constants (bit-relevant; never tuning axes).
 V2_NORM_BLOCK_H = 4096  # per-chunk tree width for hidden-dim norms
 V2_QK_MAX_HEAD_DIM = 256
 
 FAMILIES_V2_ENV_VARS = ("XORL_FAMILIES_V2", "SGLANG_FAMILIES_V2")
-
-
-def families_v2_enabled() -> bool:
-    """families-v2 is DEFAULT ON for the contract lanes (the v2 re-anchor);
-    kill switch: set either env-pair var to 0. Call sites additionally gate on
-    the BI/contract lane, so stock lanes never see the v2 trees. The k3
-    harness asserts the two engines' flags AGREE (a mixed flip is the
-    silent family-flip class)."""
-    return not any(
-        os.getenv(v, "1").lower() in ("0", "false", "no") for v in FAMILIES_V2_ENV_VARS
-    )
+_V2_OFF = ("0", "false", "no")
 
 
 @triton.jit
@@ -94,12 +106,12 @@ def _rms_norm_v2_kernel(
     x * inv_rms * w (left-to-right, fp32 weight-mul) -> single cast at store.
     Tree is a function of n_cols alone => batch-invariant by construction.
 
-    This fused one-launch form serves small M (decode), where launch count
-    dominates and the monolithic wide tree has the best ILP; rows > V2_NORM_SPLIT_M
-    dispatch to the bit-identical split realization below (prefill/scoring M),
-    which factorizes the same tree into per-TILE trees + a partials tree
-    (adjacent pairing preserves contiguity at every level => identical bits;
-    cross-structure gates + frozen goldens).
+    This fused one-launch form serves nearly every shipped shape, where launch
+    count dominates and the monolithic wide tree has the best ILP; shapes with
+    few rows over many tiles dispatch to the bit-identical split realization
+    below (see ``_v2_norm_use_split``), which factorizes the same tree into
+    per-TILE trees + a partials tree (adjacent pairing preserves contiguity at
+    every level => identical bits; cross-structure gates + frozen goldens).
     """
     row = tl.program_id(0)
     n_chunks = tl.cdiv(n_cols, BLOCK_H)
@@ -225,17 +237,19 @@ def rms_norm_v2(
         ), "zero-centered exists in no-residual form only (v1 rule kept)"
     rows, H = x.shape
     weight = weight.contiguous()
-    if rows > V2_NORM_SPLIT_M:
-        # bit-identical split realization (see _rms_norm_v2_split) — wins at
-        # prefill/scoring M; the fused one-launch form wins at decode M.
-        if residual is not None:
-            assert residual.shape == x.shape and residual.stride(1) == 1
-            assert residual.dtype == torch.bfloat16
-        return _rms_norm_v2_split(x, weight, eps, residual, zero_centered)
-    out = torch.empty_like(x)
     if residual is not None:
         assert residual.shape == x.shape and residual.stride(1) == 1
         assert residual.dtype == torch.bfloat16
+    if _v2_norm_use_split(rows, triton.cdiv(H, V2_NORM_TILE)):
+        return _rms_norm_v2_split(x, weight, eps, residual, zero_centered)
+    return _rms_norm_v2_fused(x, weight, eps, residual, zero_centered)
+
+
+def _rms_norm_v2_fused(x, weight, eps, residual, zero_centered):
+    """One-launch realization of the v2 norm tree (see ``_rms_norm_v2_kernel``)."""
+    rows, H = x.shape
+    out = torch.empty_like(x)
+    if residual is not None:
         res_out = torch.empty_like(x)
         _rms_norm_v2_kernel[(rows,)](
             x,
@@ -784,16 +798,35 @@ def head_v2_selected_logprob_from_logits(
 
 # --- split realization of the SAME norm tree (structure is bit-neutral) -----
 #
-# The fused one-launch kernel wins at decode M (launch overhead dominates) but
-# serializes ~n_tiles dependent tree steps per row, which loses badly at
-# prefill M. The split realization computes the IDENTICAL tree — per-tile
-# partial trees in a 2D-parallel kernel, the pinned combine in a per-row
-# kernel, elementwise normalize in a 2D-parallel kernel — with fp32 partials
-# stored/loaded exactly and the bf16 residual round-trip identical to the
-# fused kernel's own res_out reload. Bit-equality fused==split is gated
-# (gate_norm_v2.py) and both check against the same frozen goldens.
+# The split realization computes the IDENTICAL tree — per-tile partial trees in
+# a 2D-parallel kernel, the pinned combine in a per-row kernel, elementwise
+# normalize in a 2D-parallel kernel — with fp32 partials stored/loaded exactly
+# and the bf16 residual round-trip identical to the fused kernel's own res_out
+# reload. Bit-equality fused==split is gated by the families-v2 norm tests,
+# which force each realization explicitly rather than relying on the rule
+# below to select one, and both realizations check the same frozen goldens.
+#
+# It pays three launches and an HBM round-trip for the partials, and buys
+# rows*n_tiles-way parallelism where the fused grid=(rows,) has only rows-way.
+# That trade only pays at few rows over many tiles; the fused form wins
+# everywhere else, prefill included (see _v2_norm_use_split for the measured
+# boundary).
 
-V2_NORM_SPLIT_M = 256  # structure switch (perf-only, NOT bit-relevant)
+V2_NORM_SPLIT_MIN_TILES = 10  # fewest tiles at which the split realization ever wins
+
+
+def _v2_norm_use_split(rows: int, n_tiles: int) -> bool:
+    """Structure switch (perf-only, NOT bit-relevant): split wins at few rows over
+    many tiles, where the fused ``grid=(rows,)`` cannot fill the GPU.
+
+    ``n_tiles`` must be the split kernel's 512-wide tile count, not the fused
+    kernel's 4096-wide chunk count. Boundary measured on H100/132 SMs,
+    CUDA-graph GPU-only, H in [2048, 32768] x M in [1, 2048]: 2 raw slower
+    choices out of 72, only 1 beyond a 1.01x tie margin, worst 1.092x. Both
+    realizations compute the same tree, so a wrong choice here costs speed
+    only; re-fit with families_v2/bench_norm_structure_switch.py.
+    """
+    return n_tiles >= V2_NORM_SPLIT_MIN_TILES and rows <= n_tiles
 
 
 @triton.jit

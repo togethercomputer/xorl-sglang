@@ -29,7 +29,7 @@ requires_cuda = pytest.mark.skipif(
 # byte-identical in xorl/ops/ and sglang/srt/batch_invariant_ops/. The digest is committed
 # in BOTH repos' suites so each gates its own copy without a sibling checkout.
 BI_FAMILIES_V2_SHA256 = (
-    "3277e41fbcba4e89ed014bdc938f9dd4765c3e84876eb82a53928795144dcbc6"
+    "fd4c5bac2a52d2148b8e4d0e9afa4e46e8c62689a68c2bc0e309f671597799e6"
 )
 
 H, DQK, V = 1024, 128, 20480

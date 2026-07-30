@@ -22,6 +22,12 @@ import numpy as np
 import torch
 
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.srt.batch_invariant_ops import (
+    V2_QK_MAX_HEAD_DIM,
+    families_v2_enabled,
+    is_batch_invariant_mode_enabled,
+    qk_norm_v2,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -228,6 +234,37 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+    if (
+        _is_cuda
+        and families_v2_enabled()
+        and is_batch_invariant_mode_enabled()
+        and q.dim() == 2
+        and k.dim() == 2
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and head_dim <= V2_QK_MAX_HEAD_DIM
+        and getattr(q_norm, "variance_size_override", None) is None
+        and getattr(k_norm, "variance_size_override", None) is None
+        and q_norm.weight.shape[0] == head_dim
+        and k_norm.weight.shape[0] == head_dim
+    ):
+        q = qk_norm_v2(
+            q,
+            q_norm.weight.data,
+            q_eps,
+            head_dim=head_dim,
+            out=q if allow_inplace else None,
+        )
+        k = qk_norm_v2(
+            k,
+            k_norm.weight.data,
+            k_eps,
+            head_dim=head_dim,
+            out=k if allow_inplace else None,
+        )
+        return q, k
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed

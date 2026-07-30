@@ -21,12 +21,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.batch_invariant_ops import (
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+    bi_fused_add_rms_norm,
+    bi_rms_norm,
+    families_v2_enabled,
     is_batch_invariant_mode_enabled,
-    rms_norm_batch_invariant,
+    is_batch_invariant_op_enabled,
+    rms_norm_v2,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -45,6 +50,9 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+# Cross-engine contract: multiply by the RMSNorm weight in fp32 and cast once
+# at store. Read once because the serving lane declares it before module import.
+_OPGAP_RMSNORM_FP32_WEIGHT_MUL = get_bool_env_var("SGLANG_RMSNORM_FP32_WEIGHT_MUL")
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 
@@ -125,17 +133,46 @@ class RMSNorm(MultiPlatformOp):
             return x
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
-        if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or get_global_server_args().rl_on_policy_target == "fsdp"
-            ):
-                return self.forward_native(x, residual, post_residual_addition)
-            return rms_norm_batch_invariant(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
+        if is_batch_invariant_mode_enabled() and is_batch_invariant_op_enabled(
+            "rms_norm"
+        ):
+            use_v2 = (
+                families_v2_enabled()
+                and x.dtype == torch.bfloat16
+                and self.override_orig_dtype is None
             )
+            if residual is None:
+                if use_v2:
+                    return rms_norm_v2(x, self.weight.data, self.variance_epsilon)
+                return bi_rms_norm(
+                    x,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    family=RMS_NORM_FAMILY_NO_RESIDUAL,
+                )
+            if (
+                _OPGAP_RMSNORM_FP32_WEIGHT_MUL
+                and is_batch_invariant_op_enabled("mean")
+                and self.cast_x_before_out_mul
+                and not self.fp32_residual
+                and post_residual_addition is None
+                and residual.dtype == torch.bfloat16
+            ):
+                if use_v2:
+                    return rms_norm_v2(
+                        x,
+                        self.weight.data,
+                        self.variance_epsilon,
+                        residual=residual,
+                    )
+                return bi_fused_add_rms_norm(
+                    x,
+                    residual,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    family=RMS_NORM_FAMILY_RESIDUAL_TREE,
+                )
+            return self.forward_native(x, residual, post_residual_addition)
         if residual is not None:
             # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
             # but right now we can only have hidden_states+(residual+post_residual_addition).
@@ -222,14 +259,28 @@ class RMSNorm(MultiPlatformOp):
         orig_dtype = self.override_orig_dtype or x.dtype
 
         # RL path: residual addition in orig_dtype for training consistency
-        if self.cast_x_before_out_mul and not self.fp32_residual and residual is not None:
-            x = x + residual + (post_residual_addition if post_residual_addition is not None else 0.0)
+        if (
+            self.cast_x_before_out_mul
+            and not self.fp32_residual
+            and residual is not None
+        ):
+            x = (
+                x
+                + residual
+                + (
+                    post_residual_addition
+                    if post_residual_addition is not None
+                    else 0.0
+                )
+            )
             residual = x.clone()
 
         x = x.to(torch.float32)
 
         # Standard path: residual addition in fp32 (upstream behavior)
-        if residual is not None and not (self.cast_x_before_out_mul and not self.fp32_residual):
+        if residual is not None and not (
+            self.cast_x_before_out_mul and not self.fp32_residual
+        ):
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
                 x = x + post_residual_addition.to(torch.float32)
