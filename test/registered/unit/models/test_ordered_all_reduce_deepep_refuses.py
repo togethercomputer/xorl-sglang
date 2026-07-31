@@ -1,0 +1,75 @@
+"""An order pin must not be silently ignored by the DeepEP early return."""
+
+import ast
+import pathlib
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+
+
+class TestOrderedAllReduceDeepEPRefuses(unittest.TestCase):
+    def _check(self, *, pinned: bool):
+        from sglang.srt.models import qwen2_moe
+
+        with patch.object(
+            qwen2_moe, "_ordered_moe_all_reduce_enabled", return_value=pinned
+        ):
+            qwen2_moe._require_no_ordered_all_reduce_under_deepep()
+
+    def test_pin_under_deepep_refuses(self):
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._check(pinned=True)
+        message = str(ctx.exception)
+        self.assertIn("DeepEP", message)
+        self.assertIn("moe-a2a-backend none", message)
+
+    def test_unpinned_deepep_is_untouched(self):
+        self._check(pinned=False)
+
+    def test_deterministic_inference_enables_the_ordered_collective(self):
+        from sglang.srt.models import qwen2_moe
+
+        with patch.object(
+            qwen2_moe,
+            "get_global_server_args",
+            return_value=SimpleNamespace(enable_deterministic_inference=True),
+        ), patch.object(qwen2_moe, "get_bool_env_var", return_value=False):
+            self.assertTrue(qwen2_moe._ordered_moe_all_reduce_enabled())
+
+    def test_explicit_pin_enables_the_ordered_collective(self):
+        from sglang.srt.models import qwen2_moe
+
+        with patch.object(
+            qwen2_moe,
+            "get_global_server_args",
+            return_value=SimpleNamespace(enable_deterministic_inference=False),
+        ), patch.object(qwen2_moe, "get_bool_env_var", return_value=True):
+            self.assertTrue(qwen2_moe._ordered_moe_all_reduce_enabled())
+
+    def test_guard_runs_before_the_deepep_forward(self):
+        from sglang.srt.models import qwen2_moe
+
+        tree = ast.parse(pathlib.Path(qwen2_moe.__file__).read_text())
+        found = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.If):
+                continue
+            body = node.body
+            if len(body) != 2 or not isinstance(body[1], ast.Return):
+                continue
+            call = getattr(body[0], "value", None)
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+                and call.func.id == "_require_no_ordered_all_reduce_under_deepep"
+            ):
+                found = True
+        self.assertTrue(found, "the DeepEP early return does not call the pin guard")
+
+
+if __name__ == "__main__":
+    unittest.main()
