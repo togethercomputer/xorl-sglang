@@ -31,6 +31,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_ordered_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -77,6 +78,7 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     make_layers,
@@ -88,6 +90,25 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
+
+
+def _ordered_moe_all_reduce_enabled() -> bool:
+    return get_global_server_args().enable_deterministic_inference or get_bool_env_var(
+        "SGLANG_MOE_ORDERED_ALL_REDUCE"
+    )
+
+
+def _require_no_ordered_all_reduce_under_deepep() -> None:
+    """Refuse an order pin that the DeepEP combine cannot honor."""
+    if not _ordered_moe_all_reduce_enabled():
+        return
+    raise NotImplementedError(
+        "The ordered MoE reduction contract has no DeepEP implementation: "
+        "DeepEP reduces inside its combine and never reaches the model block's "
+        "order-pinned all-reduce. Use --moe-a2a-backend none, or disable "
+        "--enable-deterministic-inference and unset "
+        "SGLANG_MOE_ORDERED_ALL_REDUCE."
+    )
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -315,6 +336,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if get_moe_a2a_backend().is_deepep():
+            _require_no_ordered_all_reduce_under_deepep()
             return self._forward_deepep(hidden_states, forward_batch)
 
         if (
@@ -336,7 +358,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
         if self.tp_size > 1 and not use_reduce_scatter:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if _ordered_moe_all_reduce_enabled():
+                final_hidden_states = tensor_model_parallel_ordered_all_reduce(
+                    final_hidden_states
+                )
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states.view(num_tokens, hidden_dim)
 

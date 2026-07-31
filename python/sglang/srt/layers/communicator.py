@@ -78,6 +78,24 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 
+logger = logging.getLogger(__name__)
+
+_REDUCE_SCATTER_PINNED_OFF_LOGGED = False
+
+
+def _log_reduce_scatter_pinned_off() -> None:
+    """Announce once that the order pin disables the load-dependent bypass."""
+    global _REDUCE_SCATTER_PINNED_OFF_LOGGED
+    if _REDUCE_SCATTER_PINNED_OFF_LOGGED:
+        return
+    _REDUCE_SCATTER_PINNED_OFF_LOGGED = True
+    logger.info(
+        "Reduction order is pinned: the post-MoE/MLP reduce-scatter bypass is "
+        "disabled so the cross-rank sum always runs through the model block's "
+        "ordered all-reduce."
+    )
+
+
 if _use_aiter and _is_gfx95_supported:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
@@ -376,6 +394,12 @@ class LayerCommunicator:
         self._speculative_algo = SpeculativeAlgorithm.from_string(
             get_global_server_args().speculative_algorithm
         )
+        self._reduction_order_pinned = (
+            get_global_server_args().enable_deterministic_inference
+            or get_bool_env_var("SGLANG_MOE_ORDERED_ALL_REDUCE")
+        )
+        if self._reduction_order_pinned and allow_reduce_scatter:
+            _log_reduce_scatter_pinned_off()
 
     def _post_init_communicate(self):
         self._communicate_simple_fn = CommunicateSimpleFn.get_fn(
@@ -589,7 +613,9 @@ class LayerCommunicator:
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
-            allow_reduce_scatter=self.allow_reduce_scatter,
+            allow_reduce_scatter=(
+                self.allow_reduce_scatter and not self._reduction_order_pinned
+            ),
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
@@ -600,12 +626,24 @@ class LayerCommunicator:
             is CommunicateSummableTensorPairFn._scatter_hidden_states
             and forward_batch.dp_padding_mode.is_max_len()
         ):
-            return True
+            return not self._reduction_order_pinned
         if nsa_use_prefill_cp(forward_batch):
+            self._raise_if_reduction_order_pinned("NSA prefill context parallel")
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
+            self._raise_if_reduction_order_pinned("attn-TP scattered input")
             return True
         return False
+
+    def _raise_if_reduction_order_pinned(self, reason: str) -> None:
+        if not self._reduction_order_pinned:
+            return
+        raise RuntimeError(
+            f"{reason} routes the cross-rank MoE/MLP sum through an NCCL "
+            "reduce-scatter with no order-pinned variant, but this server "
+            "requires an order-pinned reduction. Disable that feature or the "
+            "determinism requirement; do not run them together."
+        )
 
     # NOTE: This function will cause torch recompilation
     def should_fuse_mlp_allreduce_with_next_layer(

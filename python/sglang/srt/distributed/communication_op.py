@@ -13,6 +13,31 @@ def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     return get_tp_group().all_reduce(input_)
 
 
+def tensor_model_parallel_ordered_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce through a fixed reverse-rank BF16 addition chain.
+
+    Raw all-gather communication performs no floating-point arithmetic. Every
+    rank then executes the same explicit ``world_size - 1 -> 0`` addition
+    sequence, so the result is independent of the NCCL all-reduce tree.
+    """
+    group = get_tp_group()
+    if group.world_size == 1 or input_.numel() == 0:
+        return input_
+
+    input_ = input_.contiguous()
+    gathered = torch.empty(
+        (group.world_size * input_.shape[0], *input_.shape[1:]),
+        dtype=input_.dtype,
+        device=input_.device,
+    )
+    torch.distributed.all_gather_into_tensor(gathered, input_, group=group.device_group)
+    partials = gathered.view(group.world_size, *input_.shape)
+    result = partials[-1]
+    for rank in range(group.world_size - 2, -1, -1):
+        result = result + partials[rank]
+    return result
+
+
 def tensor_model_parallel_fused_allreduce_rmsnorm(
     input_: torch.Tensor,
     residual_inp_: torch.Tensor,
