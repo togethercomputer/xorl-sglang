@@ -147,6 +147,19 @@ class DeepseekV2WeightLoaderMixin:
             params_dict = dict(self.named_parameters())
             weight_names = []
             for name, loaded_weight in weights:
+                if getattr(
+                    self.config, "indexer_types", None
+                ) is not None and name.endswith(".mlp.gate.e_score_correction_bias"):
+                    if loaded_weight.dtype is not torch.float32:
+                        raise TypeError(
+                            f"{name} must enter the GLM-5.2 serving loader as the official FP32 tensor"
+                        )
+                    if loaded_weight.shape != (
+                        self.config.n_routed_experts,
+                    ) or not bool(torch.all(torch.isfinite(loaded_weight))):
+                        raise ValueError(
+                            f"{name} must be a finite ({self.config.n_routed_experts},) correction-bias vector"
+                        )
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
                 if (

@@ -13,6 +13,7 @@
 # ==============================================================================
 
 
+from enum import Enum
 from functools import partial
 from typing import Callable, Optional
 
@@ -34,7 +35,12 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
+    get_attention_cp_size,
     get_local_dp_buffer,
+)
+from sglang.srt.layers.glm52_positions import (
+    CanonicalMoEPositions,
+    align_glm52_moe_positions as _align_glm52_moe_positions,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -44,6 +50,30 @@ def nsa_enable_prefill_cp():
     # The three parts of prepare_attn, prepare_mlp, and postprocess_layer
     # no longer require additional communication for reduce, scatter, etc.
     return is_nsa_enable_prefill_cp()
+
+
+def align_glm52_moe_positions(
+    positions: torch.Tensor,
+    full_hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> CanonicalMoEPositions:
+    """Apply the same rank-major CP gather and padding layout as FULL MoE rows."""
+
+    prefill_cp = nsa_use_prefill_cp(forward_batch)
+    return _align_glm52_moe_positions(
+        positions,
+        full_hidden_states,
+        prefill_cp=prefill_cp,
+        cp_size=get_attention_cp_size() if prefill_cp else 1,
+        all_gather=attn_cp_all_gather_into_tensor if prefill_cp else None,
+    )
+
+
+class NSAMoEOutputLayout(str, Enum):
+    """Cross-rank reduction state of an NSA layer's MoE output."""
+
+    LEGACY_PARTIAL = "legacy_partial"
+    REPLICATED_CANONICAL = "replicated_canonical"
 
 
 class NSACPLayerCommunicator(LayerCommunicator):
@@ -56,7 +86,9 @@ class NSACPLayerCommunicator(LayerCommunicator):
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        moe_output_layout: NSAMoEOutputLayout = NSAMoEOutputLayout.LEGACY_PARTIAL,
     ):
+        self.moe_output_layout = moe_output_layout
         super().__init__(
             layer_scatter_modes,
             input_layernorm,
@@ -69,9 +101,9 @@ class NSACPLayerCommunicator(LayerCommunicator):
     def _post_init_communicate(self):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
-            assert (
-                self._context.attn_dp_size == 1
-            ), f"dp_size should be 1 when moe_runner_backend is none"
+            assert self._context.attn_dp_size == 1, (
+                "dp_size should be 1 when moe_runner_backend is none"
+            )
         self._communicate_simple_fn = NSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
@@ -84,12 +116,76 @@ class NSACPLayerCommunicator(LayerCommunicator):
             residual_output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
+        if self.moe_output_layout is NSAMoEOutputLayout.REPLICATED_CANONICAL:
+            if self.layer_scatter_modes.mlp_mode is not ScatterMode.FULL:
+                raise RuntimeError(
+                    "Canonical NSA MoE output must enter postprocessing in FULL layout"
+                )
+            if not self._context.is_same_group_size(
+                self.layer_scatter_modes.middle_residual_mode,
+                ScatterMode.SCATTERED,
+            ) or not self._context.is_same_group_size(
+                self.layer_scatter_modes.layer_output_mode,
+                ScatterMode.SCATTERED,
+            ):
+                raise RuntimeError(
+                    "Canonical NSA MoE output requires a rank-local CP residual/output layout"
+                )
+            self._communicate_summable_tensor_pair_fn = (
+                self._reject_legacy_canonical_postprocess
+            )
+            return
         self._communicate_summable_tensor_pair_fn = NSACPCommunicateSummableTensorPairFn.get_fn(
             hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
             residual_input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
+
+    @staticmethod
+    def _reject_legacy_canonical_postprocess(**_kwargs):
+        raise RuntimeError(
+            "Replicated canonical NSA MoE output cannot use the legacy summed reduce-scatter path"
+        )
+
+    def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        if self.moe_output_layout is NSAMoEOutputLayout.REPLICATED_CANONICAL:
+            return False
+        return super().should_use_reduce_scatter(forward_batch)
+
+    def postprocess_layer(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if self.moe_output_layout is NSAMoEOutputLayout.LEGACY_PARTIAL:
+            return super().postprocess_layer(hidden_states, residual, forward_batch)
+        if residual is None:
+            raise RuntimeError("Canonical NSA MoE output requires a residual layout")
+        if not nsa_use_prefill_cp(forward_batch):
+            if hidden_states.shape != residual.shape:
+                raise RuntimeError(
+                    "Canonical NSA decode output must match the replicated residual layout"
+                )
+            return hidden_states, residual
+        cp_size = self._context.attn_cp_size
+        cp_rank = self._context.attn_cp_rank
+        if cp_size <= 1 or not 0 <= cp_rank < cp_size:
+            raise RuntimeError(
+                f"Invalid canonical NSA CP coordinates rank={cp_rank}, size={cp_size}"
+            )
+        local_rows = residual.shape[0]
+        if (
+            hidden_states.shape[0] != local_rows * cp_size
+            or hidden_states.shape[1:] != residual.shape[1:]
+        ):
+            raise RuntimeError(
+                "Replicated canonical NSA MoE rows do not match the rank-local CP residual capacity"
+            )
+        # The NSA FULL gather is rank-major. Canonical reduction preserves that
+        # row order, so selecting this block changes layout without another sum.
+        return hidden_states.narrow(0, cp_rank * local_rows, local_rows), residual
 
 
 class NSACPCommunicateSimpleFn(CommunicateSimpleFn):

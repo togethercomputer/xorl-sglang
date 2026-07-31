@@ -156,6 +156,8 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
+GLM_NSA_DETERMINISTIC_BACKEND_PAIR = ("flashmla_sparse", "fa3")
+
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
@@ -172,7 +174,15 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "xorl", "xorl-batch-invariant"]
+XORL_BATCH_INVARIANT_TARGET = "xorl"
+RL_ON_POLICY_TARGET_CHOICES = [
+    "fsdp",
+    "xorl-batch-invariant",
+    XORL_BATCH_INVARIANT_TARGET,
+]
+BATCH_INVARIANT_RL_TARGETS = frozenset(
+    {"fsdp", "xorl-batch-invariant", XORL_BATCH_INVARIANT_TARGET}
+)
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -270,6 +280,10 @@ def add_radix_eviction_policy_choices(choices):
 
 def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
+
+
+def is_batch_invariant_rl_target(target: Optional[str]) -> bool:
+    return target in BATCH_INVARIANT_RL_TARGETS
 
 
 def add_mamba_ssm_dtype_choices(choices):
@@ -739,6 +753,10 @@ class ServerArgs:
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
 
+        # Validate the strict XORL numerical envelope before any worker can
+        # short-circuit model setup or initialize a draft path.
+        self._validate_xorl_batch_invariant_contract()
+
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
             return
@@ -889,6 +907,19 @@ class ServerArgs:
             raise ValueError(
                 "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
                 "to be specified."
+            )
+
+    def _validate_xorl_batch_invariant_contract(self) -> None:
+        if self.rl_on_policy_target != XORL_BATCH_INVARIANT_TARGET:
+            return
+        if (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "The XORL batch-invariant target does not support speculative "
+                "or draft decoding."
             )
 
     def _handle_deprecated_args(self):
@@ -3147,8 +3178,11 @@ class ServerArgs:
                 "Sampling backend is set to pytorch for deterministic inference."
             )
             is_deepseek_model = False
+            is_glm_nsa_model = False
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
+                    from sglang.srt.configs.model_config import is_deepseek_nsa
+
                     hf_config = self.get_model_config().hf_config
                     model_arch = hf_config.architectures[0]
                     is_deepseek_model = model_arch in [
@@ -3159,8 +3193,14 @@ class ServerArgs:
                         "PixtralForConditionalGeneration",
                         "GlmMoeDsaForCausalLM",
                     ]
+                    is_glm_nsa_model = (
+                        model_arch == "GlmMoeDsaForCausalLM"
+                        and is_deepseek_nsa(hf_config)
+                    )
                 except Exception:
                     pass
+
+            is_glm_nsa_backend = is_glm_nsa_model and self.attention_backend == "nsa"
 
             # Check attention backend
             if self.attention_backend is None:
@@ -3180,6 +3220,17 @@ class ServerArgs:
                     f"Attention backend not specified. Falling back to '{self.attention_backend}' for deterministic inference. "
                     f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
                 )
+            elif is_glm_nsa_backend:
+                nsa_backend_pair = (
+                    self.nsa_prefill_backend,
+                    self.nsa_decode_backend,
+                )
+                if nsa_backend_pair != GLM_NSA_DETERMINISTIC_BACKEND_PAIR:
+                    raise ValueError(
+                        "Deterministic GLM NSA requires "
+                        f"prefill/decode backends {GLM_NSA_DETERMINISTIC_BACKEND_PAIR}, "
+                        f"but got {nsa_backend_pair}."
+                    )
             elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
                 # User explicitly specified an incompatible attention backend
                 raise ValueError(
@@ -3187,7 +3238,7 @@ class ServerArgs:
                     f"but you explicitly specified '{self.attention_backend}'."
                 )
 
-            if is_deepseek_model:
+            if is_deepseek_model and not is_glm_nsa_backend:
                 if self.attention_backend not in ["fa3", "triton"]:
                     raise ValueError(
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."

@@ -14,9 +14,13 @@ from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
+    as_deep_gemm_context_lens,
     rotate_activation,
 )
-from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+from sglang.srt.layers.attention.nsa_backend import (
+    NativeSparseAttnBackend,
+    _get_deep_gemm_paged_mqa_schedule,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -47,6 +51,76 @@ DEFAULT_CONFIG = {
     "layer_id": 0,
     "page_size": 64,
 }
+
+
+class TestDeepGemmContextLens(unittest.TestCase):
+    def test_adapts_indexer_lengths_as_single_token_queries(self):
+        seqlens = torch.tensor([1, 17, 257], dtype=torch.int32)
+
+        adapted = as_deep_gemm_context_lens(seqlens)
+
+        self.assertEqual(adapted.shape, (3, 1))
+        self.assertEqual(adapted.dtype, seqlens.dtype)
+        self.assertEqual(adapted.device, seqlens.device)
+        self.assertTrue(torch.equal(adapted[:, 0], seqlens))
+
+    def test_flattens_speculative_lengths_as_single_token_queries(self):
+        seqlens = torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32)
+
+        adapted = as_deep_gemm_context_lens(seqlens)
+
+        self.assertEqual(adapted.shape, (6, 1))
+        self.assertTrue(torch.equal(adapted[:, 0], seqlens))
+
+    def test_reflattens_multi_token_layout(self):
+        seqlens = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
+
+        adapted = as_deep_gemm_context_lens(seqlens)
+
+        self.assertEqual(adapted.shape, (4, 1))
+        self.assertTrue(torch.equal(adapted[:, 0], seqlens.flatten()))
+
+    def test_rejects_invalid_rank(self):
+        for shape in ((), (1, 2, 3)):
+            with self.subTest(shape=shape):
+                with self.assertRaisesRegex(ValueError, "must be 1D or 2D"):
+                    as_deep_gemm_context_lens(torch.empty(shape, dtype=torch.int32))
+
+    def test_schedule_boundary_passes_decode_layout_to_deep_gemm(self):
+        deep_gemm = MagicMock()
+        deep_gemm.get_num_sms.return_value = 132
+        sentinel = object()
+        deep_gemm.get_paged_mqa_logits_metadata.return_value = sentinel
+
+        result = _get_deep_gemm_paged_mqa_schedule(
+            deep_gemm,
+            torch.tensor([7, 11], dtype=torch.int32),
+            block_size=64,
+        )
+
+        self.assertIs(result, sentinel)
+        context_lens, block_size, sm_count = (
+            deep_gemm.get_paged_mqa_logits_metadata.call_args.args
+        )
+        self.assertTrue(
+            torch.equal(context_lens, torch.tensor([[7], [11]], dtype=torch.int32))
+        )
+        self.assertEqual((block_size, sm_count), (64, 132))
+
+    def test_schedule_boundary_passes_speculative_layout_to_deep_gemm(self):
+        deep_gemm = MagicMock()
+        deep_gemm.get_num_sms.return_value = 132
+
+        _get_deep_gemm_paged_mqa_schedule(
+            deep_gemm,
+            torch.tensor([1, 2, 3, 4, 5, 6], dtype=torch.int32),
+            block_size=64,
+        )
+
+        context_lens = deep_gemm.get_paged_mqa_logits_metadata.call_args.args[0]
+        self.assertTrue(
+            torch.equal(context_lens, torch.tensor([[1], [2], [3], [4], [5], [6]]))
+        )
 
 
 class MockIndexerMetadata(BaseIndexerMetadata):

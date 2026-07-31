@@ -156,27 +156,25 @@ class NSAContextParallelMetadata:
 
 
 def can_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+    if (
+        cp_size <= 1
+        or not use_nsa
+        or not forward_batch.forward_mode.is_context_parallel_extend()
+        or not is_nsa_enable_prefill_cp()
+        or sum(forward_batch.extend_seq_lens_cpu) < cp_size
+    ):
+        return False
     if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
-        assert (
-            seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+        assert seq_len % cp_size == 0, (
+            f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+        )
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
         # the seq data needs to be divided and recombined at twice the size of cp_size.
         cur_cp_seq_len = seq_len // (cp_size * 2)
-    if (
-        cur_cp_seq_len != 0
-        and cp_size > 1
-        and use_nsa
-        and forward_batch.forward_mode.is_context_parallel_extend()
-        and is_nsa_enable_prefill_cp()
-        and sum(forward_batch.extend_seq_lens_cpu) >= cp_size
-    ):
-        return True
-    else:
-        return False
+    return cur_cp_seq_len != 0
 
 
 def cp_split_and_rebuild_data(forward_batch, input_: torch.Tensor):

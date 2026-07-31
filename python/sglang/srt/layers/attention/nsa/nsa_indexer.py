@@ -60,6 +60,20 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def as_deep_gemm_context_lens(seqlens: torch.Tensor) -> torch.Tensor:
+    """Normalize DeepGEMM context lengths to contiguous ``[N_total, 1]``."""
+    if seqlens.ndim == 1:
+        return seqlens.contiguous().view(-1, 1)
+    if seqlens.ndim == 2:
+        if seqlens.shape[1] == 1 and seqlens.is_contiguous():
+            return seqlens
+        return seqlens.contiguous().view(-1, 1)
+    else:
+        raise ValueError(
+            f"DeepGEMM context lengths must be 1D or 2D, got shape {tuple(seqlens.shape)}"
+        )
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -400,6 +414,7 @@ class Indexer(MultiPlatformOp):
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
         if _is_cuda:
+            seqlens_32 = as_deep_gemm_context_lens(seqlens_32)
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, blocksize, self.sm_count

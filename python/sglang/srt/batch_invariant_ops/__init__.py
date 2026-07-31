@@ -25,6 +25,12 @@ from .batch_invariant_ops import (
     rms_norm_residual_tree_batch_invariant,
     set_batch_invariant_mode,
 )
+from .bi_families_v2 import (
+    families_v2_enabled,
+    head_v2_full_logits_with_lse,
+    head_v2_selected_logprob_from_logits,
+    rms_norm_v2,
+)
 
 __version__ = "0.1.0"
 
@@ -44,6 +50,10 @@ __all__ = [
     "bi_lm_head_full_logits",
     "bi_lm_head_selected_logprob",
     "bi_lm_head_selected_logprob_from_logits",
+    "families_v2_enabled",
+    "head_v2_full_logits_with_lse",
+    "head_v2_selected_logprob_from_logits",
+    "rms_norm_v2",
     "fused_add_rms_norm_batch_invariant",
     "rms_norm_residual_tree_batch_invariant",
     "RMSNormFamily",

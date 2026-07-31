@@ -73,6 +73,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -1286,6 +1287,8 @@ class DummyModelLoader(BaseModelLoader):
                 )
 
             for _, module in model.named_modules():
+                if isinstance(module, PPMissingLayer):
+                    continue
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
                     # Skip FusedMoE layers already quantized during init (FP8 or FP4)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -25,6 +25,7 @@ _use_fp8_prefill_attn = (
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+    from sglang.srt.models.glm52_index_share import Glm52IndexShareContext
 
 if _is_cuda:
     from sgl_kernel import concat_mla_k, merge_state_v2
@@ -85,7 +86,6 @@ if _use_aiter_gfx95:
 
 
 class DeepseekMHAForwardMixin:
-
     def init_mha_forward(self: DeepseekV2AttentionMLA):
         self.disable_chunked_prefix_cache = (
             get_global_server_args().disable_chunked_prefix_cache
@@ -102,6 +102,7 @@ class DeepseekMHAForwardMixin:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        index_share_context: Optional[Glm52IndexShareContext] = None,
     ):
         if self.q_lora_rank is not None:
             q, latent_cache = (
@@ -144,7 +145,9 @@ class DeepseekMHAForwardMixin:
                     q = self.q_b_proj(q_lora)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                _ = self.indexer(
+                _ = self.run_or_reuse_glm52_indexer(
+                    index_share_context,
+                    require_indices=False,
                     x=hidden_states,
                     q_lora=q_lora,
                     positions=positions,
@@ -164,7 +167,6 @@ class DeepseekMHAForwardMixin:
                 )
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.float8_e4m3fn:
-
                 q, _, _, _ = fused_rms_fp8_group_quant(
                     q,
                     self.q_a_layernorm.weight,
@@ -193,7 +195,6 @@ class DeepseekMHAForwardMixin:
         latent_cache = latent_cache.unsqueeze(1)
 
         if _use_aiter_gfx95 and self.kv_b_proj.weight.dtype == torch.float8_e4m3fn:
-
             kv_a_quanted, kv_a, _, _ = fused_rms_fp8_group_quant(
                 kv_a,
                 self.kv_a_layernorm.weight,
@@ -282,6 +283,7 @@ class DeepseekMHAForwardMixin:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        index_share_context: Optional[Glm52IndexShareContext] = None,
     ):
         # In normal mha, the k and v tensors will become overly large when the prefix length is long.
         # To avoid this, we split the kv cache into chunks and process them one after another.
@@ -291,7 +293,11 @@ class DeepseekMHAForwardMixin:
 
         # First do normal mha forward to get output for extended part
         return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
+            positions,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+            index_share_context=index_share_context,
         )
 
     def forward_normal_chunked_kv_core(
@@ -336,10 +342,15 @@ class DeepseekMHAForwardMixin:
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
+        index_share_context: Optional[Glm52IndexShareContext] = None,
     ):
         forward_batch.mha_one_shot = True
         return self.forward_normal_prepare(
-            positions, hidden_states, forward_batch, zero_allocator
+            positions,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+            index_share_context=index_share_context,
         )
 
     def forward_normal_one_shot_core(
@@ -367,7 +378,6 @@ class DeepseekMHAForwardMixin:
         accum_lse: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-
         assert forward_batch.num_prefix_chunks is not None
         for i in range(forward_batch.num_prefix_chunks):
             forward_batch.set_prefix_chunk_idx(i)
@@ -467,9 +477,9 @@ class DeepseekMHAForwardMixin:
         if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
             backend = backend.primary
         kv_indices = backend.forward_metadata.page_table_1_flattened
-        assert (
-            kv_indices is not None
-        ), "page_table_1_flattened should have been generated for FP8 MHA path"
+        assert kv_indices is not None, (
+            "page_table_1_flattened should have been generated for FP8 MHA path"
+        )
 
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
             self.attn_mha.layer_id

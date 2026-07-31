@@ -49,12 +49,20 @@ from sglang.srt.layers.utils.logprob import (
     get_top_logprobs_prefill,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.xorl_batch_invariant import (
+    resolve_xorl_bi_family,
+    validate_xorl_bi_logit_transforms,
+    xorl_bi_lm_head,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.server_args import (
+    XORL_BATCH_INVARIANT_TARGET,
+    get_global_server_args,
+)
 from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 
 logger = logging.getLogger(__name__)
@@ -251,6 +259,12 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
+        self.use_xorl_bi_lm_head = (
+            get_global_server_args().rl_on_policy_target == XORL_BATCH_INVARIANT_TARGET
+        )
+        self.xorl_bi_lm_head_family = (
+            resolve_xorl_bi_family() if self.use_xorl_bi_lm_head else None
+        )
         if self.use_attn_tp_group:
             self.attn_tp_size = get_attention_tp_size()
             self.do_tensor_parallel_all_gather = (
@@ -272,6 +286,10 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
+        if self.use_xorl_bi_lm_head:
+            validate_xorl_bi_logit_transforms(
+                self.logit_scale, self.final_logit_softcapping
+            )
 
         self.return_full_logits = return_full_logits
         self.multi_item_delimiter = (
@@ -869,6 +887,15 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.use_xorl_bi_lm_head:
+            return xorl_bi_lm_head(
+                hidden_states,
+                lm_head,
+                use_fp32_lm_head=self.use_fp32_lm_head,
+                embedding_bias=embedding_bias,
+                family=self.xorl_bi_lm_head_family,
+            )
+
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
             logits = lm_head(hidden_states)

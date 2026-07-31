@@ -28,6 +28,7 @@ from sglang.srt.utils import BumpAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
+    from sglang.srt.models.glm52_index_share import Glm52IndexShareContext
 
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
@@ -77,7 +78,6 @@ if _use_aiter_gfx95:
 
 
 class DeepseekMLAForwardMixin:
-
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
             get_global_server_args().flashinfer_mla_disable_ragged
@@ -90,6 +90,7 @@ class DeepseekMLAForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         llama_4_scaling: Optional[torch.Tensor] = None,
+        index_share_context: Optional[Glm52IndexShareContext] = None,
     ):
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
@@ -181,7 +182,9 @@ class DeepseekMLAForwardMixin:
                     q = self.q_b_proj(q)[0].view(
                         -1, self.num_local_heads, self.qk_head_dim
                     )
-                topk_indices = self.indexer(
+                topk_indices = self.run_or_reuse_glm52_indexer(
+                    index_share_context,
+                    require_indices=True,
                     x=hidden_states,
                     q_lora=q_lora,
                     positions=positions,
@@ -193,7 +196,9 @@ class DeepseekMLAForwardMixin:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
-                    topk_indices = self.indexer(
+                    topk_indices = self.run_or_reuse_glm52_indexer(
+                        index_share_context,
+                        require_indices=True,
                         x=hidden_states,
                         q_lora=q_lora,
                         positions=positions,

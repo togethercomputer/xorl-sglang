@@ -48,6 +48,54 @@ class TestLoadBalanceMethod(unittest.TestCase):
         self.assertEqual(server_args.load_balance_method, "round_robin")
 
 
+class TestDeterministicGlmNsa(unittest.TestCase):
+    @staticmethod
+    def _server_args(prefill_backend="flashmla_sparse", decode_backend="fa3"):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.model_path = "/tmp/glm-5.2"
+        server_args.enable_deterministic_inference = True
+        server_args.attention_backend = "nsa"
+        server_args.nsa_prefill_backend = prefill_backend
+        server_args.nsa_decode_backend = decode_backend
+        return server_args
+
+    @staticmethod
+    def _glm_model_config():
+        hf_config = MagicMock()
+        hf_config.architectures = ["GlmMoeDsaForCausalLM"]
+        hf_config.index_topk = 2048
+        model_config = MagicMock()
+        model_config.hf_config = hf_config
+        return model_config
+
+    def test_accepts_pinned_glm_nsa_pair_and_disables_uncertified_radix(self):
+        server_args = self._server_args()
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        server_args._handle_deterministic_inference()
+
+        self.assertEqual(server_args.attention_backend, "nsa")
+        self.assertEqual(server_args.nsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.nsa_decode_backend, "fa3")
+        self.assertTrue(server_args.disable_radix_cache)
+
+    def test_rejects_unpinned_glm_nsa_pair(self):
+        server_args = self._server_args(decode_backend="flashmla_kv")
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        with self.assertRaisesRegex(ValueError, "Deterministic GLM NSA requires"):
+            server_args._handle_deterministic_inference()
+
+    def test_top_level_fa3_remains_a_distinct_non_nsa_path(self):
+        server_args = self._server_args()
+        server_args.attention_backend = "fa3"
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        server_args._handle_deterministic_inference()
+
+        self.assertEqual(server_args.attention_backend, "fa3")
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")

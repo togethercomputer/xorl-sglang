@@ -21,12 +21,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.srt.batch_invariant_ops import (
+    RMS_NORM_FAMILIES,
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMSNormFamily,
+    bi_fused_add_rms_norm,
+    bi_rms_norm,
     is_batch_invariant_mode_enabled,
+    rms_norm_v2,
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.layers.xorl_batch_invariant import (
+    record_xorl_bi_engagement,
+    resolve_or_validate_xorl_bi_family,
+)
+from sglang.srt.server_args import XORL_BATCH_INVARIANT_TARGET, get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -97,12 +107,22 @@ class RMSNorm(MultiPlatformOp):
         has_weight: bool = True,
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
+        batch_invariant_family: Optional[RMSNormFamily] = None,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
         self.override_orig_dtype = override_orig_dtype
+        if (
+            batch_invariant_family is not None
+            and batch_invariant_family not in RMS_NORM_FAMILIES
+        ):
+            raise ValueError(
+                f"Unknown RMSNorm family {batch_invariant_family!r}; "
+                f"expected one of {RMS_NORM_FAMILIES}"
+            )
+        self.batch_invariant_family = batch_invariant_family
         if self.has_weight:
             self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
         else:
@@ -127,6 +147,15 @@ class RMSNorm(MultiPlatformOp):
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if (
+                get_global_server_args().rl_on_policy_target
+                == XORL_BATCH_INVARIANT_TARGET
+            ):
+                return self._forward_xorl_batch_invariant(
+                    x,
+                    residual,
+                    post_residual_addition,
+                )
+            if (
                 residual is not None
                 or get_global_server_args().rl_on_policy_target == "fsdp"
             ):
@@ -147,6 +176,73 @@ class RMSNorm(MultiPlatformOp):
             return x, residual
         out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         return out
+
+    def _forward_xorl_batch_invariant(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor],
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        family = self.batch_invariant_family
+        if family is None:
+            raise RuntimeError(
+                "The XORL batch-invariant target reached an RMSNorm site without "
+                "an explicit batch_invariant_family."
+            )
+        if family == RMS_NORM_FAMILY_NO_RESIDUAL and residual is not None:
+            raise RuntimeError(
+                "An XORL no-residual RMSNorm site received a residual stream."
+            )
+        if post_residual_addition is not None:
+            raise RuntimeError(
+                "The XORL batch-invariant RMSNorm contract does not support "
+                "post_residual_addition."
+            )
+        if self.override_orig_dtype is not None or self.fp32_residual:
+            raise RuntimeError(
+                "The XORL batch-invariant RMSNorm contract does not support "
+                "override_orig_dtype or fp32_residual."
+            )
+        if not self.has_weight:
+            raise RuntimeError(
+                "The XORL batch-invariant RMSNorm contract requires a learned weight."
+            )
+        if x.dtype != torch.bfloat16 or self.weight.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "The XORL batch-invariant RMSNorm contract requires BF16 input "
+                f"and weight, got {x.dtype} and {self.weight.dtype}."
+            )
+        if residual is not None and residual.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "The XORL batch-invariant RMSNorm contract requires a BF16 residual, "
+                f"got {residual.dtype}."
+            )
+
+        version = resolve_or_validate_xorl_bi_family(None)
+        if version == "v2":
+            result = rms_norm_v2(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                residual=residual,
+            )
+        elif residual is not None:
+            result = bi_fused_add_rms_norm(
+                x,
+                residual,
+                self.weight.data,
+                self.variance_epsilon,
+                family=family,
+            )
+        else:
+            result = bi_rms_norm(
+                x,
+                self.weight.data,
+                self.variance_epsilon,
+                family=family,
+            )
+        record_xorl_bi_engagement("rmsnorm")
+        return result
 
     def forward_npu(
         self,

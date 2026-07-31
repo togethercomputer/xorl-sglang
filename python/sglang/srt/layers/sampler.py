@@ -13,9 +13,16 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.utils.hash import murmur_hash32
 from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
+from sglang.srt.layers.xorl_batch_invariant import (
+    resolve_xorl_bi_family,
+    xorl_bi_sample_and_score,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.server_args import (
+    XORL_BATCH_INVARIANT_TARGET,
+    get_global_server_args,
+)
 from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
 if is_cuda():
@@ -47,6 +54,12 @@ class Sampler(nn.Module):
             self.tp_sync_group = get_attention_tp_group().device_group
 
         self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
+        self.use_xorl_bi_sampling = (
+            self.rl_on_policy_target == XORL_BATCH_INVARIANT_TARGET
+        )
+        self.xorl_bi_lm_head_family = (
+            resolve_xorl_bi_family() if self.use_xorl_bi_sampling else None
+        )
         # In RL on-policy mode, deterministic inference is automatically enabled.
         self.enable_deterministic = (
             get_global_server_args().enable_deterministic_inference
@@ -98,6 +111,21 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+
+        if self.use_xorl_bi_sampling:
+            return xorl_bi_sample_and_score(
+                logits_output,
+                sampling_info,
+                return_logprob=return_logprob,
+                top_logprobs_nums=top_logprobs_nums,
+                token_ids_logprobs=token_ids_logprobs,
+                positions=positions,
+                sample_from_logprobs=self._sample_from_logprobs,
+                sync_token_ids=self._sync_token_ids_across_tp,
+                enable_deterministic=self.enable_deterministic,
+                return_original_logprob=SGLANG_RETURN_ORIGINAL_LOGPROB,
+                family=self.xorl_bi_lm_head_family,
+            )
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
