@@ -51,10 +51,12 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDistribution,
+    CanonicalMoEV3Workspace,
     CanonicalMoEWorkspace,
     CanonicalRowSlots,
     SamplerParallelPlan,
     canonicalize_glm52_local_partial,
+    canonicalize_glm52_local_partial_v3,
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -73,6 +75,9 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
+from sglang.srt.layers.attention.nsa.glm52_selector import (
+    log_glm52_sparse_receipt_once,
+)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -81,7 +86,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_nsa_cp import (
     CanonicalMoEPositions,
-    NSAMoEOutputLayout,
+    NSAMLPOutputLayout,
     NSACPLayerCommunicator,
     align_glm52_moe_positions,
 )
@@ -589,8 +594,16 @@ class DeepseekV2MoE(nn.Module):
         self.last_canonical_receipt = None
         self._canonical_workspace = None
         self._canonical_input = None
+        self._canonical_v3_workspaces = {}
+        self._glm52_canonical_transport = str(
+            getattr(config, "_glm52_canonical_moe_transport", "dense_v1")
+        )
         self.glm52_parallel_plan = None
         if self._glm52_canonical_contract:
+            if self._glm52_canonical_transport not in {"dense_v1", "canonical_v3"}:
+                raise RuntimeError(
+                    "GLM-5.2 canonical transport must be dense_v1 or canonical_v3"
+                )
             if self._enable_a2a_moe:
                 raise RuntimeError(
                     "GLM-5.2 canonical MoE requires moe_a2a_backend=none"
@@ -633,6 +646,7 @@ class DeepseekV2MoE(nn.Module):
                 should_allreduce_fusion,
                 use_reduce_scatter,
                 gemm_output_zero_allocator,
+                forward_batch=forward_batch,
                 absolute_positions=absolute_positions,
             )
         if not self._enable_a2a_moe:
@@ -697,6 +711,7 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
         *,
+        forward_batch: Optional[ForwardBatch] = None,
         absolute_positions: torch.Tensor = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
@@ -764,6 +779,7 @@ class DeepseekV2MoE(nn.Module):
             return self._canonicalize_glm52_partial(
                 final_hidden_states,
                 absolute_positions,
+                forward_batch=forward_batch,
                 should_allreduce_fusion=should_allreduce_fusion,
                 use_reduce_scatter=use_reduce_scatter,
             )
@@ -781,6 +797,7 @@ class DeepseekV2MoE(nn.Module):
         local_partial: torch.Tensor,
         absolute_positions: torch.Tensor | CanonicalMoEPositions,
         *,
+        forward_batch: Optional[ForwardBatch] = None,
         should_allreduce_fusion: bool,
         use_reduce_scatter: bool,
     ) -> torch.Tensor:
@@ -794,9 +811,18 @@ class DeepseekV2MoE(nn.Module):
             )
         if local_partial.dtype is not torch.bfloat16:
             raise TypeError("GLM-5.2 serving local MoE partial must be BF16")
-        if self.tp_size != 8 or self.moe_ep_size != 8:
+        plan = self.glm52_parallel_plan
+        if plan is None:
             raise RuntimeError(
-                "GLM-5.2 sampler canonical MoE requires launcher TP8 and EP8"
+                "GLM-5.2 canonical MoE requires a model-bound stage-local parallel plan"
+            )
+        if (
+            self.tp_size != plan.contributor_count
+            or self.moe_ep_size != plan.contributor_count
+        ):
+            raise RuntimeError(
+                "GLM-5.2 sampler canonical MoE requires launcher TP and EP "
+                "to equal the canonical contributor count"
             )
         if (
             self.gate.e_score_correction_bias is None
@@ -807,7 +833,20 @@ class DeepseekV2MoE(nn.Module):
             )
 
         rows = local_partial.shape[0]
-        capacity = int(getattr(self.config, "_glm52_moe_graph_capacity", rows))
+        capture_mode = get_is_capture_mode()
+        use_v3 = (
+            getattr(self, "_glm52_canonical_transport", "dense_v1") == "canonical_v3"
+        )
+        if use_v3 and capture_mode:
+            raise RuntimeError(
+                "GLM-5.2 canonical v3 does not yet admit CUDA graph capture"
+            )
+        if use_v3:
+            prefill_cp = forward_batch is not None and nsa_use_prefill_cp(forward_batch)
+            capacity = rows
+        else:
+            prefill_cp = False
+            capacity = int(getattr(self.config, "_glm52_moe_graph_capacity", rows))
         if rows > capacity:
             raise ValueError(
                 f"GLM-5.2 local MoE rows {rows} exceed graph capacity {capacity}"
@@ -823,13 +862,44 @@ class DeepseekV2MoE(nn.Module):
             capacity=capacity,
             valid_mask=position_valid,
         )
-        capture_mode = get_is_capture_mode()
-        plan = self.glm52_parallel_plan
-        if plan is None:
-            raise RuntimeError(
-                "GLM-5.2 canonical MoE requires a model-bound stage-local parallel plan"
-            )
         group = get_tp_group().device_group
+        if use_v3:
+            distribution = (
+                CanonicalDistribution.CONSUMER_SHARDED
+                if prefill_cp
+                else CanonicalDistribution.REPLICATED_CANONICAL
+            )
+            key = (
+                distribution.value,
+                capacity,
+                tuple(local_partial.shape[1:]),
+                local_partial.dtype,
+                local_partial.device,
+            )
+            workspace = self._canonical_v3_workspaces.get(key)
+            if workspace is None:
+                workspace = CanonicalMoEV3Workspace.allocate(
+                    local_partial,
+                    plan=plan,
+                    group=group,
+                    distribution=distribution,
+                )
+                self._canonical_v3_workspaces[key] = workspace
+            canonical = canonicalize_glm52_local_partial_v3(
+                local_partial,
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=self.layer_id,
+                distribution=distribution,
+                graph_capture=False,
+                workspace=workspace,
+            )
+            canonical.raise_for_status()
+            self.last_canonical_receipt = canonical.receipt
+            self.canonical_engagement_count += 1
+            return canonical.values
+
         if self._canonical_workspace is None:
             if capture_mode:
                 raise RuntimeError(
@@ -1871,20 +1941,27 @@ class DeepseekV2DecoderLayer(nn.Module):
         glm52_canonical_moe = (
             isinstance(self.mlp, DeepseekV2MoE) and self.mlp._glm52_canonical_contract
         )
+        glm52_complete_mlp = glm52_canonical_moe or (
+            glm52_xorl_bi_contract
+            and (
+                isinstance(self.mlp, DeepseekV2MLP)
+                and enable_moe_dense_fully_dp()
+            )
+        )
         if self.nsa_enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(
                 layer_scatter_modes=self.layer_scatter_modes,
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
-                allow_reduce_scatter=not glm52_canonical_moe,
+                allow_reduce_scatter=not glm52_complete_mlp,
                 is_last_layer=(
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
-                moe_output_layout=(
-                    NSAMoEOutputLayout.REPLICATED_CANONICAL
-                    if glm52_canonical_moe
-                    else NSAMoEOutputLayout.LEGACY_PARTIAL
+                mlp_output_layout=(
+                    NSAMLPOutputLayout.COMPLETE
+                    if glm52_complete_mlp
+                    else NSAMLPOutputLayout.LEGACY_PARTIAL
                 ),
             )
         else:
@@ -2149,6 +2226,7 @@ class DeepseekV2Model(nn.Module):
                 use_qk_norm=bool(getattr(config, "use_qk_norm", False))
             )
         self.last_forward_canonical_receipts = ()
+        self.last_forward_glm52_sparse_receipts = ()
         if self.nsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
         else:
@@ -2192,6 +2270,7 @@ class DeepseekV2Model(nn.Module):
                 )
             physical_ranks = tuple(get_group_ranks(tp_group))
             self.glm52_parallel_plan = SamplerParallelPlan.glm52(
+                contributors=server_args.tp_size,
                 pp_size=server_args.pp_size,
                 pp_rank=self.pp_group.rank_in_group,
                 physical_ranks=physical_ranks,
@@ -2445,7 +2524,34 @@ class DeepseekV2Model(nn.Module):
             if self.glm52_index_share_manager is not None
             else nullcontext(None)
         )
-        with index_share_invocation as index_share_context:
+        attn_backend = forward_batch.attn_backend
+        sparse_active = (
+            self.glm52_xorl_bi_contract
+            and getattr(attn_backend, "glm52_sparse_eager_enabled", False)
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and not forward_batch.forward_mode.is_idle()
+        )
+        if sparse_active:
+            receipt_book = getattr(attn_backend, "glm52_sparse_receipts", None)
+            if receipt_book is None:
+                raise RuntimeError("GLM-5.2 exact sparse backend has no receipt book")
+            producer_by_layer = {
+                layer_id: self.glm52_index_share_plan.producer_by_layer[layer_id]
+                for layer_id in range(normal_start_layer, normal_end_layer)
+            }
+            full_layers = [
+                layer_id
+                for layer_id in range(normal_start_layer, normal_end_layer)
+                if self.glm52_index_share_plan.indexer_types[layer_id] == "full"
+            ]
+            sparse_invocation = receipt_book.invocation(
+                producer_by_layer=producer_by_layer,
+                full_layers=full_layers,
+            )
+        else:
+            receipt_book = None
+            sparse_invocation = nullcontext()
+        with index_share_invocation as index_share_context, sparse_invocation:
             for i in range(normal_start_layer, normal_end_layer):
                 # NOTE: torch dynamo does not support graph break in context manager
                 ctx = (
@@ -2473,6 +2579,18 @@ class DeepseekV2Model(nn.Module):
                         llama_4_scaling,
                         index_share_context,
                     )
+        if receipt_book is not None:
+            self.last_forward_glm52_sparse_receipts = receipt_book.last_receipts
+            log_glm52_sparse_receipt_once(
+                self.last_forward_glm52_sparse_receipts,
+                start_layer=normal_start_layer,
+                end_layer=normal_end_layer,
+                request_ids=forward_batch.rids,
+                request_count=getattr(
+                    forward_batch, "_original_batch_size", forward_batch.batch_size
+                ),
+                receipt_logger=logger,
+            )
         if canonical_counts_before:
             receipts = []
             for layer_id, before in canonical_counts_before.items():

@@ -12,12 +12,20 @@ import torch.distributed as dist
 
 
 GLM52_CANONICAL_MOE_VERSION = "canonical_moe_reduce_v1"
+GLM52_CANONICAL_MOE_V3_VERSION = "glm52_canonical_moe_reduce_v3"
 GLM52_SAMPLER_LOCAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_bf16_v2"
 
 
 class CanonicalDistribution(str, Enum):
     OWNER_SHARDED = "owner_sharded"
+    CONSUMER_SHARDED = "consumer_sharded"
     REPLICATED_CANONICAL = "replicated_canonical"
+
+
+class CanonicalTransport(str, Enum):
+    DENSE_V1 = GLM52_CANONICAL_MOE_VERSION
+    CP_SHARDED_V3 = GLM52_CANONICAL_MOE_V3_VERSION
+    REPLICATED_DECODE_V3 = "glm52_canonical_moe_replicated_decode_v3"
 
 
 @dataclass(frozen=True)
@@ -37,8 +45,8 @@ class SamplerParallelPlan:
     version: str = GLM52_CANONICAL_MOE_VERSION
 
     def __post_init__(self) -> None:
-        if self.contributor_count not in (2, 4, 8):
-            raise ValueError("Canonical MoE admits exactly 2, 4, or 8 contributors")
+        if self.contributor_count not in (2, 4, 8, 16):
+            raise ValueError("Canonical MoE admits exactly 2, 4, 8, or 16 contributors")
         if (
             len(self.physical_ranks) != self.contributor_count
             or len(set(self.physical_ranks)) != self.contributor_count
@@ -79,44 +87,53 @@ class SamplerParallelPlan:
                 "Physical ranks must be the ordered ranks of this pipeline stage"
             )
         if self.production:
-            if self.contributor_count != 8:
+            if self.contributor_count not in (8, 16):
                 raise ValueError(
-                    "Production GLM-5.2 requires exactly eight contributors"
+                    "Production GLM-5.2 requires exactly 8 or 16 contributors"
                 )
-            if self.physical_to_logical != tuple(range(8)):
+            if self.physical_to_logical != tuple(range(self.contributor_count)):
                 raise ValueError(
                     "Production GLM-5.2 requires identity logical contributor ordinals"
                 )
             if (
-                self.ep_size != 8
-                or self.attention_cp_size != 8
-                or self.launcher_tp_size != 8
+                self.ep_size != self.contributor_count
+                or self.attention_cp_size != self.contributor_count
+                or self.launcher_tp_size != self.contributor_count
             ):
                 raise ValueError(
-                    "Production GLM-5.2 sampler requires launcher TP8, attention CP8, and EP8"
+                    "Production GLM-5.2 sampler requires launcher TP, attention CP, "
+                    "and EP to equal the contributor count"
                 )
 
     @classmethod
     def glm52(
         cls,
         *,
+        contributors: int = 8,
         pp_size: int = 1,
         pp_rank: int = 0,
         physical_ranks: tuple[int, ...] | None = None,
     ) -> SamplerParallelPlan:
         ranks = (
-            tuple(range(pp_rank * 8, (pp_rank + 1) * 8))
+            tuple(
+                range(
+                    pp_rank * contributors,
+                    (pp_rank + 1) * contributors,
+                )
+            )
             if physical_ranks is None
             else tuple(physical_ranks)
         )
         return cls(
-            8,
+            contributors,
             ranks,
-            tuple(range(8)),
-            launcher_tp_size=8,
-            global_world_size=8 * pp_size,
+            tuple(range(contributors)),
+            launcher_tp_size=contributors,
+            global_world_size=contributors * pp_size,
             pp_rank=pp_rank,
             pp_size=pp_size,
+            ep_size=contributors,
+            attention_cp_size=contributors,
             production=True,
         )
 
@@ -256,6 +273,8 @@ class CanonicalMoEReceipt:
     capacity: int
     graph_capture: bool
     local_policy: str
+    transport: CanonicalTransport = CanonicalTransport.DENSE_V1
+    source_capacity: int | None = None
 
 
 @dataclass(frozen=True)
@@ -360,11 +379,124 @@ class CanonicalMoEWorkspace:
             )
 
 
+@dataclass
+class CanonicalMoEV3Workspace:
+    """Mode-shaped storage for the eager v3 serving transports."""
+
+    plan_hash: str
+    distribution: CanonicalDistribution
+    capacity: int
+    local_capacity: int
+    payload_shape: tuple[int, ...]
+    masked_input: torch.Tensor
+    collective: torch.Tensor
+    received: torch.Tensor | None
+    result: torch.Tensor
+    zero: torch.Tensor
+    logical_to_group: torch.Tensor
+    status: torch.Tensor
+
+    @classmethod
+    def allocate(
+        cls,
+        local_partial: torch.Tensor,
+        *,
+        plan: SamplerParallelPlan,
+        group: dist.ProcessGroup,
+        distribution: CanonicalDistribution,
+    ) -> CanonicalMoEV3Workspace:
+        if distribution not in {
+            CanonicalDistribution.CONSUMER_SHARDED,
+            CanonicalDistribution.REPLICATED_CANONICAL,
+        }:
+            raise ValueError(
+                f"v3 does not admit output distribution {distribution.value}"
+            )
+        plan.validate_runtime(
+            group=group,
+            launcher_tp_size=plan.launcher_tp_size,
+            effective_dense_tp=plan.effective_dense_tp,
+            pp_size=plan.pp_size,
+            ep_size=plan.ep_size,
+            attention_cp_size=plan.attention_cp_size,
+        )
+        contributors = plan.contributor_count
+        capacity = local_partial.shape[0]
+        payload_shape = tuple(local_partial.shape[1:])
+        logical_to_group = torch.tensor(
+            tuple(
+                plan.physical_to_logical.index(logical)
+                for logical in range(contributors)
+            ),
+            dtype=torch.long,
+            device=local_partial.device,
+        )
+        if distribution is CanonicalDistribution.CONSUMER_SHARDED:
+            if capacity % contributors:
+                raise ValueError(
+                    "v3 consumer-sharded transport requires equal padded CP-source capacity"
+                )
+            local_capacity = capacity // contributors
+            collective = torch.empty_like(local_partial)
+            received = torch.empty(
+                (contributors, local_capacity, *payload_shape),
+                dtype=local_partial.dtype,
+                device=local_partial.device,
+            )
+            result = torch.empty(
+                (local_capacity, *payload_shape),
+                dtype=local_partial.dtype,
+                device=local_partial.device,
+            )
+        else:
+            local_capacity = capacity
+            collective = torch.empty(
+                (contributors, capacity, *payload_shape),
+                dtype=local_partial.dtype,
+                device=local_partial.device,
+            )
+            received = None
+            result = torch.empty_like(local_partial)
+        return cls(
+            plan_hash=plan.identity,
+            distribution=distribution,
+            capacity=capacity,
+            local_capacity=local_capacity,
+            payload_shape=payload_shape,
+            masked_input=torch.empty_like(local_partial),
+            collective=collective,
+            received=received,
+            result=result,
+            zero=torch.zeros(
+                (), dtype=local_partial.dtype, device=local_partial.device
+            ),
+            logical_to_group=logical_to_group,
+            status=torch.zeros((), dtype=torch.int32, device=local_partial.device),
+        )
+
+    def validate(
+        self,
+        local_partial: torch.Tensor,
+        plan: SamplerParallelPlan,
+        distribution: CanonicalDistribution,
+    ) -> None:
+        if self.plan_hash != plan.identity:
+            raise RuntimeError(
+                "Canonical MoE v3 workspace topology does not match the immutable plan"
+            )
+        if self.distribution is not distribution:
+            raise RuntimeError("Canonical MoE v3 workspace distribution changed")
+        if local_partial.shape != (self.capacity, *self.payload_shape):
+            raise RuntimeError("Canonical MoE v3 workspace shape changed")
+
+
 def _balanced_adjacent_tree(partials: torch.Tensor) -> torch.Tensor:
     if partials.dtype is not torch.bfloat16:
         raise TypeError("Canonical MoE arithmetic requires BF16 partials")
-    if partials.shape[0] not in (2, 4, 8):
-        raise ValueError("Canonical MoE arithmetic requires 2, 4, or 8 contributors")
+    if partials.shape[0] not in (2, 4, 8, 16):
+        raise ValueError(
+            "Canonical MoE arithmetic requires 2, 4, 8, or 16 contributors"
+        )
     level = tuple(partials.unbind(0))
     while len(level) > 1:
         level = tuple(
@@ -474,15 +606,146 @@ def canonicalize_glm52_local_partial(
     )
 
 
+def canonicalize_glm52_local_partial_v3(
+    local_partial: torch.Tensor,
+    slots: CanonicalRowSlots,
+    *,
+    plan: SamplerParallelPlan,
+    group: dist.ProcessGroup,
+    layer_id: int,
+    distribution: CanonicalDistribution,
+    graph_capture: bool = False,
+    workspace: CanonicalMoEV3Workspace | None = None,
+) -> CanonicalMoEOutput:
+    """Fold identical BF16 contributors with mode-specific byte transport.
+
+    Prefill CP sends each rank-major source bucket directly to its consuming CP
+    rank. Eager decode gathers one unexpanded partial from every contributor and
+    folds locally on every rank. Both modes preserve the v1 logical contributor
+    order and balanced adjacent BF16 tree; dense v1 remains the independent
+    oracle.
+    """
+    if graph_capture:
+        raise RuntimeError("Canonical MoE v3 does not yet admit CUDA graph capture")
+    if local_partial.dtype is not torch.bfloat16:
+        raise TypeError("GLM-5.2 local MoE contribution must be BF16")
+    if local_partial.shape[0] != slots.capacity:
+        raise ValueError("Local partial rows must equal the v3 source capacity")
+    if distribution not in {
+        CanonicalDistribution.CONSUMER_SHARDED,
+        CanonicalDistribution.REPLICATED_CANONICAL,
+    }:
+        raise ValueError(f"Canonical MoE v3 does not admit {distribution.value}")
+    if workspace is None:
+        workspace = CanonicalMoEV3Workspace.allocate(
+            local_partial,
+            plan=plan,
+            group=group,
+            distribution=distribution,
+        )
+    workspace.validate(local_partial, plan, distribution)
+
+    payload_shape = local_partial.shape[1:]
+    mask_tail = (1,) * len(payload_shape)
+    torch.where(
+        slots.valid_mask.view(-1, *mask_tail),
+        local_partial,
+        workspace.zero,
+        out=workspace.masked_input,
+    )
+    group_rank = dist.get_rank(group)
+    invalid_position = slots.valid_mask & (slots.absolute_positions < 0)
+
+    if distribution is CanonicalDistribution.CONSUMER_SHARDED:
+        contributors = plan.contributor_count
+        assert workspace.received is not None
+        # Rank-major FULL prefill rows already form equal destination buckets.
+        # The all-to-all moves only one source payload; it does not create the
+        # contributor-count zero expansion used by dense v1.
+        dist.all_to_all_single(
+            workspace.received.view(
+                contributors * workspace.local_capacity, *payload_shape
+            ),
+            workspace.masked_input,
+            group=group,
+        )
+        logical_sources = workspace.received.index_select(0, workspace.logical_to_group)
+        folded = _balanced_adjacent_tree(logical_sources)
+        start = group_rank * workspace.local_capacity
+        end = start + workspace.local_capacity
+        local_valid = slots.valid_mask[start:end]
+        torch.where(
+            local_valid.view(-1, *mask_tail),
+            folded,
+            workspace.zero,
+            out=workspace.result,
+        )
+        output_slots = CanonicalRowSlots(
+            absolute_positions=slots.absolute_positions[start:end],
+            valid_mask=local_valid,
+            capacity=workspace.local_capacity,
+        )
+        owner_mask = local_valid
+        transport = CanonicalTransport.CP_SHARDED_V3
+    else:
+        # Decode rows are replicated across CP. Gather each real local partial
+        # exactly once, restore logical contributor order, and fold identically
+        # on every rank. No owner slots or replication gather are materialized.
+        dist.all_gather_into_tensor(
+            workspace.collective.view(
+                plan.contributor_count * slots.capacity, *payload_shape
+            ),
+            workspace.masked_input,
+            group=group,
+        )
+        logical_sources = workspace.collective.index_select(
+            0, workspace.logical_to_group
+        )
+        folded = _balanced_adjacent_tree(logical_sources)
+        torch.where(
+            slots.valid_mask.view(-1, *mask_tail),
+            folded,
+            workspace.zero,
+            out=workspace.result,
+        )
+        output_slots = slots
+        owner_mask = slots.valid_mask
+        transport = CanonicalTransport.REPLICATED_DECODE_V3
+
+    workspace.status.copy_(invalid_position.any().to(torch.int32))
+    receipt = CanonicalMoEReceipt(
+        version=GLM52_CANONICAL_MOE_V3_VERSION,
+        plan_hash=plan.identity,
+        layer_id=layer_id,
+        distribution=distribution,
+        capacity=workspace.local_capacity,
+        graph_capture=False,
+        local_policy=GLM52_SAMPLER_LOCAL_POLICY,
+        transport=transport,
+        source_capacity=slots.capacity,
+    )
+    return CanonicalMoEOutput(
+        workspace.result,
+        owner_mask,
+        output_slots,
+        receipt,
+        workspace.status,
+    )
+
+
 __all__ = [
+    "GLM52_CANONICAL_MOE_V3_VERSION",
     "GLM52_CANONICAL_MOE_VERSION",
     "GLM52_SAMPLER_LOCAL_POLICY",
     "CanonicalDistribution",
+    "CanonicalTransport",
     "CanonicalMoEOutput",
     "CanonicalMoEReceipt",
     "CanonicalRowSlots",
     "CanonicalMoEWorkspace",
+    "CanonicalMoEV3Workspace",
     "SamplerParallelPlan",
     "canonical_moe_reference",
     "canonicalize_glm52_local_partial",
+    "canonicalize_glm52_local_partial_v3",
 ]

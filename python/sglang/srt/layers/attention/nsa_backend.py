@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlias
+from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, Tuple, TypeAlias
 
 import torch
 
@@ -18,6 +18,11 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
     BaseIndexerMetadata,
     as_deep_gemm_context_lens,
+)
+from sglang.srt.layers.attention.nsa.glm52_selector import (
+    Glm52SparseReceiptBook,
+    pack_selected_kv_dynamic,
+    select_canonical_logical_topk,
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
@@ -195,6 +200,9 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
     topk_transform_method: TopkTransformMethod
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     canonical_logical_indices: bool = False
+    stable_logical_selector: bool = False
+    selector_receipt_required: bool = False
+    selector_receipt_hook: Optional[Callable[[torch.Tensor], None]] = None
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -236,6 +244,19 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         batch_idx_list: List[int] = None,
         topk_indices_offset_override: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.stable_logical_selector:
+            selected = select_canonical_logical_topk(
+                logits,
+                ke_offset if ke_offset is not None else self.get_seqlens_expanded(),
+                topk,
+                row_starts=ks,
+            )
+            if self.selector_receipt_required and self.selector_receipt_hook is None:
+                raise RuntimeError("exact sparse selector is missing its fail-closed receipt hook")
+            if self.selector_receipt_hook is not None:
+                self.selector_receipt_hook(selected)
+            return selected
+
         from sgl_kernel import (
             fast_topk_transform_fused,
             fast_topk_transform_ragged_fused,
@@ -339,6 +360,12 @@ class NativeSparseAttnBackend(
             model_runner.server_args.nsa_prefill_backend
         )
         self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
+        self.glm52_sparse_eager_enabled = (
+            self.canonical_logical_indices
+            and model_runner.server_args.rl_on_policy_target == "xorl"
+            and self.nsa_decode_impl == "flashmla_sparse"
+        )
+        self.glm52_sparse_receipts = Glm52SparseReceiptBook()
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
@@ -1578,7 +1605,24 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get() and not canonical_logical_payload:
+        selected_counts = None
+        if self.glm52_sparse_eager_enabled:
+            if not canonical_logical_payload:
+                raise RuntimeError(
+                    "GLM-5.2 exact sparse requires typed canonical logical indices"
+                )
+            if topk_indices is None:
+                raise RuntimeError("GLM-5.2 exact sparse decode requires selected indices")
+            packed = pack_selected_kv_dynamic(
+                kv_cache,
+                metadata.page_table_1,
+                topk_indices,
+            )
+            self.glm52_sparse_receipts.record_packer(layer.layer_id, packed)
+            kv_cache = packed.kv
+            page_table_1 = packed.compact_indices
+            selected_counts = packed.selected_counts
+        elif envs.SGLANG_NSA_FUSE_TOPK.get() and not canonical_logical_payload:
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -1596,6 +1640,7 @@ class NativeSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                selected_counts=selected_counts,
             )
         elif self.nsa_decode_impl == "flashmla_kv":
             if q_rope is not None:
@@ -1695,6 +1740,7 @@ class NativeSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
+        selected_counts: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
 
@@ -1706,6 +1752,9 @@ class NativeSparseAttnBackend(
         required_padding = 128 if self.device_sm_major >= 10 else 64
 
         need_padding = num_heads % required_padding != 0
+
+        if selected_counts is not None and int(selected_counts.sum().item()) == 0:
+            return q_all.new_zeros((num_tokens, num_heads, v_head_dim))
 
         if need_padding:
             assert required_padding % num_heads == 0, (
@@ -1734,6 +1783,13 @@ class NativeSparseAttnBackend(
         # Trim output back to original num_heads if we padded
         if need_padding:
             o = o[:, :num_heads, :]
+
+        if selected_counts is not None:
+            o = torch.where(
+                (selected_counts > 0).view(-1, 1, 1),
+                o,
+                torch.zeros((), dtype=o.dtype, device=o.device),
+            )
 
         return o
 
@@ -2165,11 +2221,31 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
+        receipted_decode_selector = (
+            self.glm52_sparse_eager_enabled
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and not forward_batch.forward_mode.is_idle()
+        )
+        stable_logical_selector = receipted_decode_selector or (
+            self.glm52_sparse_eager_enabled
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        )
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             canonical_logical_indices=self.canonical_logical_indices,
+            stable_logical_selector=stable_logical_selector,
+            selector_receipt_required=receipted_decode_selector,
+            selector_receipt_hook=(
+                (
+                    lambda selected: self.glm52_sparse_receipts.record_selector(
+                        layer_id, selected
+                    )
+                )
+                if receipted_decode_selector
+                else None
+            ),
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):

@@ -77,17 +77,19 @@ def transform_index_page_table_prefill_fast(
 ) -> torch.Tensor:
     # TODO(baizhou): can be implemented with another triton kernel
     assert page_size == 1
-    result = torch.empty_like(topk_indices, dtype=torch.int32)
-    assert len(extend_lens_cpu) == page_table.shape[0]
+    active_rows = _validate_prefill_row_domain(
+        page_table, topk_indices, extend_lens_cpu
+    )
+    result = torch.full_like(topk_indices, -1, dtype=torch.int32)
     offset = 0
-    for i, l in enumerate(extend_lens_cpu):
+    for i, length in enumerate(extend_lens_cpu):
         transform_index_page_table_decode_fast(
-            page_table[i].unsqueeze(0).expand(l, -1),
-            topk_indices[offset : offset + l],
-            result=result[offset : offset + l],
+            page_table[i].unsqueeze(0).expand(length, -1),
+            topk_indices[offset : offset + length],
+            result=result[offset : offset + length],
         )
-        offset += l
-    assert offset == topk_indices.shape[0]
+        offset += length
+    assert offset == active_rows
     return result
 
 
@@ -112,6 +114,29 @@ def transform_index_page_table_decode_ref(
     return result
 
 
+def _validate_prefill_row_domain(
+    page_table: torch.Tensor,
+    topk_indices: torch.Tensor,
+    extend_lens_cpu: List[int],
+) -> int:
+    if len(extend_lens_cpu) != page_table.shape[0]:
+        raise ValueError(
+            "Prefill extend lengths must contain one entry per page-table row"
+        )
+    active_rows = sum(extend_lens_cpu)
+    if active_rows > topk_indices.shape[0]:
+        raise ValueError(
+            f"Prefill metadata names {active_rows} active rows, but top-k indices "
+            f"contain only {topk_indices.shape[0]} rows"
+        )
+    if active_rows < topk_indices.shape[0]:
+        torch._assert_async(
+            torch.all(topk_indices[active_rows:] == -1),
+            "Prefill rows beyond the active token domain must be -1 padding",
+        )
+    return active_rows
+
+
 def transform_index_page_table_prefill_ref(
     page_table: torch.Tensor,
     topk_indices: torch.Tensor,
@@ -119,17 +144,19 @@ def transform_index_page_table_prefill_ref(
     page_size: int = 1,
 ) -> torch.Tensor:
     assert page_size == 1
-    result = torch.empty_like(topk_indices, dtype=torch.int32)
-    assert len(extend_lens_cpu) == page_table.shape[0]
+    active_rows = _validate_prefill_row_domain(
+        page_table, topk_indices, extend_lens_cpu
+    )
+    result = torch.full_like(topk_indices, -1, dtype=torch.int32)
     offset = 0
-    for i, l in enumerate(extend_lens_cpu):
+    for i, length in enumerate(extend_lens_cpu):
         transform_index_page_table_decode_ref(
-            page_table[i].unsqueeze(0).expand(l, -1),
-            topk_indices[offset : offset + l],
-            result=result[offset : offset + l],
+            page_table[i].unsqueeze(0).expand(length, -1),
+            topk_indices[offset : offset + length],
+            result=result[offset : offset + length],
         )
-        offset += l
-    assert offset == topk_indices.shape[0]
+        offset += length
+    assert offset == active_rows
     return result
 
 

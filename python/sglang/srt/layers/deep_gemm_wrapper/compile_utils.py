@@ -102,6 +102,28 @@ class DeepGemmKernelType(IntEnum):
 _INITIALIZATION_DICT: Dict[Tuple[DeepGemmKernelType, int, int, int], bool] = dict()
 
 
+@contextmanager
+def _temporary_deep_gemm_compile_mode(deep_gemm_module):
+    """Enable legacy eager compilation when the installed DeepGEMM supports it."""
+    has_getter = hasattr(deep_gemm_module, "get_compile_mode")
+    has_setter = hasattr(deep_gemm_module, "set_compile_mode")
+    if has_getter != has_setter:
+        raise RuntimeError(
+            "DeepGEMM must expose both get_compile_mode and set_compile_mode, or neither"
+        )
+
+    if not has_getter:
+        yield
+        return
+
+    old_compile_mode = deep_gemm_module.get_compile_mode()
+    deep_gemm_module.set_compile_mode(1)
+    try:
+        yield
+    finally:
+        deep_gemm_module.set_compile_mode(old_compile_mode)
+
+
 # TODO improve code
 def _maybe_compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
@@ -194,12 +216,10 @@ def _compile_deep_gemm_one_type_all(
             kernel_type, max_m=max_m, n=n, k=k, num_groups=num_groups
         )
 
-        old_compile_mode = deep_gemm.get_compile_mode()
-        deep_gemm.set_compile_mode(1)
-        # TODO can use multi thread
-        for m in tqdm(m_list, desc=f"DeepGEMM warmup"):
-            executor.execute(m=m)
-        deep_gemm.set_compile_mode(old_compile_mode)
+        with _temporary_deep_gemm_compile_mode(deep_gemm):
+            # TODO can use multi thread
+            for m in tqdm(m_list, desc="DeepGEMM warmup"):
+                executor.execute(m=m)
 
         # clean up input buffers
         torch.cuda.current_stream().synchronize()

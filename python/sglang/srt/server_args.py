@@ -157,6 +157,10 @@ DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
 GLM_NSA_DETERMINISTIC_BACKEND_PAIR = ("flashmla_sparse", "fa3")
+GLM_NSA_EXACT_SPARSE_DETERMINISTIC_BACKEND_PAIR = (
+    "flashmla_sparse",
+    "flashmla_sparse",
+)
 
 NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
@@ -1510,9 +1514,15 @@ class ServerArgs:
                             assert (
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
-                        assert (
-                            self.tp_size == 8
-                        ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
+                        supported_cp_sizes = (
+                            (8, 16)
+                            if model_arch == "GlmMoeDsaForCausalLM"
+                            else (8,)
+                        )
+                        assert self.tp_size in supported_cp_sizes, (
+                            "NSA prefill context parallelism supports TP8, plus the "
+                            "two-node TP16 exact-parity lane for GlmMoeDsaForCausalLM"
+                        )
                         self.attn_cp_size = self.tp_size
 
                         logger.warning(
@@ -3225,10 +3235,13 @@ class ServerArgs:
                     self.nsa_prefill_backend,
                     self.nsa_decode_backend,
                 )
-                if nsa_backend_pair != GLM_NSA_DETERMINISTIC_BACKEND_PAIR:
+                allowed_glm_pairs = {GLM_NSA_DETERMINISTIC_BACKEND_PAIR}
+                if self.rl_on_policy_target == XORL_BATCH_INVARIANT_TARGET:
+                    allowed_glm_pairs.add(GLM_NSA_EXACT_SPARSE_DETERMINISTIC_BACKEND_PAIR)
+                if nsa_backend_pair not in allowed_glm_pairs:
                     raise ValueError(
                         "Deterministic GLM NSA requires "
-                        f"prefill/decode backends {GLM_NSA_DETERMINISTIC_BACKEND_PAIR}, "
+                        f"prefill/decode backends in {sorted(allowed_glm_pairs)}, "
                         f"but got {nsa_backend_pair}."
                     )
             elif self.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:

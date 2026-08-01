@@ -991,7 +991,6 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self._pad_inputs_to_size(model_runner, tokens_padded, self.batch_size)
 
     def post_forward_mlp_sync_batch(self, logits_output: LogitsProcessorOutput):
-
         self.forward_mode = getattr(self, "_original_forward_mode", self.forward_mode)
         self.batch_size = getattr(self, "_original_batch_size", self.batch_size)
         bs = self.batch_size
@@ -1032,6 +1031,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.out_cache_loc = self.output_cache_loc_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
+            if self.forward_mode.is_decode():
+                # MLP synchronization may pad a logical decode batch to the
+                # attention-CP width. Sampling consumes request-shaped metadata,
+                # so restore it alongside the already restored logits.
+                self.positions = self.positions[:bs]
+                self.seq_lens = self.seq_lens[:bs]
+                self.req_pool_indices = self.req_pool_indices[:bs]
+                if self.seq_lens_cpu is not None:
+                    self.seq_lens_cpu = self.seq_lens_cpu[:bs]
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]

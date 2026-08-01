@@ -86,6 +86,23 @@ class TestDeterministicGlmNsa(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Deterministic GLM NSA requires"):
             server_args._handle_deterministic_inference()
 
+    def test_accepts_sparse_sparse_decode_only_for_xorl_contract(self):
+        server_args = self._server_args(decode_backend="flashmla_sparse")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        server_args._handle_deterministic_inference()
+
+        self.assertEqual(server_args.nsa_decode_backend, "flashmla_sparse")
+        self.assertTrue(server_args.disable_radix_cache)
+
+    def test_rejects_sparse_sparse_decode_without_xorl_contract(self):
+        server_args = self._server_args(decode_backend="flashmla_sparse")
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        with self.assertRaisesRegex(ValueError, "Deterministic GLM NSA requires"):
+            server_args._handle_deterministic_inference()
+
     def test_top_level_fa3_remains_a_distinct_non_nsa_path(self):
         server_args = self._server_args()
         server_args.attention_backend = "fa3"
