@@ -1,6 +1,5 @@
 import logging
 from abc import ABC
-from contextlib import contextmanager
 from typing import Optional
 
 import numpy as np
@@ -15,12 +14,12 @@ from sglang.srt.layers.dp_attention import (
     get_dp_local_info,
     is_dp_attention_enabled,
 )
-from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.server_args import get_global_server_args
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +178,12 @@ class RoutedExpertsCapturer(ABC):
     ):
         raise NotImplementedError
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor, topk_weights: Optional[torch.Tensor] = None):
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor] = None,
+    ):
         raise NotImplementedError
 
     def get_routed_experts(
@@ -284,21 +288,33 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.host_cache.buffer[out_cache_loc_cpu] = self.device_cache.buffer[
             local_start_pos:local_end_pos, :, : self.num_experts_per_tok
         ].cpu()
-        if self.capture_topk_weights and self.host_cache.topk_weights_buffer is not None:
+        if (
+            self.capture_topk_weights
+            and self.host_cache.topk_weights_buffer is not None
+        ):
             self.host_cache.topk_weights_buffer[out_cache_loc_cpu] = (
                 self.device_cache.topk_weights_buffer[
                     local_start_pos:local_end_pos, :, : self.num_experts_per_tok
                 ].cpu()
             )
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor, topk_weights: Optional[torch.Tensor] = None):
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor] = None,
+    ):
         if get_moe_a2a_backend().is_deepep():
             local_topk_ids = topk_ids
-            topk_ids = self.gather_buffer[: local_topk_ids.size(0) * get_attention_tp_size()]
+            topk_ids = self.gather_buffer[
+                : local_topk_ids.size(0) * get_attention_tp_size()
+            ]
             attn_tp_all_gather_into_tensor(topk_ids, local_topk_ids)
             if topk_weights is not None and self.capture_topk_weights:
                 local_topk_weights = topk_weights
-                topk_weights = self.gather_weights_buffer[: local_topk_weights.size(0) * get_attention_tp_size()]
+                topk_weights = self.gather_weights_buffer[
+                    : local_topk_weights.size(0) * get_attention_tp_size()
+                ]
                 attn_tp_all_gather_into_tensor(topk_weights, local_topk_weights)
         self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
         if topk_weights is not None:
@@ -354,7 +370,12 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     ):
         pass
 
-    def capture(self, layer_id: int, topk_ids: torch.Tensor, topk_weights: Optional[torch.Tensor] = None):
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        topk_weights: Optional[torch.Tensor] = None,
+    ):
         pass
 
     def get_routed_experts(

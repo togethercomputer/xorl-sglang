@@ -40,6 +40,8 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.glm52_positions import (
     CanonicalMoEPositions,
+)
+from sglang.srt.layers.glm52_positions import (
     align_glm52_moe_positions as _align_glm52_moe_positions,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -101,9 +103,9 @@ class NSACPLayerCommunicator(LayerCommunicator):
     def _post_init_communicate(self):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
         if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
-            assert self._context.attn_dp_size == 1, (
-                "dp_size should be 1 when moe_runner_backend is none"
-            )
+            assert (
+                self._context.attn_dp_size == 1
+            ), "dp_size should be 1 when moe_runner_backend is none"
         self._communicate_simple_fn = NSACPCommunicateSimpleFn.get_fn(
             input_mode=ScatterMode.SCATTERED,
             output_mode=ScatterMode.SCATTERED,

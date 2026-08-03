@@ -684,7 +684,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts or get_global_server_args().enable_return_expert_logits,
+                enable=get_global_server_args().enable_return_routed_experts
+                or get_global_server_args().enable_return_expert_logits,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
@@ -1397,7 +1398,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # NCCL needs the correct device context to initialize properly
             if self.device == "cuda":
                 torch.cuda.set_device(self.gpu_id)
-                logger.info(f"Set CUDA device to {self.gpu_id} before process group creation")
+                logger.info(
+                    f"Set CUDA device to {self.gpu_id} before process group creation"
+                )
 
             # IMPORTANT: device_id forces eager NCCL communicator creation.
             # xorl's training side also passes device_id, so both sides must
@@ -1405,8 +1408,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # rank 0 hangs in _new_process_group_helper waiting for peers that
             # never enter the collective. Do NOT remove this without also
             # changing xorl's nccl_broadcast.py to match.
-            device_id = torch.device(f"cuda:{self.gpu_id}") if self.device == "cuda" else None
-            logger.info(f"Creating process group with device_id={device_id}, NCCL_CUMEM_ENABLE=0")
+            device_id = (
+                torch.device(f"cuda:{self.gpu_id}") if self.device == "cuda" else None
+            )
+            logger.info(
+                f"Creating process group with device_id={device_id}, NCCL_CUMEM_ENABLE=0"
+            )
 
             na = NetworkAddress(master_address, master_port)
             self._model_update_group[group_name] = init_custom_process_group(
@@ -1600,7 +1607,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     for transfer in expert_transfer_plan:
                         name = transfer["weight_name"]
                         if name not in params_dict:
-                            logger.warning(f"[EP_SCATTER] Expert param {name} not found, skipping")
+                            logger.warning(
+                                f"[EP_SCATTER] Expert param {name} not found, skipping"
+                            )
                             continue
 
                         param = params_dict[name]
@@ -1628,12 +1637,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                     f"expected {expected_shape}, got {actual_shape}"
                                 )
 
-                            p2p_ops.append(P2POp(
-                                op=torch.distributed.irecv,
-                                tensor=recv_buffer,
-                                peer=source_rank,
-                                group=group,
-                            ))
+                            p2p_ops.append(
+                                P2POp(
+                                    op=torch.distributed.irecv,
+                                    tensor=recv_buffer,
+                                    peer=source_rank,
+                                    group=group,
+                                )
+                            )
 
                         updated_count += 1
 
@@ -1642,7 +1653,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     for transfer in non_expert_transfer_plan:
                         name = transfer["weight_name"]
                         if name not in params_dict:
-                            logger.warning(f"[EP_SCATTER] Non-expert param {name} not found, skipping")
+                            logger.warning(
+                                f"[EP_SCATTER] Non-expert param {name} not found, skipping"
+                            )
                             continue
 
                         param = params_dict[name]
@@ -1657,12 +1670,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 f"expected {per_transfer_shape}, got {actual_shape}"
                             )
 
-                        p2p_ops.append(P2POp(
-                            op=torch.distributed.irecv,
-                            tensor=param.data,
-                            peer=source_rank,
-                            group=group,
-                        ))
+                        p2p_ops.append(
+                            P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=param.data,
+                                peer=source_rank,
+                                group=group,
+                            )
+                        )
 
                         updated_count += 1
 
@@ -1670,12 +1685,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 # Legacy mode: detect expert weights by naming patterns
                 for name in weight_names:
                     if name not in params_dict:
-                        logger.warning(f"[EP_SCATTER] Parameter {name} not found, skipping")
+                        logger.warning(
+                            f"[EP_SCATTER] Parameter {name} not found, skipping"
+                        )
                         continue
 
                     param = params_dict[name]
                     # Detect expert weights by common MoE naming patterns
-                    is_expert = ".experts." in name or "w13_weight" in name or "w2_weight" in name
+                    is_expert = (
+                        ".experts." in name
+                        or "w13_weight" in name
+                        or "w2_weight" in name
+                    )
 
                     if is_expert:
                         # Expert weights: receive from ALL EP ranks into slices of param.data
@@ -1689,20 +1710,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             # param.data[start:end] is a contiguous view for dim-0 slicing
                             recv_slice = param.data[expert_start:expert_end]
 
-                            p2p_ops.append(P2POp(
-                                op=torch.distributed.irecv,
-                                tensor=recv_slice,
-                                peer=ep_rank,  # Training EP ranks are global ranks 0 to (training_world_size-1)
-                                group=group,
-                            ))
+                            p2p_ops.append(
+                                P2POp(
+                                    op=torch.distributed.irecv,
+                                    tensor=recv_slice,
+                                    peer=ep_rank,  # Training EP ranks are global ranks 0 to (training_world_size-1)
+                                    group=group,
+                                )
+                            )
                     else:
                         # Non-expert weights: receive from rank 0 directly into param.data
-                        p2p_ops.append(P2POp(
-                            op=torch.distributed.irecv,
-                            tensor=param.data,  # Receive directly into param.data!
-                            peer=0,
-                            group=group,
-                        ))
+                        p2p_ops.append(
+                            P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=param.data,  # Receive directly into param.data!
+                                peer=0,
+                                group=group,
+                            )
+                        )
 
                     updated_count += 1
 
@@ -1739,12 +1764,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             source_rank = range_info["source_nccl_rank"]
 
                             recv_buffer = param.data[start:end]
-                            expert_p2p_ops.append(P2POp(
-                                op=torch.distributed.irecv,
-                                tensor=recv_buffer,
-                                peer=source_rank,
-                                group=group,
-                            ))
+                            expert_p2p_ops.append(
+                                P2POp(
+                                    op=torch.distributed.irecv,
+                                    tensor=recv_buffer,
+                                    peer=source_rank,
+                                    group=group,
+                                )
+                            )
 
                         updated_count += 1
 
@@ -1762,26 +1789,34 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         continue
 
                     param = params_dict[name]
-                    is_expert = ".experts." in name or "w13_weight" in name or "w2_weight" in name
+                    is_expert = (
+                        ".experts." in name
+                        or "w13_weight" in name
+                        or "w2_weight" in name
+                    )
 
                     if is_expert:
                         for ep_rank in range(training_world_size):
                             expert_start = ep_rank * num_experts_per_rank
                             expert_end = (ep_rank + 1) * num_experts_per_rank
                             recv_slice = param.data[expert_start:expert_end]
-                            expert_p2p_ops.append(P2POp(
-                                op=torch.distributed.irecv,
-                                tensor=recv_slice,
-                                peer=ep_rank,
-                                group=group,
-                            ))
+                            expert_p2p_ops.append(
+                                P2POp(
+                                    op=torch.distributed.irecv,
+                                    tensor=recv_slice,
+                                    peer=ep_rank,
+                                    group=group,
+                                )
+                            )
                     else:
-                        non_expert_p2p_ops.append(P2POp(
-                            op=torch.distributed.irecv,
-                            tensor=param.data,
-                            peer=0,
-                            group=group,
-                        ))
+                        non_expert_p2p_ops.append(
+                            P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=param.data,
+                                peer=0,
+                                group=group,
+                            )
+                        )
 
                     updated_count += 1
 
@@ -1813,7 +1848,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                                 break
 
                 num_layers = len(layer_transfers)
-                logger.info(f"[TP{self.tp_rank}] PHASE 1: Starting {num_layers} expert layers")
+                logger.info(
+                    f"[TP{self.tp_rank}] PHASE 1: Starting {num_layers} expert layers"
+                )
 
                 for layer_idx in sorted(layer_transfers.keys()):
                     layer_batch = layer_transfers[layer_idx]
@@ -1830,15 +1867,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             source_rank = range_info["source_nccl_rank"]
 
                             recv_buffer = param.data[start:end]
-                            layer_ops.append(P2POp(
-                                op=torch.distributed.irecv,
-                                tensor=recv_buffer,
-                                peer=source_rank,
-                                group=group,
-                            ))
+                            layer_ops.append(
+                                P2POp(
+                                    op=torch.distributed.irecv,
+                                    tensor=recv_buffer,
+                                    peer=source_rank,
+                                    group=group,
+                                )
+                            )
 
                     if layer_ops:
-                        logger.debug(f"[TP{self.tp_rank}] PHASE 1: Layer {layer_idx}, {len(layer_ops)} recv ops")
+                        logger.debug(
+                            f"[TP{self.tp_rank}] PHASE 1: Layer {layer_idx}, {len(layer_ops)} recv ops"
+                        )
                         reqs = batch_isend_irecv(layer_ops)
                         for req in reqs:
                             req.wait()
@@ -1849,12 +1890,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
             elif expert_p2p_ops:
                 # Legacy mode: no transfer plan, use pre-built ops in a single batch
-                logger.debug(f"[TP{self.tp_rank}] PHASE 1 (legacy): Built {len(expert_p2p_ops)} expert recv ops")
+                logger.debug(
+                    f"[TP{self.tp_rank}] PHASE 1 (legacy): Built {len(expert_p2p_ops)} expert recv ops"
+                )
                 reqs = batch_isend_irecv(expert_p2p_ops)
                 for req in reqs:
                     req.wait()
                 torch.cuda.synchronize()
-                logger.debug(f"[TP{self.tp_rank}] PHASE 1 (legacy): Expert weights synchronized")
+                logger.debug(
+                    f"[TP{self.tp_rank}] PHASE 1 (legacy): Expert weights synchronized"
+                )
 
             # ========== PHASE 2: Non-Expert Weights (in sub-batches) ==========
             # Process non-expert weights in batches to match Tomni's batched sending.
@@ -1862,8 +1907,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if non_expert_transfer_plan:
                 # Use transfer plan for batched processing
                 num_non_expert = len(non_expert_transfer_plan)
-                num_batches = (num_non_expert + non_expert_batch_size - 1) // non_expert_batch_size
-                logger.info(f"[TP{self.tp_rank}] PHASE 2: Processing {num_non_expert} non-expert weights in {num_batches} batches")
+                num_batches = (
+                    num_non_expert + non_expert_batch_size - 1
+                ) // non_expert_batch_size
+                logger.info(
+                    f"[TP{self.tp_rank}] PHASE 2: Processing {num_non_expert} non-expert weights in {num_batches} batches"
+                )
 
                 for batch_idx in range(num_batches):
                     start_idx = batch_idx * non_expert_batch_size
@@ -1879,12 +1928,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         param = params_dict[name]
                         source_rank = transfer["source_nccl_rank"]
 
-                        batch_ops.append(P2POp(
-                            op=torch.distributed.irecv,
-                            tensor=param.data,
-                            peer=source_rank,
-                            group=group,
-                        ))
+                        batch_ops.append(
+                            P2POp(
+                                op=torch.distributed.irecv,
+                                tensor=param.data,
+                                peer=source_rank,
+                                group=group,
+                            )
+                        )
 
                     if batch_ops:
                         reqs = batch_isend_irecv(batch_ops)
@@ -1892,18 +1943,27 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                             req.wait()
                         torch.cuda.synchronize()
 
-                logger.info(f"[TP{self.tp_rank}] PHASE 2: All non-expert batches complete")
+                logger.info(
+                    f"[TP{self.tp_rank}] PHASE 2: All non-expert batches complete"
+                )
 
             elif non_expert_p2p_ops:
                 # Legacy mode: process pre-built ops in a single batch
                 reqs = batch_isend_irecv(non_expert_p2p_ops)
                 for req in reqs:
                     req.wait()
-                logger.debug(f"[TP{self.tp_rank}] PHASE 2 (legacy): All ops complete, synchronizing...")
+                logger.debug(
+                    f"[TP{self.tp_rank}] PHASE 2 (legacy): All ops complete, synchronizing..."
+                )
                 torch.cuda.synchronize()
 
-            logger.info(f"[TP{self.tp_rank}] ep_scatter_receive complete: Updated {updated_count} params")
-            return True, f"Updated {updated_count} params in-place from {training_world_size} EP ranks (2-phase batched)"
+            logger.info(
+                f"[TP{self.tp_rank}] ep_scatter_receive complete: Updated {updated_count} params"
+            )
+            return (
+                True,
+                f"Updated {updated_count} params in-place from {training_world_size} EP ranks (2-phase batched)",
+            )
 
         except Exception as e:
             logger.error(f"EP scatter receive failed: {e}", exc_info=True)
@@ -2066,7 +2126,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         """Receive a single bucket as a flattened tensor."""
         # Use explicit device based on gpu_id for NCCL compatibility
-        explicit_device = f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        explicit_device = (
+            f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        )
         named_tensors = []
         for name, dtype, shape in zip(names, dtypes, shapes):
             target_dtype = (
@@ -2113,7 +2175,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Allocate all tensors first
         # Use explicit device based on gpu_id for NCCL compatibility
-        explicit_device = f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        explicit_device = (
+            f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        )
         for name, dtype, shape in zip(names, dtypes, shapes):
             target_dtype = (
                 dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
@@ -2250,7 +2314,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             Tuple[bool, str]: (success, message)
         """
-        logger.info(f"receive_weights: receiving {num_buckets} buckets via group '{group_name}'")
+        logger.info(
+            f"receive_weights: receiving {num_buckets} buckets via group '{group_name}'"
+        )
 
         # Get the NCCL group
         if group_name not in self._model_update_group:
@@ -2303,7 +2369,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             # Ensure use_presharded_weights=False for NCCL weight sync
             # NCCL sync sends FULL weights that need to be sharded per TP rank
             for module in self.model.modules():
-                if hasattr(module, 'use_presharded_weights'):
+                if hasattr(module, "use_presharded_weights"):
                     if module.use_presharded_weights:
                         module.use_presharded_weights = False
 
@@ -2311,24 +2377,41 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.model.load_weights(all_weights)
 
             # Re-establish tied embeddings if necessary (defensive fix)
-            has_tied_embeddings = getattr(self.model_config.hf_config, 'tie_word_embeddings', False)
+            has_tied_embeddings = getattr(
+                self.model_config.hf_config, "tie_word_embeddings", False
+            )
             if has_tied_embeddings:
                 try:
-                    if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                    if hasattr(self.model, "model") and hasattr(
+                        self.model.model, "embed_tokens"
+                    ):
                         embed_weight = self.model.model.embed_tokens.weight
-                        if hasattr(self.model, 'lm_head') and hasattr(self.model.lm_head, 'weight'):
-                            if embed_weight.data_ptr() != self.model.lm_head.weight.data_ptr():
-                                logger.warning("receive_weights: tied embeddings aliasing broken, re-establishing...")
+                        if hasattr(self.model, "lm_head") and hasattr(
+                            self.model.lm_head, "weight"
+                        ):
+                            if (
+                                embed_weight.data_ptr()
+                                != self.model.lm_head.weight.data_ptr()
+                            ):
+                                logger.warning(
+                                    "receive_weights: tied embeddings aliasing broken, re-establishing..."
+                                )
                                 self.model.lm_head.weight = embed_weight
                 except Exception as e:
-                    logger.warning(f"receive_weights: could not verify/fix tied embeddings: {e}")
+                    logger.warning(
+                        f"receive_weights: could not verify/fix tied embeddings: {e}"
+                    )
 
             # CRITICAL: Synchronize CUDA to ensure all weight updates are complete
             torch.cuda.synchronize()
 
             # CRITICAL: Recapture CUDA graphs after weight update
             # CUDA graphs capture memory pointers at capture time - must recapture when weights change
-            if recapture_cuda_graph and self.device == "cuda" and not self.server_args.disable_cuda_graph:
+            if (
+                recapture_cuda_graph
+                and self.device == "cuda"
+                and not self.server_args.disable_cuda_graph
+            ):
                 self.init_device_graphs()
 
             return True, f"Received and applied {len(all_weights)} weights"
@@ -2442,11 +2525,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             weights = []
             for param_name, param in self.model.named_parameters():
                 if prefix is None or param_name.startswith(prefix):
-                    weights.append({
-                        "name": param_name,
-                        "shape": list(param.shape),
-                        "data_ptr": param.data.data_ptr(),
-                    })
+                    weights.append(
+                        {
+                            "name": param_name,
+                            "shape": list(param.shape),
+                            "data_ptr": param.data.data_ptr(),
+                        }
+                    )
 
             return {
                 "success": True,

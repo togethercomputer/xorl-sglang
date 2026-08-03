@@ -980,7 +980,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
-                return_expert_logits=getattr(obj, 'return_expert_logits', False),
+                return_expert_logits=getattr(obj, "return_expert_logits", False),
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
                 priority=obj.priority,
@@ -1514,7 +1514,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             BatchTokenIDOutput,
         ],
     ):
-        def _safe_get_field_value(field_values, field_name: str, req_index: int, req_id: str):
+        def _safe_get_field_value(
+            field_values, field_name: str, req_index: int, req_id: str
+        ):
             if field_values is None:
                 return None
             if req_index >= len(field_values):

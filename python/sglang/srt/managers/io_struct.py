@@ -1389,9 +1389,7 @@ class PrepareWeightsUpdateReqInput(BaseReq):
         elif self.names is not None:
             # Convert flat format to single bucket
             return [
-                WeightBucket(
-                    names=self.names, dtypes=self.dtypes, shapes=self.shapes
-                )
+                WeightBucket(names=self.names, dtypes=self.dtypes, shapes=self.shapes)
             ]
         else:
             raise ValueError(
@@ -1495,11 +1493,15 @@ class ReceiveWeightsEPScatterReqInput(BaseReq):
     sender and receiver buffers to have identical shapes.
     """
 
-    weight_names: List[str]  # Unique weight names to receive (legacy, for compatibility)
+    weight_names: List[
+        str
+    ]  # Unique weight names to receive (legacy, for compatibility)
     group_name: str = "ep_scatter_group"
     training_world_size: int = 8  # Number of EP training ranks
     num_experts_per_rank: int = 16  # Experts per training rank
-    total_num_experts: int = 128  # Total experts = training_world_size * num_experts_per_rank
+    total_num_experts: int = (
+        128  # Total experts = training_world_size * num_experts_per_rank
+    )
     inference_tp_size: int = 8  # TP size on inference side
     flush_cache: bool = True
     free_kv_cache_before_recv: bool = False

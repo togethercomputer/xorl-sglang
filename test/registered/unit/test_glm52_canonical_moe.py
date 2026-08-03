@@ -1,8 +1,8 @@
 import importlib.util
 import unittest
 from dataclasses import replace
-from unittest.mock import patch
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -12,24 +12,24 @@ from sglang.srt.distributed.canonical_moe import (
     CanonicalDistribution,
     CanonicalMoEOutput,
     CanonicalMoEReceipt,
-    CanonicalTransport,
     CanonicalMoEWorkspace,
     CanonicalRowSlots,
+    CanonicalTransport,
     SamplerParallelPlan,
     canonical_moe_reference,
     canonicalize_glm52_local_partial,
     canonicalize_glm52_local_partial_v3,
-)
-from sglang.srt.models.glm52_index_share import (
-    CanonicalLogicalIndices,
-    Glm52IndexShareManager,
-    Glm52IndexSharePlan,
 )
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode_ref,
     transform_index_page_table_prefill_ref,
 )
 from sglang.srt.layers.glm52_positions import align_glm52_moe_positions
+from sglang.srt.models.glm52_index_share import (
+    CanonicalLogicalIndices,
+    Glm52IndexShareManager,
+    Glm52IndexSharePlan,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
@@ -423,8 +423,8 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             ScatterMode,
         )
         from sglang.srt.layers.communicator_nsa_cp import (
-            NSAMLPOutputLayout,
             NSACPLayerCommunicator,
+            NSAMLPOutputLayout,
         )
         from sglang.srt.models.deepseek_v2 import (
             DeepseekV2DecoderLayer,
@@ -693,8 +693,8 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             ScatterMode,
         )
         from sglang.srt.layers.communicator_nsa_cp import (
-            NSAMLPOutputLayout,
             NSACPLayerCommunicator,
+            NSAMLPOutputLayout,
         )
 
         modes = LayerScatterModes(
@@ -772,8 +772,8 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             ScatterMode,
         )
         from sglang.srt.layers.communicator_nsa_cp import (
-            NSAMLPOutputLayout,
             NSACPLayerCommunicator,
+            NSAMLPOutputLayout,
         )
         from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 

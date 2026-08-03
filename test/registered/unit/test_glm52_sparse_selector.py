@@ -1,7 +1,7 @@
 import logging
 import unittest
-from unittest import mock
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -15,8 +15,8 @@ from sglang.srt.layers.attention.nsa.glm52_selector import (
     select_canonical_logical_topk,
 )
 from sglang.srt.layers.attention.nsa_backend import (
-    NSAIndexerMetadata,
     NativeSparseAttnBackend,
+    NSAIndexerMetadata,
     TopkTransformMethod,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode

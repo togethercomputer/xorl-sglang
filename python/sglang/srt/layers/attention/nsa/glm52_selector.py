@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
-from dataclasses import dataclass
 import hashlib
 import logging
+from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Iterator, Mapping, Sequence
 
 import torch

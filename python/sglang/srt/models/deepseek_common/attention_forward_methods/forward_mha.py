@@ -477,9 +477,9 @@ class DeepseekMHAForwardMixin:
         if isinstance(backend, TboAttnBackend):  # if enable tbo, get primary backend
             backend = backend.primary
         kv_indices = backend.forward_metadata.page_table_1_flattened
-        assert kv_indices is not None, (
-            "page_table_1_flattened should have been generated for FP8 MHA path"
-        )
+        assert (
+            kv_indices is not None
+        ), "page_table_1_flattened should have been generated for FP8 MHA path"
 
         kv_cache_fp8 = forward_batch.token_to_kv_pool.get_key_buffer(
             self.attn_mha.layer_id

@@ -251,7 +251,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         prompt_kwargs = {"input_ids": request.input_ids}
 
-         # Extract custom labels from raw request headers
+        # Extract custom labels from raw request headers
         custom_labels = self.extract_custom_labels(raw_request)
 
         # Resolve LoRA adapter from model parameter or explicit lora_path
@@ -293,7 +293,6 @@ class OpenAIServingChat(OpenAIServingBase):
 
         return adapted_request, request
 
-
     def _convert_to_internal_request(
         self,
         request: ChatCompletionRequest,
@@ -316,7 +315,9 @@ class OpenAIServingChat(OpenAIServingBase):
         is_multimodal = self.tokenizer_manager.model_config.is_multimodal
 
         if request.input_ids:
-            return self._convert_chat_completion_with_input_ids_to_internal_request(request, raw_request)
+            return self._convert_chat_completion_with_input_ids_to_internal_request(
+                request, raw_request
+            )
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
@@ -1006,9 +1007,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if request.logprobs:
                 choice_logprobs = self._process_response_logprobs(ret_item)
                 input_token_logprobs = ret_item["meta_info"]["input_token_logprobs"]
-                input_token_ids = [
-                    token_id for _, token_id, _ in input_token_logprobs
-                ]
+                input_token_ids = [token_id for _, token_id, _ in input_token_logprobs]
 
             # Handle hidden states
             hidden_states = process_hidden_states_from_ret(ret_item, request)

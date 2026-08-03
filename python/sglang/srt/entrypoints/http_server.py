@@ -120,9 +120,9 @@ from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
     GenerateReqInput,
     GetWeightsByNameReqInput,
-    ListWeightsReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
+    ListWeightsReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     OpenSessionReqInput,
@@ -1075,12 +1075,15 @@ async def list_weights(prefix: str = None, rank: int = 0):
         result = await _global_state.tokenizer_manager.list_weights(
             ListWeightsReqInput(prefix=prefix), rank
         )
-        return ORJSONResponse(result, status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST)
+        return ORJSONResponse(
+            result,
+            status_code=200 if result.get("success", False) else HTTPStatus.BAD_REQUEST,
+        )
     except Exception as e:
         logger.error(f"list_weights failed: {e}")
         return ORJSONResponse(
             {"success": False, "message": str(e)},
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR
+            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
 
 
@@ -1166,8 +1169,8 @@ async def receive_weights_ep_scatter(
     This endpoint enables parallel weight transfer where all EP training ranks
     simultaneously send their local expert weights to all TP inference ranks.
     """
-    success, message = (
-        await _global_state.tokenizer_manager.receive_weights_ep_scatter(obj, request)
+    success, message = await _global_state.tokenizer_manager.receive_weights_ep_scatter(
+        obj, request
     )
     content = {"success": success, "message": message}
     return ORJSONResponse(
@@ -1177,9 +1180,7 @@ async def receive_weights_ep_scatter(
 
 @app.post("/prepare_weights_update")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def prepare_weights_update(
-    obj: PrepareWeightsUpdateReqInput, request: Request
-):
+async def prepare_weights_update(obj: PrepareWeightsUpdateReqInput, request: Request):
     """Phase 1 of two-phase weight update protocol.
 
     This starts background recv threads that are ready to receive NCCL broadcasts.
@@ -1190,8 +1191,8 @@ async def prepare_weights_update(
         2. Perform NCCL broadcast from the training side
         3. Call /complete_weights_update to apply the received weights
     """
-    success, message = (
-        await _global_state.tokenizer_manager.prepare_weights_update(obj, request)
+    success, message = await _global_state.tokenizer_manager.prepare_weights_update(
+        obj, request
     )
 
     if success:
@@ -1204,16 +1205,14 @@ async def prepare_weights_update(
 
 @app.post("/complete_weights_update")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def complete_weights_update(
-    obj: CompleteWeightsUpdateReqInput, request: Request
-):
+async def complete_weights_update(obj: CompleteWeightsUpdateReqInput, request: Request):
     """Phase 2 of two-phase weight update protocol.
 
     This waits for the background recv threads to complete and applies the weights.
     Should be called after the NCCL broadcast has completed on the sender side.
     """
-    success, message = (
-        await _global_state.tokenizer_manager.complete_weights_update(obj, request)
+    success, message = await _global_state.tokenizer_manager.complete_weights_update(
+        obj, request
     )
 
     content = {"success": success, "message": message}

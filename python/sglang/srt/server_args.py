@@ -1602,9 +1602,7 @@ class ServerArgs:
                                 self.dp_size == 1
                             ), "For round-robin split mode, dp attention is not supported."
                         supported_cp_sizes = (
-                            (8, 16)
-                            if model_arch == "GlmMoeDsaForCausalLM"
-                            else (8,)
+                            (8, 16) if model_arch == "GlmMoeDsaForCausalLM" else (8,)
                         )
                         assert self.tp_size in supported_cp_sizes, (
                             "NSA prefill context parallelism supports TP8, plus the "

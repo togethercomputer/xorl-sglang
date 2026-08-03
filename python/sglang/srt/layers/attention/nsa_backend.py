@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import IntEnum, auto
-from typing import TYPE_CHECKING, Callable, Dict, List, Literal, Optional, Tuple, TypeAlias
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Tuple,
+    TypeAlias,
+)
 
 import torch
 
@@ -10,6 +19,12 @@ from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
+from sglang.srt.layers.attention.nsa.glm52_selector import (
+    Glm52SparseReceiptBook,
+    pack_selected_kv_dynamic,
+    pack_selected_kv_static,
+    select_canonical_logical_topk,
+)
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     NativeSparseAttnBackendMTPPrecomputeMixin,
     PrecomputedMetadata,
@@ -19,18 +34,11 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import (
     BaseIndexerMetadata,
     as_deep_gemm_context_lens,
 )
-from sglang.srt.layers.attention.nsa.glm52_selector import (
-    Glm52SparseReceiptBook,
-    pack_selected_kv_dynamic,
-    pack_selected_kv_static,
-    select_canonical_logical_topk,
-)
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
-from sglang.srt.models.glm52_index_share import CanonicalLogicalIndices
 from sglang.srt.layers.attention.nsa.utils import (
     can_nsa_prefill_cp_round_robin_split,
     compute_nsa_seqlens,
@@ -45,8 +53,9 @@ from sglang.srt.layers.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.models.glm52_index_share import CanonicalLogicalIndices
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -608,9 +617,9 @@ class NativeSparseAttnBackend(
                         )
                     ]
                 )
-                assert page_table_1_flattened.shape[0] == sum(indexer_seq_lens_cpu), (
-                    f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
-                )
+                assert page_table_1_flattened.shape[0] == sum(
+                    indexer_seq_lens_cpu
+                ), f"{page_table_1_flattened.shape[0] = } must be the same as {sum(indexer_seq_lens_cpu) = }"
 
                 # Validate indices when logical tokens exceed physical capacity
                 # This is likely to be triggered by PP with high kv reuse & parallelism
@@ -1399,9 +1408,9 @@ class NativeSparseAttnBackend(
         if self.use_mha:
             assert k is not None and v is not None
             assert q_rope is None, "MHA_ONE_SHOT path should not pass q_rope"
-            assert layer.tp_k_head_num == layer.tp_q_head_num > 1, (
-                "MHA_ONE_SHOT requires dense multi-head config"
-            )
+            assert (
+                layer.tp_k_head_num == layer.tp_q_head_num > 1
+            ), "MHA_ONE_SHOT requires dense multi-head config"
             return self._forward_standard_mha(
                 q=q,
                 k=k,
@@ -2056,9 +2065,9 @@ class NativeSparseAttnBackend(
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert q_rope is not None, "For FP8 path q_rope should not be None."
             assert k_rope is not None, "For FP8 path k_rope should not be None."
-            assert cos_sin_cache is not None, (
-                "For FP8 path cos_sin_cache should not be None."
-            )
+            assert (
+                cos_sin_cache is not None
+            ), "For FP8 path cos_sin_cache should not be None."
 
             q, k, k_rope = mla_quantize_and_rope_for_fp8(
                 q,
@@ -2075,9 +2084,9 @@ class NativeSparseAttnBackend(
 
             # Save KV cache if requested
         if save_kv_cache:
-            assert k is not None and k_rope is not None, (
-                "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
-            )
+            assert (
+                k is not None and k_rope is not None
+            ), "For populating trtllm_mla kv cache, both k_nope and k_rope should be not None."
             cache_loc = (
                 forward_batch.out_cache_loc
                 if not layer.is_cross_attention
@@ -2230,7 +2239,8 @@ class NativeSparseAttnBackend(
         """
         if (
             # disable for MTP
-            self.nsa_kv_cache_store_fp8 and self.nsa_prefill_impl == "flashmla_sparse"
+            self.nsa_kv_cache_store_fp8
+            and self.nsa_prefill_impl == "flashmla_sparse"
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
         else:

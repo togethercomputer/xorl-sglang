@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import traceback
 from typing import TYPE_CHECKING, Tuple
 
@@ -14,8 +13,6 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.distributed import get_moe_ep_group, get_moe_tp_group, get_tp_group
-from sglang.srt.layers.dp_attention import get_attention_tp_group
 from sglang.srt.managers.io_struct import (
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
@@ -141,7 +138,9 @@ class SchedulerUpdateWeightsMixin:
             # Try to recreate KV cache buffers if we freed them and failed
             if kv_cache_freed:
                 try:
-                    logger.info("Attempting to recreate KV cache buffers after failure...")
+                    logger.info(
+                        "Attempting to recreate KV cache buffers after failure..."
+                    )
                     kv_cache._create_buffers()
                 except Exception as e2:
                     logger.error(f"Failed to recreate KV cache buffers: {e2}")
@@ -262,7 +261,9 @@ class SchedulerUpdateWeightsMixin:
                 if recv_req.recapture_cuda_graph:
                     need_recapture_cuda_graph = True
                     recv_req.recapture_cuda_graph = False
-                    logger.info("Deferring CUDA graph recapture until after KV cache buffer recreation.")
+                    logger.info(
+                        "Deferring CUDA graph recapture until after KV cache buffer recreation."
+                    )
 
             success, message = self.tp_worker.receive_weights(recv_req)
 
@@ -275,8 +276,13 @@ class SchedulerUpdateWeightsMixin:
                 # Now recapture CUDA graphs if needed (buffers are available now)
                 if need_recapture_cuda_graph and success:
                     model_runner = self.tp_worker.model_runner
-                    if model_runner.device == "cuda" and not model_runner.server_args.disable_cuda_graph:
-                        logger.info("Recapturing CUDA graphs after KV cache buffer recreation...")
+                    if (
+                        model_runner.device == "cuda"
+                        and not model_runner.server_args.disable_cuda_graph
+                    ):
+                        logger.info(
+                            "Recapturing CUDA graphs after KV cache buffer recreation..."
+                        )
                         model_runner.init_device_graphs()
                         logger.info("CUDA graph recapture complete.")
 
@@ -288,7 +294,9 @@ class SchedulerUpdateWeightsMixin:
             # Try to recreate KV cache buffers if we freed them and failed
             if kv_cache_freed:
                 try:
-                    logger.info("Attempting to recreate KV cache buffers after failure...")
+                    logger.info(
+                        "Attempting to recreate KV cache buffers after failure..."
+                    )
                     kv_cache._create_buffers()
                 except Exception as e2:
                     logger.error(f"Failed to recreate KV cache buffers: {e2}")
@@ -336,19 +344,31 @@ class SchedulerUpdateWeightsMixin:
                     # Initialize the group
                     # For EP scatter: inference ranks start at rank_offset in the global NCCL group
                     # With multiple endpoints, total world = training + ALL inference ranks (not just this endpoint)
-                    total_inference_ws = recv_req.total_inference_world_size if recv_req.total_inference_world_size is not None else self.tp_size
+                    total_inference_ws = (
+                        recv_req.total_inference_world_size
+                        if recv_req.total_inference_world_size is not None
+                        else self.tp_size
+                    )
                     total_world_size = recv_req.training_world_size + total_inference_ws
-                    rank_offset = recv_req.rank_offset if recv_req.rank_offset is not None else recv_req.training_world_size
-                    init_success, init_msg = self.tp_worker.model_runner.init_weights_update_group(
-                        master_address=recv_req.master_address,
-                        master_port=recv_req.master_port,
-                        rank_offset=rank_offset,
-                        world_size=total_world_size,
-                        group_name=recv_req.group_name,
-                        backend="nccl",
+                    rank_offset = (
+                        recv_req.rank_offset
+                        if recv_req.rank_offset is not None
+                        else recv_req.training_world_size
+                    )
+                    init_success, init_msg = (
+                        self.tp_worker.model_runner.init_weights_update_group(
+                            master_address=recv_req.master_address,
+                            master_port=recv_req.master_port,
+                            rank_offset=rank_offset,
+                            world_size=total_world_size,
+                            group_name=recv_req.group_name,
+                            backend="nccl",
+                        )
                     )
                     if not init_success:
-                        self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+                        self.send_to_detokenizer.send_output(
+                            WeightUpdateResumeReq(), recv_req
+                        )
                         return ReceiveWeightsEPScatterReqOutput(
                             success=False,
                             message=f"Failed to init NCCL group: {init_msg}",
@@ -356,7 +376,9 @@ class SchedulerUpdateWeightsMixin:
                     logger.info(f"NCCL group initialized: {init_msg}")
                 finally:
                     # Resume detokenizer after NCCL init
-                    self.send_to_detokenizer.send_output(WeightUpdateResumeReq(), recv_req)
+                    self.send_to_detokenizer.send_output(
+                        WeightUpdateResumeReq(), recv_req
+                    )
 
             # Now do the actual P2P receives
             success, message = self.tp_worker.receive_weights_ep_scatter(recv_req)
@@ -370,7 +392,9 @@ class SchedulerUpdateWeightsMixin:
                     # - KV cache layout doesn't change
                     # Avoids expensive torch.cuda.empty_cache() (~30s overhead).
                     torch.cuda.synchronize()
-                    logger.info("Weight transfer complete, using lightweight synchronize (skip_flush_cache=True)")
+                    logger.info(
+                        "Weight transfer complete, using lightweight synchronize (skip_flush_cache=True)"
+                    )
                 elif recv_req.flush_cache:
                     flush_success = self.flush_cache()
                     if not flush_success:

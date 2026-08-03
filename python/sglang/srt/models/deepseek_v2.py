@@ -65,6 +65,9 @@ from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
+from sglang.srt.layers.attention.nsa.glm52_selector import (
+    log_glm52_sparse_receipt_once,
+)
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
     can_cp_split,
@@ -75,9 +78,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     nsa_use_prefill_cp,
     prepare_input_dp_with_cp_dsa,
 )
-from sglang.srt.layers.attention.nsa.glm52_selector import (
-    log_glm52_sparse_receipt_once,
-)
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
@@ -86,8 +86,8 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_nsa_cp import (
     CanonicalMoEPositions,
-    NSAMLPOutputLayout,
     NSACPLayerCommunicator,
+    NSAMLPOutputLayout,
     align_glm52_moe_positions,
 )
 from sglang.srt.layers.dp_attention import (
@@ -381,9 +381,9 @@ class MoEGate(nn.Module):
                 raise TypeError(
                     "GLM-5.2 batch-invariant router requires BF16 hidden states and BF16 gate weights"
                 )
-            from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
                 bi_router_gemm,
-            )  # noqa: PLC0415
+            )
 
             logits = bi_router_gemm(hidden_states, self.weight)
             record_xorl_bi_engagement("bi_router_gemm")
@@ -535,15 +535,13 @@ class DeepseekV2MoE(nn.Module):
                     else {}
                 ),
             )
-            is_packed_weight = (
-                hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
-                and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
-                in {
+            is_packed_weight = hasattr(
+                self.shared_experts.gate_up_proj.quant_method, "quant_config"
+            ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
                 "awq",
                 "awq_marlin",
                 "moe_wna16",
             }
-            )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
@@ -565,7 +563,9 @@ class DeepseekV2MoE(nn.Module):
                         self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
                         == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
                     )
-                    self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    self.shared_experts_weight_block_size = (
+                        self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
+                    )
 
         self.top_k = config.num_experts_per_tok
 
@@ -1662,18 +1662,18 @@ class DeepseekV2AttentionMLA(
                 not get_attn_tp_context().input_scattered
                 and hidden_states[0].shape[0] == 0
             ):
-                assert not self.o_proj.reduce_results, (
-                    "short-circuiting allreduce will lead to hangs"
-                )
+                assert (
+                    not self.o_proj.reduce_results
+                ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states[0]
         else:
             if (
                 not get_attn_tp_context().input_scattered
                 and hidden_states.shape[0] == 0
             ):
-                assert not self.o_proj.reduce_results, (
-                    "short-circuiting allreduce will lead to hangs"
-                )
+                assert (
+                    not self.o_proj.reduce_results
+                ), "short-circuiting allreduce will lead to hangs"
                 return hidden_states, None, forward_batch, None
 
         attn_forward_method = self.dispatch_attn_forward_method(forward_batch)
@@ -1947,10 +1947,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         glm52_complete_mlp = glm52_canonical_moe or (
             glm52_xorl_bi_contract
-            and (
-                isinstance(self.mlp, DeepseekV2MLP)
-                and enable_moe_dense_fully_dp()
-            )
+            and (isinstance(self.mlp, DeepseekV2MLP) and enable_moe_dense_fully_dp())
         )
         if self.nsa_enable_prefill_cp:
             self.layer_communicator = NSACPLayerCommunicator(

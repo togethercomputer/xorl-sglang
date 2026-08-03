@@ -9,7 +9,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
-
 from sglang.srt.managers.io_struct import (
     AbortReq,
     BatchEmbeddingOutput,
@@ -919,7 +918,9 @@ class SchedulerOutputProcessorMixin:
         load = self.get_load()
         routed_experts = None
         output_expert_logits = (
-            [] if any(getattr(req, 'return_expert_logits', False) for req in reqs) else None
+            []
+            if any(getattr(req, "return_expert_logits", False) for req in reqs)
+            else None
         )
         customized_info = {}
 
@@ -1114,7 +1115,9 @@ class SchedulerOutputProcessorMixin:
                     routed_experts.append(req.routed_experts)
                 if output_expert_logits is not None:
                     output_expert_logits.append(
-                        req.expert_logits if getattr(req, 'return_expert_logits', False) else None
+                        req.expert_logits
+                        if getattr(req, "return_expert_logits", False)
+                        else None
                     )
 
                 if req.customized_info is not None:
