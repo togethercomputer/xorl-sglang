@@ -341,6 +341,8 @@ class TestQwen35GDNContractDefaults(CustomTestCase):
         "SGLANG_BI_LM_HEAD",
         "SGLANG_BI_LM_HEAD_DECODE",
         "SGLANG_FAMILIES_V2",
+        "SGLANG_DETERMINISTIC_FA4_RADIX",
+        "SGLANG_BI_GDN_DECODE_GRAPH",
     )
 
     def _resolve(
@@ -367,6 +369,34 @@ class TestQwen35GDNContractDefaults(CustomTestCase):
         self.assertTrue(args.disable_cuda_graph)
         self.assertTrue(args.disable_radix_cache)
         self.assertEqual(args.linear_attn_prefill_backend, "triton")
+
+    def test_qwen35_xorl_speed_optins_enable_graph_and_fa4_radix(self):
+        args, resolved = self._resolve(
+            env={
+                "SGLANG_DETERMINISTIC_FA4_RADIX": "1",
+                "SGLANG_BI_GDN_DECODE_GRAPH": "1",
+            }
+        )
+        self.assertEqual(resolved["SGLANG_DETERMINISTIC_FA4_RADIX"], "1")
+        self.assertFalse(args.disable_radix_cache)
+        self.assertFalse(args.disable_cuda_graph)
+
+    def test_qwen35_fa4_radix_optin_survives_deterministic_validation(self):
+        args = ServerArgs(model_path="dummy")
+        args.rl_on_policy_target = "xorl"
+        args.attention_backend = "fa4"
+        with patch.dict(
+            "os.environ",
+            {
+                "SGLANG_DETERMINISTIC_FA4_RADIX": "1",
+                "SGLANG_BI_GDN_DECODE_GRAPH": "1",
+            },
+            clear=False,
+        ):
+            args._handle_qwen35_gdn_contract("Qwen3_5ForConditionalGeneration")
+            args._handle_deterministic_inference()
+        self.assertFalse(args.disable_radix_cache)
+        self.assertFalse(args.disable_cuda_graph)
 
     def test_decode_kill_switch_preserves_fast_path(self):
         args, resolved = self._resolve(env={"SGLANG_BI_GDN_DECODE": "0"})

@@ -555,7 +555,12 @@ class MambaAttnBackendBase(AttentionBackend):
         # Make sure forward metadata is correctly handled for padding reqs
         req_pool_indices[bs - num_padding :] = 0
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
-        mamba_indices[bs - num_padding :] = -1
+        # MambaPool reserves cache slot zero for padded/dummy rows.  Keep the
+        # eager path's PAD_SLOT_ID (-1), but use the reserved slot for graph
+        # replay: captured PyTorch gather/index-select operations do not all
+        # honor the negative padding sentinel, and can otherwise assert during
+        # replay.  Real Mamba requests use slots >= 1.
+        mamba_indices[bs - num_padding :] = 0
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
         if forward_mode.is_decode_or_idle():
             if num_padding == 0:
@@ -787,6 +792,30 @@ class HybridLinearAttnBackend(AttentionBackend):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_cuda_graph_state(max_bs, max_num_tokens)
+
+    def begin_cuda_graph_capture(self):
+        return [
+            getattr(backend, "begin_cuda_graph_capture", lambda: None)()
+            for backend in self.attn_backend_list
+        ]
+
+    def end_cuda_graph_capture(self, snapshots) -> None:
+        for backend, snapshot in zip(self.attn_backend_list, snapshots):
+            hook = getattr(backend, "end_cuda_graph_capture", None)
+            if hook is not None:
+                hook(snapshot)
+
+    def prepare_cuda_graph_replay(self) -> None:
+        for backend in self.attn_backend_list:
+            hook = getattr(backend, "prepare_cuda_graph_replay", None)
+            if hook is not None:
+                hook()
+
+    def finish_cuda_graph_replay(self) -> None:
+        for backend in self.attn_backend_list:
+            hook = getattr(backend, "finish_cuda_graph_replay", None)
+            if hook is not None:
+                hook()
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

@@ -1,4 +1,6 @@
-from typing import Tuple, Union
+from __future__ import annotations
+
+from typing import Optional, Tuple, Union
 
 import torch
 
@@ -16,6 +18,7 @@ from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.memory_pool import MambaPool
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.utils import is_cpu, is_cuda, is_npu
@@ -28,11 +31,27 @@ if not is_cpu():
 
 BI_GDN_PREFILL_ENABLED = False
 BI_GDN_DECODE_ENABLED = False
+BI_GDN_DECODE_GRAPH = False
+BI_GDN_BS1_STATIC = False
+
+
+def _use_bi_gdn_graph_workspace() -> bool:
+    """Use slot zero only while recording the graph that replays from it.
+
+    A graph-enabled server can still execute an eager fallback for a local DP
+    batch.  That path has no replay prologue to gather the live request into
+    slot zero, so it must retain the ordinary live-slot decode semantics.
+    """
+    return BI_GDN_DECODE_GRAPH and get_is_capture_mode()
+
 
 if is_cuda():
     from sglang.srt.layers.attention.fla.bi_gdn_decode import (
+        BI_GDN_BS1_STATIC,
         BI_GDN_DECODE_ENABLED,
+        BI_GDN_DECODE_GRAPH,
         BIGDNDecodeCache,
+        BIGDNDecodeStepMetadata,
     )
     from sglang.srt.layers.attention.fla.bi_gdn_prefill import (
         BI_GDN_PREFILL_ENABLED,
@@ -237,11 +256,37 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 raise RuntimeError(
                     "SGLANG_BI_GDN_DECODE=1 requires SGLANG_BI_GDN_PREFILL=1."
                 )
-            if not model_runner.server_args.disable_cuda_graph:
+            if (
+                not model_runner.server_args.disable_cuda_graph
+                and not BI_GDN_DECODE_GRAPH
+            ):
                 raise RuntimeError(
-                    "SGLANG_BI_GDN_DECODE=1 is eager-only; use --disable-cuda-graph."
+                    "SGLANG_BI_GDN_DECODE=1 is eager-only (dynamic partial-chunk "
+                    "rescan shapes); launch with --disable-cuda-graph or opt in with "
+                    "SGLANG_BI_GDN_DECODE_GRAPH=1 (XORL-245)."
                 )
-        self._bi_decode_caches = {}
+            if BI_GDN_DECODE_GRAPH:
+                if not BI_GDN_BS1_STATIC:
+                    raise RuntimeError(
+                        "SGLANG_BI_GDN_DECODE_GRAPH=1 requires SGLANG_BI_GDN_BS1_STATIC=1."
+                    )
+                if model_runner.server_args.disable_cuda_graph:
+                    raise RuntimeError(
+                        "SGLANG_BI_GDN_DECODE_GRAPH=1 requires CUDA graphs to be enabled."
+                    )
+                graph_bs = list(model_runner.server_args.cuda_graph_bs or [])
+                if len(graph_bs) != 1 or graph_bs[0] < 1:
+                    raise RuntimeError(
+                        "SGLANG_BI_GDN_DECODE_GRAPH=1 currently requires one exact-size "
+                        "--cuda-graph-bs bucket (XORL-245)."
+                    )
+        self._bi_decode_caches = {}  # layer_id -> BIGDNDecodeCache (XORL-245)
+        self._bi_decode_step_metadata: Optional[BIGDNDecodeStepMetadata] = None
+        self._bi_decode_slots: Optional[list[int]] = None
+        self._bi_graph_bs: Optional[int] = None
+        self._bi_graph_workspace_indices: Optional[torch.Tensor] = None
+        self._bi_graph_seq_lens: Optional[torch.Tensor] = None
+        self._bi_graph_step_metadata: Optional[BIGDNDecodeStepMetadata] = None
         if BI_GDN_DECODE_ENABLED:
             rank0_log("GDN decode contract ENGAGED: partial-chunk rescan")
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
@@ -257,8 +302,40 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 head_v_dim=layer.head_v_dim,
                 device=ssm_states.device,
             )
+            if BI_GDN_DECODE_GRAPH and self._bi_graph_bs is not None:
+                cache.configure_graph_workspace(self._bi_graph_bs)
             self._bi_decode_caches[layer.layer_id] = cache
         return cache
+
+    def _bi_decode_metadata(
+        self,
+        cache: BIGDNDecodeCache,
+        slots: list[int],
+        slot_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> BIGDNDecodeStepMetadata:
+        metadata = self._bi_decode_step_metadata
+        if metadata is None:
+            metadata = cache.prepare_step_metadata(
+                slots,
+                slot_indices,
+                seq_lens,
+                graph_capture=BI_GDN_DECODE_GRAPH and get_is_capture_mode(),
+            )
+            self._bi_decode_step_metadata = metadata
+            if (
+                BI_GDN_DECODE_GRAPH
+                and get_is_capture_mode()
+                and self._bi_decode_slots is not None
+                and slots == self._bi_decode_slots
+            ):
+                self._bi_graph_step_metadata = metadata
+        elif metadata.slots != tuple(slots):
+            raise RuntimeError(
+                "SGLANG_BI_GDN_DECODE slot selection changed within one forward: "
+                f"expected {metadata.slots}, got {tuple(slots)} (XORL-245)."
+            )
+        return metadata
 
     def _bi_gdn_decode_seed(
         self,
@@ -290,6 +367,117 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states,
             )
 
+    def init_forward_metadata(self, forward_batch: ForwardBatch):
+        super().init_forward_metadata(forward_batch)
+        self._bi_decode_step_metadata = None
+        self._bi_decode_slots = None
+        if BI_GDN_DECODE_ENABLED and forward_batch.forward_mode.is_decode_or_idle():
+            # One device-to-host synchronization per model forward, rather than
+            # one in every GDN layer. Exact decode is eager-only, so the host
+            # slot list is safe to reuse for all layers in this forward.
+            self._bi_decode_slots = self.forward_metadata.mamba_cache_indices.tolist()
+
+    def init_forward_metadata_capture_cuda_graph(
+        self,
+        bs,
+        num_tokens,
+        req_pool_indices,
+        seq_lens,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+    ):
+        super().init_forward_metadata_capture_cuda_graph(
+            bs,
+            num_tokens,
+            req_pool_indices,
+            seq_lens,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+        )
+        if BI_GDN_DECODE_GRAPH:
+            if bs < 1 or num_tokens != bs:
+                raise RuntimeError(
+                    "BI GDN graph capture requires an exact single-token decode "
+                    f"bucket (bs={bs}, num_tokens={num_tokens})"
+                )
+            self._bi_graph_bs = bs
+            self._bi_decode_step_metadata = None
+            self._bi_graph_step_metadata = None
+            self._bi_decode_slots = list(range(bs))
+            self._bi_graph_workspace_indices = torch.arange(
+                bs, dtype=torch.int32, device=seq_lens.device
+            )
+            self._bi_graph_seq_lens = seq_lens[:bs]
+            for cache in self._bi_decode_caches.values():
+                cache.configure_graph_workspace(bs)
+
+    def init_forward_metadata_replay_cuda_graph(
+        self,
+        bs,
+        req_pool_indices,
+        seq_lens,
+        seq_lens_sum,
+        encoder_lens,
+        forward_mode,
+        spec_info,
+        seq_lens_cpu,
+    ):
+        super().init_forward_metadata_replay_cuda_graph(
+            bs,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+            seq_lens_cpu,
+        )
+        if BI_GDN_DECODE_GRAPH:
+            self._bi_graph_bs = bs
+            self._bi_graph_seq_lens = seq_lens[:bs]
+
+    def begin_cuda_graph_capture(self):
+        if not BI_GDN_DECODE_GRAPH:
+            return None
+        pool = self.req_to_token_pool.mamba_pool.mamba_cache
+        graph_bs = self._bi_graph_bs or 1
+        return {
+            "temporal": pool.temporal[:, :graph_bs].clone(),
+            "conv": [tensor[:, :graph_bs].clone() for tensor in pool.conv],
+        }
+
+    def end_cuda_graph_capture(self, snapshot) -> None:
+        if snapshot is None:
+            return
+        pool = self.req_to_token_pool.mamba_pool.mamba_cache
+        graph_bs = self._bi_graph_bs or 1
+        pool.temporal[:, :graph_bs].copy_(snapshot["temporal"])
+        for tensor, saved in zip(pool.conv, snapshot["conv"]):
+            tensor[:, :graph_bs].copy_(saved)
+        for cache in self._bi_decode_caches.values():
+            cache.clear_graph_workspace()
+
+    def prepare_cuda_graph_replay(self) -> None:
+        if not BI_GDN_DECODE_GRAPH:
+            return
+        indices = self.forward_metadata.mamba_cache_indices
+        first_cache = next(iter(self._bi_decode_caches.values()), None)
+        if first_cache is not None:
+            first_cache.refresh_graph_metadata(
+                self._bi_graph_step_metadata, self._bi_graph_seq_lens
+            )
+        for cache in self._bi_decode_caches.values():
+            cache.copy_to_graph_workspace(indices)
+
+    def finish_cuda_graph_replay(self) -> None:
+        if not BI_GDN_DECODE_GRAPH:
+            return
+        indices = self.forward_metadata.mamba_cache_indices
+        for cache in self._bi_decode_caches.values():
+            cache.copy_from_graph_workspace(indices)
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -319,27 +507,38 @@ class GDNAttnBackend(MambaAttnBackendBase):
             num_tokens = mixed_qkv.shape[0]
             if num_tokens == 0:
                 return mixed_qkv.new_empty(1, 0, layer.num_v_heads, layer.head_v_dim)
-            slots = cache_indices.tolist()
-            if len(set(slots)) != len(slots):
+            cache = self._bi_decode_cache(layer, ssm_states)
+            slots_list = self._bi_decode_slots
+            if slots_list is None:
+                slots_list = cache_indices.tolist()
+            if len(set(slots_list)) != len(slots_list):
                 raise RuntimeError(
-                    f"SGLANG_BI_GDN_DECODE received duplicate cache slots: {slots}"
+                    "SGLANG_BI_GDN_DECODE received duplicate cache slots: "
+                    f"{slots_list}"
                 )
-            if any(slot < 0 for slot in slots):
+            if any(slot < 0 for slot in slots_list):
                 raise RuntimeError(
                     "SGLANG_BI_GDN_DECODE does not support padded cache slots"
                 )
-            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
-            core_attn_out = (
-                self._bi_decode_cache(layer, ssm_states)
-                .step(
-                    slots=slots,
-                    qkv_rows=mixed_qkv,
-                    g_rows=g.view(num_tokens, -1),
-                    beta_rows=beta.view(num_tokens, -1),
-                    ssm_states=ssm_states,
-                )
-                .unsqueeze(0)
-            )
+            g_rows, beta_rows = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            metadata_indices = cache_indices
+            metadata_seq_lens = forward_batch.seq_lens
+            state_indices = None
+            use_graph_workspace = _use_bi_gdn_graph_workspace()
+            if use_graph_workspace:
+                metadata_indices = self._bi_graph_workspace_indices
+                metadata_seq_lens = self._bi_graph_seq_lens
+                state_indices = cache_indices
+            core_attn_out = cache.step(
+                metadata=self._bi_decode_metadata(
+                    cache, slots_list, metadata_indices, metadata_seq_lens
+                ),
+                qkv_rows=mixed_qkv,
+                g_rows=g_rows.view(num_tokens, -1),
+                beta_rows=beta_rows.view(num_tokens, -1),
+                ssm_states=ssm_states,
+                state_indices=state_indices,
+            ).unsqueeze(0)
             self._track_mamba_state_decode(
                 forward_batch, conv_states, ssm_states, cache_indices
             )

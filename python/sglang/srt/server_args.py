@@ -152,7 +152,7 @@ ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "moo
 
 GRAMMAR_BACKEND_CHOICES = ["xgrammar", "outlines", "llguidance", "none"]
 
-DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "triton"]
+DETERMINISTIC_ATTENTION_BACKEND_CHOICES = ["flashinfer", "fa3", "fa4", "triton"]
 
 RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND = ["fa3", "triton"]
 
@@ -1425,13 +1425,25 @@ class ServerArgs:
 
         os.environ.setdefault("SGLANG_BI_GDN_PREFILL", "1")
         os.environ.setdefault("SGLANG_GDN_NORM_ROWS_PER_BLOCK", "4")
-        self.disable_radix_cache = True
-        self.disable_cuda_graph = True
+        # The v1 rescan cache is per live Mamba request slot. Keep the
+        # conservative eager/no-radix default, but allow the separately gated
+        # exact-GDN speed receipt to opt into bounded FA4 radix reuse.
+        os.environ.setdefault("SGLANG_DETERMINISTIC_FA4_RADIX", "0")
+        explicit_disable_radix = self.disable_radix_cache
+        radix_opt_in = get_bool_env_var("SGLANG_DETERMINISTIC_FA4_RADIX")
+        self.disable_radix_cache = explicit_disable_radix or not radix_opt_in
+        explicit_disable_cuda_graph = self.disable_cuda_graph
+        exact_graph = get_bool_env_var("SGLANG_BI_GDN_DECODE_GRAPH")
+        self.disable_cuda_graph = explicit_disable_cuda_graph or not exact_graph
         if self.linear_attn_prefill_backend is None:
             self.linear_attn_prefill_backend = "triton"
         logger.info(
-            "Dense Qwen3.5 exact GDN contract enabled: partial-chunk rescan, "
-            "paired BI prefill/head, eager decode, no radix cache."
+            "Dense Qwen3.5 exact GDN contract enabled: "
+            "exact partial-chunk rescan, BI prefill/head rescore, norm rows/block=%s, "
+            "%s radix cache, %s decode.",
+            os.environ.get("SGLANG_GDN_NORM_ROWS_PER_BLOCK"),
+            "FA4" if not self.disable_radix_cache else "no",
+            "exact-size CUDA graph" if exact_graph else "eager",
         )
 
     def _handle_model_specific_adjustments(self):
@@ -3226,10 +3238,11 @@ class ServerArgs:
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
                     )
 
-            if (
-                self.attention_backend
-                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
-            ):
+            radix_supported = list(RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND)
+            if get_bool_env_var("SGLANG_DETERMINISTIC_FA4_RADIX"):
+                # FA4 radix reuse is opt-in for deterministic serving lanes.
+                radix_supported.append("fa4")
+            if self.attention_backend not in radix_supported:
                 # Currently, only certain backends support radix cache. Support for other backends is in progress
                 self.disable_radix_cache = True
                 logger.warning(

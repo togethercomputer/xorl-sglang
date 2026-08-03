@@ -313,10 +313,16 @@ class TestBIGDNDecodeRescan(CustomTestCase):
         )
 
         decoded = []
+        slot_indices = torch.tensor([0], device="cuda", dtype=torch.int32)
         for pos in range(prompt_len, total):
+            metadata = cache.prepare_step_metadata(
+                [0],
+                slot_indices,
+                torch.tensor([pos + 1], device="cuda", dtype=torch.int32),
+            )
             decoded.append(
                 cache.step(
-                    slots=[0],
+                    metadata=metadata,
                     qkv_rows=packed[pos : pos + 1],
                     g_rows=g.reshape(total, HV)[pos : pos + 1],
                     beta_rows=beta.reshape(total, HV)[pos : pos + 1],

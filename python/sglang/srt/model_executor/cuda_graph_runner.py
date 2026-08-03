@@ -731,7 +731,7 @@ class CudaGraphRunner:
         return profile_context
 
     def _post_process_after_profile(self, prof_context):
-        torch.cuda.memory._dump_snapshot(f"cuda_graph_runner_memory_usage.pickle")
+        torch.cuda.memory._dump_snapshot("cuda_graph_runner_memory_usage.pickle")
         torch.cuda.memory._record_memory_history(enabled=None)
         log_message = (
             "Sorted by CUDA Time:\n"
@@ -972,6 +972,9 @@ class CudaGraphRunner:
             forward_batch.spec_info,
         )
 
+        capture_state_hook = getattr(attn_backend, "begin_cuda_graph_capture", None)
+        capture_state = capture_state_hook() if capture_state_hook is not None else None
+
         # Run and capture
         def run_once():
             # Clean intermediate result cache for DP attention
@@ -1002,18 +1005,23 @@ class CudaGraphRunner:
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
-        for _ in range(2):
-            self.device_module.synchronize()
-            self.model_runner.tp_group.barrier()
-            run_once()
+        try:
+            for _ in range(2):
+                self.device_module.synchronize()
+                self.model_runner.tp_group.barrier()
+                run_once()
 
-        if get_global_graph_memory_pool() is None:
-            set_global_graph_memory_pool(self.device_module.graph_pool_handle())
-        # Set graph pool id globally to be able to use symmetric memory
-        set_graph_pool_id(get_global_graph_memory_pool())
-        out = self._capture_graph(
-            graph, get_global_graph_memory_pool(), stream, run_once
-        )
+            if get_global_graph_memory_pool() is None:
+                set_global_graph_memory_pool(self.device_module.graph_pool_handle())
+            # Set graph pool id globally to be able to use symmetric memory
+            set_graph_pool_id(get_global_graph_memory_pool())
+            out = self._capture_graph(
+                graph, get_global_graph_memory_pool(), stream, run_once
+            )
+        finally:
+            restore_hook = getattr(attn_backend, "end_cuda_graph_capture", None)
+            if restore_hook is not None:
+                restore_hook(capture_state)
 
         return graph, out
 
@@ -1134,12 +1142,24 @@ class CudaGraphRunner:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
             self.buffers.positions[: self.raw_num_token].copy_(forward_batch.positions)
 
+        attn_backend = (
+            self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
+            if self.enable_pdmux
+            else self.model_runner.attn_backend
+        )
+        replay_prepare_hook = getattr(attn_backend, "prepare_cuda_graph_replay", None)
+        if replay_prepare_hook is not None:
+            replay_prepare_hook()
+
         # Replay
         if self.enable_pdmux:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
         self.graphs[graph_key].replay()
+        replay_finish_hook = getattr(attn_backend, "finish_cuda_graph_replay", None)
+        if replay_finish_hook is not None:
+            replay_finish_hook()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):
