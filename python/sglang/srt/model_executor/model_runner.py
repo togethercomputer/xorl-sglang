@@ -153,6 +153,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     get_global_server_args,
     is_batch_invariant_rl_target,
+    is_glm52_exact_mode,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -605,18 +606,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.init_double_sparsity_channel_config(server_args.ds_heavy_channel_type)
 
         # Enable batch invariant mode only for targets whose numerical contract needs it.
-        if is_batch_invariant_rl_target(server_args.rl_on_policy_target):
+        if is_batch_invariant_rl_target(
+            server_args.rl_on_policy_target
+        ) or is_glm52_exact_mode(server_args):
             from sglang.srt.batch_invariant_ops import (
                 enable_batch_invariant_mode,
                 get_batch_invariant_ops,
             )
 
-            enable_batch_invariant_mode()
-            if server_args.rl_on_policy_target == "xorl":
+            if is_glm52_exact_mode(server_args):
                 from sglang.srt.layers.xorl_batch_invariant import (
+                    XORL_GLM52_REQUIRED_BI_OPS,
                     log_xorl_bi_contract_plan_once,
                 )
 
+                enable_batch_invariant_mode(ops=XORL_GLM52_REQUIRED_BI_OPS)
                 log_xorl_bi_contract_plan_once(
                     logger,
                     use_qk_norm=bool(
@@ -627,9 +631,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         self.is_draft_worker or server_args.enable_multi_layer_eagle
                     ),
                     legacy_bi_ops=get_batch_invariant_ops(),
-                    bi_router_enabled=os.getenv("SGLANG_BI_ROUTER", "").lower()
-                    in {"1", "true", "yes", "on"},
                 )
+            else:
+                enable_batch_invariant_mode()
 
         # Deduce KV cache dtype
         self.configure_kv_cache_dtype()

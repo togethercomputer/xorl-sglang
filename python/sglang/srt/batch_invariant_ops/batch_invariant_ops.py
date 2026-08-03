@@ -4,7 +4,7 @@ import contextlib
 import logging
 import os
 from collections import namedtuple
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, Dict, Literal, Optional, Tuple
 
 import torch
@@ -85,6 +85,20 @@ _BATCH_INVARIANT_ALIASES = {
 }
 
 
+def _normalize_batch_invariant_ops(ops: Iterable[str]) -> set[str]:
+    normalized = set()
+    for raw_op in ops:
+        op = raw_op.strip().lower().replace("-", "_")
+        op = _BATCH_INVARIANT_ALIASES.get(op, op)
+        if op not in _BATCH_INVARIANT_ALL_OPS:
+            raise ValueError(
+                f"Unsupported batch-invariant op {raw_op!r}; "
+                f"supported values are: {sorted(_BATCH_INVARIANT_ALL_OPS)}"
+            )
+        normalized.add(op)
+    return normalized
+
+
 def _parse_batch_invariant_ops() -> set[str]:
     raw = os.environ.get("SGLANG_BATCH_INVARIANT_OPS", "all").strip().lower()
     if raw in ("", "1", "true", "yes", "all"):
@@ -92,19 +106,9 @@ def _parse_batch_invariant_ops() -> set[str]:
     if raw in ("0", "false", "no", "none"):
         return set()
 
-    ops = set()
-    for part in raw.replace(";", ",").split(","):
-        op = part.strip().lower().replace("-", "_")
-        if not op:
-            continue
-        op = _BATCH_INVARIANT_ALIASES.get(op, op)
-        if op not in _BATCH_INVARIANT_ALL_OPS:
-            raise ValueError(
-                f"Unsupported SGLANG_BATCH_INVARIANT_OPS entry {part!r}; "
-                f"supported values are: {sorted(_BATCH_INVARIANT_ALL_OPS)}"
-            )
-        ops.add(op)
-    return ops
+    return _normalize_batch_invariant_ops(
+        part for part in raw.replace(";", ",").split(",") if part.strip()
+    )
 
 
 def _matmul_launch_metadata(
@@ -1824,12 +1828,18 @@ def is_batch_invariant_op_enabled(op: str) -> bool:
 
 def enable_batch_invariant_mode(
     enable_bmm: bool = True,
+    *,
+    ops: Optional[Iterable[str]] = None,
 ):
     global _batch_invariant_MODE, _batch_invariant_LIB, _batch_invariant_OPS, _original_torch_bmm
     if _batch_invariant_MODE:
         return
 
-    _batch_invariant_OPS = _parse_batch_invariant_ops()
+    _batch_invariant_OPS = (
+        _parse_batch_invariant_ops()
+        if ops is None
+        else _normalize_batch_invariant_ops(ops)
+    )
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     if "mm" in _batch_invariant_OPS:

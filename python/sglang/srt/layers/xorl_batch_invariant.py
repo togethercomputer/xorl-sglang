@@ -17,13 +17,11 @@ from sglang.srt.batch_invariant_ops import (
 
 XorlBiFamily = Literal["v1", "v2"]
 XorlGlm52NormSite = Literal["q_a", "kv_a", "input", "post_attention", "final"]
-BI_FAMILIES_V2_SHA256 = (
-    "fd4c5bac2a52d2148b8e4d0e9afa4e46e8c62689a68c2bc0e309f671597799e6"
-)
+BI_FAMILIES_V2_CONTRACT = "xorl_batch_invariant_families_v2"
 _FAMILY_ENV_VARS = ("XORL_FAMILIES_V2", "SGLANG_FAMILIES_V2")
 _FAMILY_ON = frozenset({"1", "true", "yes"})
 _FAMILY_OFF = frozenset({"0", "false", "no"})
-_REQUIRED_LEGACY_BI_OPS = ("addmm", "bmm", "log_softmax", "mean", "mm")
+XORL_GLM52_REQUIRED_BI_OPS = ("addmm", "bmm", "log_softmax", "mean", "mm")
 _TEMPLATE_OR_EAGER_PATHS = (
     "rmsnorm",
     "lm_head",
@@ -96,7 +94,6 @@ def log_xorl_bi_contract_plan_once(
     speculative_decode: bool,
     mtp_decode: bool,
     legacy_bi_ops: tuple[str, ...],
-    bi_router_enabled: bool,
 ) -> XorlBiFamily:
     """Validate and emit the serving plan before the first real forward."""
     global _CONTRACT_PLAN_LOGGED
@@ -107,27 +104,23 @@ def log_xorl_bi_contract_plan_once(
             "The XORL GLM-5.2 batch-invariant contract requires speculative "
             "and MTP decoding to be disabled."
         )
-    if tuple(sorted(legacy_bi_ops)) != _REQUIRED_LEGACY_BI_OPS:
+    if tuple(sorted(legacy_bi_ops)) != XORL_GLM52_REQUIRED_BI_OPS:
         raise RuntimeError(
             "The XORL GLM-5.2 batch-invariant contract requires exactly the "
-            f"legacy BI ops {_REQUIRED_LEGACY_BI_OPS}, got "
+            f"legacy BI ops {XORL_GLM52_REQUIRED_BI_OPS}, got "
             f"{tuple(sorted(legacy_bi_ops))}."
-        )
-    if not bi_router_enabled:
-        raise RuntimeError(
-            "The XORL GLM-5.2 batch-invariant contract requires SGLANG_BI_ROUTER=1."
         )
     if not _CONTRACT_PLAN_LOGGED:
         receipt_logger.info(
             "XORL batch-invariant numerical contract plan: family=%s "
-            "vendor_sha256=%s serving_target=xorl "
+            "family_contract=%s serving_target=xorl "
             "resolved_use_qk_norm=false speculative_decode=false mtp_decode=false "
             "legacy_bi_ops=%s glm52_bi_router=true "
             "required_peer_trainer_rmsnorm_mode=sglang_fused "
             "required_engagements=%s",
             family,
-            BI_FAMILIES_V2_SHA256,
-            ",".join(_REQUIRED_LEGACY_BI_OPS),
+            BI_FAMILIES_V2_CONTRACT,
+            ",".join(XORL_GLM52_REQUIRED_BI_OPS),
             ",".join(_REQUIRED_ENGAGEMENTS),
         )
         _CONTRACT_PLAN_LOGGED = True

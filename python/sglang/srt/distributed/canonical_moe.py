@@ -10,7 +10,6 @@ from enum import Enum
 import torch
 import torch.distributed as dist
 
-
 GLM52_CANONICAL_MOE_VERSION = "canonical_moe_reduce_v1"
 GLM52_CANONICAL_MOE_V3_VERSION = "glm52_canonical_moe_reduce_v3"
 GLM52_SAMPLER_LOCAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_bf16_v2"
@@ -625,8 +624,6 @@ def canonicalize_glm52_local_partial_v3(
     order and balanced adjacent BF16 tree; dense v1 remains the independent
     oracle.
     """
-    if graph_capture:
-        raise RuntimeError("Canonical MoE v3 does not yet admit CUDA graph capture")
     if local_partial.dtype is not torch.bfloat16:
         raise TypeError("GLM-5.2 local MoE contribution must be BF16")
     if local_partial.shape[0] != slots.capacity:
@@ -719,7 +716,7 @@ def canonicalize_glm52_local_partial_v3(
         layer_id=layer_id,
         distribution=distribution,
         capacity=workspace.local_capacity,
-        graph_capture=False,
+        graph_capture=graph_capture,
         local_policy=GLM52_SAMPLER_LOCAL_POLICY,
         transport=transport,
         source_capacity=slots.capacity,

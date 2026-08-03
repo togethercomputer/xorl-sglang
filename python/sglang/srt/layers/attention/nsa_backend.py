@@ -22,6 +22,7 @@ from sglang.srt.layers.attention.nsa.nsa_indexer import (
 from sglang.srt.layers.attention.nsa.glm52_selector import (
     Glm52SparseReceiptBook,
     pack_selected_kv_dynamic,
+    pack_selected_kv_static,
     select_canonical_logical_topk,
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
@@ -45,6 +46,7 @@ from sglang.srt.layers.attention.utils import (
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -250,9 +252,12 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
                 ke_offset if ke_offset is not None else self.get_seqlens_expanded(),
                 topk,
                 row_starts=ks,
+                validate=not self.stable_logical_selector,
             )
             if self.selector_receipt_required and self.selector_receipt_hook is None:
-                raise RuntimeError("exact sparse selector is missing its fail-closed receipt hook")
+                raise RuntimeError(
+                    "exact sparse selector is missing its fail-closed receipt hook"
+                )
             if self.selector_receipt_hook is not None:
                 self.selector_receipt_hook(selected)
             return selected
@@ -1345,7 +1350,6 @@ class NativeSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "NSA is causal only"
@@ -1548,7 +1552,6 @@ class NativeSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-
         causal = not layer.is_cross_attention
         metadata = self.forward_metadata
         assert causal, "NSA is causal only"
@@ -1612,13 +1615,25 @@ class NativeSparseAttnBackend(
                     "GLM-5.2 exact sparse requires typed canonical logical indices"
                 )
             if topk_indices is None:
-                raise RuntimeError("GLM-5.2 exact sparse decode requires selected indices")
-            packed = pack_selected_kv_dynamic(
-                kv_cache,
-                metadata.page_table_1,
-                topk_indices,
-            )
-            self.glm52_sparse_receipts.record_packer(layer.layer_id, packed)
+                raise RuntimeError(
+                    "GLM-5.2 exact sparse decode requires selected indices"
+                )
+            if get_is_capture_mode():
+                packed = pack_selected_kv_static(
+                    kv_cache,
+                    metadata.page_table_1,
+                    topk_indices,
+                    max_selected_tokens=topk_indices.numel(),
+                )
+            else:
+                packed = pack_selected_kv_dynamic(
+                    kv_cache,
+                    metadata.page_table_1,
+                    topk_indices,
+                    validate=False,
+                )
+            if self.glm52_sparse_receipts.active:
+                self.glm52_sparse_receipts.record_packer(layer.layer_id, packed)
             kv_cache = packed.kv
             page_table_1 = packed.compact_indices
             selected_counts = packed.selected_counts
@@ -1753,7 +1768,11 @@ class NativeSparseAttnBackend(
 
         need_padding = num_heads % required_padding != 0
 
-        if selected_counts is not None and int(selected_counts.sum().item()) == 0:
+        if selected_counts is not None and not get_is_capture_mode():
+            selected_rows = int(selected_counts.sum().item())
+        else:
+            selected_rows = None
+        if selected_rows == 0:
             return q_all.new_zeros((num_tokens, num_heads, v_head_dim))
 
         if need_padding:
@@ -2221,12 +2240,15 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        receipted_decode_selector = (
+        canonical_decode_selector = (
             self.glm52_sparse_eager_enabled
             and forward_batch.forward_mode.is_decode_or_idle()
             and not forward_batch.forward_mode.is_idle()
         )
-        stable_logical_selector = receipted_decode_selector or (
+        receipted_decode_selector = (
+            canonical_decode_selector and not get_is_capture_mode()
+        )
+        stable_logical_selector = canonical_decode_selector or (
             self.glm52_sparse_eager_enabled
             and forward_batch.forward_mode.is_extend_without_speculative()
         )

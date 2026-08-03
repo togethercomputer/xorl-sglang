@@ -36,7 +36,7 @@ from sglang.srt.layers.xorl_batch_invariant import (
     record_xorl_bi_engagement,
     resolve_or_validate_xorl_bi_family,
 )
-from sglang.srt.server_args import XORL_BATCH_INVARIANT_TARGET, get_global_server_args
+from sglang.srt.server_args import get_global_server_args, is_glm52_exact_mode
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -146,10 +146,7 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if (
-                get_global_server_args().rl_on_policy_target
-                == XORL_BATCH_INVARIANT_TARGET
-            ):
+            if is_glm52_exact_mode(get_global_server_args()):
                 return self._forward_xorl_batch_invariant(
                     x,
                     residual,

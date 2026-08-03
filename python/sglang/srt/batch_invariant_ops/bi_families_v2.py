@@ -1,11 +1,9 @@
 # Families v2 — the redefined frozen reduction trees for the batch-invariance
 # contract (hidden-dim RMSNorm, qk-norm, and the final projection).
 #
-# VENDORED BYTE-IDENTICAL into the trainer (xorl/ops/) and the serving engine
-# (sglang/srt/batch_invariant_ops/). Both suites pin the same sha256 of this
-# file, so neither copy can be edited without the other. Self-contained: torch
-# + triton only, no engine imports, so the same bytes run under either engine
-# and any venv.
+# Mirrored by the trainer and serving engine behind the same semantic contract.
+# Self-contained: torch + triton only, with no engine imports. Changes to a
+# bit-relevant tree require a contract-version bump and cross-engine gates.
 #
 # Rule A: every bit-relevant reduction is written explicitly — an
 # adjacent-pairwise balanced binary tree within a block (tl.split + one add

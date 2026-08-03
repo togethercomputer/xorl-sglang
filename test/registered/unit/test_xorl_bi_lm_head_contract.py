@@ -1,4 +1,3 @@
-import hashlib
 import importlib.util
 import os
 import sys
@@ -11,8 +10,14 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.batch_invariant_ops import bi_families_v2
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+    disable_batch_invariant_mode,
+    enable_batch_invariant_mode,
+    get_batch_invariant_ops,
+)
 from sglang.srt.layers.xorl_batch_invariant import (
-    BI_FAMILIES_V2_SHA256,
+    BI_FAMILIES_V2_CONTRACT,
+    XORL_GLM52_REQUIRED_BI_OPS,
     log_xorl_bi_contract_plan_once,
     record_xorl_bi_engagement,
     record_xorl_glm52_pipeline_stage_receipt,
@@ -27,9 +32,10 @@ from sglang.srt.layers.xorl_batch_invariant import (
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.srt.server_args import (
     RL_ON_POLICY_TARGET_CHOICES,
-    XORL_BATCH_INVARIANT_TARGET,
+    XORL_RL_TARGET,
     ServerArgs,
     is_batch_invariant_rl_target,
+    is_glm52_exact_mode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -153,9 +159,11 @@ class _SchedulerResponseHarness(SchedulerOutputProcessorMixin):
 
 
 class TestXorlBatchInvariantTarget(unittest.TestCase):
-    def test_xorl_is_an_explicit_batch_invariant_target(self):
-        self.assertIn(XORL_BATCH_INVARIANT_TARGET, RL_ON_POLICY_TARGET_CHOICES)
-        self.assertTrue(is_batch_invariant_rl_target(XORL_BATCH_INVARIANT_TARGET))
+    def test_xorl_exact_mode_is_resolved_from_the_model(self):
+        self.assertIn(XORL_RL_TARGET, RL_ON_POLICY_TARGET_CHOICES)
+        self.assertFalse(is_batch_invariant_rl_target(XORL_RL_TARGET))
+        self.assertFalse(is_glm52_exact_mode(SimpleNamespace()))
+        self.assertTrue(is_glm52_exact_mode(SimpleNamespace(glm52_exact_mode=True)))
 
     def test_standard_unfiltered_request_sets_no_rejected_sampling_flag(self):
         params = SamplingParams(
@@ -171,28 +179,29 @@ class TestXorlBatchInvariantTarget(unittest.TestCase):
         self.assertFalse(params.top_k != TOP_K_ALL)
         self.assertFalse(params.min_p > 0)
 
-    def test_xorl_rejects_speculative_and_draft_modes_before_dummy_short_circuit(self):
+    def test_glm52_exact_mode_rejects_speculative_and_draft_modes(self):
         for kwargs in (
             {"speculative_algorithm": "EAGLE"},
             {"speculative_draft_model_path": "draft-model"},
             {"enable_multi_layer_eagle": True},
         ):
             with self.subTest(kwargs=kwargs):
+                args = ServerArgs(
+                    model_path="dummy",
+                    rl_on_policy_target=XORL_RL_TARGET,
+                    **kwargs,
+                )
+                args.glm52_exact_mode = True
                 with self.assertRaisesRegex(
                     ValueError, "does not support speculative or draft decoding"
                 ):
-                    ServerArgs(
-                        model_path="dummy",
-                        rl_on_policy_target=XORL_BATCH_INVARIANT_TARGET,
-                        **kwargs,
-                    )
+                    args._validate_glm52_exact_contract()
 
         args = ServerArgs(model_path="dummy", speculative_algorithm="EAGLE")
         self.assertEqual(args.speculative_algorithm, "EAGLE")
 
-    def test_vendored_v2_family_has_public_cross_engine_digest(self):
-        digest = hashlib.sha256(Path(bi_families_v2.__file__).read_bytes()).hexdigest()
-        self.assertEqual(digest, BI_FAMILIES_V2_SHA256)
+    def test_v2_family_exports_semantic_contract(self):
+        self.assertEqual(BI_FAMILIES_V2_CONTRACT, "xorl_batch_invariant_families_v2")
 
     def test_family_receipt_defaults_v2_supports_paired_rollback_and_rejects_mismatch(
         self,
@@ -248,7 +257,6 @@ class TestXorlBatchInvariantTarget(unittest.TestCase):
                 speculative_decode=False,
                 mtp_decode=False,
                 legacy_bi_ops=("addmm", "bmm", "log_softmax", "mean", "mm"),
-                bi_router_enabled=True,
             )
             self.assertEqual(
                 log_xorl_bi_contract_plan_once(receipt_logger, **kwargs), "v2"
@@ -264,19 +272,33 @@ class TestXorlBatchInvariantTarget(unittest.TestCase):
         self.assertIn("legacy_bi_ops=%s glm52_bi_router=true", message)
         self.assertIn("required_peer_trainer_rmsnorm_mode=sglang_fused", message)
         self.assertNotIn("observed", message)
-        self.assertEqual(receipt_logger.info.call_args.args[2], BI_FAMILIES_V2_SHA256)
+        self.assertEqual(receipt_logger.info.call_args.args[2], BI_FAMILIES_V2_CONTRACT)
 
         invalid_plans = (
             {**kwargs, "use_qk_norm": True},
             {**kwargs, "speculative_decode": True},
             {**kwargs, "mtp_decode": True},
             {**kwargs, "legacy_bi_ops": ("mm",)},
-            {**kwargs, "bi_router_enabled": False},
         )
         for invalid in invalid_plans:
             with self.subTest(invalid=invalid), _paired_family("v2"):
                 with self.assertRaises(RuntimeError):
                     log_xorl_bi_contract_plan_once(MagicMock(), **invalid)
+
+    def test_exact_contract_selects_its_ops_without_an_environment_override(self):
+        disable_batch_invariant_mode()
+        with (
+            patch.dict(os.environ, {"SGLANG_BATCH_INVARIANT_OPS": "all"}),
+            patch("torch.library.Library"),
+        ):
+            try:
+                enable_batch_invariant_mode(ops=XORL_GLM52_REQUIRED_BI_OPS)
+                self.assertEqual(
+                    get_batch_invariant_ops(),
+                    XORL_GLM52_REQUIRED_BI_OPS,
+                )
+            finally:
+                disable_batch_invariant_mode()
 
     def test_observation_receipt_separates_template_paths_from_sampled_boundary(self):
         receipt_logger = MagicMock()
@@ -442,7 +464,10 @@ class TestXorlBatchInvariantRMSNormDispatch(unittest.TestCase):
 
     @staticmethod
     def _server_args():
-        return SimpleNamespace(rl_on_policy_target=XORL_BATCH_INVARIANT_TARGET)
+        return SimpleNamespace(
+            rl_on_policy_target=XORL_RL_TARGET,
+            glm52_exact_mode=True,
+        )
 
     def _norm(self, family):
         return self.rms_norm_class(

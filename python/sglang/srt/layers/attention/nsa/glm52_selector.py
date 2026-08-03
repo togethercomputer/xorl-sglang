@@ -64,6 +64,7 @@ def select_canonical_logical_topk(
     topk: int,
     *,
     row_starts: torch.Tensor | None = None,
+    validate: bool = True,
 ) -> torch.Tensor:
     """Select request-local logical keys with the stable sparse ordering contract.
 
@@ -76,7 +77,19 @@ def select_canonical_logical_topk(
 
     if topk <= 0:
         raise ValueError(f"exact sparse topk must be positive, got {topk}")
-    lengths, starts = _normalize_row_metadata(scores, lengths, row_starts)
+    if validate:
+        lengths, starts = _normalize_row_metadata(scores, lengths, row_starts)
+    else:
+        if scores.ndim != 2 or lengths.ndim != 1 or lengths.shape[0] != scores.shape[0]:
+            raise ValueError(
+                "exact sparse trusted selector received invalid tensor ranks"
+            )
+        lengths = lengths.to(device=scores.device, dtype=torch.int64)
+        starts = (
+            torch.zeros_like(lengths)
+            if row_starts is None
+            else row_starts.to(device=scores.device, dtype=torch.int64)
+        )
     rows, width = scores.shape
 
     columns = torch.arange(width, device=scores.device, dtype=torch.int64)
@@ -84,10 +97,11 @@ def select_canonical_logical_topk(
     legal = (columns >= starts.unsqueeze(1)) & (
         columns < (starts + lengths).unsqueeze(1)
     )
-    _require_host_true(
-        ~(torch.isnan(scores) & legal),
-        "exact sparse selector encountered NaN in a legal score",
-    )
+    if validate:
+        _require_host_true(
+            ~(torch.isnan(scores) & legal),
+            "exact sparse selector encountered NaN in a legal score",
+        )
 
     take = min(topk, width)
     if take == 0:
@@ -182,12 +196,15 @@ class PackedSelectedKV:
     compact_indices: torch.Tensor
     physical_indices: torch.Tensor
     selected_counts: torch.Tensor
+    contract_ok: torch.Tensor | None = None
 
 
 def pack_selected_kv_dynamic(
     kv_cache: torch.Tensor,
     page_table: torch.Tensor,
     selected_logical: torch.Tensor,
+    *,
+    validate: bool = True,
 ) -> PackedSelectedKV:
     """Copy selected physical KV rows into canonical request-local order."""
 
@@ -220,17 +237,22 @@ def pack_selected_kv_dynamic(
             "exact sparse dynamic selected-KV packing is eager-only; CUDA graph capture is unsupported"
         )
 
-    selected_counts = validate_canonical_logical_indices(
-        selected_logical, max_logical_width=page_table.shape[1]
+    selected_counts = (
+        validate_canonical_logical_indices(
+            selected_logical, max_logical_width=page_table.shape[1]
+        )
+        if validate
+        else (selected_logical >= 0).sum(dim=1, dtype=torch.int32)
     )
     valid = selected_logical >= 0
     physical = torch.gather(
         page_table.to(torch.int64), 1, selected_logical.clamp(min=0).to(torch.int64)
     )
-    _require_host_true(
-        (~valid) | ((physical >= 0) & (physical < kv_cache.shape[0])),
-        "exact sparse selected logical key maps to an invalid physical KV row",
-    )
+    if validate:
+        _require_host_true(
+            (~valid) | ((physical >= 0) & (physical < kv_cache.shape[0])),
+            "exact sparse selected logical key maps to an invalid physical KV row",
+        )
 
     flat_physical = physical.masked_select(valid)
     # Index the storage bytes, not arithmetic values. This keeps packing a
@@ -254,6 +276,111 @@ def pack_selected_kv_dynamic(
     )
 
 
+def pack_selected_kv_static(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    selected_logical: torch.Tensor,
+    *,
+    max_selected_tokens: int,
+) -> PackedSelectedKV:
+    """Graph-safe fixed-shape form of :func:`pack_selected_kv_dynamic`.
+
+    Live request rows are compacted into the leading logical interval consumed
+    by FlashMLA. Every inactive or invalid slot receives a private trash row,
+    so ``index_copy_`` has unique destinations and remains deterministic. The
+    device scalar ``contract_ok`` records canonical-index, physical-page, and
+    capacity validity without a host synchronization inside capture.
+    """
+
+    if kv_cache.ndim < 2 or not kv_cache.is_contiguous():
+        raise RuntimeError(
+            "exact sparse static selected-KV packing requires contiguous cache rows"
+        )
+    if page_table.ndim != 2 or selected_logical.ndim != 2:
+        raise ValueError(
+            "exact sparse static packing requires rank-two page and selection tables"
+        )
+    if page_table.dtype not in (torch.int32, torch.int64):
+        raise TypeError("exact sparse page table must use an integer dtype")
+    if selected_logical.dtype not in (torch.int32, torch.int64):
+        raise TypeError(
+            "exact sparse selected logical indices must use an integer dtype"
+        )
+    if page_table.shape[0] != selected_logical.shape[0]:
+        raise ValueError(
+            "exact sparse static packing requires one page-table row per request"
+        )
+    if not (page_table.device == selected_logical.device == kv_cache.device):
+        raise ValueError("exact sparse static packing tensors must share one device")
+    if page_table.shape[1] < 1 or kv_cache.shape[0] < 1 or max_selected_tokens < 1:
+        raise ValueError(
+            "exact sparse static packing requires positive storage capacities"
+        )
+
+    valid = selected_logical >= 0
+    selected_counts = valid.sum(dim=1, dtype=torch.int32)
+    row_offsets = torch.cumsum(selected_counts.to(torch.int64), dim=0) - selected_counts
+    compact_positions = torch.cumsum(valid.to(torch.int64), dim=1) - 1
+    destinations = row_offsets.unsqueeze(1) + compact_positions
+    within_capacity = destinations < max_selected_tokens
+
+    suffix_only = (~valid).cummax(dim=1).values.logical_and(valid).logical_not().all()
+    logical_in_range = (
+        (selected_logical >= -1) & ((~valid) | (selected_logical < page_table.shape[1]))
+    ).all()
+    if selected_logical.shape[1] > 1:
+        adjacent_valid = valid[:, 1:] & valid[:, :-1]
+        ascending = (
+            (~adjacent_valid) | (selected_logical[:, 1:] > selected_logical[:, :-1])
+        ).all()
+    else:
+        ascending = torch.ones((), dtype=torch.bool, device=selected_logical.device)
+    capacity_ok = selected_counts.sum(dtype=torch.int64) <= max_selected_tokens
+
+    safe_logical = selected_logical.clamp(min=0, max=page_table.shape[1] - 1).to(
+        torch.int64
+    )
+    physical = torch.gather(page_table.to(torch.int64), 1, safe_logical)
+    physical_in_range = (
+        (~valid) | ((physical >= 0) & (physical < kv_cache.shape[0]))
+    ).all()
+    contract_ok = (
+        suffix_only & logical_in_range & ascending & capacity_ok & physical_in_range
+    )
+
+    slots = selected_logical.numel()
+    slot_ids = torch.arange(
+        slots, device=selected_logical.device, dtype=torch.int64
+    ).view_as(selected_logical)
+    trash = max_selected_tokens + slot_ids
+    copy_destinations = torch.where(
+        valid & within_capacity, destinations, trash
+    ).reshape(-1)
+    source_rows = physical.clamp(min=0, max=kv_cache.shape[0] - 1).reshape(-1)
+    gathered = torch.index_select(kv_cache.view(torch.uint8), 0, source_rows)
+    packed_storage = torch.zeros(
+        (max_selected_tokens + slots, *kv_cache.view(torch.uint8).shape[1:]),
+        dtype=torch.uint8,
+        device=kv_cache.device,
+    )
+    packed_storage.index_copy_(0, copy_destinations, gathered)
+    packed_kv = (
+        packed_storage[:max_selected_tokens]
+        .view(kv_cache.dtype)
+        .view(max_selected_tokens, *kv_cache.shape[1:])
+    )
+    compact_indices = torch.where(valid & within_capacity, destinations, -1).to(
+        torch.int32
+    )
+    return PackedSelectedKV(
+        kv=packed_kv,
+        compact_indices=compact_indices,
+        physical_indices=physical.reshape(-1),
+        selected_counts=selected_counts,
+        contract_ok=contract_ok,
+    )
+
+
 @dataclass(frozen=True)
 class Glm52SparseLayerReceipt:
     layer_id: int
@@ -272,8 +399,8 @@ class Glm52SparseReceiptBook:
     def __init__(self) -> None:
         self._expected_producers: dict[int, int] | None = None
         self._expected_full_layers: frozenset[int] = frozenset()
-        self._selector: dict[int, tuple[int, int, int]] = {}
-        self._packer: dict[int, tuple[int, int, int]] = {}
+        self._selector: dict[int, tuple[int, int, torch.Tensor]] = {}
+        self._packer: dict[int, tuple[int, int, torch.Tensor]] = {}
         self.last_receipts: tuple[Glm52SparseLayerReceipt, ...] = ()
 
     @property
@@ -315,11 +442,11 @@ class Glm52SparseReceiptBook:
             raise RuntimeError(
                 f"exact sparse selector engaged on shared layer {layer_id}"
             )
-        counts = (selected >= 0).sum(dim=1)
+        selected_rows = (selected >= 0).sum(dtype=torch.int64)
         self._selector[layer_id] = (
             selected.shape[0],
             selected.shape[1],
-            int(counts.sum().item()),
+            selected_rows,
         )
 
     def record_packer(self, layer_id: int, packed: PackedSelectedKV) -> None:
@@ -332,10 +459,11 @@ class Glm52SparseReceiptBook:
             raise RuntimeError(
                 f"exact sparse selected-KV packer engaged on unexpected layer {layer_id}"
             )
+        selected_rows = packed.selected_counts.sum(dtype=torch.int64)
         self._packer[layer_id] = (
             packed.compact_indices.shape[0],
             packed.compact_indices.shape[1],
-            int(packed.selected_counts.sum().item()),
+            selected_rows,
         )
 
     def _finish(self) -> None:
@@ -354,12 +482,26 @@ class Glm52SparseReceiptBook:
                 f"expected {sorted(expected_layers)}, got {sorted(packer_layers)}"
             )
 
-        receipts = []
-        for layer_id in sorted(expected_layers):
+        paired_counts = []
+        ordered_layers = sorted(expected_layers)
+        for layer_id in ordered_layers:
             producer = self._expected_producers[layer_id]
             selected_shape = self._selector[producer]
             packed_shape = self._packer[layer_id]
-            if packed_shape != selected_shape:
+            if packed_shape[:2] != selected_shape[:2]:
+                raise RuntimeError(
+                    f"exact sparse layer {layer_id} packed shape disagrees with producer {producer}"
+                )
+            paired_counts.extend((selected_shape[2], packed_shape[2]))
+        host_counts = torch.stack(paired_counts).cpu().tolist()
+
+        receipts = []
+        for ordinal, layer_id in enumerate(ordered_layers):
+            producer = self._expected_producers[layer_id]
+            selected_shape = self._selector[producer]
+            packed_shape = self._packer[layer_id]
+            selected_rows, packed_rows = host_counts[2 * ordinal : 2 * ordinal + 2]
+            if selected_rows != packed_rows:
                 raise RuntimeError(
                     f"exact sparse layer {layer_id} packed state disagrees with producer {producer}"
                 )
@@ -369,7 +511,7 @@ class Glm52SparseReceiptBook:
                     producer_layer=producer,
                     query_rows=packed_shape[0],
                     topk=packed_shape[1],
-                    selected_rows=packed_shape[2],
+                    selected_rows=packed_rows,
                 )
             )
         self.last_receipts = tuple(receipts)
@@ -461,6 +603,7 @@ __all__ = [
     "Glm52SparseReceiptBook",
     "PackedSelectedKV",
     "pack_selected_kv_dynamic",
+    "pack_selected_kv_static",
     "log_glm52_sparse_receipt_once",
     "select_canonical_logical_topk",
     "validate_canonical_logical_indices",

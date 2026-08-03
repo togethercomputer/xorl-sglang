@@ -60,8 +60,8 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.server_args import (
-    XORL_BATCH_INVARIANT_TARGET,
     get_global_server_args,
+    is_glm52_exact_mode,
 )
 from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 
@@ -212,7 +212,6 @@ class LogitsMetadata:
         )
 
     def compute_dp_attention_metadata(self):
-
         cumtokens = torch.cumsum(self.global_num_tokens_for_logprob_gpu, dim=0)
         dp_rank = get_attention_dp_rank()
         if dp_rank == 0:
@@ -259,9 +258,7 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self.use_attn_tp_group = get_global_server_args().enable_dp_lm_head
         self.use_fp32_lm_head = get_global_server_args().enable_fp32_lm_head
-        self.use_xorl_bi_lm_head = (
-            get_global_server_args().rl_on_policy_target == XORL_BATCH_INVARIANT_TARGET
-        )
+        self.use_xorl_bi_lm_head = is_glm52_exact_mode(get_global_server_args())
         self.xorl_bi_lm_head_family = (
             resolve_xorl_bi_family() if self.use_xorl_bi_lm_head else None
         )

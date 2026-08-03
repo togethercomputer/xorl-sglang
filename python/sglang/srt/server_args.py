@@ -178,15 +178,13 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
-XORL_BATCH_INVARIANT_TARGET = "xorl"
+XORL_RL_TARGET = "xorl"
 RL_ON_POLICY_TARGET_CHOICES = [
     "fsdp",
     "xorl-batch-invariant",
-    XORL_BATCH_INVARIANT_TARGET,
+    XORL_RL_TARGET,
 ]
-BATCH_INVARIANT_RL_TARGETS = frozenset(
-    {"fsdp", "xorl-batch-invariant", XORL_BATCH_INVARIANT_TARGET}
-)
+BATCH_INVARIANT_RL_TARGETS = frozenset({"fsdp", "xorl-batch-invariant"})
 
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
@@ -288,6 +286,11 @@ def add_rl_on_policy_target_choices(choices):
 
 def is_batch_invariant_rl_target(target: Optional[str]) -> bool:
     return target in BATCH_INVARIANT_RL_TARGETS
+
+
+def is_glm52_exact_mode(server_args: "ServerArgs") -> bool:
+    """Return whether the resolved model uses the exact GLM-5.2 XORL contract."""
+    return bool(getattr(server_args, "glm52_exact_mode", False))
 
 
 def add_mamba_ssm_dtype_choices(choices):
@@ -677,6 +680,9 @@ class ServerArgs:
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
+    # Resolved after loading the model config. This is deliberately not a CLI flag:
+    # selecting the XORL target on GLM-5.2 selects one fail-closed exact contract.
+    glm52_exact_mode: bool = dataclasses.field(init=False, default=False, repr=False)
     enable_attn_tp_input_scattered: bool = False
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
     enable_nsa_prefill_context_parallel: bool = False
@@ -756,10 +762,6 @@ class ServerArgs:
 
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
-
-        # Validate the strict XORL numerical envelope before any worker can
-        # short-circuit model setup or initialize a draft path.
-        self._validate_xorl_batch_invariant_contract()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -913,8 +915,8 @@ class ServerArgs:
                 "to be specified."
             )
 
-    def _validate_xorl_batch_invariant_contract(self) -> None:
-        if self.rl_on_policy_target != XORL_BATCH_INVARIANT_TARGET:
+    def _validate_glm52_exact_contract(self) -> None:
+        if not self.glm52_exact_mode:
             return
         if (
             self.speculative_algorithm is not None
@@ -922,7 +924,7 @@ class ServerArgs:
             or self.enable_multi_layer_eagle
         ):
             raise ValueError(
-                "The XORL batch-invariant target does not support speculative "
+                "The exact GLM-5.2 XORL contract does not support speculative "
                 "or draft decoding."
             )
 
@@ -1438,6 +1440,86 @@ class ServerArgs:
             f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
         )
 
+    def _resolve_glm52_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+        is_nsa_model: bool,
+    ) -> None:
+        self.glm52_exact_mode = (
+            self.rl_on_policy_target == XORL_RL_TARGET
+            and model_arch == "GlmMoeDsaForCausalLM"
+            and is_nsa_model
+        )
+        hf_config._glm52_exact_mode = self.glm52_exact_mode
+        self._validate_glm52_exact_contract()
+
+        if not self.glm52_exact_mode:
+            return
+
+        # These are semantic requirements of the certified numerical program,
+        # not optional tuning knobs. Resolve defaults here and reject explicit
+        # incompatible choices instead of silently running a different program.
+        if self.dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError("The exact GLM-5.2 XORL contract requires BF16 dtype")
+        self.dtype = "bfloat16"
+        if self.quantization not in (None, "fp8"):
+            raise ValueError("The exact GLM-5.2 XORL contract requires FP8 weights")
+        self.quantization = "fp8"
+        if self.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError("The exact GLM-5.2 XORL contract requires BF16 KV cache")
+        self.kv_cache_dtype = "bfloat16"
+        if self.attention_backend not in (None, "nsa"):
+            raise ValueError("The exact GLM-5.2 XORL contract requires NSA attention")
+        self.attention_backend = "nsa"
+        if self.nsa_prefill_backend is None:
+            self.nsa_prefill_backend = "flashmla_sparse"
+        elif self.nsa_prefill_backend != "flashmla_sparse":
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires flashmla_sparse prefill"
+            )
+        if self.nsa_decode_backend is None:
+            self.nsa_decode_backend = "flashmla_sparse"
+        elif self.nsa_decode_backend != "flashmla_sparse":
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires flashmla_sparse decode"
+            )
+        if self.moe_runner_backend == "auto":
+            self.moe_runner_backend = "triton"
+        elif self.moe_runner_backend != "triton":
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires the Triton MoE runner"
+            )
+        if self.fp8_gemm_runner_backend == "auto":
+            self.fp8_gemm_runner_backend = "triton"
+        elif self.fp8_gemm_runner_backend != "triton":
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires the Triton FP8 GEMM runner"
+            )
+        if self.moe_dense_tp_size is None:
+            self.moe_dense_tp_size = 1
+        elif self.moe_dense_tp_size != 1:
+            raise ValueError("The exact GLM-5.2 XORL contract requires dense TP1")
+        if self.moe_a2a_backend != "none":
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires moe_a2a_backend=none"
+            )
+        if self.ep_size not in (1, self.tp_size):
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires EP to equal launcher TP"
+            )
+        if self.ep_size == 1 and self.tp_size > 1:
+            self.ep_size = self.tp_size
+        self.enable_nsa_prefill_context_parallel = True
+        if self.nsa_prefill_cp_mode != "round-robin-split":
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires round-robin NSA prefill CP"
+            )
+        self.disable_shared_experts_fusion = True
+        self.disable_custom_all_reduce = True
+        self.disable_overlap_schedule = True
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
 
@@ -1446,6 +1528,11 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        self._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch=model_arch,
+            is_nsa_model=is_deepseek_nsa(hf_config),
+        )
 
         if model_arch in [
             "MistralLarge3ForCausalLM",
@@ -3236,8 +3323,10 @@ class ServerArgs:
                     self.nsa_decode_backend,
                 )
                 allowed_glm_pairs = {GLM_NSA_DETERMINISTIC_BACKEND_PAIR}
-                if self.rl_on_policy_target == XORL_BATCH_INVARIANT_TARGET:
-                    allowed_glm_pairs.add(GLM_NSA_EXACT_SPARSE_DETERMINISTIC_BACKEND_PAIR)
+                if self.glm52_exact_mode:
+                    allowed_glm_pairs.add(
+                        GLM_NSA_EXACT_SPARSE_DETERMINISTIC_BACKEND_PAIR
+                    )
                 if nsa_backend_pair not in allowed_glm_pairs:
                     raise ValueError(
                         "Deterministic GLM NSA requires "
@@ -3257,10 +3346,14 @@ class ServerArgs:
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {self.attention_backend}."
                     )
 
-            if (
-                self.attention_backend
-                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
-            ):
+            radix_supported = list(RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND)
+            if is_glm_nsa_backend:
+                # The pinned GLM NSA pair addresses cached rows through the
+                # scheduler-provided page table and canonicalizes selected KV
+                # by logical key. Radix reuse therefore changes physical slot
+                # placement, not the numerical program.
+                radix_supported.append("nsa")
+            if self.attention_backend not in radix_supported:
                 # Currently, only certain backends support radix cache. Support for other backends is in progress
                 self.disable_radix_cache = True
                 logger.warning(
@@ -3399,7 +3492,6 @@ class ServerArgs:
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
-
         # Model and tokenizer
         parser.add_argument(
             "--model-path",
@@ -5727,7 +5819,7 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):

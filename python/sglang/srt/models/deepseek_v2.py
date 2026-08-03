@@ -172,16 +172,12 @@ from sglang.srt.models.glm52_index_share import (
     Glm52IndexShareManager,
     Glm52IndexSharePlan,
 )
-from sglang.srt.server_args import (
-    XORL_BATCH_INVARIANT_TARGET,
-    get_global_server_args,
-)
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
-    get_bool_env_var,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -214,8 +210,24 @@ else:
 logger = logging.getLogger(__name__)
 
 
-def _glm52_bi_router_enabled() -> bool:
-    return get_bool_env_var("SGLANG_BI_ROUTER")
+def _resolve_glm52_canonical_transport(config) -> str:
+    exact_mode = bool(getattr(config, "_glm52_exact_mode", False))
+    transport = str(
+        getattr(
+            config,
+            "_glm52_canonical_moe_transport",
+            "canonical_v3" if exact_mode else "dense_v1",
+        )
+    )
+    if transport not in {"dense_v1", "canonical_v3"}:
+        raise RuntimeError(
+            "GLM-5.2 canonical transport must be dense_v1 or canonical_v3"
+        )
+    if exact_mode and transport != "canonical_v3":
+        raise RuntimeError(
+            "The exact GLM-5.2 XORL contract requires canonical_v3 transport"
+        )
+    return transport
 
 
 class DeepseekV2MLP(nn.Module):
@@ -308,6 +320,9 @@ class MoEGate(nn.Module):
         self.is_nextn = is_nextn
         self.is_glm52 = getattr(config, "indexer_types", None) is not None
         self._glm52_canonical_contract = self.is_glm52 and not is_nextn
+        self._glm52_exact_router = self._glm52_canonical_contract and bool(
+            getattr(config, "_glm52_exact_mode", False)
+        )
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
@@ -348,9 +363,7 @@ class MoEGate(nn.Module):
                 True,  # is_vnni
             )
 
-        if self._glm52_canonical_contract and not _glm52_bi_router_enabled():
-            raise RuntimeError("GLM-5.2 canonical MoE requires SGLANG_BI_ROUTER=1")
-        if self._glm52_canonical_contract:
+        if self._glm52_exact_router:
             if not get_global_server_args().enable_deterministic_inference:
                 raise RuntimeError(
                     "GLM-5.2 batch-invariant router requires deterministic inference"
@@ -526,10 +539,10 @@ class DeepseekV2MoE(nn.Module):
                 hasattr(self.shared_experts.gate_up_proj.quant_method, "quant_config")
                 and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name()
                 in {
-                    "awq",
-                    "awq_marlin",
-                    "moe_wna16",
-                }
+                "awq",
+                "awq_marlin",
+                "moe_wna16",
+            }
             )
             self.shared_experts_is_int8 = (
                 not is_packed_weight
@@ -595,15 +608,9 @@ class DeepseekV2MoE(nn.Module):
         self._canonical_workspace = None
         self._canonical_input = None
         self._canonical_v3_workspaces = {}
-        self._glm52_canonical_transport = str(
-            getattr(config, "_glm52_canonical_moe_transport", "dense_v1")
-        )
+        self._glm52_canonical_transport = _resolve_glm52_canonical_transport(config)
         self.glm52_parallel_plan = None
         if self._glm52_canonical_contract:
-            if self._glm52_canonical_transport not in {"dense_v1", "canonical_v3"}:
-                raise RuntimeError(
-                    "GLM-5.2 canonical transport must be dense_v1 or canonical_v3"
-                )
             if self._enable_a2a_moe:
                 raise RuntimeError(
                     "GLM-5.2 canonical MoE requires moe_a2a_backend=none"
@@ -837,10 +844,6 @@ class DeepseekV2MoE(nn.Module):
         use_v3 = (
             getattr(self, "_glm52_canonical_transport", "dense_v1") == "canonical_v3"
         )
-        if use_v3 and capture_mode:
-            raise RuntimeError(
-                "GLM-5.2 canonical v3 does not yet admit CUDA graph capture"
-            )
         if use_v3:
             prefill_cp = forward_batch is not None and nsa_use_prefill_cp(forward_batch)
             capacity = rows
@@ -892,10 +895,11 @@ class DeepseekV2MoE(nn.Module):
                 group=group,
                 layer_id=self.layer_id,
                 distribution=distribution,
-                graph_capture=False,
+                graph_capture=capture_mode,
                 workspace=workspace,
             )
-            canonical.raise_for_status()
+            if not capture_mode:
+                canonical.raise_for_status()
             self.last_canonical_receipt = canonical.receipt
             self.canonical_engagement_count += 1
             return canonical.values
@@ -2216,10 +2220,8 @@ class DeepseekV2Model(nn.Module):
             if self.glm52_index_share_plan is not None
             else None
         )
-        self.glm52_xorl_bi_contract = (
-            self.glm52_index_share_plan is not None
-            and get_global_server_args().rl_on_policy_target
-            == XORL_BATCH_INVARIANT_TARGET
+        self.glm52_xorl_bi_contract = self.glm52_index_share_plan is not None and bool(
+            getattr(config, "_glm52_exact_mode", False)
         )
         if self.glm52_xorl_bi_contract:
             validate_xorl_glm52_norm_envelope(
@@ -2525,13 +2527,14 @@ class DeepseekV2Model(nn.Module):
             else nullcontext(None)
         )
         attn_backend = forward_batch.attn_backend
-        sparse_active = (
+        sparse_receipts_active = (
             self.glm52_xorl_bi_contract
             and getattr(attn_backend, "glm52_sparse_eager_enabled", False)
             and forward_batch.forward_mode.is_decode_or_idle()
             and not forward_batch.forward_mode.is_idle()
+            and not get_is_capture_mode()
         )
-        if sparse_active:
+        if sparse_receipts_active:
             receipt_book = getattr(attn_backend, "glm52_sparse_receipts", None)
             if receipt_book is None:
                 raise RuntimeError("GLM-5.2 exact sparse backend has no receipt book")
@@ -2544,14 +2547,14 @@ class DeepseekV2Model(nn.Module):
                 for layer_id in range(normal_start_layer, normal_end_layer)
                 if self.glm52_index_share_plan.indexer_types[layer_id] == "full"
             ]
-            sparse_invocation = receipt_book.invocation(
+            sparse_receipt_invocation = receipt_book.invocation(
                 producer_by_layer=producer_by_layer,
                 full_layers=full_layers,
             )
         else:
             receipt_book = None
-            sparse_invocation = nullcontext()
-        with index_share_invocation as index_share_context, sparse_invocation:
+            sparse_receipt_invocation = nullcontext()
+        with index_share_invocation as index_share_context, sparse_receipt_invocation:
             for i in range(normal_start_layer, normal_end_layer):
                 # NOTE: torch dynamo does not support graph break in context manager
                 ctx = (

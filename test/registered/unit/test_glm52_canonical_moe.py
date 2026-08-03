@@ -32,11 +32,29 @@ from sglang.srt.layers.attention.nsa.transform_index import (
 from sglang.srt.layers.glm52_positions import align_glm52_moe_positions
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 
 class TestGlm52CanonicalMoE(unittest.TestCase):
+    def test_exact_mode_defaults_to_v3_and_rejects_dense_override(self):
+        if importlib.util.find_spec("sgl_kernel") is None:
+            self.skipTest("sgl_kernel is required to import the serving model")
+        from sglang.srt.models.deepseek_v2 import (
+            _resolve_glm52_canonical_transport,
+        )
+
+        self.assertEqual(
+            _resolve_glm52_canonical_transport(SimpleNamespace(_glm52_exact_mode=True)),
+            "canonical_v3",
+        )
+        with self.assertRaisesRegex(RuntimeError, "requires canonical_v3"):
+            _resolve_glm52_canonical_transport(
+                SimpleNamespace(
+                    _glm52_exact_mode=True,
+                    _glm52_canonical_moe_transport="dense_v1",
+                )
+            )
+
     def test_glm52_explicit_mlp_layer_types_treat_boundaries_as_absent(self):
         if importlib.util.find_spec("sgl_kernel") is None:
             self.skipTest("sgl_kernel is required to import the serving model")
@@ -91,6 +109,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             hidden_size=8,
             topk_method="noaux_tc",
             indexer_types=["full"],
+            _glm52_exact_mode=True,
         )
         quant_config = SimpleNamespace(get_name=lambda: "compressed_tensors")
         with patch(
@@ -110,6 +129,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             hidden_size=8,
             topk_method="noaux_tc",
             indexer_types=["full"],
+            _glm52_exact_mode=True,
         )
         fake_hidden = SimpleNamespace(
             device=SimpleNamespace(type="cuda"),
@@ -127,12 +147,11 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 return_value=False,
             ),
             patch(
-                "sglang.srt.models.deepseek_v2._glm52_bi_router_enabled",
-                return_value=True,
-            ),
-            patch(
                 "sglang.srt.models.deepseek_v2.get_global_server_args",
-                return_value=SimpleNamespace(enable_deterministic_inference=True),
+                return_value=SimpleNamespace(
+                    enable_deterministic_inference=True,
+                    glm52_exact_mode=True,
+                ),
             ),
             patch(
                 "sglang.srt.batch_invariant_ops.batch_invariant_ops.bi_router_gemm",
@@ -155,6 +174,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             hidden_size=8,
             topk_method="noaux_tc",
             indexer_types=["full"],
+            _glm52_exact_mode=True,
         )
         with (
             patch(
@@ -166,19 +186,18 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 return_value=False,
             ),
             patch(
-                "sglang.srt.models.deepseek_v2._glm52_bi_router_enabled",
-                return_value=True,
-            ),
-            patch(
                 "sglang.srt.models.deepseek_v2.get_global_server_args",
-                return_value=SimpleNamespace(enable_deterministic_inference=False),
+                return_value=SimpleNamespace(
+                    enable_deterministic_inference=False,
+                    glm52_exact_mode=True,
+                ),
             ),
         ):
             gate = MoEGate(config, quant_config=None).to(dtype=torch.bfloat16)
             with self.assertRaisesRegex(RuntimeError, "deterministic inference"):
                 gate(torch.zeros((1, 8), dtype=torch.bfloat16))
 
-    def test_glm52_canonical_gate_fails_closed_without_bi_router(self):
+    def test_glm52_non_exact_gate_uses_the_standard_deterministic_path(self):
         if importlib.util.find_spec("sgl_kernel") is None:
             self.skipTest("sgl_kernel is required to import the serving model")
         from sglang.srt.models.deepseek_v2 import MoEGate
@@ -199,13 +218,20 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 return_value=False,
             ),
             patch(
-                "sglang.srt.models.deepseek_v2._glm52_bi_router_enabled",
-                return_value=False,
+                "sglang.srt.models.deepseek_v2.get_global_server_args",
+                return_value=SimpleNamespace(
+                    enable_deterministic_inference=True,
+                    glm52_exact_mode=False,
+                ),
             ),
         ):
             gate = MoEGate(config, quant_config=None).to(dtype=torch.bfloat16)
-            with self.assertRaisesRegex(RuntimeError, "SGLANG_BI_ROUTER=1"):
-                gate(torch.zeros((1, 8), dtype=torch.bfloat16))
+            hidden = torch.zeros((1, 8), dtype=torch.bfloat16)
+            self.assertTrue(
+                torch.equal(
+                    gate(hidden), torch.nn.functional.linear(hidden, gate.weight)
+                )
+            )
 
     def test_non_glm_gate_is_unchanged_when_bi_router_is_enabled(self):
         if importlib.util.find_spec("sgl_kernel") is None:
@@ -229,12 +255,11 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 return_value=False,
             ),
             patch(
-                "sglang.srt.models.deepseek_v2._glm52_bi_router_enabled",
-                return_value=True,
-            ),
-            patch(
                 "sglang.srt.models.deepseek_v2.get_global_server_args",
-                return_value=SimpleNamespace(enable_deterministic_inference=True),
+                return_value=SimpleNamespace(
+                    enable_deterministic_inference=True,
+                    glm52_exact_mode=True,
+                ),
             ),
         ):
             gate = MoEGate(config, quant_config=None)
@@ -1311,6 +1336,15 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 layer_id=3,
                 distribution=CanonicalDistribution.CONSUMER_SHARDED,
             )
+            graph_replicated = canonicalize_glm52_local_partial_v3(
+                partials[rank],
+                slots,
+                plan=plan,
+                group=object(),
+                layer_id=3,
+                distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+                graph_capture=True,
+            )
 
         replicated.raise_for_status()
         sharded.raise_for_status()
@@ -1325,6 +1359,8 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         )
         self.assertEqual(sharded.receipt.transport, CanonicalTransport.CP_SHARDED_V3)
         self.assertEqual(sharded.receipt.source_capacity, capacity)
+        self.assertTrue(torch.equal(graph_replicated.values, expected))
+        self.assertTrue(graph_replicated.receipt.graph_capture)
 
     @unittest.skipUnless(torch.cuda.is_available(), "CUDA graph replay requires CUDA")
     def test_reference_cuda_graph_replay_has_stable_slots(self):

@@ -20,8 +20,8 @@ from sglang.srt.layers.xorl_batch_invariant import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import (
-    XORL_BATCH_INVARIANT_TARGET,
     get_global_server_args,
+    is_glm52_exact_mode,
 )
 from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
 
@@ -54,9 +54,7 @@ class Sampler(nn.Module):
             self.tp_sync_group = get_attention_tp_group().device_group
 
         self.rl_on_policy_target = get_global_server_args().rl_on_policy_target
-        self.use_xorl_bi_sampling = (
-            self.rl_on_policy_target == XORL_BATCH_INVARIANT_TARGET
-        )
+        self.use_xorl_bi_sampling = is_glm52_exact_mode(get_global_server_args())
         self.xorl_bi_lm_head_family = (
             resolve_xorl_bi_family() if self.use_xorl_bi_sampling else None
         )

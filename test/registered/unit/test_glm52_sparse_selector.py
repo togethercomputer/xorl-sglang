@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.nsa.glm52_selector import (
     Glm52SparseReceiptBook,
     log_glm52_sparse_receipt_once,
     pack_selected_kv_dynamic,
+    pack_selected_kv_static,
     select_canonical_logical_topk,
 )
 from sglang.srt.layers.attention.nsa_backend import (
@@ -98,6 +99,17 @@ class TestGlm52SparseSelector(unittest.TestCase):
         )
 
         self.assertEqual(selected.tolist(), [list(range(2048))])
+
+    def test_trusted_selector_preserves_valid_input_bytes(self):
+        scores = torch.tensor(
+            [[3.0, 1.0, 3.0, 2.0, float("-inf")]], dtype=torch.float32
+        )
+        lengths = torch.tensor([4])
+
+        checked = select_canonical_logical_topk(scores, lengths, topk=3)
+        trusted = select_canonical_logical_topk(scores, lengths, topk=3, validate=False)
+
+        self.assertTrue(torch.equal(checked, trusted))
 
     def test_threshold_repair_matches_lexicographic_reference(self):
         generator = torch.Generator().manual_seed(520052)
@@ -188,7 +200,7 @@ class TestGlm52SparseSelector(unittest.TestCase):
                 ke_offset=torch.tensor([2]),
             )
 
-    def test_sparse_uses_stable_selector_for_prefill_and_decode(self):
+    def test_exact_sparse_uses_stable_selector_for_prefill_and_decode(self):
         backend = object.__new__(NativeSparseAttnBackend)
         backend.glm52_sparse_eager_enabled = True
         backend.canonical_logical_indices = True
@@ -209,6 +221,26 @@ class TestGlm52SparseSelector(unittest.TestCase):
         self.assertTrue(decode.stable_logical_selector)
         self.assertTrue(decode.selector_receipt_required)
         self.assertIsNotNone(decode.selector_receipt_hook)
+
+    def test_graph_capture_keeps_stable_selector_without_eager_receipt(self):
+        backend = object.__new__(NativeSparseAttnBackend)
+        backend.glm52_sparse_eager_enabled = True
+        backend.canonical_logical_indices = True
+        backend.forward_metadata = SimpleNamespace(paged_mqa_schedule_metadata=None)
+        backend.glm52_sparse_receipts = SimpleNamespace(record_selector=lambda *_: None)
+        backend.get_topk_transform_method = lambda: TopkTransformMethod.PAGED
+
+        with mock.patch(
+            "sglang.srt.layers.attention.nsa_backend.get_is_capture_mode",
+            return_value=True,
+        ):
+            decode = backend.get_indexer_metadata(
+                1, SimpleNamespace(forward_mode=ForwardMode.DECODE)
+            )
+
+        self.assertTrue(decode.stable_logical_selector)
+        self.assertFalse(decode.selector_receipt_required)
+        self.assertIsNone(decode.selector_receipt_hook)
 
 
 class TestGlm52SparseSelectedKVPacker(unittest.TestCase):
@@ -253,6 +285,57 @@ class TestGlm52SparseSelectedKVPacker(unittest.TestCase):
 
         expected_bits = torch.stack([storage[6], storage[5]])
         self.assertTrue(torch.equal(packed.kv.view(torch.int16), expected_bits))
+
+    def test_trusted_packer_preserves_valid_input_bytes_and_metadata(self):
+        storage = torch.arange(24, dtype=torch.int16).view(8, 1, 3)
+        cache = storage.view(torch.bfloat16)
+        table = torch.tensor([[6, 1, 5]], dtype=torch.int32)
+        selected = torch.tensor([[0, 2, -1]], dtype=torch.int32)
+
+        checked = pack_selected_kv_dynamic(cache, table, selected)
+        trusted = pack_selected_kv_dynamic(cache, table, selected, validate=False)
+
+        self.assertTrue(
+            torch.equal(checked.kv.view(torch.int16), trusted.kv.view(torch.int16))
+        )
+        self.assertTrue(torch.equal(checked.compact_indices, trusted.compact_indices))
+        self.assertTrue(torch.equal(checked.physical_indices, trusted.physical_indices))
+        self.assertTrue(torch.equal(checked.selected_counts, trusted.selected_counts))
+
+    def test_static_packer_matches_dynamic_live_prefix_and_zeroes_tail(self):
+        storage = torch.arange(36, dtype=torch.int16).view(12, 1, 3)
+        cache = storage.view(torch.bfloat16)
+        table = torch.tensor([[7, 3, 9, 1], [5, 2, 10, 4]], dtype=torch.int32)
+        selected = torch.tensor([[0, 2, 3, -1], [1, 3, -1, -1]], dtype=torch.int32)
+
+        dynamic = pack_selected_kv_dynamic(cache, table, selected)
+        static = pack_selected_kv_static(cache, table, selected, max_selected_tokens=8)
+
+        self.assertTrue(bool(static.contract_ok))
+        self.assertTrue(
+            torch.equal(
+                static.kv[: dynamic.kv.shape[0]].view(torch.int16),
+                dynamic.kv.view(torch.int16),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                static.kv[dynamic.kv.shape[0] :].view(torch.int16),
+                torch.zeros_like(static.kv[dynamic.kv.shape[0] :].view(torch.int16)),
+            )
+        )
+        self.assertTrue(torch.equal(static.compact_indices, dynamic.compact_indices))
+        self.assertTrue(torch.equal(static.selected_counts, dynamic.selected_counts))
+
+    def test_static_packer_reports_invalid_contract_without_oob_access(self):
+        cache = torch.arange(8, dtype=torch.uint8).view(4, 2)
+        table = torch.tensor([[0, -1, 2]], dtype=torch.int32)
+        selected = torch.tensor([[0, 1, 8]], dtype=torch.int32)
+
+        packed = pack_selected_kv_static(cache, table, selected, max_selected_tokens=2)
+
+        self.assertFalse(bool(packed.contract_ok))
+        self.assertEqual(packed.kv.shape, (2, 2))
 
     def test_noncanonical_or_invalid_rows_fail_closed(self):
         cache = torch.zeros((4, 2), dtype=torch.uint8)

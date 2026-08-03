@@ -68,7 +68,7 @@ class TestDeterministicGlmNsa(unittest.TestCase):
         model_config.hf_config = hf_config
         return model_config
 
-    def test_accepts_pinned_glm_nsa_pair_and_disables_uncertified_radix(self):
+    def test_accepts_pinned_glm_nsa_pair_with_radix(self):
         server_args = self._server_args()
         server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
 
@@ -77,7 +77,81 @@ class TestDeterministicGlmNsa(unittest.TestCase):
         self.assertEqual(server_args.attention_backend, "nsa")
         self.assertEqual(server_args.nsa_prefill_backend, "flashmla_sparse")
         self.assertEqual(server_args.nsa_decode_backend, "fa3")
-        self.assertTrue(server_args.disable_radix_cache)
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_glm52_xorl_resolves_the_exact_defaults_without_environment_flags(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.tp_size = 16
+        hf_config = self._glm_model_config().hf_config
+
+        server_args._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_nsa_model=True,
+        )
+
+        self.assertTrue(server_args.glm52_exact_mode)
+        self.assertTrue(hf_config._glm52_exact_mode)
+        self.assertEqual(server_args.dtype, "bfloat16")
+        self.assertEqual(server_args.quantization, "fp8")
+        self.assertEqual(server_args.kv_cache_dtype, "bfloat16")
+        self.assertEqual(server_args.attention_backend, "nsa")
+        self.assertEqual(server_args.nsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.nsa_decode_backend, "flashmla_sparse")
+        self.assertEqual(server_args.moe_runner_backend, "triton")
+        self.assertEqual(server_args.fp8_gemm_runner_backend, "triton")
+        self.assertEqual(server_args.moe_dense_tp_size, 1)
+        self.assertEqual(server_args.ep_size, 16)
+        self.assertTrue(server_args.enable_nsa_prefill_context_parallel)
+        self.assertEqual(server_args.nsa_prefill_cp_mode, "round-robin-split")
+        self.assertTrue(server_args.disable_shared_experts_fusion)
+        self.assertTrue(server_args.disable_custom_all_reduce)
+        self.assertTrue(server_args.disable_overlap_schedule)
+
+    def test_glm52_xorl_rejects_explicit_incompatible_programs(self):
+        incompatible = {
+            "dtype": "float16",
+            "quantization": "int8",
+            "kv_cache_dtype": "fp8_e4m3",
+            "attention_backend": "fa3",
+            "nsa_prefill_backend": "fa3",
+            "nsa_decode_backend": "flashmla_kv",
+            "moe_runner_backend": "flashinfer_trtllm",
+            "fp8_gemm_runner_backend": "deep_gemm",
+            "moe_dense_tp_size": 2,
+            "moe_a2a_backend": "deepep",
+            "ep_size": 8,
+            "nsa_prefill_cp_mode": "in-seq-split",
+        }
+        for name, value in incompatible.items():
+            with self.subTest(name=name, value=value):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.rl_on_policy_target = "xorl"
+                server_args.tp_size = 16
+                setattr(server_args, name, value)
+                with self.assertRaisesRegex(ValueError, "exact GLM-5.2 XORL"):
+                    server_args._resolve_glm52_exact_contract(
+                        self._glm_model_config().hf_config,
+                        model_arch="GlmMoeDsaForCausalLM",
+                        is_nsa_model=True,
+                    )
+
+    def test_non_glm_xorl_does_not_enable_the_glm_numerical_family(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        hf_config = MagicMock()
+
+        server_args._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch="Qwen3ForCausalLM",
+            is_nsa_model=False,
+        )
+
+        self.assertFalse(server_args.glm52_exact_mode)
+        self.assertFalse(hf_config._glm52_exact_mode)
+        self.assertIsNone(server_args.nsa_prefill_backend)
+        self.assertEqual(server_args.moe_runner_backend, "auto")
 
     def test_rejects_unpinned_glm_nsa_pair(self):
         server_args = self._server_args(decode_backend="flashmla_kv")
@@ -86,17 +160,18 @@ class TestDeterministicGlmNsa(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Deterministic GLM NSA requires"):
             server_args._handle_deterministic_inference()
 
-    def test_accepts_sparse_sparse_decode_only_for_xorl_contract(self):
+    def test_accepts_exact_sparse_decode_only_for_xorl_contract(self):
         server_args = self._server_args(decode_backend="flashmla_sparse")
         server_args.rl_on_policy_target = "xorl"
+        server_args.glm52_exact_mode = True
         server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
 
         server_args._handle_deterministic_inference()
 
         self.assertEqual(server_args.nsa_decode_backend, "flashmla_sparse")
-        self.assertTrue(server_args.disable_radix_cache)
+        self.assertFalse(server_args.disable_radix_cache)
 
-    def test_rejects_sparse_sparse_decode_without_xorl_contract(self):
+    def test_rejects_exact_sparse_decode_without_xorl_contract(self):
         server_args = self._server_args(decode_backend="flashmla_sparse")
         server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
 
