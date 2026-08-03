@@ -222,14 +222,28 @@ class RMSNorm(MultiPlatformOp):
         orig_dtype = self.override_orig_dtype or x.dtype
 
         # RL path: residual addition in orig_dtype for training consistency
-        if self.cast_x_before_out_mul and not self.fp32_residual and residual is not None:
-            x = x + residual + (post_residual_addition if post_residual_addition is not None else 0.0)
+        if (
+            self.cast_x_before_out_mul
+            and not self.fp32_residual
+            and residual is not None
+        ):
+            x = (
+                x
+                + residual
+                + (
+                    post_residual_addition
+                    if post_residual_addition is not None
+                    else 0.0
+                )
+            )
             residual = x.clone()
 
         x = x.to(torch.float32)
 
         # Standard path: residual addition in fp32 (upstream behavior)
-        if residual is not None and not (self.cast_x_before_out_mul and not self.fp32_residual):
+        if residual is not None and not (
+            self.cast_x_before_out_mul and not self.fp32_residual
+        ):
             x = x + residual.to(torch.float32)
             if post_residual_addition is not None:
                 x = x + post_residual_addition.to(torch.float32)
