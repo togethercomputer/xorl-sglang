@@ -28,6 +28,7 @@ from torch import nn
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.glm52 import maybe_create_glm52_validator
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.utils.hf_transformers_utils import AutoConfig
@@ -78,6 +79,9 @@ class LoRAAdapter(nn.Module):
             self,
             "_moe_is_gated_by_layer",
             self._build_moe_gated_map(base_model) if base_model is not None else {},
+        )
+        self._glm52_validator = maybe_create_glm52_validator(
+            base_hf_config, self.config.hf_config
         )
 
         self.layers: List[LoRALayer] = nn.ModuleList(
@@ -153,16 +157,23 @@ class LoRAAdapter(nn.Module):
         ):
             self._process_weight(name, loaded_weight)
 
+        if self._glm52_validator is not None:
+            self._glm52_validator.finalize()
         self._normalize_weights()
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
         for name, tensor in tensors.items():
             self._process_weight(name, tensor)
 
+        if self._glm52_validator is not None:
+            self._glm52_validator.finalize()
         self._normalize_weights()
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules
+
+        if self._glm52_validator is not None:
+            self._glm52_validator.observe(name, loaded_weight)
 
         normalized_target_modules = get_normalized_target_modules(
             self.config.target_modules

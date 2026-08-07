@@ -3554,7 +3554,10 @@ def require_mlp_tp_gather(server_args: ServerArgs):
 
     # elastic-EP scale-up rewrites dp_size on the published config
     if get_parallel().enable_dp_attention:
-        assert get_parallel().dp_size > 1, "dp_size must be greater than 1"
+        # Prefill CP reuses DP-attention scheduler synchronization at DP1, but
+        # there are no attention-DP shards for the MLP path to gather.
+        if get_parallel().dp_size == 1:
+            return False
         if get_exec().moe.elastic_ep_backend is not None:
             from sglang.srt.elastic_ep.elastic_ep import (
                 elastic_expanded_world_enabled,

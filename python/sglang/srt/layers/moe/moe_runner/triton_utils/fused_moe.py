@@ -95,7 +95,11 @@ padding_size = get_moe_padding_size(_use_aiter)
 
 
 def _use_moe_sum_reduce_torch_compile(num_tokens: int) -> bool:
-    return num_tokens <= 32 and not is_batch_invariant_mode_enabled()
+    return (
+        num_tokens <= 32
+        and not is_batch_invariant_mode_enabled()
+        and not get_exec().deterministic.enable_deterministic_inference
+    )
 
 
 @register_custom_op(mutates_args=["hidden_states"])
@@ -367,6 +371,21 @@ def _down_moe_use_tma():
     return support_tensor_descriptor()
 
 
+def _is_contiguous_or_gkn_transpose_view(weight: torch.Tensor) -> bool:
+    """Accept serving-contiguous weights or a zero-copy XoRL GKN transpose."""
+    return weight.is_contiguous() or (
+        weight.ndim == 3 and weight.transpose(1, 2).is_contiguous()
+    )
+
+
+def _resolve_down_moe_tma(
+    w2: torch.Tensor, down_config: Optional[Dict[str, Any]]
+) -> bool:
+    """Consume the config flag and reject TMA for strided down weights."""
+    configured = down_config.pop("USE_TMA", False) if down_config is not None else False
+    return _down_moe_use_tma() and configured and w2.is_contiguous()
+
+
 def _prepare_fused_moe_run(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -409,11 +428,10 @@ def _prepare_fused_moe_run(
         per_channel_quant=per_channel_quant,
         return_down_config=True,
     )
-    down_moe_use_tma = (
-        _down_moe_use_tma()
-        and down_config is not None
-        and down_config.pop("USE_TMA", False)
-    )
+    # Tensor descriptors require the down weight's innermost dimension to be
+    # contiguous. The ordinary kernel consumes explicit strides and remains
+    # valid for a zero-copy GKN transpose view.
+    down_moe_use_tma = _resolve_down_moe_tma(w2, down_config)
 
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
         topk_ids, config["BLOCK_SIZE_M"], E
@@ -917,8 +935,12 @@ def fused_experts_impl(
         ), f"Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"
-    assert w1.is_contiguous(), "Expert weights1 must be contiguous"
-    assert w2.is_contiguous(), "Expert weights2 must be contiguous"
+    assert _is_contiguous_or_gkn_transpose_view(
+        w1
+    ), "Expert weights1 must be contiguous or a GKN transpose view"
+    assert _is_contiguous_or_gkn_transpose_view(
+        w2
+    ), "Expert weights2 must be contiguous or a GKN transpose view"
     assert hidden_states.dtype in [torch.float32, torch.float16, torch.bfloat16]
 
     (

@@ -33,6 +33,22 @@ register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 
 class TestGlm52CanonicalMoE(unittest.TestCase):
+    def test_cp16_dp1_does_not_request_mlp_tp_gather(self):
+        from sglang.srt.utils.common import require_mlp_sync, require_mlp_tp_gather
+
+        parallel = SimpleNamespace(enable_dp_attention=True, dp_size=1)
+        moe_utils = SimpleNamespace(
+            get_moe_a2a_backend=lambda: self.fail(
+                "DP1 must return before inspecting the MoE A2A backend"
+            )
+        )
+        with (
+            patch.dict("sys.modules", {"sglang.srt.layers.moe.utils": moe_utils}),
+            patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
+        ):
+            self.assertFalse(require_mlp_tp_gather(SimpleNamespace(tp_size=16)))
+            self.assertTrue(require_mlp_sync(SimpleNamespace(tp_size=16)))
+
     def test_exact_mode_serves_the_certified_v3b_and_rejects_dense_override(self):
         if importlib.util.find_spec("sgl_kernel") is None:
             self.skipTest("sgl_kernel is required to import the serving model")

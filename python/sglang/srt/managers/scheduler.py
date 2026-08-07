@@ -147,6 +147,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqOutput,
     LoadLoRAAdapterReqInput,
     LoadLoRAAdapterReqOutput,
+    LoRAUpdateOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PrepareWeightsUpdateReqInput,
@@ -4679,16 +4680,77 @@ class Scheduler(
     ) -> LoadLoRAAdapterReqOutput:
         """In-place loading a new lora adapter from disk or huggingface."""
 
-        result = self.tp_worker.load_lora_adapter(recv_req)
-        return result
+        return self._load_lora_adapter_with_tp_consensus(
+            recv_req,
+            self.tp_worker.load_lora_adapter,
+        )
 
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ) -> LoadLoRAAdapterFromTensorsReqOutput:
         """In-place loading a new lora adapter from serialized tensors."""
 
-        result = self.tp_worker.load_lora_adapter_from_tensors(recv_req)
-        return result
+        return self._load_lora_adapter_with_tp_consensus(
+            recv_req,
+            self.tp_worker.load_lora_adapter_from_tensors,
+        )
+
+    def _load_lora_adapter_with_tp_consensus(self, recv_req, load_fn):
+        """Commit a dynamic LoRA load only when every TP rank agrees."""
+        try:
+            local_result = load_fn(recv_req)
+        except Exception as e:
+            local_result = LoRAUpdateOutput(
+                success=False,
+                error_message=str(e),
+            )
+
+        rank_results = self.tp_group.all_gather_object(local_result)
+        failed_ranks = [
+            (rank, result)
+            for rank, result in enumerate(rank_results)
+            if not result.success
+        ]
+        loaded_adapters = [result.loaded_adapters for result in rank_results]
+        registries_match = all(
+            adapters == loaded_adapters[0] for adapters in loaded_adapters[1:]
+        )
+        if not failed_ranks and registries_match:
+            return rank_results[0]
+
+        failure_messages = [
+            f"TP rank {rank}: {result.error_message or 'load failed'}"
+            for rank, result in failed_ranks
+        ]
+        if not registries_match:
+            failure_messages.append("loaded adapter registries differ across TP ranks")
+
+        try:
+            local_rollback = self.tp_worker.rollback_lora_adapter(recv_req.lora_id)
+        except Exception as e:
+            local_rollback = LoRAUpdateOutput(
+                success=False,
+                error_message=str(e),
+            )
+        rollback_results = self.tp_group.all_gather_object(local_rollback)
+        failure_messages.extend(
+            f"TP rank {rank} rollback: {result.error_message or 'rollback failed'}"
+            for rank, result in enumerate(rollback_results)
+            if not result.success
+        )
+        rollback_registries = [result.loaded_adapters for result in rollback_results]
+        if any(
+            adapters != rollback_registries[0] for adapters in rollback_registries[1:]
+        ):
+            failure_messages.append(
+                "loaded adapter registries still differ after TP rollback"
+            )
+
+        return LoRAUpdateOutput(
+            success=False,
+            error_message=" | ".join(failure_messages),
+            loaded_adapters=rollback_registries[0],
+        )
 
     def unload_lora_adapter(
         self, recv_req: UnloadLoRAAdapterReqInput

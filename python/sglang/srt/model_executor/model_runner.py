@@ -1280,6 +1280,10 @@ class ModelRunner:
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
         return self.lora_manager.unload_lora_adapter(lora_ref)
 
+    def rollback_lora_adapter(self, lora_id: str):
+        """Compensate an uncommitted dynamic LoRA load on this rank."""
+        return self.lora_manager.rollback_lora_adapter(lora_id)
+
     @property
     def effective_max_total_num_tokens(self):
         """Return the max token pool size considering hybrid swa settings."""

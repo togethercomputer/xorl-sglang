@@ -1459,6 +1459,19 @@ class Glm4MoeForCausalLM(nn.Module):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
+    # XoRL exports q_a + kv_a and gate + up as separate logical factors.
+    # The ordinary LoRA loader packs those into the fused runtime targets
+    # listed here; kv_b_proj is consumed by the absorbed-MLA correction path.
+    supported_lora_modules = [
+        "fused_qkv_a_proj_with_mqa",
+        "q_b_proj",
+        "kv_b_proj",
+        "o_proj",
+        "gate_up_proj",
+        "down_proj",
+        "lm_head",
+    ]
+
     def determine_num_fused_shared_experts(self):
         super().determine_num_fused_shared_experts("GlmMoeDsaForCausalLM")
 

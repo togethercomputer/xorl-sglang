@@ -1988,6 +1988,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             {},
         )
+        self.assertEqual(
+            _data_parallelism_defaults(
+                ResolvedView(
+                    SimpleNamespace(
+                        dp_size=1, ep_join_mode=None, enable_prefill_cp=True
+                    )
+                )
+            ),
+            {"enable_dp_lm_head": False},
+        )
 
         with patch("sglang.srt.environ.envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE") as e:
             e.get.return_value = False
@@ -2115,6 +2125,32 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                     glm52_exact_mode=False,
                                 ),
                                 glm52_hf_config,
+                            ),
+                            {
+                                "attention_backend": "dsa",
+                                "page_size": 64,
+                                "enable_dp_attention": True,
+                                "moe_dense_tp_size": 1,
+                                "attn_cp_size": 16,
+                            },
+                        )
+                        # Exact mode remains an independent admission path.
+                        self.assertEqual(
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=16,
+                                    dp_size=1,
+                                    ep_size=16,
+                                    moe_a2a_backend="none",
+                                    kv_cache_dtype="auto",
+                                    nnodes=2,
+                                    glm52_exact_mode=True,
+                                ),
+                                SimpleNamespace(
+                                    architectures=["GlmMoeDsaForCausalLM"]
+                                ),
                             ),
                             {
                                 "attention_backend": "dsa",

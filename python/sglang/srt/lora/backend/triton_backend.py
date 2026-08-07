@@ -58,16 +58,32 @@ class TritonLoRABackend(BaseLoRABackend):
             extra_embeddings=extra_embeddings,
         )
 
-    def _sgemm_info(self, pruned_batch_info=None):
+    def _sgemm_info(self, pruned_batch_info=None, *, num_tokens: int | None = None):
         """Return the sgemm batch_info (merged segments when available)."""
         if pruned_batch_info is not None:
             return pruned_batch_info
-        assert self.batch_info is not None, (
+        batch_info = (
+            self.batch_info
+            if num_tokens is None
+            else self.get_batch_info_for_rows(num_tokens)
+        )
+        assert batch_info is not None, (
             "LoRA kernel invoked with no prepared batch (DP-attention idle "
             "forward?). Gate the caller on lora_active, as in "
             "sglang/srt/lora/layers.py forwards."
         )
-        return self.sgemm_batch_info or self.batch_info
+        if batch_info is not self.batch_info:
+            return batch_info
+        return self.sgemm_batch_info or batch_info
+
+    @staticmethod
+    def _validate_sgemm_rows(x: torch.Tensor, batch_info: LoRABatchInfo) -> None:
+        expected_tokens = batch_info.expected_tokens
+        if expected_tokens is not None and x.shape[0] != expected_tokens:
+            raise RuntimeError(
+                "LoRA batch metadata does not match the activation rows: "
+                f"metadata_rows={expected_tokens}, activation_rows={x.shape[0]}."
+            )
 
     def run_lora_a_sgemm(
         self,
@@ -78,9 +94,9 @@ class TritonLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        return sgemm_lora_a_fwd(
-            x, weights, self._sgemm_info(pruned_batch_info), stack_num=stack_num
-        )
+        batch_info = self._sgemm_info(pruned_batch_info, num_tokens=x.shape[0])
+        self._validate_sgemm_rows(x, batch_info)
+        return sgemm_lora_a_fwd(x, weights, batch_info, stack_num=stack_num)
 
     def run_lora_b_sgemm(
         self,
@@ -91,9 +107,9 @@ class TritonLoRABackend(BaseLoRABackend):
         *args,
         **kwargs,
     ) -> torch.Tensor:
-        return sgemm_lora_b_fwd(
-            x, weights, self._sgemm_info(pruned_batch_info), base_output
-        )
+        batch_info = self._sgemm_info(pruned_batch_info, num_tokens=x.shape[0])
+        self._validate_sgemm_rows(x, batch_info)
+        return sgemm_lora_b_fwd(x, weights, batch_info, base_output)
 
     def run_qkv_lora(
         self,
@@ -113,7 +129,8 @@ class TritonLoRABackend(BaseLoRABackend):
         # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
-        sgemm_info = self._sgemm_info()
+        sgemm_info = self._sgemm_info(num_tokens=x.shape[0])
+        self._validate_sgemm_rows(x, sgemm_info)
         lora_a_output = sgemm_lora_a_fwd(x, qkv_lora_a, sgemm_info, stack_num=n_slices)
         lora_output = qkv_lora_b_fwd(
             lora_a_output,
@@ -142,7 +159,8 @@ class TritonLoRABackend(BaseLoRABackend):
         assert isinstance(gate_up_lora_b, torch.Tensor)
         output_dim = gate_up_lora_b.shape[-2] // 2
 
-        sgemm_info = self._sgemm_info()
+        sgemm_info = self._sgemm_info(num_tokens=x.shape[0])
+        self._validate_sgemm_rows(x, sgemm_info)
         # lora_a_output: (s, 2 * r)
         lora_a_output = sgemm_lora_a_fwd(x, gate_up_lora_a, sgemm_info, stack_num=2)
         lora_output = gate_up_lora_b_fwd(

@@ -30,6 +30,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # reset_batch_state() on DP-attention idle forwards. None means "no
         # batch prepared" — the LoRA layers read it to skip LoRA application.
         self.batch_info: Optional[LoRABatchInfo] = None
+        # CP-v2 gathers rank-local rows before sparse MLPs. The manager
+        # installs matching rank-major physical metadata here for the gathered
+        # row count; attention and dense fully-DP MLPs keep batch_info.
+        self.context_parallel_mlp_batch_info: Optional[LoRABatchInfo] = None
         self.init_lm_head_config()
         self._is_moe_lora = False
         # Static metadata read by prefill-CUDA-graph kernels, refreshed in
@@ -44,9 +48,33 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         per-batch metadata. batch_info=None is the master "no batch
         prepared" signal that the layer guards (lora_active) read."""
         self.batch_info = None
+        self.context_parallel_mlp_batch_info = None
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
+
+    def get_batch_info_for_rows(self, num_tokens: int) -> Optional[LoRABatchInfo]:
+        """Return fail-closed metadata matching an activation's token rows."""
+        batch_info = self.batch_info
+        if (
+            batch_info is None
+            or batch_info.expected_tokens is None
+            or batch_info.expected_tokens == num_tokens
+        ):
+            return batch_info
+        gathered_batch_info = self.context_parallel_mlp_batch_info
+        if (
+            gathered_batch_info is not None
+            and gathered_batch_info.expected_tokens == num_tokens
+        ):
+            return gathered_batch_info
+        raise RuntimeError(
+            "LoRA batch metadata does not match the activation rows: "
+            f"local_metadata_rows={batch_info.expected_tokens}, "
+            "gathered_metadata_rows="
+            f"{getattr(gathered_batch_info, 'expected_tokens', None)}, "
+            f"activation_rows={num_tokens}."
+        )
 
     def run_lora_a_embedding(
         self,

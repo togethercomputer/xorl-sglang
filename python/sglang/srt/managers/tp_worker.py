@@ -247,6 +247,9 @@ class BaseTpWorker(ABC):
         result = self.model_runner.unload_lora_adapter(recv_req.to_ref())
         return result
 
+    def rollback_lora_adapter(self, lora_id: str):
+        return self.model_runner.rollback_lora_adapter(lora_id)
+
     def load_lora_adapter_from_tensors(
         self, recv_req: LoadLoRAAdapterFromTensorsReqInput
     ):

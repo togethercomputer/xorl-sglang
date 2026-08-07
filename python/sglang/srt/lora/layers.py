@@ -1064,11 +1064,9 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self.down_lora_a_weights = down_lora_a_weights
         self.down_lora_b_weights = down_lora_b_weights
 
-    def _get_lora_info(self):
+    def _get_lora_info(self, batch_info: LoRABatchInfo):
         """Build LoRAInfo for the current batch."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
-
-        batch_info = self.lora_backend.batch_info
 
         lora_ranks = batch_info.lora_ranks
         max_lora_rank = self.down_lora_a_weights.shape[2]
@@ -1121,11 +1119,19 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         2. After down projection, before final reduction
         """
         # DP-attention idle forward: no batch_info, run the base MoE path.
-        if self.lora_backend.batch_info is None:
+        batch_info = self.lora_backend.get_batch_info_for_rows(hidden_states.shape[0])
+        if batch_info is None:
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 
+        expected_tokens = batch_info.expected_tokens
+        if expected_tokens is not None and hidden_states.shape[0] != expected_tokens:
+            raise RuntimeError(
+                "MoE LoRA batch metadata does not match the activation rows: "
+                f"metadata_rows={expected_tokens}, activation_rows={hidden_states.shape[0]}."
+            )
+
         # Build LoRA info for this batch
-        lora_info = self._get_lora_info()
+        lora_info = self._get_lora_info(batch_info)
 
         # run lora moe_runner
         return self._forward_with_lora(hidden_states, topk_output, lora_info, **kwargs)

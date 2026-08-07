@@ -353,12 +353,20 @@ class EagerRunner(BaseRunner):
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
                 model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-            hidden_states = model.model(
-                forward_batch.input_ids,
-                sharded_positions,
-                forward_batch,
-                **model_kwargs,
-            )
+            lora_context = contextlib.nullcontext()
+            if self.model_runner.server_args.enable_lora:
+                lora_context = (
+                    self.model_runner.lora_manager.glm52_context_parallel_lora_batch(
+                        forward_batch, sharded_input_embeds.shape[0]
+                    )
+                )
+            with lora_context:
+                hidden_states = model.model(
+                    forward_batch.input_ids,
+                    sharded_positions,
+                    forward_batch,
+                    **model_kwargs,
+                )
         capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
         aux_hidden_states = None
         if capture_aux_hidden_states:

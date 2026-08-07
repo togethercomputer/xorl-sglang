@@ -17,7 +17,10 @@
 
 import logging
 import re
-from typing import Dict, Iterable, List, Optional
+from contextlib import contextmanager
+from copy import copy
+from dataclasses import replace
+from typing import Dict, Iterable, Iterator, List, Optional
 
 import torch
 
@@ -31,6 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
+from sglang.srt.lora.glm52 import is_glm52_xorl_shared_outer_adapter
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -39,6 +43,7 @@ from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import (
     DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
+    LoRABatchInfo,
     LoRAType,
     auto_detect_lora_target_modules,
     get_normalized_target_modules,
@@ -83,6 +88,11 @@ class LoRAManager:
         self.device: torch.device = next(self.base_model.parameters()).device
         self.tp_size: int = tp_size
         self.tp_rank: int = tp_rank
+        self.dp_size: int = getattr(server_args, "dp_size", 1)
+        self.ep_size: int = getattr(server_args, "ep_size", 1)
+        self.pp_size: int = getattr(server_args, "pp_size", 1)
+        self.attn_cp_size: int = getattr(server_args, "attn_cp_size", 1)
+        self.cp_strategy: Optional[str] = getattr(server_args, "cp_strategy", None)
         # Attention projections shard on the attn-TP group; extracted once
         # here (parallel groups are frozen after init_torch_distributed).
         self.attn_tp_size: int = get_parallel().attn_tp_size
@@ -260,12 +270,55 @@ class LoRAManager:
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
+            rollback_result = self.rollback_lora_adapter(lora_ref.lora_id)
+            error_message = str(e)
+            if not rollback_result.success:
+                error_message += (
+                    "; local rollback failed: " + rollback_result.error_message
+                )
             return self.create_lora_update_result(
                 success=False,
-                error_message=str(e),
+                error_message=error_message,
             )
 
         return self.create_lora_update_result(success=True)
+
+    def rollback_lora_adapter(self, lora_id: str) -> LoRAUpdateOutput:
+        """Remove every local trace of an uncommitted adapter load.
+
+        Dynamic loads are committed by the control plane only after all TP
+        ranks agree.  This compensation path is deliberately idempotent so it
+        can clean both a locally failed load and a locally successful load
+        whose peer failed.
+        """
+        errors = []
+
+        pending_event = self.pending_lora_load_events.pop(lora_id, None)
+        if pending_event is not None:
+            try:
+                pending_event.synchronize()
+            except Exception as e:
+                errors.append(f"pending load synchronization failed: {e}")
+
+        memory_pool = getattr(self, "memory_pool", None)
+        if memory_pool is not None:
+            try:
+                removed_slot = memory_pool.remove_lora(lora_id)
+                if removed_slot is not None:
+                    self._notify_lora_slots_updated({removed_slot})
+            except Exception as e:
+                errors.append(f"memory-pool rollback failed: {e}")
+
+        lora_ref = self.lora_refs.pop(lora_id, None)
+        self.loras.pop(lora_id, None)
+        self.configs.pop(lora_id, None)
+        if lora_ref is not None:
+            self.num_pinned_loras -= int(lora_ref.pinned)
+
+        return self.create_lora_update_result(
+            success=not errors,
+            error_message="; ".join(errors),
+        )
 
     def validate_new_adapter(self, lora_config: LoRAConfig, lora_ref: LoRARef):
         """
@@ -296,6 +349,8 @@ class LoRAManager:
 
         # Check if the LoRA adapter shape is compatible with the current LoRA memory pool configuration.
         memory_pool = getattr(self, "memory_pool", None)
+        if memory_pool is not None:
+            self._validate_glm52_runtime_layout(lora_config)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
         if incompatible:
             raise ValueError(
@@ -310,6 +365,24 @@ class LoRAManager:
                 f"Failed to load LoRA adapter {lora_ref.lora_name} as a pinned adapter. It is not allowed to pin all slots "
                 "in the LoRA memory pool to avoid starvation for unpinned adapters and base models. Please increase your "
                 "`--max-loras-per-batch` or load it as unpinned LoRA adapters."
+            )
+
+    def _validate_glm52_runtime_layout(self, lora_config: LoRAConfig) -> None:
+        if not is_glm52_xorl_shared_outer_adapter(
+            self.base_hf_config, lora_config.hf_config
+        ):
+            return
+        if not getattr(self, "experts_shared_outer_loras", False):
+            raise ValueError(
+                "GLM-5.2 XoRL shared-outer adapters require a shared-outer "
+                "LoRA memory pool. Start the server with "
+                "--experts-shared-outer-loras before using POST "
+                "/load_lora_adapter."
+            )
+        if getattr(self.base_model, "num_fused_shared_experts", 0) != 0:
+            raise ValueError(
+                "GLM-5.2 XoRL adapters require unfused shared-expert modules. "
+                "Start the server with --disable-shared-experts-fusion."
             )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
@@ -424,6 +497,269 @@ class LoRAManager:
         take the base path instead of reading the previous batch's stale
         metadata."""
         self.lora_backend.reset_batch_state()
+
+    @contextmanager
+    def glm52_context_parallel_lora_batch(
+        self, forward_batch: ForwardBatch, local_num_tokens: int
+    ) -> Iterator[None]:
+        """Use certified GLM-5.2 CP-local LoRA metadata in the sharded body.
+
+        ``ForwardBatch.init_new`` prepares LoRA metadata before CP-v2 shards the
+        model input.  Triton LoRA kernels size their grids and row masks from
+        that metadata, so leaving the global sequence lengths installed while
+        the body sees only rank-local rows can issue out-of-bounds accesses.
+
+        Sparse MLPs gather those local rows in raw rank-major order before
+        reducing/scattering them again. Build both rank-local body metadata and
+        rank-major physical MLP metadata, then restore the full object before
+        returning to logits processing. This initial path is deliberately
+        limited to the qualified WORLD16 topology.
+
+        This context is only for CP-v2 extend. WORLD16 decode does not shard
+        rows through CP-v2: its CUDA graph uses the backend's fixed decode
+        batch/SGEMM/MoE buffers, refreshed by ``prepare_lora_batch`` before
+        replay. Decode graph metadata must therefore never enter this context.
+        """
+        if forward_batch.lora_ids is None:
+            yield
+            return
+
+        backend = self.lora_backend
+        architectures = getattr(self.base_hf_config, "architectures", None) or []
+        architecture = architectures[0] if architectures else None
+        strategy = None
+        moe_a2a_backend = None
+        if backend.name == "triton":
+            from sglang.srt.layers.cp.base import get_cp_strategy
+            from sglang.srt.layers.moe import get_moe_a2a_backend
+
+            strategy = get_cp_strategy()
+            moe_a2a_backend = get_moe_a2a_backend().value
+        geometry = {
+            "architecture": architecture,
+            "tp_size": self.tp_size,
+            "dp_size": self.dp_size,
+            "ep_size": self.ep_size,
+            "pp_size": self.pp_size,
+            "attn_cp_size": self.attn_cp_size,
+            "cp_strategy": self.cp_strategy,
+            "live_cp_strategy": getattr(strategy, "name", None),
+            "live_cp_size": getattr(strategy, "cp_size", None),
+            "experts_shared_outer_loras": self._experts_shared_outer_override,
+            "enable_dp_attention": self.enable_dp_attention,
+            "backend": backend.name,
+            "moe_lora": backend.is_moe_lora,
+            "moe_a2a_backend": moe_a2a_backend,
+            "experimental_lora_opti": bool(_SGLANG_EXPERIMENTAL_LORA_OPTI),
+        }
+        certified_geometry = {
+            "architecture": "GlmMoeDsaForCausalLM",
+            "tp_size": 16,
+            "dp_size": 1,
+            "ep_size": 16,
+            "pp_size": 1,
+            "attn_cp_size": 16,
+            "cp_strategy": "interleave",
+            "live_cp_strategy": "interleave",
+            "live_cp_size": 16,
+            "experts_shared_outer_loras": True,
+            "enable_dp_attention": True,
+            "backend": "triton",
+            "moe_lora": True,
+            "moe_a2a_backend": "none",
+            "experimental_lora_opti": False,
+        }
+        if geometry != certified_geometry:
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 LoRA is only certified for the WORLD16 "
+                f"shared-outer Triton geometry; got {geometry}."
+            )
+        if backend.batch_info is None:
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 LoRA entered without prepared global batch metadata."
+            )
+        if (
+            forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.extend_seq_lens is None
+        ):
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 LoRA requires host and device extend sequence lengths."
+            )
+        if len(forward_batch.lora_ids) != forward_batch.batch_size:
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 LoRA request metadata is inconsistent: "
+                f"batch_size={forward_batch.batch_size}, lora_ids={len(forward_batch.lora_ids)}."
+            )
+
+        full_batch_info = backend.batch_info
+        if full_batch_info.use_cuda_graph or full_batch_info.permutation is not None:
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 extend requires eager, unpermuted full-batch metadata; "
+                "decode CUDA graphs use the separate fixed-buffer LoRA path."
+            )
+        if backend.sgemm_batch_info is not None:
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 extend received decode-style SGEMM routing; "
+                "decode CUDA graphs must not enter the CP-v2 extend context."
+            )
+        if backend.context_parallel_mlp_batch_info is not None:
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 LoRA entered with stale gathered MLP metadata."
+            )
+        if (
+            full_batch_info.bs != forward_batch.batch_size
+            or full_batch_info.num_segments != forward_batch.batch_size
+        ):
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 LoRA full-batch metadata does not match the request batch: "
+                f"batch_size={forward_batch.batch_size}, batch_info_bs={full_batch_info.bs}, "
+                f"segments={full_batch_info.num_segments}."
+            )
+        global_lens_cpu = [int(length) for length in forward_batch.extend_seq_lens_cpu]
+        if len(global_lens_cpu) != forward_batch.batch_size or any(
+            length <= 0 for length in global_lens_cpu
+        ):
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 LoRA requires one positive extend length per request; "
+                f"batch_size={forward_batch.batch_size}, lengths={global_lens_cpu}."
+            )
+
+        try:
+            cp_size = int(strategy.cp_size)
+            cp_rank = int(strategy.cp_rank)
+            if not 0 <= cp_rank < cp_size:
+                raise RuntimeError(
+                    f"GLM-5.2 CP-v2 LoRA received invalid CP rank {cp_rank}."
+                )
+
+            local_num_tokens = int(local_num_tokens)
+            cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
+            physical_rank_tokens = getattr(
+                cp_metadata, "per_rank_actual_token", None
+            )
+            if physical_rank_tokens is None:
+                raise RuntimeError(
+                    "GLM-5.2 CP-v2 LoRA requires physical per-rank CP metadata."
+                )
+            physical_rank_tokens = [int(tokens) for tokens in physical_rank_tokens]
+            if (
+                len(physical_rank_tokens) != cp_size
+                or len(set(physical_rank_tokens)) != 1
+                or physical_rank_tokens[cp_rank] != local_num_tokens
+            ):
+                raise RuntimeError(
+                    "GLM-5.2 CP-v2 LoRA physical CP metadata does not match the sharded input: "
+                    f"rank={cp_rank}, input_rows={local_num_tokens}, "
+                    f"per_rank_rows={physical_rank_tokens}."
+                )
+            physical_num_tokens = physical_rank_tokens[0]
+
+            def physical_segments(rank: int) -> tuple[list[int], list[int]]:
+                # Match InterleaveCPStrategy.shard_per_request's host carry
+                # rule without launching its device metadata kernel again.
+                carry = 0
+                all_lens = []
+                for global_len in global_lens_cpu:
+                    carried_len = global_len + carry
+                    rank_len = carried_len // cp_size + int(
+                        carried_len % cp_size > rank
+                    )
+                    all_lens.append(rank_len)
+                    carry = carried_len - rank_len * cp_size
+                request_indices = [
+                    index for index, length in enumerate(all_lens) if length > 0
+                ]
+                rank_lens = [all_lens[index] for index in request_indices]
+                if not rank_lens or any(length < 0 for length in all_lens):
+                    raise RuntimeError(
+                        "GLM-5.2 CP-v2 LoRA produced invalid local Interleave segments: "
+                        f"rank={rank}, global={global_lens_cpu}, local={all_lens}."
+                    )
+                logical_num_tokens = sum(rank_lens)
+                if logical_num_tokens > physical_num_tokens:
+                    raise RuntimeError(
+                        "GLM-5.2 CP-v2 LoRA local segments exceed the sharded input: "
+                        f"rank={rank}, segments={logical_num_tokens}, "
+                        f"input_rows={physical_num_tokens}."
+                    )
+
+                # pad_local_rows appends physical zeros after the logical
+                # rank rows. Attribute them to the final active segment so
+                # dense and MoE LoRA metadata cover the collective buffer.
+                rank_lens[-1] += physical_num_tokens - logical_num_tokens
+                return request_indices, rank_lens
+
+            def build_batch_info(
+                request_indices: list[int], segment_lens_cpu: list[int]
+            ) -> LoRABatchInfo:
+                physical_batch = copy(forward_batch)
+                physical_batch.batch_size = len(request_indices)
+                physical_batch.lora_ids = [
+                    forward_batch.lora_ids[index] for index in request_indices
+                ]
+                physical_batch.extend_num_tokens = sum(segment_lens_cpu)
+                physical_batch.extend_seq_lens_cpu = segment_lens_cpu
+                segment_lens = torch.tensor(
+                    segment_lens_cpu,
+                    dtype=forward_batch.extend_seq_lens.dtype,
+                    device=forward_batch.extend_seq_lens.device,
+                )
+                physical_batch.extend_seq_lens = segment_lens
+                segment_indptr = torch.zeros(
+                    (len(request_indices) + 1,),
+                    dtype=segment_lens.dtype,
+                    device=segment_lens.device,
+                )
+                segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
+                weight_indices = full_batch_info.weight_indices[request_indices]
+                batch_info = replace(
+                    full_batch_info,
+                    use_cuda_graph=False,
+                    bs=len(request_indices),
+                    num_segments=len(request_indices),
+                    seg_lens=segment_lens,
+                    seg_indptr=segment_indptr,
+                    max_len=max(segment_lens_cpu),
+                    weight_indices=weight_indices,
+                    permutation=None,
+                    expected_tokens=physical_batch.extend_num_tokens,
+                    req_seg_indptr=segment_indptr,
+                    req_weight_indices=weight_indices,
+                    moe_lora_info=None,
+                )
+                batch_info = backend._add_moe_lora_info(physical_batch, batch_info)
+                if batch_info.moe_lora_info is None:
+                    raise RuntimeError(
+                        "GLM-5.2 CP-v2 LoRA did not construct physical MoE routing metadata."
+                    )
+                return batch_info
+
+            local_request_indices, local_lens_cpu = physical_segments(cp_rank)
+            local_batch_info = build_batch_info(local_request_indices, local_lens_cpu)
+
+            gathered_request_indices = []
+            gathered_lens_cpu = []
+            for rank in range(cp_size):
+                rank_request_indices, rank_lens_cpu = physical_segments(rank)
+                gathered_request_indices.extend(rank_request_indices)
+                gathered_lens_cpu.extend(rank_lens_cpu)
+            gathered_batch_info = build_batch_info(
+                gathered_request_indices, gathered_lens_cpu
+            )
+            expected_gathered_tokens = sum(physical_rank_tokens)
+            if gathered_batch_info.expected_tokens != expected_gathered_tokens:
+                raise RuntimeError(
+                    "GLM-5.2 CP-v2 LoRA gathered metadata has the wrong row count: "
+                    f"metadata_rows={gathered_batch_info.expected_tokens}, "
+                    f"collective_rows={expected_gathered_tokens}."
+                )
+
+            backend.batch_info = local_batch_info
+            backend.context_parallel_mlp_batch_info = gathered_batch_info
+            yield
+        finally:
+            backend.context_parallel_mlp_batch_info = None
+            backend.batch_info = full_batch_info
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
@@ -577,6 +913,8 @@ class LoRAManager:
             self.experts_shared_outer_loras = self._experts_shared_outer_override
         else:
             self.experts_shared_outer_loras = self._detect_shared_outer_loras()
+        for config in self.configs.values():
+            self._validate_glm52_runtime_layout(config)
         if self.experts_shared_outer_loras:
             logger.info(
                 "Shared outer LoRA mode enabled: gate_up lora_A and "
@@ -842,9 +1180,15 @@ class LoRAManager:
             self.lora_refs[lora_ref.lora_id] = lora_ref
             self.num_pinned_loras += int(lora_ref.pinned)
         except Exception as e:
+            rollback_result = self.rollback_lora_adapter(lora_ref.lora_id)
+            error_message = str(e)
+            if not rollback_result.success:
+                error_message += (
+                    "; local rollback failed: " + rollback_result.error_message
+                )
             return self.create_lora_update_result(
                 success=False,
-                error_message=str(e),
+                error_message=error_message,
             )
 
         return self.create_lora_update_result(success=True)
@@ -866,6 +1210,7 @@ class LoRAManager:
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             strict_loading=self.lora_strict_loading,
             enable_lora_overlap_loading=self.enable_lora_overlap_loading,
+            lora_modules=self.lora_modules,
         )
 
         # Initializing memory pool with base model

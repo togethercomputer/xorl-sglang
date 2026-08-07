@@ -147,6 +147,7 @@ class LoRAMemoryPool:
         experts_shared_outer_loras: bool = False,
         strict_loading: bool = False,
         enable_lora_overlap_loading: bool = False,
+        lora_modules: Optional[List[Dict[str, torch.nn.Module]]] = None,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -161,6 +162,9 @@ class LoRAMemoryPool:
         self.strict_loading: bool = strict_loading
         self.enable_lora_overlap_loading: bool = enable_lora_overlap_loading
         self.pin_memory_available: bool = is_pin_memory_available()
+        self._standard_ambiguous_tp_sizes = self._collect_standard_ambiguous_tp_sizes(
+            lora_modules or []
+        )
 
         # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
         # global `topk_ids` -> local expert IDs before the MoE kernel, so
@@ -267,18 +271,92 @@ class LoRAMemoryPool:
         """Whether this buffer belongs to the shared-expert MoE namespace."""
         return module_name.endswith("_shared_moe")
 
-    def _effective_tp_size(self, module_name: str) -> int:
+    def _collect_standard_ambiguous_tp_sizes(
+        self,
+        lora_modules: List[Dict[str, torch.nn.Module]],
+    ) -> Dict[Tuple[int, str], int]:
+        """Collect layer-local TP widths for ambiguous standard MLP modules.
+
+        ``gate_up_proj`` and ``down_proj`` can name both dense MLPs and
+        unfused shared experts.  Those modules do not necessarily use the
+        outer TP width (for example, dense MLPs can be fully replicated while
+        shared experts remain TP-sharded).  ``LoRAManager`` has already
+        wrapped the exact modules that ``update_lora_info`` will wire, so use
+        those wrappers as the source of truth instead of rediscovering modules
+        by scanning the model tree.
+        """
+        from sglang.srt.lora.layers import FusedMoEWithLoRA
+
+        ambiguous_modules = {"gate_up_proj", "down_proj"}
+        wrappers: Dict[Tuple[int, str], BaseLayerWithLoRA] = {}
+        tp_sizes: Dict[Tuple[int, str], int] = {}
+
+        for layer_id, layer_modules in enumerate(lora_modules):
+            for full_module_name, module in layer_modules.items():
+                base_layer = getattr(module, "base_layer", module)
+                if isinstance(module, FusedMoEWithLoRA) or getattr(
+                    base_layer, "is_shared_fused_moe", False
+                ):
+                    continue
+
+                try:
+                    target_module = get_target_module_name(
+                        full_module_name, self.target_modules
+                    )
+                except ValueError:
+                    # Compound wrappers (for example a batched MLP wrapper)
+                    # can be registered in this table without their full name
+                    # containing a normalized leaf target.
+                    continue
+                if target_module not in ambiguous_modules:
+                    continue
+                if not isinstance(module, BaseLayerWithLoRA):
+                    raise ValueError(
+                        f"LoRA module {full_module_name!r} on layer {layer_id} "
+                        "is not a BaseLayerWithLoRA wrapper."
+                    )
+
+                key = (layer_id, target_module)
+                previous = wrappers.get(key)
+                if previous is not None and previous is not module:
+                    raise ValueError(
+                        f"Multiple distinct standard LoRA wrappers map to "
+                        f"{target_module!r} on layer {layer_id}."
+                    )
+
+                tp_size = getattr(base_layer, "tp_size", None)
+                if type(tp_size) is not int or tp_size < 1:
+                    raise ValueError(
+                        f"Wrapped base layer {full_module_name!r} has invalid "
+                        f"tp_size={tp_size!r}."
+                    )
+
+                wrappers[key] = module
+                tp_sizes[key] = tp_size
+
+        return tp_sizes
+
+    def _effective_tp_size(
+        self, module_name: str, layer_idx: Optional[int] = None
+    ) -> int:
         """TP width the module's weights are actually sharded along: routed
         MoE experts shard by `moe_tp_size` (shared experts by the outer
         `tp_size` at EP=1), attention projections by `attn_tp_size` (smaller
-        than the outer `tp_size` under `--enable-dp-attention`), everything
-        else by the outer `tp_size`."""
+        than the outer `tp_size` under `--enable-dp-attention`), ambiguous
+        standard MLP modules by their layer-local wrapped base layer, and
+        everything else by the outer `tp_size`."""
         if self.is_moe_module(module_name) and not self.is_shared_moe_module(
             module_name
         ):
             return self.moe_tp_size
         if module_name in ATTN_TP_LORA_MODULE_NAMES:
             return self.attn_tp_size
+        if layer_idx is not None:
+            layer_tp_size = getattr(self, "_standard_ambiguous_tp_sizes", {}).get(
+                (layer_idx, module_name)
+            )
+            if layer_tp_size is not None:
+                return layer_tp_size
         return self.tp_size
 
     @staticmethod
@@ -409,7 +487,7 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name, base_model)
-        effective_tp_size = self._effective_tp_size(module_name)
+        effective_tp_size = self._effective_tp_size(module_name, layer_idx)
         if (
             effective_tp_size > 1
             and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
@@ -507,7 +585,7 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         # Same sharding rule as get_lora_A_shape above.
-        effective_tp_size = self._effective_tp_size(module_name)
+        effective_tp_size = self._effective_tp_size(module_name, layer_idx)
         if (
             effective_tp_size > 1
             and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
