@@ -7,6 +7,7 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 import dataclasses
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import sglang.srt.server_args as server_args_module
@@ -943,6 +944,23 @@ class TestForwardFlags(_IsolatedServerArgs):
             # Otherwise the standard all-reduce plus scatter path must be used.
             with get_parallel().override(tp_size=8, attn_dp_size=2, moe_ep_size=2):
                 self.assertFalse(should_use_dp_reduce_scatterv())
+
+    def test_qwen35_exact_mode_refuses_destination_dependent_reduce_scatterv(self):
+        from sglang.srt.layers.moe.utils import should_use_dp_reduce_scatterv
+
+        reset_context()
+        with (
+            patch(
+                "sglang.srt.layers.moe.utils.get_server_args",
+                return_value=SimpleNamespace(qwen35_gdn_exact_mode=True),
+            ),
+            patch(
+                "sglang.srt.layers.moe.utils.is_dp_attention_enabled",
+                return_value=True,
+            ),
+            get_parallel().override(tp_size=8, attn_dp_size=8, moe_ep_size=8),
+        ):
+            self.assertFalse(should_use_dp_reduce_scatterv())
 
 
 class TestPublishLifecycle(_IsolatedServerArgs):
