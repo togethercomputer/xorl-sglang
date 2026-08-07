@@ -1191,7 +1191,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if not _is_npu:
+            if _is_cuda and _qwen35_exact_mode_enabled():
+                # Match the full-depth trainer's BF16 execution order exactly:
+                # materialize the strided gate, evaluate sigmoid, then perform
+                # a separate out-of-place multiply. The fused kernel rounds
+                # differently even when both input operands are byte-identical.
+                attn_output = attn_output.reshape(attn_output.shape[0], -1).contiguous()
+                gate_value = gate.reshape(gate.shape[0], -1)
+                attn_output = attn_output * torch.sigmoid(gate_value)
+            elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate

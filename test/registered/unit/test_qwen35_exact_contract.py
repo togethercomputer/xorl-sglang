@@ -413,6 +413,7 @@ def test_qwen35_full_attention_honors_fused_qk_norm_rope_flag(use_fused):
         patch.object(qwen, "_is_xpu", False),
         patch.object(qwen, "_is_cpu", False),
         patch.object(qwen, "_is_npu", False),
+        patch.object(qwen, "_qwen35_exact_mode_enabled", return_value=False),
         patch.object(qwen, "fused_sigmoid_mul", return_value=core),
     ):
         qwen.Qwen3_5AttentionDecoderLayer.self_attention(
@@ -424,6 +425,55 @@ def test_qwen35_full_attention_honors_fused_qk_norm_rope_flag(use_fused):
 
     assert fused.call_count == int(use_fused)
     assert native.call_count == int(not use_fused)
+
+
+def test_qwen35_exact_attention_gate_matches_explicit_bf16_composition():
+    import sglang.srt.models.qwen3_5 as qwen
+
+    q = torch.zeros(1, 4, dtype=torch.bfloat16)
+    k = torch.zeros(1, 2, dtype=torch.bfloat16)
+    v = torch.zeros(1, 2, dtype=torch.bfloat16)
+    gate = torch.tensor(
+        [[[0.25, -0.75], [1.25, -1.75]]], dtype=torch.bfloat16
+    )
+    core = torch.tensor(
+        [[0.03125, -0.0625, 0.125, -0.25]], dtype=torch.bfloat16
+    )
+    expected = core.reshape(1, -1).contiguous() * torch.sigmoid(gate.reshape(1, -1))
+    projection = MagicMock(side_effect=lambda value: (value, None))
+    layer = SimpleNamespace(
+        attn_output_gate=True,
+        use_fused_qk_norm_rope=False,
+        forward_prepare_cuda_fused=MagicMock(),
+        forward_prepare_native=MagicMock(return_value=(q, k, v, gate)),
+        forward_prepare_fused_gate=MagicMock(),
+        forward_prepare_npu=MagicMock(),
+        attn=MagicMock(return_value=core),
+        o_proj=projection,
+    )
+
+    with (
+        patch.object(qwen, "_is_cuda", True),
+        patch.object(qwen, "_is_hip", False),
+        patch.object(qwen, "_is_xpu", False),
+        patch.object(qwen, "_is_cpu", False),
+        patch.object(qwen, "_is_npu", False),
+        patch.object(qwen, "_qwen35_exact_mode_enabled", return_value=True),
+        patch.object(
+            qwen,
+            "fused_sigmoid_mul",
+            side_effect=AssertionError("exact Qwen must not use fused sigmoid-multiply"),
+        ),
+    ):
+        output = qwen.Qwen3_5AttentionDecoderLayer.self_attention(
+            layer,
+            positions=torch.zeros(1, dtype=torch.long),
+            hidden_states=torch.zeros(1, 4, dtype=torch.bfloat16),
+            forward_batch=SimpleNamespace(),
+        )
+
+    assert torch.equal(output, expected)
+    assert torch.equal(projection.call_args.args[0], expected)
 
 
 def test_qwen35_exact_rotary_replays_eager_bf16_rounding_with_text_positions():
