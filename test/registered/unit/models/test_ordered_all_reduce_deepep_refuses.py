@@ -101,6 +101,37 @@ class TestOrderedAllReduceDeepEPRefuses(unittest.TestCase):
         self.assertIn("_bi_router_logits", calls)
         self.assertIn("_bi_topk_output", calls)
 
+    def test_ordered_reduce_uses_the_graph_safe_group_gather(self):
+        from sglang.srt.distributed import communication_op
+
+        tree = ast.parse(pathlib.Path(communication_op.__file__).read_text())
+        ordered_reduce = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "tensor_model_parallel_ordered_all_reduce"
+        )
+        calls = [
+            node.func for node in ast.walk(ordered_reduce) if isinstance(node, ast.Call)
+        ]
+        group_gathers = [
+            call
+            for call in calls
+            if isinstance(call, ast.Attribute)
+            and isinstance(call.value, ast.Name)
+            and call.value.id == "group"
+            and call.attr == "all_gather_into_tensor"
+        ]
+        direct_gathers = [
+            call
+            for call in calls
+            if isinstance(call, ast.Attribute)
+            and call.attr == "all_gather_into_tensor"
+            and not (isinstance(call.value, ast.Name) and call.value.id == "group")
+        ]
+        self.assertEqual(len(group_gathers), 1)
+        self.assertEqual(direct_gathers, [])
+
 
 if __name__ == "__main__":
     unittest.main()

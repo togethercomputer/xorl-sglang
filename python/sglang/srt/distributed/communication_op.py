@@ -43,9 +43,10 @@ def tensor_model_parallel_ordered_all_reduce(input_: torch.Tensor) -> torch.Tens
         dtype=input_.dtype,
         device=input_.device,
     )
-    torch.distributed.all_gather_into_tensor(
-        gathered, input_, group=group.device_group
-    )
+    # Use the coordinator so its capture-aware communicator records the
+    # collective. A direct torch.distributed call can replay only the local
+    # contribution from a full CUDA graph.
+    group.all_gather_into_tensor(gathered, input_)
     partials = gathered.view(group.world_size, *input_.shape)
     if _ORDERED_COMBINE_FUSED_ENABLED:
         from sglang.srt.distributed.ordered_combine_fused import (
