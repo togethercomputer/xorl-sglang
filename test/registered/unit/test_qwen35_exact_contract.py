@@ -68,6 +68,7 @@ def test_qwen35_moe_plain_config_resolves_certified_topology():
     assert args.sampling_backend == "pytorch"
     assert args.sampling_defaults == "openai"
     assert args.disable_custom_all_reduce
+    assert not args.enable_fused_qk_norm_rope
     assert args.tp_size == args.dp_size == args.ep_size == 8
     assert args.pp_size == 1
     assert args.enable_dp_attention
@@ -383,6 +384,84 @@ def test_qwen35_gemma_norm_routes_the_certified_family_split():
         assert out.dtype == torch.bfloat16
         assert torch.equal(residual_out, x + residual)
 
+
+@pytest.mark.parametrize("use_fused", (False, True))
+def test_qwen35_full_attention_honors_fused_qk_norm_rope_flag(use_fused):
+    import sglang.srt.models.qwen3_5 as qwen
+
+    q = torch.zeros(1, 8, dtype=torch.bfloat16)
+    k = torch.zeros(1, 4, dtype=torch.bfloat16)
+    v = torch.zeros(1, 4, dtype=torch.bfloat16)
+    gate = torch.zeros(1, 8, dtype=torch.bfloat16)
+    core = torch.zeros_like(q)
+    native = MagicMock(return_value=(q, k, v, gate))
+    fused = MagicMock(return_value=(q, k, v, gate))
+    layer = SimpleNamespace(
+        attn_output_gate=True,
+        use_fused_qk_norm_rope=use_fused,
+        forward_prepare_cuda_fused=fused,
+        forward_prepare_native=native,
+        forward_prepare_fused_gate=MagicMock(),
+        forward_prepare_npu=MagicMock(),
+        attn=MagicMock(return_value=core),
+        o_proj=MagicMock(return_value=(core, None)),
+    )
+
+    with (
+        patch.object(qwen, "_is_cuda", True),
+        patch.object(qwen, "_is_hip", False),
+        patch.object(qwen, "_is_xpu", False),
+        patch.object(qwen, "_is_cpu", False),
+        patch.object(qwen, "_is_npu", False),
+        patch.object(qwen, "fused_sigmoid_mul", return_value=core),
+    ):
+        qwen.Qwen3_5AttentionDecoderLayer.self_attention(
+            layer,
+            positions=torch.zeros(1, dtype=torch.long),
+            hidden_states=torch.zeros(1, 8, dtype=torch.bfloat16),
+            forward_batch=SimpleNamespace(),
+        )
+
+    assert fused.call_count == int(use_fused)
+    assert native.call_count == int(not use_fused)
+
+
+def test_qwen35_exact_rotary_replays_eager_bf16_rounding_with_text_positions():
+    import sglang.srt.models.qwen3_5 as qwen
+
+    rotary = SimpleNamespace(
+        cos_sin_cache=torch.zeros(16, 4, dtype=torch.float32),
+        rotary_dim=4,
+    )
+    layer = SimpleNamespace(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        rotary_emb=rotary,
+    )
+    query = torch.arange(24, dtype=torch.bfloat16).view(3, 8)
+    key = torch.arange(12, dtype=torch.bfloat16).view(3, 4)
+    positions = torch.tensor([[2, 3, 4], [2, 3, 4], [2, 3, 4]])
+
+    with (
+        patch.object(qwen, "_is_cuda", True),
+        patch.object(qwen, "_qwen35_exact_mode_enabled", return_value=True),
+        patch.object(
+            qwen,
+            "bi_fused_native_rope",
+            side_effect=lambda value, *_args: value.clone(),
+        ) as exact_rope,
+    ):
+        q_out, k_out = qwen.Qwen3_5AttentionDecoderLayer._apply_rotary(
+            layer, positions, query, key
+        )
+
+    assert torch.equal(q_out, query)
+    assert torch.equal(k_out, key)
+    assert exact_rope.call_count == 2
+    assert exact_rope.call_args_list[0].args[0].shape == (3, 2, 4)
+    assert exact_rope.call_args_list[1].args[0].shape == (3, 1, 4)
+    assert torch.equal(exact_rope.call_args_list[0].args[1], positions[0])
 
 def _exact_logits_processor(vocab_size=32):
     from sglang.srt.layers.logits_processor import LogitsProcessor

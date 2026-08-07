@@ -65,6 +65,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.bi_fused_native import bi_fused_native_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -97,6 +98,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_stream,
 )
+from sglang.srt.server_args import get_global_server_args, is_qwen35_gdn_exact_mode
 
 # Utils
 from sglang.srt.utils import (
@@ -140,6 +142,10 @@ def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
     return get_exec().moe.disable_shared_experts_fusion
+
+
+def _qwen35_exact_mode_enabled() -> bool:
+    return is_qwen35_gdn_exact_mode(get_global_server_args())
 
 
 if _is_cuda:
@@ -870,6 +876,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
+        self.use_fused_qk_norm_rope = bool(
+            _is_cuda
+            and self.attn_output_gate
+            and get_exec().kernel.enable_fused_qk_norm_rope
+        )
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
@@ -1015,6 +1026,32 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def _apply_rotary(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _is_cuda and _qwen35_exact_mode_enabled():
+            seq_len = q.shape[0]
+            exact_positions = positions.reshape(-1)[:seq_len]
+            q_shape = q.shape
+            k_shape = k.shape
+            q = bi_fused_native_rope(
+                q.view(seq_len, self.num_heads, self.head_dim),
+                exact_positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.rotary_dim,
+            ).view(q_shape)
+            k = bi_fused_native_rope(
+                k.view(seq_len, self.num_kv_heads, self.head_dim),
+                exact_positions,
+                self.rotary_emb.cos_sin_cache,
+                self.rotary_emb.rotary_dim,
+            ).view(k_shape)
+            return q, k
+        return self.rotary_emb(positions, q, k)
+
     def forward_prepare_cuda_fused(self, positions, hidden_states):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1064,7 +1101,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = None
 
         q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._apply_rotary(positions, q, k)
         return q, k, v, gate
 
     def forward_prepare_fused_gate(self, positions, hidden_states):
@@ -1095,7 +1132,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = None
             q, k = self._apply_qk_norm(q, k)
 
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._apply_rotary(positions, q, k)
         return q, k, v, gate
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -1125,7 +1162,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        if _is_cuda and self.attn_output_gate and self.use_fused_qk_norm_rope:
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
