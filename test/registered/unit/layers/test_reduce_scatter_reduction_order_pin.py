@@ -59,7 +59,19 @@ class TestReduceScatterReductionOrderPin(unittest.TestCase):
     def test_max_len_keeps_the_pinned_all_reduce(self):
         comm = _make_communicator(pinned=True)
         batch = _FakeForwardBatch(DpPaddingMode.MAX_LEN)
-        self.assertFalse(comm.should_use_reduce_scatter(batch))
+        with (
+            patch(
+                "sglang.srt.layers.communicator.dsa_use_prefill_cp",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.mla_use_prefill_cp",
+                return_value=False,
+            ),
+            patch("sglang.srt.layers.communicator.get_attn_tp_context") as attn_ctx,
+        ):
+            attn_ctx.return_value.input_scattered = False
+            self.assertFalse(comm.should_use_reduce_scatter(batch))
 
     def test_sum_len_never_uses_reduce_scatter(self):
         batch = _FakeForwardBatch(DpPaddingMode.SUM_LEN)
@@ -67,7 +79,11 @@ class TestReduceScatterReductionOrderPin(unittest.TestCase):
             comm = _make_communicator(pinned=pinned)
             with (
                 patch(
-                    "sglang.srt.layers.communicator.nsa_use_prefill_cp",
+                    "sglang.srt.layers.communicator.dsa_use_prefill_cp",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.layers.communicator.mla_use_prefill_cp",
                     return_value=False,
                 ),
                 patch("sglang.srt.layers.communicator.get_attn_tp_context") as attn_ctx,
@@ -81,11 +97,11 @@ class TestReduceScatterReductionOrderPin(unittest.TestCase):
         batch = _FakeForwardBatch(DpPaddingMode.MAX_LEN)
         self.assertFalse(comm.should_use_reduce_scatter(batch))
 
-    def test_nsa_prefill_cp_refuses_the_unpinned_collective(self):
+    def test_dsa_prefill_cp_refuses_the_unpinned_collective(self):
         comm = _make_communicator(pinned=True)
         batch = _FakeForwardBatch(DpPaddingMode.SUM_LEN)
         with patch(
-            "sglang.srt.layers.communicator.nsa_use_prefill_cp",
+            "sglang.srt.layers.communicator.dsa_use_prefill_cp",
             return_value=True,
         ):
             with self.assertRaises(RuntimeError) as ctx:
@@ -97,7 +113,11 @@ class TestReduceScatterReductionOrderPin(unittest.TestCase):
         batch = _FakeForwardBatch(DpPaddingMode.SUM_LEN)
         with (
             patch(
-                "sglang.srt.layers.communicator.nsa_use_prefill_cp",
+                "sglang.srt.layers.communicator.dsa_use_prefill_cp",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.mla_use_prefill_cp",
                 return_value=False,
             ),
             patch("sglang.srt.layers.communicator.get_attn_tp_context") as attn_ctx,

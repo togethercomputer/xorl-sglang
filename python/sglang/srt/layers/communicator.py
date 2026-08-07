@@ -73,7 +73,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+    get_spec,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     get_bool_env_var,
@@ -94,6 +100,15 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 _is_gfx95_supported = is_gfx95_supported()
 _is_npu = is_npu()
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
+
+
+def _exact_reduction_order_pinned(server_args) -> bool:
+    """Whether the serving contract requires one fixed cross-rank sum tree."""
+    return bool(
+        getattr(server_args, "glm52_exact_mode", False)
+        or getattr(server_args, "qwen35_gdn_exact_mode", False)
+    )
+
 
 if _use_aiter:
     from aiter.ops.rmsnorm import add_rmsnorm_quant as _aiter_add_rmsnorm_quant
@@ -468,6 +483,14 @@ class LayerCommunicator:
         self.force_layernorm_before_dp_gather = force_layernorm_before_dp_gather
         self.enable_fused_ar_quant = enable_fused_ar_quant
         self.fused_ar_quant_keep_bf16 = fused_ar_quant_keep_bf16
+        try:
+            self._reduction_order_pinned = _exact_reduction_order_pinned(
+                get_server_args()
+            )
+        except ValueError:
+            # Unit-level communicator construction can intentionally precede
+            # runtime-context publication. It retains the upstream policy.
+            self._reduction_order_pinned = False
 
         self._context = CommunicateContext.init_new()
         self._context.force_layernorm_before_dp_gather = (
@@ -744,9 +767,9 @@ class LayerCommunicator:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if hidden_states.shape[0] == 0:
             return hidden_states, hidden_states
-        assert (
-            hidden_states.shape[0] % self._context.tp_size == 0
-        ), f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        assert hidden_states.shape[0] % self._context.tp_size == 0, (
+            f"Expected total tokens {hidden_states.shape[0]} % tp_size {self._context.tp_size} to be 0"
+        )
         local_tokens = hidden_states.shape[0] // self._context.tp_size
         output = hidden_states.new_empty(local_tokens, *hidden_states.shape[1:])
         get_tp_group().reduce_scatter_tensor(output, hidden_states)
@@ -785,23 +808,41 @@ class LayerCommunicator:
             residual=residual,
             forward_batch=forward_batch,
             context=self._context,
-            allow_reduce_scatter=self.allow_reduce_scatter,
+            allow_reduce_scatter=(
+                self.allow_reduce_scatter
+                and not getattr(self, "_reduction_order_pinned", False)
+            ),
         )
 
     def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
         if not self.allow_reduce_scatter:
             return False
+        reduction_order_pinned = getattr(self, "_reduction_order_pinned", False)
         if (
             self._communicate_summable_tensor_pair_fn
             is CommunicateSummableTensorPairFn._scatter_hidden_states
         ):
-            if should_use_dp_reduce_scatterv():
-                return True
-            if forward_batch.dp_padding_mode.is_max_len():
-                return True
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
+            if not reduction_order_pinned:
+                if should_use_dp_reduce_scatterv():
+                    return True
+                if forward_batch.dp_padding_mode.is_max_len():
+                    return True
+        uses_prefill_cp_reduce_scatter = dsa_use_prefill_cp(
+            forward_batch
+        ) or mla_use_prefill_cp(forward_batch)
+        if uses_prefill_cp_reduce_scatter:
+            if reduction_order_pinned:
+                raise RuntimeError(
+                    "The order-pinned exact serving contract cannot use the "
+                    "prefill-CP reduce-scatter path."
+                )
             return True
         if get_attn_tp_context().input_scattered and not self.is_last_layer:
+            if reduction_order_pinned:
+                raise RuntimeError(
+                    "The order-pinned exact serving contract cannot use the "
+                    "scattered attention-TP reduce-scatter path."
+                )
             return True
         return False
 
@@ -981,7 +1022,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
         residual_output_mode: ScatterMode,
         context: CommunicateContext,
     ):
-
         if (
             context.is_same_group_size(
                 hidden_states_input_mode, hidden_states_output_mode

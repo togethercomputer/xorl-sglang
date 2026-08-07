@@ -1,6 +1,7 @@
 """The post-MoE reduce-scatter bypass is one decision shared by both halves."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.layers.communicator import (
@@ -33,18 +34,27 @@ def _make_communicator(*, pinned: bool) -> LayerCommunicator:
 
 def _no_other_bypass_reasons():
     return (
-        patch("sglang.srt.layers.communicator.nsa_use_prefill_cp", return_value=False),
+        patch("sglang.srt.layers.communicator.dsa_use_prefill_cp", return_value=False),
+        patch("sglang.srt.layers.communicator.mla_use_prefill_cp", return_value=False),
         patch("sglang.srt.layers.communicator.get_attn_tp_context"),
+        patch(
+            "sglang.srt.layers.communicator.get_parallel",
+            return_value=SimpleNamespace(tp_size=8, attn_dp_size=8),
+        ),
+        patch("sglang.srt.layers.communicator.get_tp_group", return_value=object()),
     )
 
 
 class TestBypassIsASingleDecision(unittest.TestCase):
     def _halves(self, *, pinned, mode):
         batch = _FakeForwardBatch(mode)
-        nsa, attn = _no_other_bypass_reasons()
+        dsa, mla, attn, parallel, tp_group = _no_other_bypass_reasons()
         with (
-            nsa,
+            dsa,
+            mla,
             attn as attn_ctx,
+            parallel,
+            tp_group,
             patch("sglang.srt.layers.communicator.get_local_dp_buffer"),
             patch(
                 "sglang.srt.layers.communicator.dp_reduce_scatter_tensor"
@@ -76,10 +86,13 @@ class TestBypassIsASingleDecision(unittest.TestCase):
 
     def test_pinned_max_len_slices_instead_of_reducing_again(self):
         batch = _FakeForwardBatch(DpPaddingMode.MAX_LEN)
-        nsa, attn = _no_other_bypass_reasons()
+        dsa, mla, attn, parallel, tp_group = _no_other_bypass_reasons()
         with (
-            nsa,
+            dsa,
+            mla,
             attn as attn_ctx,
+            parallel,
+            tp_group,
             patch("sglang.srt.layers.communicator.get_local_dp_buffer"),
             patch(
                 "sglang.srt.layers.communicator.dp_reduce_scatter_tensor"
@@ -96,10 +109,13 @@ class TestBypassIsASingleDecision(unittest.TestCase):
 
     def test_unpinned_max_len_still_bypasses(self):
         batch = _FakeForwardBatch(DpPaddingMode.MAX_LEN)
-        nsa, attn = _no_other_bypass_reasons()
+        dsa, mla, attn, parallel, tp_group = _no_other_bypass_reasons()
         with (
-            nsa,
+            dsa,
+            mla,
             attn as attn_ctx,
+            parallel,
+            tp_group,
             patch("sglang.srt.layers.communicator.get_local_dp_buffer"),
             patch(
                 "sglang.srt.layers.communicator.dp_reduce_scatter_tensor"
