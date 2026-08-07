@@ -728,6 +728,256 @@ class TestContextParallelServerArgs(CustomTestCase):
                 )
 
 
+class TestDeterministicGlmDsa(unittest.TestCase):
+    @staticmethod
+    def _server_args(prefill_backend="flashmla_sparse", decode_backend="fa3"):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.model_path = "/tmp/glm-5.2"
+        server_args.enable_deterministic_inference = True
+        server_args.attention_backend = "dsa"
+        server_args.dsa_prefill_backend = prefill_backend
+        server_args.dsa_decode_backend = decode_backend
+        return server_args
+
+    @staticmethod
+    def _glm_model_config():
+        hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"],
+            hidden_size=6144,
+            num_hidden_layers=78,
+            vocab_size=154880,
+            num_attention_heads=64,
+            num_key_value_heads=64,
+            first_k_dense_replace=3,
+            mlp_layer_types=["dense"] * 3 + ["sparse"] * 75,
+            n_routed_experts=256,
+            n_shared_experts=1,
+            num_experts_per_tok=8,
+            index_topk=2048,
+            index_topk_freq=4,
+            index_skip_topk_offset=3,
+            index_head_dim=128,
+            index_n_heads=32,
+            indexer_types=[
+                "full" if i < 3 or i % 4 == 2 else "shared" for i in range(78)
+            ],
+        )
+        model_config = MagicMock()
+        model_config.hf_config = hf_config
+        return model_config
+
+    def test_accepts_pinned_glm_dsa_pair_with_radix(self):
+        server_args = self._server_args()
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        server_args._handle_deterministic_inference()
+
+        self.assertEqual(server_args.attention_backend, "dsa")
+        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.dsa_decode_backend, "fa3")
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_glm52_xorl_resolves_the_exact_defaults_without_environment_flags(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.tp_size = 16
+        hf_config = self._glm_model_config().hf_config
+
+        server_args._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_dsa_model=True,
+        )
+
+        self.assertTrue(server_args.glm52_exact_mode)
+        self.assertTrue(hf_config._glm52_exact_mode)
+        self.assertEqual(server_args.dtype, "bfloat16")
+        self.assertEqual(server_args.quantization, "fp8")
+        self.assertEqual(server_args.kv_cache_dtype, "bfloat16")
+        self.assertEqual(server_args.attention_backend, "dsa")
+        self.assertEqual(server_args.dsa_prefill_backend, "flashmla_sparse")
+        self.assertEqual(server_args.dsa_decode_backend, "flashmla_sparse")
+        self.assertEqual(server_args.moe_runner_backend, "triton")
+        self.assertEqual(server_args.fp8_gemm_runner_backend, "triton")
+        self.assertEqual(server_args.moe_dense_tp_size, 1)
+        self.assertEqual(server_args.ep_size, 16)
+        self.assertEqual(server_args.attn_cp_size, 16)
+        self.assertEqual(server_args.dp_size, 1)
+        self.assertEqual(server_args.moe_dp_size, 1)
+        self.assertEqual(server_args.tp_size, 16)
+        self.assertEqual(server_args.pp_size, 1)
+        self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
+        self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
+        self.assertTrue(server_args.disable_shared_experts_fusion)
+        self.assertTrue(server_args.disable_custom_all_reduce)
+        self.assertTrue(server_args.disable_overlap_schedule)
+        self.assertTrue(server_args.disable_piecewise_cuda_graph)
+        self.assertTrue(server_args.disable_radix_cache)
+        self.assertEqual(server_args.cuda_graph_bs_decode, [16])
+        self.assertEqual(server_args.cuda_graph_max_bs_decode, 16)
+
+    def test_glm52_xorl_rejects_explicit_incompatible_programs(self):
+        incompatible = {
+            "dtype": "float16",
+            "quantization": "int8",
+            "kv_cache_dtype": "fp8_e4m3",
+            "attention_backend": "fa3",
+            "dsa_prefill_backend": "fa3",
+            "dsa_decode_backend": "flashmla_kv",
+            "moe_runner_backend": "flashinfer_trtllm",
+            "fp8_gemm_runner_backend": "deep_gemm",
+            "moe_dense_tp_size": 2,
+            "moe_a2a_backend": "deepep",
+            "tp_size": 8,
+            "ep_size": 8,
+            "pp_size": 2,
+            "dp_size": 2,
+            "moe_dp_size": 2,
+            "attn_cp_size": 8,
+            "dsa_prefill_cp_mode": "in-seq-split",
+        }
+        for name, value in incompatible.items():
+            with self.subTest(name=name, value=value):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.rl_on_policy_target = "xorl"
+                server_args.tp_size = 16
+                setattr(server_args, name, value)
+                with self.assertRaisesRegex(ValueError, "exact GLM-5.2 XORL"):
+                    server_args._resolve_glm52_exact_contract(
+                        self._glm_model_config().hf_config,
+                        model_arch="GlmMoeDsaForCausalLM",
+                        is_dsa_model=True,
+                    )
+
+    def test_glm52_xorl_rejects_architecture_alias_with_unqualified_geometry(self):
+        hf_config = self._glm_model_config().hf_config
+        hf_config.num_hidden_layers = 92
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.tp_size = 16
+
+        with self.assertRaisesRegex(
+            ValueError, "qualified model geometry.*num_hidden_layers"
+        ):
+            server_args._resolve_glm52_exact_contract(
+                hf_config,
+                model_arch="GlmMoeDsaForCausalLM",
+                is_dsa_model=True,
+            )
+
+    def test_glm52_xorl_rejects_eager_and_non_bs16_graphs(self):
+        cases = (
+            ("disable_cuda_graph", True, False),
+            ("cuda_graph_bs_decode", [8, 16], True),
+        )
+        for name, value, explicit_graph_bs in cases:
+            with self.subTest(name=name, value=value):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.rl_on_policy_target = "xorl"
+                server_args.tp_size = 16
+                setattr(server_args, name, value)
+                server_args._cuda_graph_bs_user_supplied = explicit_graph_bs
+                with self.assertRaisesRegex(ValueError, "exact GLM-5.2 XORL"):
+                    server_args._resolve_glm52_exact_contract(
+                        self._glm_model_config().hf_config,
+                        model_arch="GlmMoeDsaForCausalLM",
+                        is_dsa_model=True,
+                    )
+
+    def test_non_glm_xorl_does_not_enable_the_glm_numerical_family(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        hf_config = MagicMock()
+
+        server_args._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch="Qwen3ForCausalLM",
+            is_dsa_model=False,
+        )
+
+        self.assertFalse(server_args.glm52_exact_mode)
+        self.assertFalse(hf_config._glm52_exact_mode)
+        self.assertIsNone(server_args.dsa_prefill_backend)
+        self.assertEqual(server_args.moe_runner_backend, "auto")
+
+    def test_model_specific_adjustments_resolves_qwen35_through_real_caller(self):
+        """Exercise the production caller so helper-signature drift fails here."""
+        hf_config = SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            text_config=SimpleNamespace(
+                hidden_size=2048,
+                num_hidden_layers=40,
+                num_attention_heads=16,
+                num_key_value_heads=2,
+                vocab_size=248320,
+                num_experts=256,
+                num_experts_per_tok=8,
+                linear_num_key_heads=16,
+                linear_num_value_heads=32,
+                linear_key_head_dim=128,
+                linear_value_head_dim=128,
+                linear_conv_kernel_dim=4,
+                full_attention_interval=4,
+                layer_types=[
+                    "full_attention" if (i + 1) % 4 == 0 else "linear_attention"
+                    for i in range(40)
+                ],
+            ),
+        )
+        model_config = MagicMock(hf_config=hf_config)
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.tp_size = 8
+        server_args.ep_size = 1
+        server_args.get_model_config = MagicMock(return_value=model_config)
+
+        with patch(
+            "sglang.srt.configs.model_config.is_deepseek_dsa", return_value=False
+        ):
+            server_args._handle_model_specific_adjustments()
+
+        self.assertTrue(server_args.qwen35_gdn_exact_mode)
+        self.assertTrue(hf_config._qwen35_gdn_exact_mode)
+        self.assertEqual(server_args.tp_size, 8)
+        self.assertEqual(server_args.dp_size, 8)
+        self.assertEqual(server_args.ep_size, 8)
+        self.assertTrue(server_args.enable_dp_attention)
+
+    def test_rejects_unpinned_glm_dsa_pair(self):
+        server_args = self._server_args(decode_backend="flashmla_kv")
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        with self.assertRaisesRegex(ValueError, "Deterministic GLM DSA requires"):
+            server_args._handle_deterministic_inference()
+
+    def test_accepts_exact_sparse_decode_only_for_xorl_contract(self):
+        server_args = self._server_args(decode_backend="flashmla_sparse")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.glm52_exact_mode = True
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        server_args._handle_deterministic_inference()
+
+        self.assertEqual(server_args.dsa_decode_backend, "flashmla_sparse")
+        self.assertFalse(server_args.disable_radix_cache)
+
+    def test_rejects_exact_sparse_decode_without_xorl_contract(self):
+        server_args = self._server_args(decode_backend="flashmla_sparse")
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        with self.assertRaisesRegex(ValueError, "Deterministic GLM DSA requires"):
+            server_args._handle_deterministic_inference()
+
+    def test_top_level_fa3_remains_a_distinct_non_dsa_path(self):
+        server_args = self._server_args()
+        server_args.attention_backend = "fa3"
+        server_args.get_model_config = MagicMock(return_value=self._glm_model_config())
+
+        server_args._handle_deterministic_inference()
+
+        self.assertEqual(server_args.attention_backend, "fa3")
+
+
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.tempfile.NamedTemporaryFile")
     def test_init_new_standard_case(self, mock_temp_file):
@@ -792,7 +1042,6 @@ class TestPortArgs(unittest.TestCase):
             PortArgs.init_new(server_args)
 
     def test_init_new_with_single_node_dp_attention(self):
-
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None

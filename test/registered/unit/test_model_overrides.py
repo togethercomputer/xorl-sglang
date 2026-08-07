@@ -2091,6 +2091,93 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 "attn_cp_size": 8,
                             },
                         )
+                        # The certified functional GLM-5.2 WORLD16 lane is
+                        # independent of the separately qualified exact-K3 mode.
+                        glm52_hf_config = SimpleNamespace(
+                            architectures=["GlmMoeDsaForCausalLM"],
+                            hidden_size=6144,
+                            num_hidden_layers=78,
+                            num_attention_heads=64,
+                            num_key_value_heads=64,
+                            n_routed_experts=256,
+                        )
+                        self.assertEqual(
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=16,
+                                    dp_size=1,
+                                    ep_size=16,
+                                    moe_a2a_backend="none",
+                                    kv_cache_dtype="auto",
+                                    nnodes=2,
+                                    glm52_exact_mode=False,
+                                ),
+                                glm52_hf_config,
+                            ),
+                            {
+                                "attention_backend": "dsa",
+                                "page_size": 64,
+                                "enable_dp_attention": True,
+                                "moe_dense_tp_size": 1,
+                                "attn_cp_size": 16,
+                            },
+                        )
+                        bad_glm52_geometry = SimpleNamespace(**vars(glm52_hf_config))
+                        bad_glm52_geometry.hidden_size = 4096
+                        for nnodes, hf_config in (
+                            (1, glm52_hf_config),
+                            (2, bad_glm52_geometry),
+                        ):
+                            with self.subTest(nnodes=nnodes, hf_config=hf_config):
+                                with self.assertRaises(AssertionError):
+                                    _deepseek_family_overrides(
+                                        _args(
+                                            enable_prefill_cp=True,
+                                            cp_strategy="interleave",
+                                            tp_size=16,
+                                            dp_size=1,
+                                            ep_size=16,
+                                            moe_a2a_backend="none",
+                                            kv_cache_dtype="auto",
+                                            nnodes=nnodes,
+                                            glm52_exact_mode=False,
+                                        ),
+                                        hf_config,
+                                    )
+                        with self.assertRaises(AssertionError):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="interleave",
+                                    tp_size=16,
+                                    dp_size=1,
+                                    ep_size=16,
+                                    moe_a2a_backend="none",
+                                    kv_cache_dtype="auto",
+                                    nnodes=2,
+                                    glm52_exact_mode=False,
+                                ),
+                                SimpleNamespace(
+                                    architectures=["DeepseekV32ForCausalLM"]
+                                ),
+                            )
+                        with self.assertRaises(AssertionError):
+                            _deepseek_family_overrides(
+                                _args(
+                                    enable_prefill_cp=True,
+                                    cp_strategy="zigzag",
+                                    tp_size=16,
+                                    dp_size=1,
+                                    ep_size=16,
+                                    moe_a2a_backend="none",
+                                    kv_cache_dtype="auto",
+                                    nnodes=2,
+                                    glm52_exact_mode=False,
+                                ),
+                                glm52_hf_config,
+                            )
                         # interleave CP with dp>1 must assert
                         with self.assertRaises(AssertionError):
                             _deepseek_family_overrides(

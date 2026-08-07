@@ -37,6 +37,17 @@ _use_cpu = is_cpu() and cpu_has_amx_support()
 # Maximum rows per Triton block for layernorm gated kernel
 MAX_ROWS_PER_BLOCK = 4
 
+# Exact Qwen3.5-family mode pins this launch shape across decode and prefill.
+# ``None`` preserves the ordinary upstream heuristic for every other model.
+_GDN_NORM_ROWS_PER_BLOCK_PIN: int | None = None
+
+
+def set_gdn_norm_rows_per_block_pin(rows: int | None) -> None:
+    global _GDN_NORM_ROWS_PER_BLOCK_PIN
+    if rows is not None and rows < 1:
+        raise ValueError(f"rows-per-block pin must be >= 1, got {rows}")
+    _GDN_NORM_ROWS_PER_BLOCK_PIN = rows
+
 
 def rms_norm_ref(
     x,
@@ -194,6 +205,8 @@ def _get_sm_count(device: torch.device) -> int:
 
 
 def calc_rows_per_block(M: int, device: torch.device) -> int:
+    if _GDN_NORM_ROWS_PER_BLOCK_PIN is not None:
+        return _GDN_NORM_ROWS_PER_BLOCK_PIN
     # Use a constant value when the row count must not affect kernel numerics.
     if is_batch_invariant_mode_enabled() or check_cuda_graph_backend(
         Phase.PREFILL, Backend.TC_PIECEWISE

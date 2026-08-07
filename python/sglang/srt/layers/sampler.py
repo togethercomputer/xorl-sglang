@@ -15,9 +15,11 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
+from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
+from sglang.srt.server_args import is_glm52_exact_mode
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -70,6 +72,7 @@ _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
+        self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
@@ -117,6 +120,20 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
+        if self._glm52_exact_mode:
+            return xorl_bi_sample_and_score(
+                logits_output,
+                sampling_info,
+                return_logprob=return_logprob,
+                top_logprobs_nums=top_logprobs_nums,
+                token_ids_logprobs=token_ids_logprobs,
+                positions=positions,
+                sample_from_logprobs=self._sample_from_logprobs,
+                sync_token_ids=self._sync_token_ids_across_tp,
+                enable_deterministic=self.enable_deterministic,
+                return_original_logprob=SGLANG_RETURN_ORIGINAL_LOGPROB,
+            )
+
         logits = logits_output.next_token_logits
 
         # Preprocess logits (custom processors and NaN handling)

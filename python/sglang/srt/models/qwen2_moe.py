@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_ordered_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -93,6 +94,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
+from sglang.srt.server_args import get_global_server_args, is_qwen35_gdn_exact_mode
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -124,6 +126,23 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+
+
+def _ordered_moe_all_reduce_enabled() -> bool:
+    return is_qwen35_gdn_exact_mode(get_global_server_args())
+
+
+def _bi_router_enabled() -> bool:
+    return is_qwen35_gdn_exact_mode(get_global_server_args())
+
+
+def _require_no_ordered_all_reduce_under_deepep() -> None:
+    if not _ordered_moe_all_reduce_enabled():
+        return
+    raise NotImplementedError(
+        "The ordered MoE reduction contract has no DeepEP implementation: "
+        "use --moe-a2a-backend none, or disable the Qwen3.5-family XORL exact target."
+    )
 
 
 def get_num_shared_experts(config: PretrainedConfig) -> int:
@@ -458,6 +477,72 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         return shared_output
 
+    def _bi_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import bi_router_gemm
+
+        if not isinstance(self.gate, ReplicatedLinear):
+            raise NotImplementedError(
+                "The exact-contract BI router requires a replicated router gate"
+            )
+        if getattr(self.gate, "quant_config", None) is not None:
+            raise NotImplementedError(
+                "The exact-contract BI router does not support a quantized gate"
+            )
+        if getattr(self.topk.topk_config, "use_grouped_topk", False):
+            raise NotImplementedError(
+                "The exact-contract BI router does not support grouped top-k"
+            )
+        return bi_router_gemm(hidden_states, self.gate.weight)
+
+    def _bi_topk_output(
+        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+    ) -> StandardTopKOutput:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            bi_router_topk_weights,
+        )
+        from sglang.srt.layers.moe.routed_experts_capturer import (
+            get_global_experts_capturer,
+        )
+
+        config = self.topk.topk_config
+        if config.custom_routing_function is not None:
+            raise NotImplementedError(
+                "The exact-contract BI router does not support custom routing"
+            )
+        if config.correction_bias is not None:
+            raise NotImplementedError(
+                "The exact-contract BI router does not support correction bias"
+            )
+        if config.num_fused_shared_experts != 0:
+            raise NotImplementedError(
+                "The exact-contract BI router does not support fused shared experts"
+            )
+        if config.scoring_func != "softmax":
+            raise NotImplementedError(
+                "The exact-contract BI router supports softmax scoring only"
+            )
+        if config.routed_scaling_factor not in (None, 1.0):
+            raise NotImplementedError(
+                "The exact-contract BI router does not support routed scaling"
+            )
+        routing_weights = F.softmax(router_logits, dim=1)
+        routing_weights, selected_experts = torch.topk(
+            routing_weights, config.top_k, dim=-1
+        )
+        routing_weights = bi_router_topk_weights(
+            routing_weights, config.renormalize, hidden_states.dtype
+        )
+        get_global_experts_capturer().capture(
+            layer_id=self.topk.layer_id,
+            topk_ids=selected_experts,
+            topk_weights=routing_weights,
+        )
+        return StandardTopKOutput(
+            topk_weights=routing_weights,
+            topk_ids=selected_experts,
+            router_logits=router_logits,
+        )
+
     def _forward_deepep(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         enable_dual_stream = (
             is_npu()
@@ -502,8 +587,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        if _bi_router_enabled():
+            router_logits = self._bi_router_logits(hidden_states)
+            topk_output = self._bi_topk_output(hidden_states, router_logits)
+        else:
+            router_logits, _ = self.gate(hidden_states)
+            topk_output = self.topk(hidden_states, router_logits)
         if self.enable_shared_expert_fusion and TopKOutputChecker.format_is_standard(
             topk_output
         ):
@@ -561,6 +650,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if get_moe_a2a_backend().is_deepep():
+            _require_no_ordered_all_reduce_under_deepep()
             return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = (
@@ -603,7 +693,14 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             and not get_moe_a2a_backend().is_flashinfer()
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if _ordered_moe_all_reduce_enabled():
+                final_hidden_states = tensor_model_parallel_ordered_all_reduce(
+                    final_hidden_states
+                )
+            else:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         # Debug removed - was causing issues during CUDA graph capture
 

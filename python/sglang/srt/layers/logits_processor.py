@@ -46,12 +46,17 @@ from sglang.srt.layers.logprob_processor import (
     get_top_logprobs_raw,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.xorl_batch_invariant import (
+    validate_xorl_bi_logit_transforms,
+    xorl_bi_lm_head,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
+from sglang.srt.server_args import is_glm52_exact_mode
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -349,6 +354,7 @@ class LogitsProcessor(nn.Module):
         self.config = config
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
+        self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         if self.use_attn_tp_group:
@@ -372,6 +378,11 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
+        if self._glm52_exact_mode:
+            validate_xorl_bi_logit_transforms(
+                self.logit_scale,
+                self.final_logit_softcapping,
+            )
 
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
@@ -757,6 +768,14 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self._glm52_exact_mode:
+            return xorl_bi_lm_head(
+                hidden_states,
+                lm_head,
+                use_fp32_lm_head=self.use_fp32_lm_head,
+                embedding_bias=embedding_bias,
+            )
+
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method

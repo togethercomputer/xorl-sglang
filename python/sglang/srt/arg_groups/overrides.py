@@ -623,9 +623,35 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     assert (
                         server_args.dp_size == 1
                     ), "interleave DSA CP does not support DP attention."
+                architectures = getattr(hf_config, "architectures", ()) or ()
+                glm52_geometry = {
+                    "hidden_size": 6144,
+                    "num_hidden_layers": 78,
+                    "num_attention_heads": 64,
+                    "num_key_value_heads": 64,
+                    "n_routed_experts": 256,
+                }
+                glm52_world16 = (
+                    bool(architectures)
+                    and architectures[0] == "GlmMoeDsaForCausalLM"
+                    and server_args.tp_size == 16
+                    and server_args.dp_size == 1
+                    and server_args.nnodes == 2
+                    and server_args.cp_strategy == "interleave"
+                    and all(
+                        getattr(hf_config, field, None) == expected
+                        for field, expected in glm52_geometry.items()
+                    )
+                )
                 assert (
                     server_args.tp_size <= 8
-                ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+                    or getattr(server_args, "glm52_exact_mode", False)
+                    or glm52_world16
+                ), (
+                    "Context parallel supports a single machine (tp_size <= 8), "
+                    "the exact GLM-5.2 contract, or the certified two-node "
+                    "TP16 GLM-5.2 lane."
+                )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                 # DSACPLayerCommunicator does not all-reduce attention-TP
                 # partial o_proj outputs before replicated dense FFNs.
@@ -2014,6 +2040,24 @@ def _deterministic_attention_backend(view: Any) -> dict:
     if not view.enable_deterministic_inference:
         return {}
     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
+
+    if view.attention_backend == "dsa":
+        try:
+            model_arch = view.get_model_config().hf_config.architectures[0]
+        except Exception:
+            model_arch = None
+        if model_arch == "GlmMoeDsaForCausalLM":
+            exact = bool(getattr(view, "glm52_exact_mode", False))
+            if view.dsa_prefill_backend != "flashmla_sparse" or (
+                view.dsa_decode_backend != "fa3"
+                and not (exact and view.dsa_decode_backend == "flashmla_sparse")
+            ):
+                raise ValueError(
+                    "Deterministic GLM DSA requires flashmla_sparse prefill and "
+                    "fa3 decode, except that the exact GLM-5.2 XORL contract "
+                    "requires flashmla_sparse decode."
+                )
+            return {}
 
     if view.attention_backend is None:
         # User didn't specify attention backend, fallback based on GPU architecture

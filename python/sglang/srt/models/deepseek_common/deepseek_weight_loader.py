@@ -20,8 +20,6 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import tqdm
-from transformers import PretrainedConfig
-
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -61,6 +59,7 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
+from transformers import PretrainedConfig
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights
@@ -206,6 +205,19 @@ class DeepseekV2WeightLoaderMixin:
             weight_names = []
 
             for name, loaded_weight in weights:
+                if getattr(
+                    self.config, "indexer_types", None
+                ) is not None and name.endswith(".mlp.gate.e_score_correction_bias"):
+                    if loaded_weight.dtype is not torch.float32:
+                        raise TypeError(
+                            f"{name} must enter the GLM-5.2 serving loader as the official FP32 tensor"
+                        )
+                    if loaded_weight.shape != (
+                        self.config.n_routed_experts,
+                    ) or not bool(torch.all(torch.isfinite(loaded_weight))):
+                        raise ValueError(
+                            f"{name} must be a finite ({self.config.n_routed_experts},) correction-bias vector"
+                        )
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
                 if (

@@ -14,7 +14,6 @@ from typing import Any, Callable, Dict, Literal, Optional, Tuple
 import torch
 import triton
 from packaging import version
-
 from sglang.srt.utils.common import torch_release
 
 logger = logging.getLogger(__name__)
@@ -31,6 +30,12 @@ SUPPORTS_AUTOTUNE_CACHE = (
 autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
+
+SUPPORTS_AUTOTUNE_CACHE = (
+    "cache_results" in inspect.signature(triton.autotune).parameters
+)
+
+autotune_cache_kwargs = {"cache_results": True} if SUPPORTS_AUTOTUNE_CACHE else {}
 
 
 @lru_cache(maxsize=1)
@@ -326,9 +331,9 @@ if torch_release >= (2, 4):
         return device_torch_lib.device(index)
 
 else:
-    assert (
-        device == "cuda"
-    ), "Only cuda device is supported for PyTorch version < 2.4.0."
+    assert device == "cuda", (
+        "Only cuda device is supported for PyTorch version < 2.4.0."
+    )
     autocast_custom_fwd = device_torch_lib.amp.custom_fwd
     autocast_custom_bwd = device_torch_lib.amp.custom_bwd
 

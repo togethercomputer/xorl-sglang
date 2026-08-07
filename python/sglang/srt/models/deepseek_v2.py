@@ -22,9 +22,11 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager, nullcontext
+from dataclasses import replace
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
@@ -54,6 +56,15 @@ from sglang.srt.distributed import (
     get_pp_group,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.canonical_moe import (
+    CanonicalDeferredStatusBook,
+    CanonicalDistribution,
+    CanonicalMoEV3Workspace,
+    CanonicalRowSlots,
+    SamplerParallelPlan,
+    canonicalize_glm52_local_partial_v3,
+    canonicalize_glm52_local_partial_v3b,
+)
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -79,7 +90,10 @@ from sglang.srt.layers.communicator import (
     get_attn_tp_context,
 )
 from sglang.srt.layers.communicator_dsa_cp import (
+    CanonicalMoEPositions,
+    DSAMLPOutputLayout,
     DSACPLayerCommunicator,
+    align_glm52_moe_positions,
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
@@ -143,6 +157,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
     get_embedding_tp_kwargs,
+)
+from sglang.srt.layers.xorl_batch_invariant import (
+    validate_xorl_glm52_norm_envelope,
+    xorl_glm52_norm_site_family,
 )
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -243,6 +261,44 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _is_glm52_architecture(config) -> bool:
+    return getattr(config, "indexer_types", None) is not None
+
+
+def _glm52_exact_mode_enabled(config) -> bool:
+    return bool(getattr(config, "_glm52_exact_mode", False))
+
+
+def _uses_glm52_exact_contract(config, *, is_nextn: bool = False) -> bool:
+    return (
+        _is_glm52_architecture(config)
+        and _glm52_exact_mode_enabled(config)
+        and not is_nextn
+    )
+
+
+def _resolve_glm52_canonical_transport(config) -> str:
+    if _glm52_exact_mode_enabled(config):
+        transport = str(
+            getattr(config, "_glm52_canonical_moe_transport", "canonical_v3b")
+        )
+        if transport != "canonical_v3b":
+            raise RuntimeError(
+                "The exact GLM-5.2 XORL contract serves the certified "
+                "canonical_v3b transport; "
+                f"{transport!r} is not a selectable alternative"
+            )
+        return transport
+    transport = str(getattr(config, "_glm52_canonical_moe_transport", "dense_v1"))
+    if transport not in {"dense_v1", "canonical_v3", "canonical_v3b"}:
+        raise RuntimeError(
+            "GLM-5.2 canonical transport must be dense_v1, canonical_v3, "
+            "or canonical_v3b"
+        )
+    return transport
+
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
 _moe_quant_once_logged = False
@@ -468,13 +524,18 @@ class MoEGate(nn.Module):
         super().__init__()
         self.is_nextn = is_nextn
         self.is_deepseek_v4 = is_deepseek_v4
+        self.is_glm52 = _is_glm52_architecture(config)
+        self._glm52_canonical_contract = _uses_glm52_exact_contract(
+            config, is_nextn=is_nextn
+        )
+        self._glm52_exact_router = self._glm52_canonical_contract
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
 
         if config.topk_method == "noaux_tc" and not is_hash_moe:
             correction_bias_dtype = torch.float32
-            if quant_config is not None:
+            if quant_config is not None and not self._glm52_canonical_contract:
                 if _use_aiter and quant_config.get_name() in (
                     "fp8",
                     "compressed_tensors",
@@ -505,6 +566,31 @@ class MoEGate(nn.Module):
                 None,  # bias
                 True,  # is_vnni
             )
+
+        if self._glm52_exact_router:
+            if not get_exec().deterministic.enable_deterministic_inference:
+                raise RuntimeError(
+                    "GLM-5.2 batch-invariant router requires deterministic inference"
+                )
+            if hidden_states.device.type != "cuda":
+                raise RuntimeError("GLM-5.2 batch-invariant router requires CUDA")
+            if hidden_states.ndim != 2:
+                raise ValueError(
+                    "GLM-5.2 batch-invariant router requires 2D hidden states"
+                )
+            if (
+                hidden_states.dtype is not torch.bfloat16
+                or self.weight.dtype is not torch.bfloat16
+            ):
+                raise TypeError(
+                    "GLM-5.2 batch-invariant router requires BF16 hidden states "
+                    "and BF16 gate weights"
+                )
+            from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+                bi_router_gemm,
+            )
+
+            return bi_router_gemm(hidden_states, self.weight)
 
         if get_exec().deterministic.enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
@@ -839,6 +925,34 @@ class DeepseekV2MoE(nn.Module):
         # SGLANG_OPT_MOE_QUANT_ONCE eligibility, resolved lazily on first
         # forward (weights and runner are final by then). None = undecided.
         self._moe_quant_once: Optional[bool] = None
+        self._glm52_canonical_contract = _uses_glm52_exact_contract(
+            config, is_nextn=is_nextn
+        )
+        self._canonical_v3_workspaces: dict[tuple, CanonicalMoEV3Workspace] = {}
+        self._glm52_deferred_status_book: CanonicalDeferredStatusBook | None = None
+        self._glm52_canonical_transport = (
+            _resolve_glm52_canonical_transport(config)
+            if self._glm52_canonical_contract
+            else None
+        )
+        self.glm52_parallel_plan: SamplerParallelPlan | None = None
+        if self._glm52_canonical_contract:
+            if self._enable_a2a_moe:
+                raise RuntimeError(
+                    "GLM-5.2 canonical MoE requires moe_a2a_backend=none"
+                )
+            if self._fuse_shared_experts_inside_sbo:
+                raise RuntimeError(
+                    "GLM-5.2 canonical MoE forbids SBO shared-expert fusion"
+                )
+            if self.num_fused_shared_experts:
+                raise RuntimeError(
+                    "GLM-5.2 canonical MoE forbids fused routed/shared experts"
+                )
+            if self._shared_expert_tp1:
+                raise RuntimeError(
+                    "GLM-5.2 canonical MoE forbids the TP1 shared-expert bypass"
+                )
 
     def get_moe_weights(self):
         # EPLB only rebalances physical routed experts. Fused shared expert
@@ -884,8 +998,24 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        absolute_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        if self._glm52_canonical_contract:
+            if self._enable_a2a_moe:
+                raise RuntimeError(
+                    "GLM-5.2 canonical MoE requires the non-A2A execution path"
+                )
+            return self.forward_normal(
+                hidden_states,
+                gemm_output_zero_allocator,
+                input_ids,
+                input_ids_global=input_ids_global,
+                skip_shared_experts=skip_shared_experts,
+                forward_batch=forward_batch,
+                absolute_positions=absolute_positions,
+            )
 
         if should_use_mega_moe(self, hidden_states):
             return forward_mega_moe(
@@ -1057,6 +1187,9 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
         skip_shared_experts: bool = False,
+        *,
+        forward_batch: Optional[ForwardBatch] = None,
+        absolute_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1181,6 +1314,15 @@ class DeepseekV2MoE(nn.Module):
             self.routed_scaling_factor,
         )
 
+        if self._glm52_canonical_contract:
+            return self._canonicalize_glm52_partial(
+                final_hidden_states,
+                absolute_positions,
+                forward_batch=forward_batch,
+                fuse_mlp_allreduce=get_forward().fuse_mlp_allreduce,
+                mlp_reduce_scatter=get_forward().mlp_reduce_scatter,
+            )
+
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
@@ -1190,6 +1332,120 @@ class DeepseekV2MoE(nn.Module):
         if shared_output is not None and self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _canonicalize_glm52_partial(
+        self,
+        local_partial: torch.Tensor,
+        absolute_positions: torch.Tensor | CanonicalMoEPositions | None,
+        *,
+        forward_batch: Optional[ForwardBatch],
+        fuse_mlp_allreduce: bool,
+        mlp_reduce_scatter: bool,
+    ) -> torch.Tensor:
+        if fuse_mlp_allreduce or mlp_reduce_scatter:
+            raise RuntimeError(
+                "GLM-5.2 canonical MoE owns the complete reduction and cannot "
+                "fuse or reduce-scatter it"
+            )
+        if absolute_positions is None:
+            raise RuntimeError(
+                "GLM-5.2 canonical MoE requires explicit absolute positions"
+            )
+        if local_partial.dtype is not torch.bfloat16:
+            raise TypeError("GLM-5.2 serving local MoE partial must be BF16")
+        plan = self.glm52_parallel_plan
+        if plan is None:
+            raise RuntimeError(
+                "GLM-5.2 canonical MoE requires a model-bound stage-local parallel plan"
+            )
+        if (
+            self.tp_size != plan.contributor_count
+            or self.moe_ep_size != plan.contributor_count
+        ):
+            raise RuntimeError(
+                "GLM-5.2 sampler canonical MoE requires launcher TP and EP "
+                "to equal the canonical contributor count"
+            )
+        if (
+            self.gate.e_score_correction_bias is None
+            or self.gate.e_score_correction_bias.dtype is not torch.float32
+        ):
+            raise RuntimeError(
+                "GLM-5.2 correction bias must remain FP32 through weight loading"
+            )
+        if self._glm52_canonical_transport != "canonical_v3b":
+            raise RuntimeError(
+                "The exact GLM-5.2 owner requires canonical_v3b transport"
+            )
+
+        prefill_cp = forward_batch is not None and (
+            dsa_use_prefill_cp(forward_batch, self.gate.dsa_enable_prefill_cp)
+            or mla_use_prefill_cp(forward_batch, self.gate.mla_enable_prefill_cp)
+        )
+        if isinstance(absolute_positions, CanonicalMoEPositions):
+            position_values = absolute_positions.values
+            position_valid = absolute_positions.valid_mask
+        else:
+            position_values = absolute_positions
+            position_valid = None
+        slots = CanonicalRowSlots.from_positions(
+            position_values,
+            capacity=local_partial.shape[0],
+            valid_mask=position_valid,
+        )
+        distribution = (
+            CanonicalDistribution.CONSUMER_SHARDED
+            if prefill_cp
+            else CanonicalDistribution.REPLICATED_CANONICAL
+        )
+        group = get_parallel().tp_group.device_group
+        workspace_key = (
+            distribution.value,
+            slots.capacity,
+            tuple(local_partial.shape[1:]),
+            local_partial.dtype,
+            local_partial.device,
+        )
+        workspace = self._canonical_v3_workspaces.get(workspace_key)
+        if workspace is None:
+            workspace = CanonicalMoEV3Workspace.allocate(
+                local_partial,
+                plan=plan,
+                group=group,
+                distribution=distribution,
+            )
+            self._canonical_v3_workspaces[workspace_key] = workspace
+
+        capture_mode = get_is_capture_mode()
+        if prefill_cp:
+            canonical = canonicalize_glm52_local_partial_v3(
+                local_partial,
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=self.layer_id,
+                distribution=distribution,
+                graph_capture=capture_mode,
+                workspace=workspace,
+            )
+        else:
+            canonical = canonicalize_glm52_local_partial_v3b(
+                local_partial,
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=self.layer_id,
+                graph_capture=capture_mode,
+                workspace=workspace,
+            )
+        if not capture_mode:
+            if self._glm52_deferred_status_book is None:
+                canonical.raise_for_status()
+            else:
+                self._glm52_deferred_status_book.record(
+                    self.layer_id, canonical.contract_status
+                )
+        return canonical.values
 
     def forward_cpu(
         self,
@@ -1747,6 +2003,7 @@ class DeepseekV2AttentionMLA(
         is_nextn: bool = False,
         dsa_enable_prefill_cp: bool = False,
         mla_enable_prefill_cp: bool = False,
+        glm52_xorl_bi_contract: bool = False,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -1792,7 +2049,15 @@ class DeepseekV2AttentionMLA(
                 quant_config=quant_config,
                 prefix=add_prefix("fused_qkv_a_proj_with_mqa", prefix),
             )
-            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = RMSNorm(
+                self.q_lora_rank,
+                eps=config.rms_norm_eps,
+                batch_invariant_family=(
+                    xorl_glm52_norm_site_family("q_a")
+                    if glm52_xorl_bi_contract
+                    else None
+                ),
+            )
             self.q_b_proj = ColumnParallelLinear(
                 q_lora_rank,
                 self.num_heads * self.qk_head_dim,
@@ -1878,7 +2143,13 @@ class DeepseekV2AttentionMLA(
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(
+            self.kv_lora_rank,
+            eps=config.rms_norm_eps,
+            batch_invariant_family=(
+                xorl_glm52_norm_site_family("kv_a") if glm52_xorl_bi_contract else None
+            ),
+        )
 
         if not skip_rope:
             is_neox_style = not getattr(config, "rope_interleave", True)
@@ -2266,6 +2537,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
         dsa_enable_prefill_cp: bool = False,
         mla_enable_prefill_cp: bool = False,
+        glm52_xorl_bi_contract: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -2286,6 +2558,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.mla_enable_prefill_cp = mla_enable_prefill_cp
         self.layer_id = layer_id
         self.is_nextn = is_nextn
+        self.glm52_xorl_bi_contract = glm52_xorl_bi_contract
         self.self_attn = DeepseekV2AttentionMLA(
             config=config,
             hidden_size=self.hidden_size,
@@ -2308,6 +2581,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_nextn=is_nextn,
             dsa_enable_prefill_cp=dsa_enable_prefill_cp,
             mla_enable_prefill_cp=mla_enable_prefill_cp,
+            glm52_xorl_bi_contract=glm52_xorl_bi_contract,
         )
         if not hasattr(config, "q_lora_rank") and envs.SGLANG_USE_AG_AFTER_QLORA.get():
             raise ValueError(
@@ -2353,13 +2627,35 @@ class DeepseekV2DecoderLayer(nn.Module):
                 swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            batch_invariant_family=(
+                xorl_glm52_norm_site_family("input", layer_id=layer_id)
+                if glm52_xorl_bi_contract
+                else None
+            ),
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            batch_invariant_family=(
+                xorl_glm52_norm_site_family("post_attention")
+                if glm52_xorl_bi_contract
+                else None
+            ),
         )
 
         self._gfx95_quant_format = self._detect_gfx95_quant_format()
 
+        glm52_canonical_moe = (
+            isinstance(self.mlp, DeepseekV2MoE) and self.mlp._glm52_canonical_contract
+        )
+        glm52_complete_mlp = glm52_canonical_moe or (
+            glm52_xorl_bi_contract
+            and isinstance(self.mlp, DeepseekV2MLP)
+            and enable_moe_dense_fully_dp()
+        )
         if self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
             # DSACPLayerCommunicator is flavor-agnostic; its internal gates
             # read both dsa_use_prefill_cp and mla_use_prefill_cp. The rename
@@ -2368,11 +2664,16 @@ class DeepseekV2DecoderLayer(nn.Module):
                 layer_scatter_modes=self.layer_scatter_modes,
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
-                allow_reduce_scatter=True,
+                allow_reduce_scatter=not glm52_complete_mlp,
                 is_last_layer=(
                     is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
                 ),
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
+                mlp_output_layout=(
+                    DSAMLPOutputLayout.COMPLETE
+                    if glm52_complete_mlp
+                    else DSAMLPOutputLayout.LEGACY_PARTIAL
+                ),
             )
         else:
             self.layer_communicator = LayerCommunicator(
@@ -2401,6 +2702,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         return ""
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+        mlp_layer_types = getattr(self.config, "mlp_layer_types", None)
+        if self.glm52_xorl_bi_contract and mlp_layer_types is not None and not is_nextn:
+            if len(mlp_layer_types) != self.config.num_hidden_layers:
+                raise ValueError(
+                    "GLM-5.2 mlp_layer_types length does not match num_hidden_layers"
+                )
+            if layer_id < 0 or layer_id >= self.config.num_hidden_layers:
+                return False
+            layer_type = mlp_layer_types[layer_id]
+            if layer_type not in {"dense", "sparse"}:
+                raise ValueError(f"Unknown GLM-5.2 mlp layer type {layer_type!r}")
+            return layer_type == "sparse"
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= self.config.first_k_dense_replace
@@ -2455,6 +2768,14 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        moe_positions = None
+        if isinstance(self.mlp, DeepseekV2MoE) and self.mlp._glm52_canonical_contract:
+            moe_positions = align_glm52_moe_positions(
+                positions,
+                hidden_states,
+                forward_batch,
+            )
+
         fuse_mlp_allreduce = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -2485,11 +2806,19 @@ class DeepseekV2DecoderLayer(nn.Module):
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
             with _mlp_ctx:
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    gemm_output_zero_allocator,
-                )
+                if moe_positions is None:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                    )
+                else:
+                    hidden_states = self.mlp(
+                        hidden_states,
+                        forward_batch,
+                        gemm_output_zero_allocator,
+                        absolute_positions=moe_positions,
+                    )
 
         if (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
@@ -2589,6 +2918,74 @@ class DeepseekV2Model(nn.Module):
         else:
             self.cp_size = None
 
+        self.glm52_xorl_bi_contract = _uses_glm52_exact_contract(config)
+        if self.glm52_xorl_bi_contract:
+            validate_xorl_glm52_norm_envelope(
+                use_qk_norm=bool(getattr(config, "use_qk_norm", False))
+            )
+        self.glm52_parallel_plan: SamplerParallelPlan | None = None
+        if self.glm52_xorl_bi_contract:
+            if not self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
+                raise RuntimeError(
+                    "The exact GLM-5.2 canonical contract requires DSA context "
+                    "parallelism"
+                )
+            server_args = get_server_args()
+            forbidden_features = {
+                "two-batch overlap": server_args.enable_two_batch_overlap,
+                "single-batch overlap": server_args.enable_single_batch_overlap,
+                "FlashInfer fused all-reduce": (
+                    server_args.enable_flashinfer_allreduce_fusion
+                ),
+                "AITer fused all-reduce": server_args.enable_aiter_allreduce_fusion,
+            }
+            enabled = [name for name, value in forbidden_features.items() if value]
+            if enabled:
+                raise RuntimeError(
+                    f"GLM-5.2 canonical contract forbids: {', '.join(enabled)}"
+                )
+            if not get_moe_a2a_backend().is_none():
+                raise RuntimeError(
+                    "GLM-5.2 canonical contract requires moe_a2a_backend=none"
+                )
+            if server_args.moe_runner_backend != "triton":
+                raise RuntimeError(
+                    "GLM-5.2 canonical contract requires moe_runner_backend=triton"
+                )
+            if server_args.fp8_gemm_runner_backend != "triton":
+                raise RuntimeError(
+                    "GLM-5.2 canonical contract requires fp8_gemm_runner_backend=triton"
+                )
+            if server_args.moe_dense_tp_size != 1 or get_parallel().attn_tp_size != 1:
+                raise RuntimeError(
+                    "GLM-5.2 canonical contract requires effective dense/head TP1"
+                )
+            tp_group = get_parallel().tp_group.device_group
+            get_group_ranks = getattr(dist, "get_process_group_ranks", None)
+            if get_group_ranks is None:
+                raise RuntimeError(
+                    "GLM-5.2 canonical contract requires explicit TP-group rank "
+                    "discovery"
+                )
+            physical_ranks = tuple(get_group_ranks(tp_group))
+            self.glm52_parallel_plan = SamplerParallelPlan.glm52(
+                contributors=get_parallel().tp_size,
+                pp_size=get_parallel().pp_size,
+                pp_rank=self.pp_group.rank_in_group,
+                physical_ranks=physical_ranks,
+            )
+            self.glm52_parallel_plan.validate_cuda_graph_policy(
+                disable_cuda_graph=server_args.disable_cuda_graph
+            )
+            self.glm52_parallel_plan.validate_runtime(
+                group=tp_group,
+                launcher_tp_size=get_parallel().tp_size,
+                effective_dense_tp=server_args.moe_dense_tp_size,
+                pp_size=get_parallel().pp_size,
+                ep_size=get_parallel().moe_ep_size,
+                attention_cp_size=get_parallel().attn_cp_size,
+            )
+
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -2619,6 +3016,7 @@ class DeepseekV2Model(nn.Module):
                 alt_stream=self.alt_stream,
                 dsa_enable_prefill_cp=self.dsa_enable_prefill_cp,
                 mla_enable_prefill_cp=self.mla_enable_prefill_cp,
+                glm52_xorl_bi_contract=self.glm52_xorl_bi_contract,
             ),
             pp_rank=self.pp_group.rank_in_group,
             pp_size=self.pp_group.world_size,
@@ -2649,12 +3047,44 @@ class DeepseekV2Model(nn.Module):
             ),
         )
 
+        self.glm52_deferred_status_book: CanonicalDeferredStatusBook | None = None
+        if self.glm52_xorl_bi_contract:
+            if self.glm52_parallel_plan is None:
+                raise RuntimeError(
+                    "The exact GLM-5.2 model has no canonical parallel plan"
+                )
+            self.glm52_parallel_plan = replace(
+                self.glm52_parallel_plan,
+                stage_layer_range=(self.start_layer, self.end_layer),
+            )
+            canonical_mlps = []
+            for layer_id in range(self.start_layer, self.end_layer):
+                mlp = self.layers[layer_id].mlp
+                if isinstance(mlp, DeepseekV2MoE):
+                    mlp.glm52_parallel_plan = self.glm52_parallel_plan
+                    if mlp._glm52_canonical_contract:
+                        canonical_mlps.append(mlp)
+            if canonical_mlps:
+                self.glm52_deferred_status_book = CanonicalDeferredStatusBook(
+                    config.num_hidden_layers
+                )
+                for mlp in canonical_mlps:
+                    mlp._glm52_deferred_status_book = self.glm52_deferred_status_book
+
         local_layer_ids = list(range(self.start_layer, self.end_layer))
         self.next_full_attention_layer_id = dict(
             zip(local_layer_ids, local_layer_ids[1:])
         )
         if self.pp_group.is_last_rank:
-            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                batch_invariant_family=(
+                    xorl_glm52_norm_site_family("final")
+                    if self.glm52_xorl_bi_contract
+                    else None
+                ),
+            )
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
@@ -2846,6 +3276,9 @@ class DeepseekV2Model(nn.Module):
                 ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
+
+        if self.glm52_deferred_status_book is not None and not get_is_capture_mode():
+            self.glm52_deferred_status_book.check_and_clear()
 
         if not self.pp_group.is_last_rank:
             proxy_tensors = {

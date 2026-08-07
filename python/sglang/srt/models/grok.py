@@ -298,18 +298,15 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
             raise ValueError(f"Unknown extrapolation method: {self.extra_method}")
         return inv_freq
 
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
-        inv_freq = self._compute_inv_freq(self.scaling_factor)
-        t = torch.arange(
+    # This model leaves `self.mscale` off its cos/sin table, so the base class'
+    # magnitude-scale hook of 1.0 is the one it wants.
+    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
+        return self._compute_inv_freq(self.scaling_factor)
+
+    def _cos_sin_cache_positions(self) -> torch.Tensor:
+        return torch.arange(
             self.max_position_embeddings * self.scaling_factor, dtype=torch.float32
         )
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        # cos = freqs.cos() * self.mscale
-        # sin = freqs.sin() * self.mscale
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
 
 
 class Grok1Attention(nn.Module):

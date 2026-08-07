@@ -15,9 +15,50 @@ from .parallel_state import (
 )
 
 
+# Installed by the Qwen3.5-family exact architecture resolver. The transport
+# remains an all-gather; only the local, reverse-rank BF16 addition chain is
+# fused when the resolved contract enables it.
+_ORDERED_COMBINE_FUSED_ENABLED = False
+
+
+def set_ordered_combine_fused_enabled(enabled: bool) -> None:
+    global _ORDERED_COMBINE_FUSED_ENABLED
+    _ORDERED_COMBINE_FUSED_ENABLED = bool(enabled)
+
+
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_)
+
+
+def tensor_model_parallel_ordered_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce through a fixed reverse-rank BF16 addition chain."""
+    group = get_tp_group()
+    if group.world_size == 1 or input_.numel() == 0:
+        return input_
+
+    input_ = input_.contiguous()
+    gathered = torch.empty(
+        (group.world_size * input_.shape[0], *input_.shape[1:]),
+        dtype=input_.dtype,
+        device=input_.device,
+    )
+    torch.distributed.all_gather_into_tensor(
+        gathered, input_, group=group.device_group
+    )
+    partials = gathered.view(group.world_size, *input_.shape)
+    if _ORDERED_COMBINE_FUSED_ENABLED:
+        from sglang.srt.distributed.ordered_combine_fused import (
+            fused_ordered_combine,
+        )
+
+        fused = fused_ordered_combine(partials)
+        if fused is not None:
+            return fused
+    result = partials[-1]
+    for rank in range(group.world_size - 2, -1, -1):
+        result = result + partials[rank]
+    return result
 
 
 def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:

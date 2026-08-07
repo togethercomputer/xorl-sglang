@@ -309,7 +309,9 @@ BF16_GEMM_BACKEND_CHOICES = ["auto", "cutedsl", "torch"]
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
+XORL_RL_TARGET = "xorl"
+RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "xorl-batch-invariant", XORL_RL_TARGET]
+BATCH_INVARIANT_RL_TARGETS = frozenset({"fsdp", "xorl-batch-invariant"})
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
@@ -429,6 +431,55 @@ def add_radix_eviction_policy_choices(choices):
 
 def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
+
+
+def is_batch_invariant_rl_target(target: Optional[str]) -> bool:
+    return target in BATCH_INVARIANT_RL_TARGETS
+
+
+def is_glm52_exact_mode(server_args: ServerArgs) -> bool:
+    return bool(getattr(server_args, "glm52_exact_mode", False))
+
+
+def is_qwen35_gdn_exact_mode(server_args: ServerArgs) -> bool:
+    return bool(getattr(server_args, "qwen35_gdn_exact_mode", False))
+
+
+def _text_model_config(hf_config):
+    return getattr(hf_config, "text_config", hf_config)
+
+
+def _validate_exact_model_geometry(
+    hf_config,
+    *,
+    contract_name: str,
+    expected: dict[str, object],
+) -> None:
+    config = _text_model_config(hf_config)
+    mismatches = []
+    for name, expected_value in expected.items():
+        actual_value = getattr(config, name, None)
+        if actual_value != expected_value:
+            mismatches.append(f"{name}={actual_value!r} (expected {expected_value!r})")
+    if mismatches:
+        raise ValueError(
+            f"The exact {contract_name} XORL contract only admits the qualified "
+            f"model geometry; mismatched fields: {', '.join(mismatches)}"
+        )
+
+
+def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | None:
+    if is_glm52_exact_mode(server_args):
+        from sglang.srt.layers.xorl_batch_invariant import XORL_GLM52_REQUIRED_BI_OPS
+
+        return XORL_GLM52_REQUIRED_BI_OPS
+    if is_qwen35_gdn_exact_mode(server_args):
+        from sglang.kernels.ops.attention.fla.qwen35_gdn_exact import (
+            QWEN35_REQUIRED_BI_OPS,
+        )
+
+        return QWEN35_REQUIRED_BI_OPS
+    return None
 
 
 def add_linear_attn_kernel_backend_choices(choices):
@@ -3258,6 +3309,15 @@ class ServerArgs:
         ),
         NS("exec.deterministic"),
     ] = None
+    # Architecture-owned runtime selections. These are resolved from the
+    # model geometry and XORL target and are intentionally not CLI flags.
+    glm52_exact_mode: bool = dataclasses.field(init=False, default=False, repr=False)
+    qwen35_gdn_exact_mode: bool = dataclasses.field(
+        init=False, default=False, repr=False
+    )
+    qwen35_gdn_exact_is_moe: bool = dataclasses.field(
+        init=False, default=False, repr=False
+    )
 
     # -------------------------------------------------------------------------
     # KV canary
@@ -5030,6 +5090,320 @@ class ServerArgs:
 
         validate_hisparse_kv_cache_dtype(self)
 
+    def _validate_glm52_exact_contract(self) -> None:
+        if not self.glm52_exact_mode:
+            return
+        if (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract does not support speculative "
+                "or draft decoding."
+            )
+
+    def _resolve_glm52_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+        is_dsa_model: bool,
+    ) -> None:
+        self.glm52_exact_mode = (
+            self.rl_on_policy_target == XORL_RL_TARGET
+            and model_arch == "GlmMoeDsaForCausalLM"
+            and is_dsa_model
+        )
+        hf_config._glm52_exact_mode = self.glm52_exact_mode
+        self._validate_glm52_exact_contract()
+        if not self.glm52_exact_mode:
+            return
+
+        _validate_exact_model_geometry(
+            hf_config,
+            contract_name="GLM-5.2",
+            expected={
+                "hidden_size": 6144,
+                "num_hidden_layers": 78,
+                "vocab_size": 154880,
+                "n_routed_experts": 256,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 8,
+                "index_topk": 2048,
+                "index_topk_freq": 4,
+            },
+        )
+        if self.dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError("The exact GLM-5.2 XORL contract requires BF16 dtype")
+        if self.quantization not in (None, "fp8"):
+            raise ValueError("The exact GLM-5.2 XORL contract requires FP8 weights")
+        if self.kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError("The exact GLM-5.2 XORL contract requires BF16 KV cache")
+        if self.attention_backend not in (None, "dsa"):
+            raise ValueError("The exact GLM-5.2 XORL contract requires DSA attention")
+        if self.dsa_prefill_backend not in (None, "flashmla_sparse"):
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires flashmla_sparse prefill"
+            )
+        if self.dsa_decode_backend not in (None, "flashmla_sparse"):
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires flashmla_sparse decode"
+            )
+        exact_program = {
+            "moe_runner_backend": (self.moe_runner_backend, ("auto", "triton")),
+            "fp8_gemm_runner_backend": (
+                self.fp8_gemm_runner_backend,
+                ("auto", "triton"),
+            ),
+            "moe_dense_tp_size": (self.moe_dense_tp_size, (None, 1)),
+            "moe_a2a_backend": (self.moe_a2a_backend, ("none",)),
+            "tp_size": (self.tp_size, (16,)),
+            "ep_size": (self.ep_size, (1, 16)),
+            "pp_size": (self.pp_size, (1,)),
+            "dp_size": (self.dp_size, (1,)),
+            "moe_dp_size": (self.moe_dp_size, (1,)),
+            "attn_cp_size": (self.attn_cp_size, (1, 16)),
+            "dsa_prefill_cp_mode": (
+                self.dsa_prefill_cp_mode,
+                ("round-robin-split",),
+            ),
+        }
+        incompatible = [
+            f"{name}={value!r}"
+            for name, (value, allowed) in exact_program.items()
+            if value not in allowed
+        ]
+        if self.disable_cuda_graph:
+            incompatible.append("disable_cuda_graph=True")
+        if self.cuda_graph_bs_decode not in (None, [16]):
+            incompatible.append(f"cuda_graph_bs_decode={self.cuda_graph_bs_decode!r}")
+        if self.cuda_graph_max_bs_decode not in (None, 16):
+            incompatible.append(
+                f"cuda_graph_max_bs_decode={self.cuda_graph_max_bs_decode!r}"
+            )
+        if incompatible:
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract rejects incompatible runtime "
+                f"settings: {', '.join(incompatible)}"
+            )
+        self.dtype = "bfloat16"
+        self.quantization = "fp8"
+        self.kv_cache_dtype = "bfloat16"
+        self.attention_backend = "dsa"
+        self.dsa_prefill_backend = "flashmla_sparse"
+        self.dsa_decode_backend = "flashmla_sparse"
+        self.moe_runner_backend = "triton"
+        self.fp8_gemm_runner_backend = "triton"
+        self.moe_dense_tp_size = 1
+        self.ep_size = 16
+        self.attn_cp_size = 16
+        self.enable_prefill_cp = True
+        self.cp_strategy = "interleave"
+        self.enable_dsa_prefill_context_parallel = True
+        self.dsa_prefill_cp_mode = "round-robin-split"
+        self.enable_deterministic_inference = True
+        self.disable_shared_experts_fusion = True
+        self.disable_custom_all_reduce = True
+        self.disable_overlap_schedule = True
+        self.disable_piecewise_cuda_graph = True
+        self.disable_radix_cache = True
+        self.cuda_graph_bs_decode = [16]
+        self.cuda_graph_max_bs_decode = 16
+
+    def _validate_qwen35_gdn_exact_contract(self, hf_config) -> None:
+        if not self.qwen35_gdn_exact_mode:
+            return
+        config = _text_model_config(hf_config)
+        expected = {
+            "hidden_size": 2048 if self.qwen35_gdn_exact_is_moe else 1024,
+            "num_hidden_layers": 40 if self.qwen35_gdn_exact_is_moe else 24,
+            "num_attention_heads": 16 if self.qwen35_gdn_exact_is_moe else 8,
+            "num_key_value_heads": 2,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32 if self.qwen35_gdn_exact_is_moe else 16,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+        }
+        if self.qwen35_gdn_exact_is_moe:
+            expected.update(num_experts=256, num_experts_per_tok=8)
+        _validate_exact_model_geometry(
+            config,
+            contract_name=(
+                "Qwen3.6-35B-A3B"
+                if self.qwen35_gdn_exact_is_moe
+                else "Qwen3.5-0.8B"
+            ),
+            expected=expected,
+        )
+        if (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "The exact Qwen3.5-family XORL contract does not support "
+                "speculative or draft decoding."
+            )
+
+    def _resolve_qwen35_gdn_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+    ) -> None:
+        from sglang.kernels.ops.attention.fla.qwen35_gdn_exact import (
+            QWEN35_EXACT_ARCHS,
+            QWEN35_MOE_ARCHS,
+        )
+
+        self.qwen35_gdn_exact_mode = (
+            self.rl_on_policy_target == XORL_RL_TARGET
+            and model_arch in QWEN35_EXACT_ARCHS
+        )
+        self.qwen35_gdn_exact_is_moe = (
+            self.qwen35_gdn_exact_mode and model_arch in QWEN35_MOE_ARCHS
+        )
+        hf_config._qwen35_gdn_exact_mode = self.qwen35_gdn_exact_mode
+        hf_config._qwen35_gdn_exact_is_moe = self.qwen35_gdn_exact_is_moe
+        self._validate_qwen35_gdn_exact_contract(hf_config)
+        if not self.qwen35_gdn_exact_mode:
+            return
+
+        if self.dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError(
+                "The exact Qwen3.5-family XORL contract requires BF16 dtype"
+            )
+        if self.quantization is not None:
+            raise ValueError(
+                "The exact Qwen3.5-family XORL contract requires unquantized weights"
+            )
+        if self.attention_backend not in (None, "fa4"):
+            raise ValueError(
+                "The exact Qwen3.5-family XORL contract requires the FA4 backend"
+            )
+        self.dtype = "bfloat16"
+        self.attention_backend = "fa4"
+        if self.linear_attn_prefill_backend not in (None, "triton"):
+            raise ValueError(
+                "The exact Qwen3.5-family XORL contract requires the triton "
+                "linear-attention prefill backend"
+            )
+        self.linear_attn_prefill_backend = "triton"
+        if self.linear_attn_decode_backend not in (None, "triton"):
+            raise ValueError(
+                "The exact Qwen3.5-family XORL contract requires the triton "
+                "linear-attention decode backend"
+            )
+        self.linear_attn_decode_backend = "triton"
+        self.enable_fp32_lm_head = True
+        self.enable_fp32_router = False
+        self.enable_deterministic_inference = True
+        self.sampling_backend = "pytorch"
+        self.sampling_defaults = "openai"
+        self.disable_custom_all_reduce = True
+        self.disable_piecewise_cuda_graph = True
+        if self.qwen35_gdn_exact_is_moe:
+            if self.tp_size != 8:
+                raise ValueError(
+                    "The exact Qwen3.5-family MoE XORL contract is certified "
+                    f"at TP8/DP8/EP8/PP1; got tp_size={self.tp_size}"
+                )
+            if self.pp_size != 1:
+                raise ValueError(
+                    "The exact Qwen3.5-family MoE XORL contract is certified "
+                    f"at PP1; got pp_size={self.pp_size}"
+                )
+            if self.dp_size == 1:
+                self.dp_size = 8
+            elif self.dp_size != 8:
+                raise ValueError(
+                    "The exact Qwen3.5-family MoE XORL contract is certified "
+                    f"at DP8; got dp_size={self.dp_size}"
+                )
+            if self.ep_size == 1:
+                self.ep_size = 8
+            elif self.ep_size != 8:
+                raise ValueError(
+                    "The exact Qwen3.5-family MoE XORL contract requires EP8; "
+                    f"got ep_size={self.ep_size}"
+                )
+            if self.moe_a2a_backend != "none":
+                raise ValueError(
+                    "The exact Qwen3.5-family MoE XORL contract requires "
+                    "--moe-a2a-backend none"
+                )
+            self.enable_dp_attention = True
+            self.enable_dp_lm_head = True
+            self.enable_fp32_router = True
+            if self.disable_cuda_graph:
+                raise ValueError(
+                    "The exact Qwen3.6 MoE XORL contract requires its CUDA graph bucket [10]"
+                )
+            if self.disable_radix_cache:
+                raise ValueError(
+                    "The exact Qwen3.6 MoE XORL contract requires radix cache"
+                )
+            if (
+                self.cuda_graph_bs_decode is not None
+                and self.cuda_graph_bs_decode != [10]
+            ):
+                raise ValueError(
+                    "The exact Qwen3.6 MoE XORL contract requires exactly "
+                    f"--cuda-graph-bs 10; got {self.cuda_graph_bs_decode}"
+                )
+            self.cuda_graph_bs_decode = [10]
+            self.cuda_graph_max_bs_decode = 10
+            self.disable_cuda_graph_padding = True
+            self.max_queued_requests = 512
+            self.chunked_prefill_size = 16384
+            self.max_prefill_tokens = 32768
+            mem_fraction_explicit = getattr(
+                self,
+                "_mem_fraction_static_user_supplied",
+                self.mem_fraction_static is not None,
+            )
+            if mem_fraction_explicit and self.mem_fraction_static != 0.40:
+                raise ValueError(
+                    "The exact Qwen3.6 MoE XORL contract requires "
+                    "--mem-fraction-static 0.40; got "
+                    f"{self.mem_fraction_static}"
+                )
+            self.mem_fraction_static = 0.40
+            if self.max_running_requests is None:
+                self.max_running_requests = 80
+            elif self.max_running_requests != 80:
+                raise ValueError(
+                    "The exact Qwen3.6 MoE XORL contract requires "
+                    "--max-running-requests 80; got "
+                    f"{self.max_running_requests}"
+                )
+            if self.max_mamba_cache_size is None:
+                self.max_mamba_cache_size = 1024
+            elif self.max_mamba_cache_size != 1024:
+                raise ValueError(
+                    "The exact Qwen3.6 MoE XORL contract requires "
+                    "--max-mamba-cache-size 1024; got "
+                    f"{self.max_mamba_cache_size}"
+                )
+        else:
+            dense_topology = (self.tp_size, self.dp_size, self.ep_size, self.pp_size)
+            if dense_topology != (1, 1, 1, 1):
+                raise ValueError(
+                    "The exact dense Qwen3.5-family XORL contract is certified "
+                    "at TP1/DP1/EP1/PP1; got "
+                    f"TP{self.tp_size}/DP{self.dp_size}/EP{self.ep_size}/PP{self.pp_size}"
+                )
+            if self.cuda_graph_bs_decode is not None:
+                raise ValueError(
+                    "The exact dense Qwen3.5 XORL contract is certified in eager mode"
+                )
+            self.disable_cuda_graph = True
+            self.disable_radix_cache = True
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
@@ -5046,6 +5420,12 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        self._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch=model_arch,
+            is_dsa_model=is_deepseek_dsa(hf_config),
+        )
+        self._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=model_arch)
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
@@ -7823,6 +8203,7 @@ class ServerArgs:
 
             run_post_process_pass(self, _deterministic_sampling_backend)
             is_deepseek_model = False
+            model_arch = None
             if parse_connector_type(self.model_path) != ConnectorType.INSTANCE:
                 try:
                     hf_config = self.get_model_config().hf_config
@@ -7842,10 +8223,14 @@ class ServerArgs:
             run_post_process_pass(self, _deterministic_attention_backend)
 
             attention_backend = resolved_view(self).attention_backend
+            is_glm_dsa_backend = (
+                model_arch == "GlmMoeDsaForCausalLM" and attention_backend == "dsa"
+            )
             if is_deepseek_model:
                 if (
                     attention_backend
                     not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                    and not is_glm_dsa_backend
                 ):
                     raise ValueError(
                         f"Currently only {RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND} attention backends are supported for deterministic inference with DeepSeek models. But you're using {attention_backend}."
@@ -7858,7 +8243,11 @@ class ServerArgs:
                         "implements on those archs."
                     )
 
-            if attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND:
+            if (
+                attention_backend
+                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                and not is_glm_dsa_backend
+            ):
                 # Currently, only certain backends support radix cache. Support for other backends is in progress
                 self.disable_radix_cache = True
                 logger.warning(

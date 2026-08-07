@@ -13,6 +13,7 @@
 # ==============================================================================
 
 
+from enum import Enum
 from functools import partial
 from typing import Callable, Optional
 
@@ -35,6 +36,10 @@ from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
+)
+from sglang.srt.layers.glm52_positions import CanonicalMoEPositions
+from sglang.srt.layers.glm52_positions import (
+    align_glm52_moe_positions as _align_glm52_moe_positions,
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -92,6 +97,30 @@ def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
     return hidden_states
 
 
+def align_glm52_moe_positions(
+    positions: torch.Tensor,
+    full_hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+) -> CanonicalMoEPositions:
+    """Apply the rank-major CP gather and padding used by FULL MoE rows."""
+
+    prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
+    return _align_glm52_moe_positions(
+        positions,
+        full_hidden_states,
+        prefill_cp=prefill_cp,
+        cp_size=get_parallel().attn_cp_size if prefill_cp else 1,
+        all_gather=attn_cp_all_gather_into_tensor if prefill_cp else None,
+    )
+
+
+class DSAMLPOutputLayout(str, Enum):
+    """Cross-rank reduction state of a DSA/MLA layer's MLP output."""
+
+    LEGACY_PARTIAL = "legacy_partial"
+    COMPLETE = "complete"
+
+
 class DSACPLayerCommunicator(LayerCommunicator):
     def __init__(
         self,
@@ -102,7 +131,9 @@ class DSACPLayerCommunicator(LayerCommunicator):
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
+        mlp_output_layout: DSAMLPOutputLayout = DSAMLPOutputLayout.LEGACY_PARTIAL,
     ):
+        self.mlp_output_layout = mlp_output_layout
         super().__init__(
             layer_scatter_modes,
             input_layernorm,
@@ -130,12 +161,91 @@ class DSACPLayerCommunicator(LayerCommunicator):
             residual_output_mode=ScatterMode.SCATTERED,
             context=self._context,
         )
-        self._communicate_summable_tensor_pair_fn = DSACPCommunicateSummableTensorPairFn.get_fn(
-            hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,  # SCATTERED, FULL
-            residual_input_mode=ScatterMode.SCATTERED,
-            output_mode=ScatterMode.SCATTERED,
-            context=self._context,
+        if self.mlp_output_layout is DSAMLPOutputLayout.COMPLETE:
+            if self.layer_scatter_modes.mlp_mode not in {
+                ScatterMode.SCATTERED,
+                ScatterMode.FULL,
+            }:
+                raise RuntimeError("Complete DSA MLP output has an unsupported layout")
+            if not self._context.is_same_group_size(
+                self.layer_scatter_modes.middle_residual_mode,
+                ScatterMode.SCATTERED,
+            ) or not self._context.is_same_group_size(
+                self.layer_scatter_modes.layer_output_mode,
+                ScatterMode.SCATTERED,
+            ):
+                raise RuntimeError(
+                    "Complete DSA MLP output requires a rank-local CP "
+                    "residual/output layout"
+                )
+            self._communicate_summable_tensor_pair_fn = (
+                self._reject_legacy_complete_postprocess
+            )
+            return
+        self._communicate_summable_tensor_pair_fn = (
+            DSACPCommunicateSummableTensorPairFn.get_fn(
+                hidden_states_input_mode=self.layer_scatter_modes.mlp_mode,
+                residual_input_mode=ScatterMode.SCATTERED,
+                output_mode=ScatterMode.SCATTERED,
+                context=self._context,
+            )
         )
+
+    @staticmethod
+    def _reject_legacy_complete_postprocess(**_kwargs):
+        raise RuntimeError(
+            "Complete DSA MLP output cannot use the legacy summed reduce-scatter path"
+        )
+
+    def should_use_reduce_scatter(self, forward_batch: ForwardBatch):
+        if self.mlp_output_layout is DSAMLPOutputLayout.COMPLETE:
+            return False
+        return super().should_use_reduce_scatter(forward_batch)
+
+    def postprocess_layer(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ):
+        if self.mlp_output_layout is DSAMLPOutputLayout.LEGACY_PARTIAL:
+            return super().postprocess_layer(hidden_states, residual, forward_batch)
+        if residual is None:
+            raise RuntimeError("Complete DSA MLP output requires a residual layout")
+        if self.layer_scatter_modes.mlp_mode is ScatterMode.SCATTERED:
+            if hidden_states.shape != residual.shape:
+                raise RuntimeError(
+                    "Complete local DSA MLP output must match the residual layout"
+                )
+            return hidden_states, residual
+        prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(
+            forward_batch
+        )
+        if not prefill_cp:
+            if hidden_states.shape != residual.shape:
+                raise RuntimeError(
+                    "Complete DSA decode output must match the replicated "
+                    "residual layout"
+                )
+            return hidden_states, residual
+        if hidden_states.shape == residual.shape:
+            return hidden_states, residual
+        cp_size = self._context.attn_cp_size
+        cp_rank = self._context.attn_cp_rank
+        if cp_size <= 1 or not 0 <= cp_rank < cp_size:
+            raise RuntimeError(
+                f"Invalid canonical DSA CP coordinates rank={cp_rank}, size={cp_size}"
+            )
+        local_rows = residual.shape[0]
+        if (
+            hidden_states.shape[0] != local_rows * cp_size
+            or hidden_states.shape[1:] != residual.shape[1:]
+        ):
+            raise RuntimeError(
+                "Replicated complete DSA MLP rows do not match the rank-local "
+                "CP residual capacity"
+            )
+        return hidden_states.narrow(0, cp_rank * local_rows, local_rows), residual
 
 
 class DSACPCommunicateSimpleFn(CommunicateSimpleFn):

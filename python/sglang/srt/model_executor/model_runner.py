@@ -184,8 +184,12 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (  # noqa: F401  (re-export)
     CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
     ServerArgs,
+    _exact_batch_invariant_ops,
     add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
+    is_batch_invariant_rl_target,
+    is_glm52_exact_mode,
+    is_qwen35_gdn_exact_mode,
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -629,6 +633,7 @@ class ModelRunner:
         self.expert_location_updater = ExpertLocationUpdater()
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
+        self.maybe_apply_xorl_exact_runtime()
         self.sampler = create_sampler()
         self.load_model()
         prepare_moe_topk(
@@ -761,8 +766,50 @@ class ModelRunner:
         if get_lora().enable_lora:
             self.init_lora_manager()
 
+    def maybe_apply_xorl_exact_runtime(self):
+        """Resolve architecture-owned kernels before model construction."""
+        if is_qwen35_gdn_exact_mode(self.server_args):
+            from sglang.kernels.ops.attention.fla.qwen35_gdn_exact import (
+                _apply_qwen35_gdn_exact,
+            )
+
+            _apply_qwen35_gdn_exact(self.server_args)
+        elif is_glm52_exact_mode(self.server_args):
+            from sglang.srt.layers.attention.nsa.glm52_selector_fast import (
+                _apply_glm52_exact_fastpath,
+            )
+
+            _apply_glm52_exact_fastpath()
+
     def maybe_enable_batch_invariant_mode(self):
-        if get_exec().deterministic.enable_deterministic_inference:
+        exact_ops = _exact_batch_invariant_ops(self.server_args)
+        if exact_ops is not None or is_batch_invariant_rl_target(
+            self.server_args.rl_on_policy_target
+        ):
+            from sglang.srt.batch_invariant_ops import (
+                enable_batch_invariant_mode,
+                get_batch_invariant_ops,
+            )
+
+            enable_batch_invariant_mode(ops=exact_ops)
+            if is_glm52_exact_mode(self.server_args):
+                from sglang.srt.layers.xorl_batch_invariant import (
+                    log_xorl_bi_contract_plan_once,
+                )
+
+                log_xorl_bi_contract_plan_once(
+                    logger,
+                    use_qk_norm=bool(
+                        getattr(self.model_config.hf_config, "use_qk_norm", False)
+                    ),
+                    speculative_decode=not self.spec_algorithm.is_none(),
+                    mtp_decode=(
+                        self.is_draft_worker
+                        or self.server_args.enable_multi_layer_eagle
+                    ),
+                    legacy_bi_ops=get_batch_invariant_ops(),
+                )
+        elif get_exec().deterministic.enable_deterministic_inference:
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
