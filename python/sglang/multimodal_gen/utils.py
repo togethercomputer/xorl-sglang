@@ -35,25 +35,21 @@ logger = init_logger(__name__)
 T = TypeVar("T")
 
 
-def _expand_path_value(field_name: str, value: Any) -> Any:
-    eu = os.path.expanduser
-    if field_name.endswith("_path") and isinstance(value, str):
-        return eu(value)
-    if field_name.endswith("_path") and isinstance(value, list):
-        return [eu(x) if isinstance(x, str) else x for x in value]
-    if field_name.endswith("_paths") and isinstance(value, dict):
-        return {k: eu(p) if isinstance(p, str) else p for k, p in value.items()}
-    return value
-
-
-def expand_path_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
-    return {key: _expand_path_value(key, value) for key, value in kwargs.items()}
-
-
 def expand_path_fields(obj) -> None:
     """In-place expanduser on all dataclass fields whose name ends with '_path' or '_paths'."""
+    eu = os.path.expanduser
     for f in fields(obj):
-        setattr(obj, f.name, _expand_path_value(f.name, getattr(obj, f.name)))
+        v = getattr(obj, f.name)
+        if f.name.endswith("_path") and isinstance(v, str):
+            setattr(obj, f.name, eu(v))
+        elif f.name.endswith("_path") and isinstance(v, list):
+            setattr(obj, f.name, [eu(x) if isinstance(x, str) else x for x in v])
+        elif f.name.endswith("_paths") and isinstance(v, dict):
+            setattr(
+                obj,
+                f.name,
+                {k: eu(p) if isinstance(p, str) else p for k, p in v.items()},
+            )
 
 
 # TODO(will): used to convert server_args.precision to torch.dtype. Find a
@@ -531,21 +527,24 @@ def shallow_asdict(obj) -> dict[str, Any]:
     return {f.name: getattr(obj, f.name) for f in fields(obj)}
 
 
-# TODO: validate that this is fine
 def kill_itself_when_parent_died() -> None:
-    # if sys.platform == "linux":
-    # sigkill this process when parent worker manager dies
-    PR_SET_PDEATHSIG = 1
-    import platform
+    if sys.platform != "linux":
+        return
 
-    if platform.system() == "Linux":
-        libc = ctypes.CDLL("libc.so.6")
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-    # elif platform.system() == "Darwin":
-    #     libc = ctypes.CDLL("libc.dylib")
-    #     logger.warning("kill_itself_when_parent_died is only supported in linux.")
-    else:
-        logger.warning("kill_itself_when_parent_died is only supported in linux.")
+    # keep GPU workers tied to the CLI process even if the parent is SIGKILLed
+    PR_SET_PDEATHSIG = 1
+    # Capture parent before arming PDEATHSIG: if the parent already died in the
+    # fork->prctl window, PDEATHSIG won't fire, so detect the reparent explicitly.
+    parent_pid = os.getppid()
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    if libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err))
+    # getppid() changing means we were reparented (parent gone). Comparing to the
+    # captured pid instead of "== 1" avoids self-killing when PID 1 is the real
+    # parent (e.g. running as a container's init process).
+    if os.getppid() != parent_pid:
+        os.kill(os.getpid(), signal.SIGKILL)
 
 
 def get_exception_traceback() -> str:

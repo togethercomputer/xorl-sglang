@@ -29,6 +29,10 @@ class TestMiniMaxM25(unittest.TestCase):
             "--mem-fraction-static=0.85",
             "--reasoning-parser=minimax-append-think",
         ]
+        dp_attn_args = base_args + [
+            "--enable-dp-attention",
+            "--dp=8",
+        ]
 
         variants = [
             ModelLaunchSettings(
@@ -37,6 +41,12 @@ class TestMiniMaxM25(unittest.TestCase):
                 extra_args=base_args,
                 variant="TP8+EP8",
             ),
+            ModelLaunchSettings(
+                MINIMAX_M25_MODEL_PATH,
+                tp_size=8,
+                extra_args=dp_attn_args,
+                variant="TP8+DP8+EP8+DPAttn",
+            ),
         ]
 
         run_combined_tests(
@@ -44,7 +54,7 @@ class TestMiniMaxM25(unittest.TestCase):
             test_name="MiniMax-M2.5",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.80),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_minimax_m25",
+                result_dir="performance_results_minimax_m25",
             ),
         )
 
