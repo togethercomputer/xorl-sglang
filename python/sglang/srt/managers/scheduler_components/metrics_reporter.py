@@ -122,6 +122,7 @@ class SchedulerMetricsReporter:
         # Basic stats
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
+        self._logged_first_decode_graph_replay = False
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
         self.last_gen_throughput: float = 0.0
@@ -729,6 +730,23 @@ class SchedulerMetricsReporter:
 
             if x := self.scheduler_status_logger:
                 x.maybe_dump(batch, self.scheduler.waiting_queue)
+
+        # A graph-eligible wave can become ragged before the periodic decode
+        # logger fires. Preserve one rank-local admission record without
+        # increasing the steady-state logging cadence.
+        if (
+            can_run_cuda_graph
+            and self.is_stats_logging_rank
+            and not self._logged_first_decode_graph_replay
+        ):
+            logger.info(
+                "Decode batch [first graph replay], #running-req: %d, "
+                "%s: True, #queue-req: %d",
+                len(batch.reqs),
+                self._graph_backend_label,
+                len(self.scheduler.waiting_queue),
+            )
+            self._logged_first_decode_graph_replay = True
 
         # Periodic work: log + heavy metrics at decode_log_interval
         if self.forward_ct_decode % self.decode_log_interval != 0:

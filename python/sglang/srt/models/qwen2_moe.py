@@ -500,8 +500,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
             bi_router_topk_weights,
         )
-        from sglang.srt.layers.moe.routed_experts_capturer import (
-            get_global_experts_capturer,
+        from sglang.srt.layers.moe.topk import (
+            capture_routed_experts_if_allowed,
         )
 
         config = self.topk.topk_config
@@ -532,10 +532,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         routing_weights = bi_router_topk_weights(
             routing_weights, config.renormalize, hidden_states.dtype
         )
-        get_global_experts_capturer().capture(
-            layer_id=self.topk.layer_id,
-            topk_ids=selected_experts,
-            topk_weights=routing_weights,
+        capture_routed_experts_if_allowed(
+            config,
+            self.topk.layer_id,
+            selected_experts,
         )
         return StandardTopKOutput(
             topk_weights=routing_weights,

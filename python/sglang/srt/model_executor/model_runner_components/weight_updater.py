@@ -100,12 +100,23 @@ class WeightUpdater:
 
         try:
             na = NetworkAddress(master_address, master_port)
+            # XoRL eagerly initializes the trainer-side NCCL communicator. Do
+            # the same here so every inference rank joins the rendezvous before
+            # this endpoint reports initialization success. Without device_id,
+            # ProcessGroupNCCL is lazy and an eager trainer can wait forever for
+            # communicators that the inference ranks have not created yet.
+            device_id = (
+                torch.device("cuda", torch.cuda.current_device())
+                if backend == "nccl"
+                else None
+            )
             self._model_update_group[group_name] = init_custom_process_group(
                 backend=backend,
                 init_method=na.to_tcp(),
                 world_size=world_size,
                 rank=rank,
                 group_name=group_name,
+                device_id=device_id,
             )
             return True, "Succeeded to initialize custom process group."
         except Exception as e:

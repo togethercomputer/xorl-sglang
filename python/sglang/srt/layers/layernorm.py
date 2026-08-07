@@ -29,6 +29,7 @@ from sglang.srt.batch_invariant_ops import (
     bi_fused_add_rms_norm,
     bi_rms_norm,
     is_batch_invariant_mode_enabled,
+    is_batch_invariant_op_enabled,
     rms_norm_batch_invariant,
     rms_norm_v2,
 )
@@ -1015,6 +1016,23 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if is_batch_invariant_mode_enabled() and is_batch_invariant_op_enabled(
+            "rms_norm"
+        ):
+            # Exact Qwen splits zero-centered RMSNorm into two numerical
+            # families. No-residual sites use the family-1 BI kernel. Residual
+            # sites keep the bf16 add in eager torch and reach the interposed
+            # BI mean through forward_native, matching the trainer's
+            # fast_zero_centered_batch_invariant_* implementations.
+            if residual is None:
+                orig_dtype = x.dtype
+                out = rms_norm_batch_invariant(
+                    x.float(),
+                    1.0 + self.weight.data.float(),
+                    self.variance_epsilon,
+                )
+                return out.to(orig_dtype)
+            return self.forward_native(x, residual, post_residual_addition)
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(

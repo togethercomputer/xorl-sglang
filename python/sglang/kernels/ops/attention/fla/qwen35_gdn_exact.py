@@ -73,41 +73,48 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     _bi_ops._ENABLE_MM_FALLBACK_VARIANT = False
     _bi_ops._ENABLE_MM_COMPARISON_TEST = False
 
-    # Both admitted checkpoints use the original exact prefill scan and
-    # partial-chunk-rescan decode. The dense 0.8B evidence predates the MoE
-    # Wave-3 fast stack, so none of those later mechanisms may leak into the
-    # dense tuple merely because both models share an HF architecture family.
+    # The production literal-zero receipt was taken with the original exact
+    # prefill scan, partial-chunk-rescan graph decode, and conservative
+    # no-overlap/no-padding serving schedule.  Live Qwen3.6 GRPO gates measured
+    # nonzero K3 for both the promoted Wave-3 tuple and the conservative GDN
+    # tuple when the newer overlap + padded-graph schedule remained selected.
+    # Keep every unpromoted mechanism out of the architecture-owned tuple until
+    # a fresh live gate promotes it; component equality is not a substitute for
+    # the trainer-versus-sampler denominator.
     _prefill.BI_GDN_PREFILL_ENABLED = True
-    _prefill.BI_GDN_SOLVE_TRIL_DECODE = is_moe
+    _prefill.BI_GDN_SOLVE_TRIL_DECODE = False
     _decode.BI_GDN_DECODE_ENABLED = True
     _decode.BI_GDN_BS1_STATIC = is_moe
     _decode.BI_GDN_DECODE_GRAPH = exact_graph
+    # The modern attention backend uses the slot-direct transport for exact
+    # graph replay.  Its arithmetic stages are the oracle prefill binaries;
+    # unlike the retired single-bucket staging path it supports every exact
+    # decode graph shape through the graph-32 ceiling.
     _fast.BI_GDN_DECODE_FAST_ENABLED = is_moe
-    _fast.BI_GDN_FUSE_SMALL_ENABLED = is_moe
-    _incr.BI_GDN_DECODE_INCR_ENABLED = exact_graph
-    _incr.BI_GDN_INCR_DEFER_ENABLED = exact_graph
-    _incr.BI_GDN_VNEW_SLIM_ENABLED = exact_graph
-    _heal.BI_GDN_LAZY_HEAL_ENABLED = exact_graph
+    _fast.BI_GDN_FUSE_SMALL_ENABLED = False
+    _incr.BI_GDN_DECODE_INCR_ENABLED = False
+    _incr.BI_GDN_INCR_DEFER_ENABLED = False
+    _incr.BI_GDN_VNEW_SLIM_ENABLED = False
+    _heal.BI_GDN_LAZY_HEAL_ENABLED = False
     _gemm_configs._force_bi_gemm_config_table(is_moe)
     _norm_gated.set_gdn_norm_rows_per_block_pin(4)
-    _tiera.set_tiera_enabled(is_moe)
-    _bi_ops.set_router_renorm_fused_enabled(is_moe)
-    _bi_ops.set_bi_head_fastpath_enabled(is_moe)
-    _comm.set_ordered_combine_fused_enabled(is_moe)
+    _tiera.set_tiera_enabled(False)
+    _bi_ops.set_router_renorm_fused_enabled(False)
+    _bi_ops.set_bi_head_fastpath_enabled(False)
+    _comm.set_ordered_combine_fused_enabled(False)
 
     logger.info(
         "Exact Qwen3.5-family zero-K3 serving resolved: BI GDN "
         "prefill/rescan decode%s, rows-per-block pin, contract lm-head + "
         "decode rescore; resolved tuple=%s",
         (
-            ", marshal fast path + decode-scheduled solve, incremental-exact "
-            "hybrid + writeback deferral + batched heal, Tier-A BI-GEMM "
-            "configs, fused router renorm, fused ordered combine, head fastpath"
+            ", conservative no-overlap/no-padding partial-chunk-rescan graph "
+            "program; Wave-3 fast mechanisms held behind live zero-K3 promotion"
             if is_moe
             else " (conservative eager tuple; MoE Wave-3 fast paths disabled)"
         ),
         (
-            "qwen3.6-moe:tp8/dp8/ep8/pp1,graph10,radix"
+            "qwen3.6-moe:tp8/dp8/ep8/pp1,graph32,no-radix,full-prefill"
             if is_moe
             else "qwen3.5-dense:tp1/dp1/ep1/pp1,eager,no-radix"
         ),

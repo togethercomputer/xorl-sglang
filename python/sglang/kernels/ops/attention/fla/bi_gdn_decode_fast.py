@@ -856,7 +856,6 @@ class BIGDNFastDecodeRunner:
                 src,
                 dst,
                 1e-6,
-                NB=triton.cdiv(l2_rows, 2048),
                 T=l2_rows,
                 D=k,
                 BD=self._next_pow2(k),

@@ -6,6 +6,9 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+    is_bi_head_fastpath_enabled,
+)
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
@@ -19,7 +22,7 @@ from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import is_glm52_exact_mode
+from sglang.srt.server_args import is_glm52_exact_mode, is_qwen35_gdn_exact_mode
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -65,6 +68,9 @@ logger = logging.getLogger(__name__)
 
 SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
+# One-time live coverage marker: the exact contract is not engaged unless this
+# line appears after real generation begins on every sampler rank.
+_bi_decode_rescore_logged = False
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
@@ -78,6 +84,14 @@ class Sampler(nn.Module):
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(
+            get_server_args()
+        )
+        self.return_original_logprob = (
+            False
+            if self.use_qwen35_bi_decode_rescore
+            else SGLANG_RETURN_ORIGINAL_LOGPROB
+        )
         # In RL on-policy mode, deterministic inference is automatically enabled.
         self.enable_deterministic = (
             get_exec().deterministic.enable_deterministic_inference
@@ -164,7 +178,7 @@ class Sampler(nn.Module):
             )
 
             # If requested, cache original logprobs before temperature scaling.
-            if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
+            if return_logprob and self.return_original_logprob:
                 original_logprobs = torch.log_softmax(logits, dim=-1)
 
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
@@ -199,7 +213,7 @@ class Sampler(nn.Module):
                     sampling_info,
                     positions,
                 )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                if return_logprob and not self.return_original_logprob:
                     logprobs = logprobs_via_logsoftmax_kernel
             else:
                 # Standard path: do softmax and sample from probs.
@@ -214,7 +228,7 @@ class Sampler(nn.Module):
                     return_logprob
                     and self.enable_deterministic
                     and logprobs_via_logsoftmax_kernel is None
-                    and not SGLANG_RETURN_ORIGINAL_LOGPROB
+                    and not self.return_original_logprob
                 ):
                     logprobs_via_logsoftmax_kernel = torch.nn.functional.log_softmax(
                         logits, dim=-1
@@ -237,7 +251,7 @@ class Sampler(nn.Module):
                         batch_next_token_ids,
                         sampling_mask_data,
                     )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                if return_logprob and not self.return_original_logprob:
                     logprobs = (
                         logprobs_via_logsoftmax_kernel
                         if logprobs_via_logsoftmax_kernel is not None
@@ -246,7 +260,7 @@ class Sampler(nn.Module):
                 del probs
 
         if return_logprob:
-            if SGLANG_RETURN_ORIGINAL_LOGPROB:
+            if self.return_original_logprob:
                 logprobs = original_logprobs
             logprob_result = self.output_logprob_processor.compute_logprobs(
                 logprobs,
@@ -255,10 +269,90 @@ class Sampler(nn.Module):
                 batch_next_token_ids,
             )
             logprob_result.write_output_to(logits_output)
+            if self.use_qwen35_bi_decode_rescore:
+                logits_output.next_token_logprobs = self._bi_contract_sampled_logprob(
+                    logits_output.next_token_logits,
+                    batch_next_token_ids,
+                    sampling_info,
+                )
+                global _bi_decode_rescore_logged
+                if not _bi_decode_rescore_logged:
+                    _bi_decode_rescore_logged = True
+                    logger.info(
+                        "BI decode rescore active: output_token_logprobs are "
+                        "contract values"
+                    )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 
         return batch_next_token_ids
+
+    def _bi_contract_sampled_logprob(
+        self,
+        logits: torch.Tensor,
+        batch_next_token_ids: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> torch.Tensor:
+        """Rescore selected tokens through the pinned contract LSE reduction."""
+        from sglang.srt.batch_invariant_ops import (
+            bi_lm_head_selected_logprob_from_logits,
+        )
+
+        if self.use_ascend_backend:
+            raise ValueError(
+                "The exact-contract decode rescore does not support Ascend"
+            )
+        if self.return_original_logprob:
+            raise ValueError(
+                "The exact-contract decode rescore does not support "
+                "SGLANG_RETURN_ORIGINAL_LOGPROB"
+            )
+        if (
+            sampling_info.has_custom_logit_processor
+            or sampling_info.logit_bias is not None
+            or sampling_info.grammars
+            or sampling_info.grammar_mask is not None
+            or sampling_info.acc_additive_penalties is not None
+            or sampling_info.acc_scaling_penalties is not None
+            or (
+                sampling_info.penalizer_orchestrator is not None
+                and sampling_info.penalizer_orchestrator.is_required
+            )
+        ):
+            raise ValueError(
+                "The exact-contract decode rescore does not support logit bias, "
+                "penalties, grammar masks, or custom logit processors"
+            )
+
+        temperature = None
+        if not sampling_info.is_all_greedy:
+            if not (
+                self.use_log_softmax_logprob
+                and self.enable_deterministic
+                and not sampling_info.need_top_p_sampling
+                and not sampling_info.need_top_k_sampling
+                and not sampling_info.need_min_p_sampling
+            ):
+                raise ValueError(
+                    "The exact-contract decode rescore requires all-greedy or the "
+                    "RL on-policy deterministic lane without top-k/top-p/min-p"
+                )
+            temperature = sampling_info.temperatures.reshape(-1)
+
+        if is_bi_head_fastpath_enabled():
+            from sglang.srt.batch_invariant_ops.bi_head_fastpath import (
+                bi_lm_head_selected_logprob_from_logits_fast,
+            )
+
+            logprob, _, _ = bi_lm_head_selected_logprob_from_logits_fast(
+                logits, batch_next_token_ids, temperature=temperature
+            )
+            return logprob
+
+        logprob, _, _ = bi_lm_head_selected_logprob_from_logits(
+            logits, batch_next_token_ids, temperature=temperature
+        )
+        return logprob
 
     def _sample_from_probs(
         self,
@@ -503,7 +597,7 @@ class Sampler(nn.Module):
             logits, sampling_info, simple_sampling_case, positions
         )
         logprobs = None
-        if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+        if return_logprob and not self.return_original_logprob:
             logprobs = torch.log_softmax(logits, dim=-1)
         return batch_next_token_ids, logprobs
 

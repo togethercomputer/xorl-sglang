@@ -38,6 +38,22 @@ def test_strided_down_weight_disables_tma_and_consumes_config_flag(monkeypatch):
     assert "USE_TMA" not in unsupported_config
 
 
+def test_moe_output_allocation_without_sglang_parallel_state(monkeypatch):
+    def fail_if_called():
+        raise AssertionError("serving-only state must not be resolved")
+
+    monkeypatch.setattr(fused_moe, "is_symmetric_memory_enabled", lambda: False)
+    monkeypatch.setattr(fused_moe, "is_allocation_symmetric", fail_if_called)
+    monkeypatch.setattr(fused_moe, "get_tp_group", fail_if_called)
+
+    hidden_states = torch.empty(5, 7)
+    output = fused_moe._allocate_moe_output(hidden_states)
+
+    assert output.shape == hidden_states.shape
+    assert output.dtype == hidden_states.dtype
+    assert output.device == hidden_states.device
+
+
 def test_small_moe_sum_compile_respects_both_batch_invariance_contracts(monkeypatch):
     deterministic = SimpleNamespace(enable_deterministic_inference=False)
     monkeypatch.setattr(

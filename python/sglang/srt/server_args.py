@@ -5341,25 +5341,61 @@ class ServerArgs:
             self.enable_fp32_router = True
             if self.disable_cuda_graph:
                 raise ValueError(
-                    "The exact Qwen3.6 MoE XORL contract requires its CUDA graph bucket [10]"
+                    "The exact Qwen3.6 MoE XORL contract requires its CUDA graph bucket [32]"
                 )
-            if self.disable_radix_cache:
-                raise ValueError(
-                    "The exact Qwen3.6 MoE XORL contract requires radix cache"
-                )
-            if (
-                self.cuda_graph_bs_decode is not None
-                and self.cuda_graph_bs_decode != [10]
+            # The exact decode cache currently stores the fp32 state at each
+            # 64-token GDN boundary plus the live partial-chunk rows.  SGLang's
+            # generic radix cache can restore an arbitrary token prefix (for
+            # example, the 81-token shared Wordle prompt) without restoring
+            # those partial rows.  That is not enough state to seed an exact
+            # rescan.  Keep prefix reuse out of the admitted program until the
+            # radix tree persists the matching GDN checkpoint metadata.
+            self.disable_radix_cache = True
+            exact_decode_graph_bs = list(range(1, 33))
+            if self.cuda_graph_bs_decode is not None and self.cuda_graph_bs_decode not in (
+                [32],
+                exact_decode_graph_bs,
             ):
                 raise ValueError(
-                    "The exact Qwen3.6 MoE XORL contract requires exactly "
-                    f"--cuda-graph-bs 10; got {self.cuda_graph_bs_decode}"
+                    "The exact Qwen3.6 MoE XORL contract requires decode CUDA "
+                    "graph buckets through 32; got "
+                    f"{self.cuda_graph_bs_decode}"
                 )
-            self.cuda_graph_bs_decode = [10]
-            self.cuda_graph_max_bs_decode = 10
+            # Padding is disabled below to preserve the literal-zero serving
+            # program.  Capture every exact local batch shape through the
+            # approved graph-32 maximum so draining and multi-turn Wordle
+            # batches do not fall back to eager merely because their active
+            # request count is below 32.
+            self.cuda_graph_bs_decode = exact_decode_graph_bs
+            self.cuda_graph_max_bs_decode = 32
+            self.disable_prefill_cuda_graph = True
+            # Model-specific contracts resolve after _handle_cuda_graph_config,
+            # so setting only the legacy flag here is too late to change the
+            # already-materialized per-phase backend.
+            if isinstance(self.cuda_graph_config, CudaGraphConfig):
+                self.cuda_graph_config.decode.bs = exact_decode_graph_bs
+                self.cuda_graph_config.decode.max_bs = 32
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                self._cuda_graph_config_locked.add((Phase.DECODE, "bs"))
+                self._cuda_graph_config_locked.add((Phase.DECODE, "max_bs"))
+                self._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
+            # The production Wordle literal-zero receipt used the conservative
+            # no-overlap/no-padding scheduler contract.  A live GRPO gate on
+            # the newer overlap + padded-graph program measured nonzero K3
+            # even after the Wave-3 GDN mechanisms were disabled.  Preserve
+            # graph-32 for full local batches, but run ragged/draining batches
+            # eagerly rather than padding them into a graph shape that has not
+            # passed the trainer-versus-sampler denominator.
+            self.disable_overlap_schedule = True
             self.disable_cuda_graph_padding = True
             self.max_queued_requests = 512
-            self.chunked_prefill_size = 16384
+            # Chunked prefill can hand the exact GDN backend a continuation at
+            # an arbitrary prompt offset (81 for the production Wordle
+            # prompt).  The exact cache only has a complete seed at the start
+            # of a request or at a persisted 64-token boundary.  Until chunk
+            # handoff carries the matching partial-row state, prefill each
+            # prompt in one forward from prefix zero.
+            self.chunked_prefill_size = -1
             self.max_prefill_tokens = 32768
             mem_fraction_explicit = getattr(
                 self,
@@ -5374,19 +5410,22 @@ class ServerArgs:
                 )
             self.mem_fraction_static = 0.40
             if self.max_running_requests is None:
-                self.max_running_requests = 80
-            elif self.max_running_requests != 80:
+                self.max_running_requests = 256
+            elif self.max_running_requests != 256:
                 raise ValueError(
                     "The exact Qwen3.6 MoE XORL contract requires "
-                    "--max-running-requests 80; got "
+                    "--max-running-requests 256; got "
                     f"{self.max_running_requests}"
                 )
             if self.max_mamba_cache_size is None:
-                self.max_mamba_cache_size = 1024
-            elif self.max_mamba_cache_size != 1024:
+                # This is a global DP8 value. The pool shards it to 160 state
+                # slots per rank; Qwen3.6's extra-buffer strategy consumes five
+                # slots per request, leaving exactly 32 effective requests.
+                self.max_mamba_cache_size = 1280
+            elif self.max_mamba_cache_size != 1280:
                 raise ValueError(
                     "The exact Qwen3.6 MoE XORL contract requires "
-                    "--max-mamba-cache-size 1024; got "
+                    "--max-mamba-cache-size 1280; got "
                     f"{self.max_mamba_cache_size}"
                 )
         else:

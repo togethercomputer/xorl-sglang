@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.logprob_processor import (
     InputLogprobProcessor,
+    LogprobResult,
     LogprobStage,
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
@@ -56,7 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-from sglang.srt.server_args import is_glm52_exact_mode
+from sglang.srt.server_args import is_glm52_exact_mode, is_qwen35_gdn_exact_mode
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -357,6 +358,11 @@ class LogitsProcessor(nn.Module):
         self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
+        # The Qwen3.5-family exact contract must own both sides of serving's
+        # probability surface: input-token rescoring and every next-token
+        # sampling distribution. Merely enabling the exact trunk kernels is
+        # insufficient because the stock lm-head reduction is batch-shaped.
+        self.use_qwen35_bi_lm_head = is_qwen35_gdn_exact_mode(get_server_args())
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -462,7 +468,12 @@ class LogitsProcessor(nn.Module):
 
         if not logits_metadata.extend_return_logprob:
             # Compute logits for both input and sampled tokens.
-            logits = self._get_logits(pruned_states, lm_head, logits_metadata)
+            if self._bi_lm_head_decode_active(logits_metadata):
+                logits = self._bi_lm_head_next_token_logits(
+                    pruned_states, lm_head, logits_metadata
+                )
+            else:
+                logits = self._get_logits(pruned_states, lm_head, logits_metadata)
             sampled_logits = (
                 logits[sample_indices] if sample_indices is not None else logits
             )
@@ -477,16 +488,50 @@ class LogitsProcessor(nn.Module):
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
-        logprobs_result, sampled_logits = self.input_logprob_processor.forward(
-            pruned_states=pruned_states,
-            sample_indices=sample_indices,
-            input_logprob_indices=input_logprob_indices,
-            token_to_seq_idx=token_to_seq_idx,
-            lm_head=lm_head,
-            get_logits_fn=self._get_logits,
-            logits_metadata=logits_metadata,
-            skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
+        # When callers request only the ordinary per-token logprobs, the exact
+        # contract below owns both outputs. Avoid materializing the stock fp32
+        # head and log-softmax only to overwrite them.
+        bi_covers_all_outputs = (
+            self.use_qwen35_bi_lm_head
+            and not logits_metadata.extend_return_top_logprob
+            and not logits_metadata.extend_token_ids_logprob
         )
+        if bi_covers_all_outputs:
+            logprobs_result = LogprobResult()
+            sampled_logits = None
+        else:
+            logprobs_result, sampled_logits = self.input_logprob_processor.forward(
+                pruned_states=pruned_states,
+                sample_indices=sample_indices,
+                input_logprob_indices=input_logprob_indices,
+                token_to_seq_idx=token_to_seq_idx,
+                lm_head=lm_head,
+                get_logits_fn=self._get_logits,
+                logits_metadata=logits_metadata,
+                skip_chunking_for_dp_attn=self.do_tensor_parallel_all_gather_dp_attn,
+            )
+
+        if self.use_qwen35_bi_lm_head:
+            logprobs_result.token_logprobs = (
+                self._bi_lm_head_input_token_logprobs(
+                    pruned_states,
+                    input_logprob_indices,
+                    lm_head,
+                    logits_metadata,
+                )
+            )
+
+        if self._bi_lm_head_decode_active(logits_metadata):
+            # The first generated token is sampled during extend, so it must
+            # use the same contract head as all subsequent decode tokens.
+            sampled_states = (
+                pruned_states[sample_indices]
+                if sample_indices is not None
+                else pruned_states
+            )
+            sampled_logits = self._bi_lm_head_next_token_logits(
+                sampled_states, lm_head, logits_metadata
+            )
 
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
@@ -495,6 +540,116 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def _validate_bi_lm_head(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        *,
+        operation: str,
+    ) -> torch.Tensor:
+        if not self.use_fp32_lm_head:
+            raise ValueError(
+                f"The exact-contract {operation} requires --enable-fp32-lm-head"
+            )
+        if (
+            self.do_tensor_parallel_all_gather
+            or self.do_tensor_parallel_all_gather_dp_attn
+        ):
+            raise ValueError(
+                f"The exact-contract {operation} does not support vocab/DP-parallel "
+                "lm-head gathers yet"
+            )
+        if self.logit_scale is not None:
+            raise ValueError(
+                f"The exact-contract {operation} does not support logit_scale"
+            )
+        if self.final_logit_softcapping:
+            raise ValueError(
+                f"The exact-contract {operation} does not support "
+                "final_logit_softcapping"
+            )
+        if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
+            raise ValueError(
+                f"The exact-contract {operation} does not support a LoRA-wrapped "
+                "lm_head"
+            )
+        if not hasattr(lm_head, "weight"):
+            raise ValueError(
+                f"The exact-contract {operation} requires a plain lm_head weight"
+            )
+        weight = lm_head.weight.data
+        if weight.dtype != torch.bfloat16 or hidden_states.dtype != torch.bfloat16:
+            raise ValueError(
+                f"The exact-contract {operation} requires bf16 hidden/weight, got "
+                f"{hidden_states.dtype}/{weight.dtype}"
+            )
+        if weight.shape[0] != self.vocab_size:
+            raise ValueError(
+                f"The exact-contract {operation} requires the full-vocab weight, "
+                f"got {weight.shape[0]} != {self.vocab_size}"
+            )
+        return weight
+
+    def _bi_lm_head_input_token_logprobs(
+        self,
+        pruned_states: torch.Tensor,
+        input_logprob_indices: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        """Score input tokens with the same pinned lm-head contract as training."""
+        from sglang.srt.batch_invariant_ops import bi_lm_head_selected_logprob
+
+        if input_logprob_indices is None:
+            raise ValueError(
+                "The exact-contract input-token rescore requires input-logprob indices"
+            )
+        hidden = pruned_states[input_logprob_indices]
+        weight = self._validate_bi_lm_head(
+            hidden, lm_head, operation="input-token lm head"
+        )
+        token_ids = logits_metadata.extend_input_logprob_token_ids_gpu
+        if token_ids is None or token_ids.shape[0] != hidden.shape[0]:
+            raise ValueError(
+                "The exact-contract input-token rescore requires one token id per "
+                f"scored row, got {None if token_ids is None else token_ids.shape[0]} "
+                f"for {hidden.shape[0]} rows"
+            )
+        logprob, _, _ = bi_lm_head_selected_logprob(
+            hidden.contiguous(), weight, token_ids, temperature=None
+        )
+        return logprob
+
+    def _bi_lm_head_decode_active(self, logits_metadata: LogitsMetadata) -> bool:
+        if not self.use_qwen35_bi_lm_head:
+            return False
+        mode = logits_metadata.forward_mode
+        if mode in (
+            ForwardMode.DECODE,
+            ForwardMode.IDLE,
+            ForwardMode.EXTEND,
+            ForwardMode.MIXED,
+        ):
+            return True
+        raise ValueError(
+            "The exact-contract decode lm head does not support forward mode "
+            f"{mode.name}"
+        )
+
+    def _bi_lm_head_next_token_logits(
+        self,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> torch.Tensor:
+        """Build every sampled distribution with the contract's fixed GEMM."""
+        from sglang.srt.batch_invariant_ops import bi_lm_head_full_logits
+
+        weight = self._validate_bi_lm_head(
+            hidden_states, lm_head, operation="decode lm head"
+        )
+        return bi_lm_head_full_logits(hidden_states.contiguous(), weight)
 
     def _get_pruned_states(
         self,
@@ -882,7 +1037,6 @@ class LogitsProcessor(nn.Module):
         logits_buffer = logits_metadata.next_token_logits_buffer if use_buffer else None
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
-        logits_width = logits.shape[-1]
         # The shared logits buffer is keyed by vocab width and rows; skip it
         # when this batch has a different logits shape than the graph buffer.
         if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(

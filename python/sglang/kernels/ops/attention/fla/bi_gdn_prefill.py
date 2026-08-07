@@ -1223,6 +1223,7 @@ def bi_chunk_gated_delta_rule_prefill(
     chunk_indices: torch.LongTensor | None = None,
     chunk_offsets: torch.LongTensor | None = None,
     cache_indices_long: torch.LongTensor | None = None,
+    return_intermediate_state: bool = False,
 ):
     """Chunked GDN prefill through the trainer's exact stage composition.
 
@@ -1347,7 +1348,7 @@ def bi_chunk_gated_delta_rule_prefill(
         cu_seqlens=cu_seqlens,
         chunk_indices=chunk_indices,
     )
-    return o
+    return (o, _trainer_state_to_pool(h)) if return_intermediate_state else o
 
 
 def _write_aligned_prefix_checkpoints(

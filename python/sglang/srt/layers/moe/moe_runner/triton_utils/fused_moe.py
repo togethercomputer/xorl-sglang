@@ -22,6 +22,7 @@ from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    is_symmetric_memory_enabled,
     use_symmetric_memory,
 )
 from sglang.srt.environ import envs
@@ -55,6 +56,22 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
 _is_musa = is_musa()
+
+
+def _allocate_moe_output(hidden_states: torch.Tensor) -> torch.Tensor:
+    """Allocate the combined MoE output without requiring serving state.
+
+    Training integrations reuse this serving kernel without initializing
+    SGLang's tensor-parallel singleton.  When symmetric memory is disabled,
+    avoid resolving that group entirely; passing ``disabled=True`` to the
+    allocator context is too late because Python evaluates ``get_tp_group()``
+    first.
+    """
+    if not is_symmetric_memory_enabled() or not is_allocation_symmetric():
+        return torch.empty_like(hidden_states)
+
+    with use_symmetric_memory(get_tp_group()):
+        return torch.empty_like(hidden_states)
 
 
 if _is_cuda:
@@ -543,10 +560,7 @@ def _fused_moe_kernel_sequence(
         # allocation is required, so the downstream all-reduce takes the low-latency
         # symmetric path. Only this output enters the pool; the intermediate caches
         # below stay on the default allocator to bound pool occupancy.
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
-            out_hidden_states = torch.empty_like(hidden_states)
+        out_hidden_states = _allocate_moe_output(hidden_states)
 
     use_fused_moe_sum_all_reduce = (
         get_exec().moe.enable_fused_moe_sum_all_reduce

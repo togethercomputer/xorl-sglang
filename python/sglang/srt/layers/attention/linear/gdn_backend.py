@@ -36,6 +36,16 @@ if is_cuda() or is_hip():
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
 if is_cuda():
+    from sglang.kernels.ops.attention.fla import bi_gdn_decode as _bi_decode_mod
+    from sglang.kernels.ops.attention.fla import bi_gdn_decode_fast as _bi_fast_mod
+    from sglang.kernels.ops.attention.fla import bi_gdn_prefill as _bi_prefill_mod
+    from sglang.kernels.ops.attention.fla.bi_gdn_decode import BIGDNDecodeCache
+    from sglang.kernels.ops.attention.fla.bi_gdn_decode_fast import (
+        BIGDNFastDecodeRunner,
+    )
+    from sglang.kernels.ops.attention.fla.bi_gdn_prefill import (
+        bi_chunk_gated_delta_rule_prefill,
+    )
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
         causal_conv1d_fn as causal_conv1d_fn_cuda,
     )
@@ -62,6 +72,18 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+
+
+def _bi_gdn_decode_enabled() -> bool:
+    return is_cuda() and _bi_decode_mod.BI_GDN_DECODE_ENABLED
+
+
+def _bi_gdn_decode_fast_enabled() -> bool:
+    return is_cuda() and _bi_fast_mod.BI_GDN_DECODE_FAST_ENABLED
+
+
+def _bi_gdn_prefill_enabled() -> bool:
+    return is_cuda() and _bi_prefill_mod.BI_GDN_PREFILL_ENABLED
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -340,12 +362,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert (
-                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
-            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
+                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+            )
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
+        if _bi_gdn_prefill_enabled() and not prefill_backend.is_triton():
+            raise RuntimeError(
+                "The exact GDN prefill contract covers the Triton prefill "
+                f"backend only; got {prefill_backend}."
+            )
+        if _bi_gdn_decode_enabled():
+            if not _bi_gdn_prefill_enabled():
+                raise RuntimeError(
+                    "The exact GDN decode contract requires the exact prefill "
+                    "composition it rescans."
+                )
+            if (
+                not _bi_gdn_decode_fast_enabled()
+                and not model_runner.server_args.disable_cuda_graph
+            ):
+                raise RuntimeError(
+                    "The exact Qwen GDN graph contract requires the "
+                    "slot-direct rescan runner."
+                )
+            rank0_log(
+                "GDN decode contract ENGAGED: slot-direct exact partial-chunk rescan"
+            )
+        self._bi_decode_caches = {}
+        self._bi_fast_runner = (
+            BIGDNFastDecodeRunner() if _bi_gdn_decode_fast_enabled() else None
+        )
+        self._bi_decode_step_metadata = None
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
@@ -356,8 +405,74 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
 
+    def _bi_decode_cache(
+        self, layer: RadixLinearAttention, ssm_states: torch.Tensor
+    ) -> BIGDNDecodeCache:
+        cache = self._bi_decode_caches.get(layer.layer_id)
+        if cache is None:
+            cache = BIGDNDecodeCache(
+                num_slots=ssm_states.shape[0],
+                qkv_dim=layer.q_dim + layer.k_dim + layer.v_dim,
+                num_v_heads=layer.num_v_heads,
+                head_k_dim=layer.head_k_dim,
+                head_v_dim=layer.head_v_dim,
+                device=ssm_states.device,
+            )
+            self._bi_decode_caches[layer.layer_id] = cache
+        return cache
+
+    def _bi_decode_metadata(
+        self,
+        cache: BIGDNDecodeCache,
+        cache_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        slots = cache_indices.tolist()
+        metadata = self._bi_decode_step_metadata
+        if metadata is None:
+            metadata = cache.prepare_step_metadata(slots, cache_indices, seq_lens)
+            self._bi_decode_step_metadata = metadata
+        elif metadata.slots != tuple(slots):
+            raise RuntimeError(
+                "Exact GDN decode slot selection changed within one forward: "
+                f"expected {metadata.slots}, got {tuple(slots)}."
+            )
+        return metadata
+
+    def _bi_gdn_decode_seed(
+        self,
+        layer: RadixLinearAttention,
+        forward_batch: ForwardBatch,
+        mixed_qkv: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        pre_states: torch.Tensor,
+    ) -> None:
+        cache = self._bi_decode_cache(layer, ssm_states)
+        starts = query_start_loc.tolist()
+        prefix_lens = forward_batch.extend_prefix_lens.tolist()
+        slots = cache_indices.tolist()
+        hv = layer.num_v_heads
+        g_rows = g.reshape(-1, hv)
+        beta_rows = beta.reshape(-1, hv)
+        for i, slot in enumerate(slots):
+            lo, hi = starts[i], starts[i + 1]
+            cache.seed_from_extend(
+                slot=slot,
+                pre_scan_state=pre_states[i],
+                qkv_rows=mixed_qkv[lo:hi],
+                g_rows=g_rows[lo:hi],
+                beta_rows=beta_rows[lo:hi],
+                prefix_len=int(prefix_lens[i]),
+                ssm_states=ssm_states,
+            )
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
+        self._bi_decode_step_metadata = None
         if self.forward_metadata.has_mamba_track_mask:
             self.forward_metadata.mamba_track_mask_indices = (
                 forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
@@ -411,6 +526,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
             layer.activation,
             conv_state_indices=cache_indices,
         )
+
+        if _bi_gdn_decode_enabled():
+            num_query_tokens = mixed_qkv.shape[0]
+            if num_query_tokens != cache_indices.shape[0]:
+                raise RuntimeError(
+                    "The exact GDN decode contract supports single-token decode only."
+                )
+            if num_query_tokens == 0:
+                return mixed_qkv.new_empty(1, 0, layer.num_v_heads, layer.head_v_dim)
+            cache = self._bi_decode_cache(layer, ssm_states)
+            g_rows, beta_rows = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if self._bi_fast_runner is not None:
+                core_attn_out = self._bi_fast_runner.step(
+                    cache=cache,
+                    indices=cache_indices,
+                    seq_lens=forward_batch.seq_lens,
+                    qkv_rows=mixed_qkv,
+                    g_rows=g_rows.reshape(num_query_tokens, -1),
+                    beta_rows=beta_rows.reshape(num_query_tokens, -1),
+                    ssm_states=ssm_states,
+                ).unsqueeze(0)
+            else:
+                core_attn_out = cache.step(
+                    metadata=self._bi_decode_metadata(
+                        cache, cache_indices, forward_batch.seq_lens
+                    ),
+                    qkv_rows=mixed_qkv,
+                    g_rows=g_rows.reshape(num_query_tokens, -1),
+                    beta_rows=beta_rows.reshape(num_query_tokens, -1),
+                    ssm_states=ssm_states,
+                ).unsqueeze(0)
+            self._track_mamba_state_decode(
+                forward_batch,
+                conv_states,
+                ssm_states,
+                cache_indices,
+                layer.layer_id,
+            )
+            return core_attn_out
 
         # Skip split + reshape + separate gating kernel by consuming
         # the packed mixed_qkv directly in a single fused Triton kernel.
@@ -665,6 +819,45 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 )
         else:
             g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            if _bi_gdn_prefill_enabled():
+                if query.dim() == 3:
+                    query = query.unsqueeze(0)
+                    key = key.unsqueeze(0)
+                    value = value.unsqueeze(0)
+                pre_states = ssm_states_contig.index_select(
+                    0, state_cache_indices.long()
+                ).clone()
+                core_attn_out, h = bi_chunk_gated_delta_rule_prefill(
+                    q=query,
+                    k=key,
+                    v=value,
+                    g=g,
+                    beta=beta,
+                    ssm_states=ssm_states_contig,
+                    cache_indices=state_cache_indices,
+                    cu_seqlens=query_start_loc,
+                    scale=layer.head_k_dim**-0.5,
+                    return_intermediate_state=True,
+                )
+                if needs_state_gather:
+                    conv_states[cache_indices] = conv_states_contig
+                    ssm_states[cache_indices] = ssm_states_contig
+                self._track_mamba_state_extend(
+                    forward_batch, h, ssm_states, forward_metadata
+                )
+                if _bi_gdn_decode_enabled():
+                    self._bi_gdn_decode_seed(
+                        layer,
+                        forward_batch,
+                        mixed_qkv,
+                        g,
+                        beta,
+                        ssm_states,
+                        cache_indices,
+                        query_start_loc,
+                        pre_states,
+                    )
+                return core_attn_out
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,

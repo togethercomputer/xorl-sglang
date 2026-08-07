@@ -12,6 +12,13 @@ from quack.cute_dsl_utils import ParamsBase
 from sglang.kernels.ops.attention.flash_attn.cute import utils
 
 
+def _page_entries_per_thread(n_block_size: int, num_threads: int) -> int:
+    """Cover partial tiles without creating a zero-sized register tensor."""
+    if n_block_size <= 0 or num_threads <= 0:
+        raise ValueError("paged-KV tile and thread counts must be positive")
+    return (n_block_size + num_threads - 1) // num_threads
+
+
 @dataclass
 class PagedKVManager(ParamsBase):
     mPageTable: cute.Tensor
@@ -93,7 +100,10 @@ class PagedKVManager(ParamsBase):
             atom_async_copy, thr_layout, val_layout
         )
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = n_block_size // num_threads
+        # SM90 FA4 commonly uses a 64-row KV tile with 128 producer threads.
+        # Floor division creates a forbidden zero-sized register tensor; the
+        # existing row validity predicate already masks the partial final tile.
+        page_entry_per_thread = _page_entries_per_thread(n_block_size, num_threads)
 
         if const_expr(mSFK_paged is not None or mSFV_paged is not None):
             atom_async_copy_sf = cute.make_copy_atom(
