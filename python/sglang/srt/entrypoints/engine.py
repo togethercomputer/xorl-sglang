@@ -49,7 +49,6 @@ from typing import (
 import torch
 import uvloop
 import zmq
-
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -64,6 +63,7 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
+    CompleteWeightsUpdateReqInput,
     DestroyWeightsUpdateGroupReqInput,
     EmbeddingReqInput,
     GenerateReqInput,
@@ -73,6 +73,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqInput,
     MultimodalDataInputFormat,
     OpenSessionReqInput,
+    PrepareWeightsUpdateReqInput,
     ProfileReq,
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
@@ -85,6 +86,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    WeightBucket,
     sock_recv,
     sock_send,
 )
@@ -126,6 +128,7 @@ from sglang.srt.utils.network import (
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.version import __version__
+
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -1365,6 +1368,41 @@ class Engine(EngineScoreMixin, EngineBase):
         )
         return self.loop.run_until_complete(
             self.tokenizer_manager.destroy_weights_update_group(obj, None)
+        )
+
+    def prepare_weights_update(
+        self,
+        names: list[str],
+        dtypes: list[str],
+        shapes: list[list[int]],
+        group_name: str = "weight_update_group",
+        load_format: Optional[str] = None,
+    ):
+        """Arm a two-phase distributed-weight receiver."""
+        obj = PrepareWeightsUpdateReqInput(
+            buckets=[WeightBucket(names=names, dtypes=dtypes, shapes=shapes)],
+            num_buckets=1,
+            group_name=group_name,
+            load_format=load_format,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.prepare_weights_update(obj, None)
+        )
+
+    def complete_weights_update(
+        self,
+        group_name: str = "weight_update_group",
+        flush_cache: bool = True,
+        weight_version: Optional[str] = None,
+    ):
+        """Apply weights received by a prior prepare call."""
+        obj = CompleteWeightsUpdateReqInput(
+            group_name=group_name,
+            flush_cache=flush_cache,
+            weight_version=weight_version,
+        )
+        return self.loop.run_until_complete(
+            self.tokenizer_manager.complete_weights_update(obj, None)
         )
 
     def update_weights_from_distributed(

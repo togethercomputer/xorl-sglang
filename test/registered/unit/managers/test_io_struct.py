@@ -1,7 +1,14 @@
 import copy
 import unittest
+from typing import Annotated
 
-from sglang.srt.managers.io_struct import GenerateReqInput
+from fastapi import Body, FastAPI
+from pydantic import TypeAdapter
+from sglang.srt.managers.io_struct import (
+    GenerateReqInput,
+    PrepareWeightsUpdateReqInput,
+    WeightBucket,
+)
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -13,9 +20,40 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
+
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=8, suite="base-c-test-cpu")
+
+
+class TestPrepareWeightsUpdateHttpSchema(unittest.TestCase):
+    def test_nested_weight_buckets_are_fastapi_compatible(self):
+        app = FastAPI()
+
+        @app.post("/prepare_weights_update")
+        async def prepare_weights_update(
+            obj: Annotated[PrepareWeightsUpdateReqInput, Body()],
+        ):
+            return obj
+
+        request = TypeAdapter(PrepareWeightsUpdateReqInput).validate_python(
+            {
+                "buckets": [
+                    {
+                        "names": ["model.layers.0.mlp.experts.0.gate_proj.weight"],
+                        "dtypes": ["torch.bfloat16"],
+                        "shapes": [[1, 2]],
+                    }
+                ]
+            }
+        )
+
+        self.assertIsInstance(request, PrepareWeightsUpdateReqInput)
+        self.assertIsInstance(request.buckets[0], WeightBucket)
+        self.assertIn(
+            "/prepare_weights_update",
+            {getattr(route, "path", None) for route in app.routes},
+        )
 
 
 class TestGenerateReqInputNormalization(CustomTestCase):

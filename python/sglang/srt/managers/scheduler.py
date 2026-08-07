@@ -42,6 +42,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
+
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
@@ -51,6 +52,7 @@ import setproctitle
 import torch
 import torch.distributed
 from torch.distributed import barrier
+
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -119,6 +121,7 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CompleteWeightsUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -146,6 +149,7 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PrepareWeightsUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -314,6 +318,7 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -1524,6 +1529,14 @@ class Scheduler(
                 (
                     UpdateWeightsFromDistributedReqInput,
                     self.weight_updater.update_weights_from_distributed,
+                ),
+                (
+                    PrepareWeightsUpdateReqInput,
+                    self.weight_updater.prepare_weights_update,
+                ),
+                (
+                    CompleteWeightsUpdateReqInput,
+                    self.weight_updater.complete_weights_update,
                 ),
                 (
                     UpdateWeightsFromTensorReqInput,

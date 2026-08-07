@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import gc
 import logging
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
-
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
@@ -24,6 +24,7 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
+
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -63,6 +64,8 @@ class WeightUpdater:
     recapture_cuda_graph: Callable[[], None]
     get_model_runner: Callable[[], ModelRunner]
     _model_update_group: dict = field(default_factory=dict)
+    _pending_weight_update_lock: Any = field(default_factory=threading.Lock)
+    _pending_weight_update_state: dict[str, Any] = field(default_factory=dict)
 
     def init_weights_update_group(
         self,
@@ -122,6 +125,213 @@ class WeightUpdater:
             message = f"Failed to destroy custom process group: {e}."
             logger.error(message)
             return False, message
+
+    def has_weights_update_group(self, group_name: str) -> bool:
+        return group_name in self._model_update_group
+
+    def prepare_weights_update(
+        self,
+        buckets,
+        group_name: str,
+        load_format: Optional[str] = None,
+        transport: str = "nccl_broadcast",
+    ) -> tuple[bool, str]:
+        """Arm a background receiver before the trainer broadcasts weights."""
+        self._assert_weight_cache_inactive("prepare_weights_update")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error
+        if transport not in ("nccl", "nccl_broadcast"):
+            return False, (
+                "prepare_weights_update on this migrated foundation supports only "
+                f"NCCL broadcast transport, got {transport!r}"
+            )
+        if group_name not in self._model_update_group:
+            return False, (
+                f"Group {group_name!r} is not initialized. "
+                "Call init_weights_update_group first."
+            )
+        if not buckets:
+            return False, "prepare_weights_update requires at least one weight bucket"
+
+        with self._pending_weight_update_lock:
+            thread = self._pending_weight_update_state.get("thread")
+            if thread is not None:
+                return False, (
+                    "A weight update is already in progress. "
+                    "Call complete_weights_update first."
+                )
+            ready_event = threading.Event()
+            self._pending_weight_update_state.update(
+                thread=None,
+                ready_event=ready_event,
+                result=None,
+                weights=None,
+                group_name=group_name,
+                load_format=load_format,
+            )
+            thread = threading.Thread(
+                target=self._recv_weights_background,
+                args=(buckets, group_name, load_format, ready_event),
+                daemon=True,
+            )
+            self._pending_weight_update_state["thread"] = thread
+            thread.start()
+
+        ready_timeout = 60
+        if not ready_event.wait(timeout=ready_timeout):
+            return False, (
+                "Timed out waiting for the distributed-weight receiver to become "
+                f"ready after {ready_timeout}s"
+            )
+        with self._pending_weight_update_lock:
+            result = self._pending_weight_update_state.get("result")
+        if result is not None and not result[0]:
+            return result
+        return True, f"Ready to receive {len(buckets)} weight bucket(s)."
+
+    def _recv_weights_background(
+        self,
+        buckets,
+        group_name: str,
+        load_format: Optional[str],
+        ready_event: threading.Event,
+    ) -> None:
+        try:
+            all_weights = []
+            for bucket_idx, bucket in enumerate(buckets):
+                if load_format == "flattened_bucket":
+                    weights = self._recv_single_bucket_flattened(
+                        bucket.names,
+                        bucket.dtypes,
+                        bucket.shapes,
+                        group_name,
+                        ready_event if bucket_idx == 0 else None,
+                    )
+                else:
+                    weights = self._recv_single_bucket_individual(
+                        bucket.names,
+                        bucket.dtypes,
+                        bucket.shapes,
+                        group_name,
+                        ready_event if bucket_idx == 0 else None,
+                    )
+                all_weights.extend(weights)
+            with self._pending_weight_update_lock:
+                self._pending_weight_update_state["weights"] = all_weights
+                self._pending_weight_update_state["result"] = (
+                    True,
+                    f"Received {len(all_weights)} weights.",
+                )
+        except Exception as exc:
+            logger.exception("Two-phase distributed-weight receive failed")
+            with self._pending_weight_update_lock:
+                self._pending_weight_update_state["result"] = (False, str(exc))
+            ready_event.set()
+
+    def _recv_single_bucket_flattened(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name: str,
+        ready_event: Optional[threading.Event],
+    ):
+        named_tensors = []
+        explicit_device = (
+            f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        )
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            named_tensors.append(
+                (name, torch.empty(shape, dtype=target_dtype, device=explicit_device))
+            )
+        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        if ready_event is not None:
+            ready_event.set()
+        torch.distributed.broadcast(
+            bucket.get_flattened_tensor(),
+            src=0,
+            group=self._model_update_group[group_name],
+        )
+        return bucket.reconstruct_tensors()
+
+    def _recv_single_bucket_individual(
+        self,
+        names,
+        dtypes,
+        shapes,
+        group_name: str,
+        ready_event: Optional[threading.Event],
+    ):
+        explicit_device = (
+            f"cuda:{self.gpu_id}" if self.device == "cuda" else self.device
+        )
+        weights = []
+        for name, dtype, shape in zip(names, dtypes, shapes):
+            target_dtype = (
+                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
+            )
+            weights.append(
+                (name, torch.empty(shape, dtype=target_dtype, device=explicit_device))
+            )
+        if self.device == "cuda":
+            torch.cuda.set_device(self.gpu_id)
+        if ready_event is not None:
+            ready_event.set()
+        handles = [
+            torch.distributed.broadcast(
+                weight,
+                src=0,
+                group=self._model_update_group[group_name],
+                async_op=True,
+            )
+            for _, weight in weights
+        ]
+        for handle in handles:
+            handle.wait()
+        return weights
+
+    def complete_weights_update(self, group_name: str) -> tuple[bool, str]:
+        """Wait for a prepared receive and apply all received tensors."""
+        with self._pending_weight_update_lock:
+            thread = self._pending_weight_update_state.get("thread")
+            prepared_group = self._pending_weight_update_state.get("group_name")
+        if thread is None:
+            return False, "No weight update is in progress."
+        if prepared_group != group_name:
+            return False, (
+                f"Prepared group {prepared_group!r} does not match "
+                f"completion group {group_name!r}."
+            )
+
+        timeout = 300
+        thread.join(timeout=timeout)
+        if thread.is_alive():
+            return False, f"Weight receive timed out after {timeout}s."
+
+        with self._pending_weight_update_lock:
+            result = self._pending_weight_update_state.get("result")
+            weights = self._pending_weight_update_state.get("weights")
+            load_format = self._pending_weight_update_state.get("load_format")
+            self._pending_weight_update_state.clear()
+        if result is None:
+            return False, "Weight receive completed without a result."
+        if not result[0]:
+            return result
+        try:
+            effective_load_format = (
+                None if load_format == "flattened_bucket" else load_format
+            )
+            return self.update_weights_from_tensor(
+                named_tensors=weights,
+                load_format=effective_load_format,
+            )
+        except Exception as exc:
+            logger.exception("Failed to apply two-phase distributed weights")
+            return False, str(exc)
 
     def _assert_weight_cache_inactive(self: WeightUpdater, op: str) -> None:
         """Reject weight mutations while the CUDA IPC weight cache is active:

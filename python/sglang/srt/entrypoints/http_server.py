@@ -62,7 +62,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
-
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -118,6 +117,7 @@ from sglang.srt.managers.io_struct import (
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
     CloseSessionReqInput,
+    CompleteWeightsUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
     DestroyWeightsUpdateGroupReqInput,
@@ -132,6 +132,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PrepareWeightsUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -184,6 +185,7 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
+
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -475,11 +477,13 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
+
 # route_class is per-router, so included routers need it set too.
 v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
+
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
@@ -1342,6 +1346,36 @@ async def destroy_weights_update_group(
         success,
         message,
     ) = await _global_state.tokenizer_manager.destroy_weights_update_group(obj, request)
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/prepare_weights_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def prepare_weights_update(
+    obj: Annotated[PrepareWeightsUpdateReqInput, Body()], request: Request
+):
+    """Arm a two-phase distributed-weight receiver before broadcast."""
+    success, message = await _global_state.tokenizer_manager.prepare_weights_update(
+        obj, request
+    )
+    content = {"success": success, "message": message}
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
+@app.post("/complete_weights_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def complete_weights_update(
+    obj: Annotated[CompleteWeightsUpdateReqInput, Body()], request: Request
+):
+    """Apply weights received by a prior prepare call."""
+    success, message = await _global_state.tokenizer_manager.complete_weights_update(
+        obj, request
+    )
     content = {"success": success, "message": message}
     return ORJSONResponse(
         content, status_code=200 if success else HTTPStatus.BAD_REQUEST

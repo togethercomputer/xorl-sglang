@@ -20,16 +20,17 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
-
 from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
+    CompleteWeightsUpdateReqInput,
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
     InitWeightsUpdateGroupReqInput,
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
+    PrepareWeightsUpdateReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
@@ -61,6 +62,7 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -153,6 +155,19 @@ class BaseTpWorker(ABC):
             )
         )
         return success, message
+
+    def prepare_weights_update(self, recv_req: PrepareWeightsUpdateReqInput):
+        return self.model_runner.weight_updater.prepare_weights_update(
+            buckets=recv_req.get_buckets(),
+            group_name=recv_req.group_name,
+            load_format=recv_req.load_format,
+            transport=recv_req.transport,
+        )
+
+    def complete_weights_update(self, recv_req: CompleteWeightsUpdateReqInput):
+        return self.model_runner.weight_updater.complete_weights_update(
+            recv_req.group_name
+        )
 
     def init_weights_send_group_for_remote_instance(
         self, recv_req: InitWeightsSendGroupForRemoteInstanceReqInput

@@ -8,7 +8,6 @@ import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import fastapi
-
 from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.io_struct import (
     AddExternalCorpusReqInput,
@@ -21,6 +20,8 @@ from sglang.srt.managers.io_struct import (
     ClearHiCacheReqInput,
     ClearHiCacheReqOutput,
     CloseSessionReqInput,
+    CompleteWeightsUpdateReqInput,
+    CompleteWeightsUpdateReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -48,6 +49,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PrepareWeightsUpdateReqInput,
+    PrepareWeightsUpdateReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -82,6 +85,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.utils import TypeBasedDispatcher
 
+
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
@@ -94,6 +98,8 @@ _COMMUNICATOR_SPECS = [
     ("init_weights_update_group", InitWeightsUpdateGroupReqOutput),
     ("destroy_weights_update_group", DestroyWeightsUpdateGroupReqOutput),
     ("update_weights_from_distributed", UpdateWeightsFromDistributedReqOutput),
+    ("prepare_weights_update", PrepareWeightsUpdateReqOutput),
+    ("complete_weights_update", CompleteWeightsUpdateReqOutput),
     (
         "init_weights_send_group_for_remote_instance",
         InitWeightsSendGroupForRemoteInstanceReqOutput,
@@ -465,6 +471,51 @@ class TokenizerControlMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def prepare_weights_update(
+        self: TokenizerManager,
+        obj: PrepareWeightsUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), (
+            "dp_size must be 1 or dp attention must be enabled for "
+            "prepare_weights_update"
+        )
+        self._weight_update_in_progress = True
+        try:
+            results = await self.prepare_weights_update_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
+            if not success:
+                self._weight_update_in_progress = False
+            return success, message
+        except Exception:
+            self._weight_update_in_progress = False
+            raise
+
+    async def complete_weights_update(
+        self: TokenizerManager,
+        obj: CompleteWeightsUpdateReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        self.auto_create_handle_loop()
+        assert (
+            self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
+        ), (
+            "dp_size must be 1 or dp attention must be enabled for "
+            "complete_weights_update"
+        )
+        try:
+            results = await self.complete_weights_update_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+            return success, message
+        finally:
+            self._weight_update_in_progress = False
 
     async def init_weights_send_group_for_remote_instance(
         self: TokenizerManager,

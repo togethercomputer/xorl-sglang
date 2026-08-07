@@ -49,7 +49,6 @@ import torch
 import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
-
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -66,6 +65,7 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
+
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -1692,6 +1692,75 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
 
 
 class UpdateWeightsFromDistributedReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class WeightBucket(msgspec.Struct, kw_only=True):
+    """Metadata for one two-phase distributed-weight receive bucket."""
+
+    names: List[str]
+    dtypes: List[str]
+    shapes: List[List[int]]
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source, handler):
+        return msgspec_struct_pydantic_core_schema(cls, handler)
+
+
+class PrepareWeightsUpdateReqInput(BaseReq, kw_only=True):
+    """Arm receivers before the trainer starts distributed broadcasts."""
+
+    buckets: Optional[List[WeightBucket]] = None
+    num_buckets: Optional[int] = None
+    names: Optional[List[str]] = None
+    dtypes: Optional[List[str]] = None
+    shapes: Optional[List[List[int]]] = None
+    group_name: str = "weight_update_group"
+    load_format: Optional[str] = None
+    transport: str = "nccl_broadcast"
+
+    def get_buckets(self) -> List[WeightBucket]:
+        if self.buckets is not None:
+            if self.num_buckets is not None and self.num_buckets != len(self.buckets):
+                raise ValueError(
+                    f"num_buckets={self.num_buckets} does not match "
+                    f"len(buckets)={len(self.buckets)}"
+                )
+            return self.buckets
+        if (
+            self.names is not None
+            and self.dtypes is not None
+            and self.shapes is not None
+        ):
+            return [
+                WeightBucket(
+                    names=self.names,
+                    dtypes=self.dtypes,
+                    shapes=self.shapes,
+                )
+            ]
+        raise ValueError(
+            "prepare_weights_update requires either buckets or names/dtypes/shapes"
+        )
+
+
+class PrepareWeightsUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+
+
+class CompleteWeightsUpdateReqInput(BaseReq, kw_only=True):
+    """Finish a previously prepared distributed-weight receive."""
+
+    group_name: str = "weight_update_group"
+    flush_cache: bool = True
+    weight_version: Optional[str] = None
+    torch_empty_cache: bool = False
+    transport: str = "nccl_broadcast"
+
+
+class CompleteWeightsUpdateReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
 

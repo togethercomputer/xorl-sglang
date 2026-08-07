@@ -10,7 +10,6 @@ from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import msgspec
 import torch
-
 from sglang.srt.constants import (
     GPU_MEMORY_ALL_TYPES,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
@@ -22,12 +21,16 @@ from sglang.srt.managers.io_struct import (
     ChecksumInfo,
     CheckWeightsReqInput,
     CheckWeightsReqOutput,
+    CompleteWeightsUpdateReqInput,
+    CompleteWeightsUpdateReqOutput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     GetWeightsByNameReqInput,
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
+    PrepareWeightsUpdateReqInput,
+    PrepareWeightsUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -41,6 +44,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +153,23 @@ class SchedulerWeightUpdaterManager:
             return UpdateWeightsFromDistributedReqOutput(
                 success=success, message=message
             )
+
+    def prepare_weights_update(self, recv_req: PrepareWeightsUpdateReqInput):
+        """Arm the receiver half of a two-phase distributed update."""
+        success, message = self.tp_worker.prepare_weights_update(recv_req)
+        if not success:
+            logger.error(message)
+        return PrepareWeightsUpdateReqOutput(success=success, message=message)
+
+    def complete_weights_update(self, recv_req: CompleteWeightsUpdateReqInput):
+        """Apply weights received by a prior prepare call."""
+        with self._observe_weight_load("distributed_two_phase"):
+            success, message = self.tp_worker.complete_weights_update(recv_req)
+            if success:
+                self.flush_cache_after_weight_update(recv_req)
+            else:
+                logger.error(message)
+            return CompleteWeightsUpdateReqOutput(success=success, message=message)
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors."""
