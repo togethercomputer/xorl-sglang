@@ -546,7 +546,7 @@ class ModelConfig:
             if is_draft_model
             else server_args.decrypted_config_file
         )
-        return ModelConfig(
+        model_config = ModelConfig(
             model_path=model_path or server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
             revision=model_revision or server_args.revision,
@@ -573,6 +573,14 @@ class ModelConfig:
             speculative_algorithm=server_args.speculative_algorithm,
             **kwargs,
         )
+        # ServerArgs resolves the GLM-5.2 exact contract on its startup
+        # ModelConfig. Workers build an isolated ModelConfig from the immutable
+        # get_config cache, so carry the resolved target contract explicitly to
+        # the per-runner config consumed by model construction.
+        glm52_exact_mode = bool(server_args.glm52_exact_mode) and not is_draft_model
+        model_config.hf_config._glm52_exact_mode = glm52_exact_mode
+        model_config.hf_text_config._glm52_exact_mode = glm52_exact_mode
+        return model_config
 
     def _config_draft_model(self):
         is_draft_model = self.is_draft_model

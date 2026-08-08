@@ -468,6 +468,94 @@ def _validate_exact_model_geometry(
         )
 
 
+def _glm52_expected_fp8_unquantized_modules() -> set[str]:
+    """Return the official GLM-5.2 FP8 checkpoint's BF16 module layout."""
+
+    modules = set()
+    for layer in range(79):
+        prefix = f"model.layers.{layer}"
+        modules.update(
+            {
+                f"{prefix}.input_layernorm",
+                f"{prefix}.post_attention_layernorm",
+                f"{prefix}.self_attn.q_a_layernorm",
+                f"{prefix}.self_attn.kv_a_layernorm",
+            }
+        )
+    for layer in range(3, 79):
+        prefix = f"model.layers.{layer}.mlp.gate"
+        modules.update({prefix, f"{prefix}.e_score_correction_bias"})
+    for layer in (0, 1, 2, *range(6, 79, 4)):
+        prefix = f"model.layers.{layer}.self_attn"
+        modules.update(
+            {
+                f"{prefix}.indexers_proj",
+                f"{prefix}.indexer.k_norm",
+                f"{prefix}.indexer.k_norm.bias",
+            }
+        )
+    modules.update(
+        {
+            "model.embed_tokens",
+            "model.norm",
+            "lm_head",
+            "model.layers.78.shared_head.norm",
+            "model.layers.78.hnorm",
+            "model.layers.78.enorm",
+            "model.layers.78.eh_proj",
+        }
+    )
+    return modules
+
+
+def _validate_glm52_exact_quantization_config(hf_config) -> None:
+    config = _text_model_config(hf_config)
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        raise ValueError(
+            "The exact GLM-5.2 XORL contract requires the qualified FP8 "
+            "quantization config"
+        )
+
+    expected = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [128, 128],
+    }
+    mismatches = [
+        f"quantization_config.{name}={quantization_config.get(name)!r} "
+        f"(expected {value!r})"
+        for name, value in expected.items()
+        if quantization_config.get(name) != value
+    ]
+    modules = quantization_config.get("modules_to_not_convert")
+    if not isinstance(modules, list) or set(modules) != (
+        expected_modules := _glm52_expected_fp8_unquantized_modules()
+    ):
+        actual_count = len(set(modules)) if isinstance(modules, list) else None
+        mismatches.append(
+            "quantization_config.modules_to_not_convert has "
+            f"{actual_count!r} unique entries (expected {len(expected_modules)}) "
+            "or a different module layout"
+        )
+    optional_defaults = {
+        "ignored_layers": None,
+        "packed_modules_mapping": None,
+        "kv_cache_quant_algo": None,
+    }
+    mismatches.extend(
+        f"quantization_config.{name}={quantization_config.get(name)!r} "
+        f"(expected {value!r})"
+        for name, value in optional_defaults.items()
+        if quantization_config.get(name) != value
+    )
+    if mismatches:
+        raise ValueError(
+            "The exact GLM-5.2 XORL contract only admits the qualified FP8 "
+            f"checkpoint layout; mismatched fields: {', '.join(mismatches)}"
+        )
+
+
 def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | None:
     if is_glm52_exact_mode(server_args):
         from sglang.srt.layers.xorl_batch_invariant import XORL_GLM52_REQUIRED_BI_OPS
@@ -3316,11 +3404,13 @@ class ServerArgs:
     ] = None
     # Architecture-owned runtime selections. These are resolved from the
     # model geometry and XORL target and are intentionally not CLI flags.
-    glm52_exact_mode: bool = dataclasses.field(init=False, default=False, repr=False)
-    qwen35_gdn_exact_mode: bool = dataclasses.field(
+    glm52_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
         init=False, default=False, repr=False
     )
-    qwen35_gdn_exact_is_moe: bool = dataclasses.field(
+    qwen35_gdn_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
+    )
+    qwen35_gdn_exact_is_moe: A[bool, NS("exec.deterministic")] = dataclasses.field(
         init=False, default=False, repr=False
     )
 
@@ -3695,6 +3785,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._validate_glm52_exact_resolved_contract()
 
     def _handle_return_hidden_states_mode(self):
         if self.return_hidden_states_mode not in (None, "last", "full"):
@@ -5130,15 +5221,75 @@ class ServerArgs:
             contract_name="GLM-5.2",
             expected={
                 "hidden_size": 6144,
+                "intermediate_size": 12288,
+                "moe_intermediate_size": 2048,
+                "moe_layer_freq": 1,
                 "num_hidden_layers": 78,
                 "vocab_size": 154880,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 64,
+                "first_k_dense_replace": 3,
+                "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 75,
                 "n_routed_experts": 256,
                 "n_shared_experts": 1,
                 "num_experts_per_tok": 8,
                 "index_topk": 2048,
                 "index_topk_freq": 4,
+                "index_skip_topk_offset": 3,
+                "index_topk_pattern": None,
+                "index_head_dim": 128,
+                "index_n_heads": 32,
+                "q_lora_rank": 2048,
+                "kv_lora_rank": 512,
+                "qk_nope_head_dim": 192,
+                "qk_rope_head_dim": 64,
+                "v_head_dim": 256,
+                "indexer_rope_interleave": True,
+                "rope_interleave": True,
+                "rms_norm_eps": 1e-5,
+                "max_position_embeddings": 1_048_576,
+                "hidden_act": "silu",
+                "norm_topk_prob": True,
+                "n_group": 1,
+                "topk_group": 1,
+                "scoring_func": "sigmoid",
+                "routed_scaling_factor": 2.5,
+                "topk_method": "noaux_tc",
+                "tie_word_embeddings": False,
+                "swiglu_limit": None,
+                "llama_4_scaling": None,
+                "indexer_types": [
+                    "full" if layer < 3 or layer % 4 == 2 else "shared"
+                    for layer in range(78)
+                ],
             },
         )
+        config = _text_model_config(hf_config)
+        rope_parameters = getattr(config, "rope_parameters", None)
+        allowed_rope_keys = {"rope_theta", "rope_type", "type"}
+        if (
+            not isinstance(rope_parameters, dict)
+            or rope_parameters.get("rope_theta") != 8_000_000
+            or rope_parameters.get("rope_type", rope_parameters.get("type"))
+            != "default"
+            or rope_parameters.get("type", rope_parameters.get("rope_type"))
+            != "default"
+            or not set(rope_parameters).issubset(allowed_rope_keys)
+        ):
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract only admits the qualified "
+                "model geometry; mismatched fields: "
+                f"rope_parameters={rope_parameters!r}"
+            )
+        if getattr(config, "cli_factor", 1) != 1:
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires cli_factor=1"
+            )
+        if getattr(config, "num_hash_layers", 0) not in (None, 0):
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract requires num_hash_layers=0"
+            )
+        _validate_glm52_exact_quantization_config(hf_config)
         if self.dtype not in ("auto", "bf16", "bfloat16"):
             raise ValueError("The exact GLM-5.2 XORL contract requires BF16 dtype")
         if self.quantization not in (None, "fp8"):
@@ -5155,18 +5306,98 @@ class ServerArgs:
             raise ValueError(
                 "The exact GLM-5.2 XORL contract requires flashmla_sparse decode"
             )
+        from sglang.srt.lora.glm52 import GLM52_REQUIRED_TARGET_MODULES
+
+        if self.lora_target_modules is not None:
+            configured_lora_targets = set(self.lora_target_modules)
+            if configured_lora_targets != GLM52_REQUIRED_TARGET_MODULES:
+                raise ValueError(
+                    "The exact GLM-5.2 XORL contract requires the complete LoRA "
+                    "target set; "
+                    f"got {sorted(configured_lora_targets)}."
+                )
+        elif self.enable_lora is True and not self.lora_paths:
+            # Dynamic POST loading needs the fixed complete memory-pool layout
+            # even when no adapter is present at server startup.
+            self.lora_target_modules = set(GLM52_REQUIRED_TARGET_MODULES)
         exact_program = {
             "moe_runner_backend": (self.moe_runner_backend, ("auto", "triton")),
             "fp8_gemm_runner_backend": (
                 self.fp8_gemm_runner_backend,
                 ("auto", "triton"),
             ),
+            "dsa_paged_mqa_logits_backend": (
+                self.dsa_paged_mqa_logits_backend,
+                ("auto", "deepgemm"),
+            ),
+            "dsa_topk_backend": (self.dsa_topk_backend, ("sgl-kernel",)),
             "moe_dense_tp_size": (self.moe_dense_tp_size, (None, 1)),
             "moe_a2a_backend": (self.moe_a2a_backend, ("none",)),
+            "ep_num_redundant_experts": (
+                self.ep_num_redundant_experts,
+                (0,),
+            ),
+            "ep_dispatch_algorithm": (self.ep_dispatch_algorithm, (None,)),
+            "init_expert_location": (self.init_expert_location, ("trivial",)),
+            "enable_eplb": (self.enable_eplb, (False,)),
+            "enable_hisparse": (self.enable_hisparse, (False,)),
+            "page_size": (self.page_size, (None, 64)),
+            "prefill_attention_backend": (
+                self.prefill_attention_backend,
+                (None, "dsa"),
+            ),
+            "decode_attention_backend": (
+                self.decode_attention_backend,
+                (None, "dsa"),
+            ),
+            "disaggregation_mode": (self.disaggregation_mode, ("null",)),
+            "sampling_backend": (self.sampling_backend, (None, "pytorch")),
+            "sampling_defaults": (self.sampling_defaults, ("model", "openai")),
+            "chunked_prefill_size": (
+                self.chunked_prefill_size,
+                (None, -1, 8192),
+            ),
+            "max_prefill_tokens": (self.max_prefill_tokens, (8192, 16384)),
+            "prefill_max_requests": (self.prefill_max_requests, (None, 1)),
+            "max_total_tokens": (self.max_total_tokens, (None, 8192)),
+            "max_running_requests": (self.max_running_requests, (None, 16)),
+            "model_impl": (self.model_impl, ("auto", "sglang")),
+            "device": (self.device, (None, "cuda")),
+            "is_embedding": (self.is_embedding, (False,)),
+            "debug_cuda_graph": (self.debug_cuda_graph, (False,)),
+            "enable_torch_compile": (self.enable_torch_compile, (False,)),
+            "enable_two_batch_overlap": (
+                self.enable_two_batch_overlap,
+                (False,),
+            ),
+            "enable_single_batch_overlap": (
+                self.enable_single_batch_overlap,
+                (False,),
+            ),
+            "debug_tensor_dump_output_folder": (
+                self.debug_tensor_dump_output_folder,
+                (None,),
+            ),
+            "msprobe_dump_config": (self.msprobe_dump_config, (None,)),
+            "max_lora_rank": (self.max_lora_rank, (None, 1)),
+            "lora_backend": (self.lora_backend, ("csgmv", "triton")),
+            "experts_shared_outer_loras": (
+                self.experts_shared_outer_loras,
+                (None, True),
+            ),
+            "enable_lora_overlap_loading": (
+                self.enable_lora_overlap_loading,
+                (None, False),
+            ),
+            "lora_use_virtual_experts": (self.lora_use_virtual_experts, (False,)),
+            "nnodes": (self.nnodes, (2,)),
             "tp_size": (self.tp_size, (16,)),
             "ep_size": (self.ep_size, (1, 16)),
             "pp_size": (self.pp_size, (1,)),
             "dp_size": (self.dp_size, (1,)),
+            "dcp_size": (self.dcp_size, (1,)),
+            "enable_cp_decode_attn_tp": (self.enable_cp_decode_attn_tp, (False,)),
+            "enable_dp_lm_head": (self.enable_dp_lm_head, (False,)),
             "moe_dp_size": (self.moe_dp_size, (1,)),
             "attn_cp_size": (self.attn_cp_size, (1, 16)),
             "dsa_prefill_cp_mode": (
@@ -5187,6 +5418,38 @@ class ServerArgs:
             incompatible.append(
                 f"cuda_graph_max_bs_decode={self.cuda_graph_max_bs_decode!r}"
             )
+        if self.disable_cuda_graph_padding:
+            incompatible.append("disable_cuda_graph_padding=True")
+        if (
+            getattr(self, "_mem_fraction_static_user_supplied", False)
+            and self.mem_fraction_static != 0.82
+        ):
+            incompatible.append(f"mem_fraction_static={self.mem_fraction_static!r}")
+        if isinstance(self.cuda_graph_config, CudaGraphConfig):
+            locked = getattr(self, "_cuda_graph_config_locked", set())
+            graph_program = {
+                (Phase.DECODE, "backend"): (
+                    self.cuda_graph_config.decode.backend,
+                    (Backend.FULL,),
+                ),
+                (Phase.DECODE, "bs"): (
+                    self.cuda_graph_config.decode.bs,
+                    ([16],),
+                ),
+                (Phase.DECODE, "max_bs"): (
+                    self.cuda_graph_config.decode.max_bs,
+                    (16,),
+                ),
+                (Phase.PREFILL, "backend"): (
+                    self.cuda_graph_config.prefill.backend,
+                    (Backend.DISABLED,),
+                ),
+            }
+            incompatible.extend(
+                f"cuda_graph_config[{phase}].{name}={value!r}"
+                for (phase, name), (value, allowed) in graph_program.items()
+                if (phase, name) in locked and value not in allowed
+            )
         if incompatible:
             raise ValueError(
                 "The exact GLM-5.2 XORL contract rejects incompatible runtime "
@@ -5196,14 +5459,37 @@ class ServerArgs:
         self.quantization = "fp8"
         self.kv_cache_dtype = "bfloat16"
         self.attention_backend = "dsa"
+        self.prefill_attention_backend = None
+        self.decode_attention_backend = None
         self.dsa_prefill_backend = "flashmla_sparse"
         self.dsa_decode_backend = "flashmla_sparse"
+        self.dsa_paged_mqa_logits_backend = "deepgemm"
+        self.dsa_topk_backend = "sgl-kernel"
+        self.sampling_backend = "pytorch"
+        self.sampling_defaults = "openai"
+        self.chunked_prefill_size = -1
+        self.max_prefill_tokens = 8192
+        self.prefill_max_requests = 1
+        self.max_total_tokens = 8192
+        self.max_running_requests = 16
+        self.mem_fraction_static = 0.82
+        self.model_impl = "sglang"
+        self.device = "cuda"
+        self.max_lora_rank = 1
+        self.lora_backend = "triton"
+        self.experts_shared_outer_loras = True
+        self.enable_lora_overlap_loading = False
+        self.lora_use_virtual_experts = False
+        self.lora_strict_loading = True
+        self.dcp_size = 1
+        self.enable_cp_decode_attn_tp = False
         self.moe_runner_backend = "triton"
         self.fp8_gemm_runner_backend = "triton"
         self.moe_dense_tp_size = 1
         self.ep_size = 16
         self.attn_cp_size = 16
         self.enable_prefill_cp = True
+        self.enable_prefill_context_parallel = False
         self.cp_strategy = "interleave"
         self.enable_dsa_prefill_context_parallel = True
         self.dsa_prefill_cp_mode = "round-robin-split"
@@ -5215,6 +5501,142 @@ class ServerArgs:
         self.disable_radix_cache = True
         self.cuda_graph_bs_decode = [16]
         self.cuda_graph_max_bs_decode = 16
+        if isinstance(self.cuda_graph_config, CudaGraphConfig):
+            self.cuda_graph_config.decode.backend = Backend.FULL
+            self.cuda_graph_config.decode.bs = [16]
+            self.cuda_graph_config.decode.max_bs = 16
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._cuda_graph_config_locked.add((Phase.DECODE, "backend"))
+            self._cuda_graph_config_locked.add((Phase.DECODE, "bs"))
+            self._cuda_graph_config_locked.add((Phase.DECODE, "max_bs"))
+            self._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
+
+    def _validate_glm52_exact_resolved_contract(self) -> None:
+        """Fail if a late resolution pass changed the certified GLM program."""
+
+        if not self.glm52_exact_mode:
+            return
+
+        expected = {
+            "dtype": "bfloat16",
+            "quantization": "fp8",
+            "kv_cache_dtype": "bfloat16",
+            "attention_backend": "dsa",
+            "prefill_attention_backend": None,
+            "decode_attention_backend": None,
+            "disaggregation_mode": "null",
+            "dsa_prefill_backend": "flashmla_sparse",
+            "dsa_decode_backend": "flashmla_sparse",
+            "dsa_paged_mqa_logits_backend": "deepgemm",
+            "dsa_topk_backend": "sgl-kernel",
+            "page_size": 64,
+            "nnodes": 2,
+            "tp_size": 16,
+            "ep_size": 16,
+            "pp_size": 1,
+            "dp_size": 1,
+            "moe_dp_size": 1,
+            "attn_cp_size": 16,
+            "moe_dense_tp_size": 1,
+            "moe_a2a_backend": "none",
+            "ep_num_redundant_experts": 0,
+            "ep_dispatch_algorithm": None,
+            "init_expert_location": "trivial",
+            "enable_eplb": False,
+            "enable_prefill_cp": True,
+            "enable_prefill_context_parallel": False,
+            "enable_dsa_prefill_context_parallel": True,
+            "cp_strategy": "interleave",
+            "dsa_prefill_cp_mode": "round-robin-split",
+            "enable_dp_attention": True,
+            "enable_hisparse": False,
+            "enable_deterministic_inference": True,
+            "disable_shared_experts_fusion": True,
+            "disable_custom_all_reduce": True,
+            "disable_overlap_schedule": True,
+            "disable_piecewise_cuda_graph": True,
+            "disable_radix_cache": True,
+            "disable_cuda_graph": False,
+            "disable_cuda_graph_padding": False,
+            "sampling_backend": "pytorch",
+            "sampling_defaults": "openai",
+            "chunked_prefill_size": -1,
+            "max_prefill_tokens": 8192,
+            "prefill_max_requests": 1,
+            "max_total_tokens": 8192,
+            "max_running_requests": 16,
+            "mem_fraction_static": 0.82,
+            "model_impl": "sglang",
+            "device": "cuda",
+            "is_embedding": False,
+            "debug_cuda_graph": False,
+            "enable_torch_compile": False,
+            "enable_two_batch_overlap": False,
+            "enable_single_batch_overlap": False,
+            "debug_tensor_dump_output_folder": None,
+            "msprobe_dump_config": None,
+            "max_lora_rank": 1,
+            "lora_backend": "triton",
+            "experts_shared_outer_loras": True,
+            "enable_lora_overlap_loading": False,
+            "lora_use_virtual_experts": False,
+            "lora_strict_loading": True,
+            "dcp_size": 1,
+            "enable_cp_decode_attn_tp": False,
+            "enable_dp_lm_head": False,
+        }
+        mismatches = [
+            f"{name}={getattr(self, name, None)!r} (expected {value!r})"
+            for name, value in expected.items()
+            if getattr(self, name, None) != value
+        ]
+        if self.node_rank not in (0, 1):
+            mismatches.append(f"node_rank={self.node_rank!r} (expected 0 or 1)")
+        if not isinstance(self.cuda_graph_config, CudaGraphConfig):
+            mismatches.append("cuda_graph_config is not resolved")
+        else:
+            graph_expected = {
+                "decode.backend": (self.cuda_graph_config.decode.backend, Backend.FULL),
+                "decode.bs": (self.cuda_graph_config.decode.bs, [16]),
+                "decode.max_bs": (self.cuda_graph_config.decode.max_bs, 16),
+                "prefill.backend": (
+                    self.cuda_graph_config.prefill.backend,
+                    Backend.DISABLED,
+                ),
+            }
+            mismatches.extend(
+                f"cuda_graph_config.{name}={value!r} (expected {wanted!r})"
+                for name, (value, wanted) in graph_expected.items()
+                if value != wanted
+            )
+        if (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.enable_multi_layer_eagle
+        ):
+            mismatches.append("speculative or draft decoding is enabled")
+        if not envs.SGLANG_ENABLE_CP_V2.get():
+            mismatches.append("SGLANG_ENABLE_CP_V2 is not enabled")
+        if envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get():
+            mismatches.append("SGLANG_DISABLE_DSA_INDEXER_FUSION is enabled")
+        if envs.SGLANG_FP8_IGNORED_LAYERS.get():
+            mismatches.append("SGLANG_FP8_IGNORED_LAYERS is nonempty")
+        exact_disabled_envs = (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS,
+            envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS,
+            envs.SGLANG_OPT_MOE_QUANT_ONCE,
+            envs.SGLANG_SHARED_EXPERT_TP1,
+        )
+        mismatches.extend(
+            f"{setting.name} is enabled"
+            for setting in exact_disabled_envs
+            if setting.get()
+        )
+        if mismatches:
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract drifted after runtime "
+                f"resolution: {', '.join(mismatches)}"
+            )
 
     def _validate_qwen35_gdn_exact_contract(self, hf_config) -> None:
         if not self.qwen35_gdn_exact_mode:

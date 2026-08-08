@@ -336,6 +336,9 @@ class DeepseekSparseAttnBackend(
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend(
             model_runner.server_args.dsa_topk_backend
         )
+        self.glm52_exact_mode = bool(
+            getattr(model_runner.server_args, "glm52_exact_mode", False)
+        )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -389,7 +392,7 @@ class DeepseekSparseAttnBackend(
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
-        self.use_fused_topk = should_use_dsa_fused_topk(
+        self.use_fused_topk = self.glm52_exact_mode or should_use_dsa_fused_topk(
             model_runner.server_args, seed_dsa_topk_from_draft_extend
         )
         if envs.SGLANG_DSA_FUSE_TOPK.get() and not self.use_fused_topk:
@@ -399,6 +402,11 @@ class DeepseekSparseAttnBackend(
 
         self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        if self.glm52_exact_mode and self.device_sm_major != 9:
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract is certified only on "
+                f"NVIDIA Hopper (SM90); got compute capability {self.device_capability}."
+            )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # `flashmla_sparse_q8` = the native FP8 SM90 sparse-prefill kernel. It always
@@ -3392,6 +3400,7 @@ class DeepseekSparseAttnBackend(
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,
+            glm52_exact_mode=getattr(self, "glm52_exact_mode", False),
         )
 
     def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):

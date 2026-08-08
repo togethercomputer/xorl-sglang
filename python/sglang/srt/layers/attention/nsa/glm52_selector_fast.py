@@ -21,11 +21,11 @@ production decode allocation is far wider than the legal interval (max-context
 logits behind a ~4k live prefix), and sweeping the allocation instead of the
 interval costs two orders of magnitude while changing no bytes.
 
-These kernels are the exact serving contract's default execution: the
-architecture resolver selects them whenever the exact sparse path serves.
-The eager reference implementations in ``glm52_selector`` remain in-tree
-solely as the certification baselines the test suite compares against;
-no production flag dispatches them.
+The architecture resolver selects the fused selector for exact GLM-5.2 DSA
+metadata before any generic DSA top-k backend can dispatch.  The eager
+reference implementations in ``glm52_selector`` remain in-tree solely as the
+certification baselines the test suite compares against; no production flag
+dispatches them.
 """
 
 from __future__ import annotations
@@ -166,6 +166,11 @@ def select_canonical_logical_topk_fused(
         raise TypeError(
             f"exact sparse fused scores must be float32, got {scores.dtype}"
         )
+    if scores.stride(1) != 1:
+        raise ValueError(
+            "exact sparse fused scores require unit column stride, "
+            f"got {scores.stride()}"
+        )
     rows, width = scores.shape
     lengths = lengths.to(device=scores.device, dtype=torch.int64)
     starts = (
@@ -182,7 +187,6 @@ def select_canonical_logical_topk_fused(
     if take == 0 or rows == 0:
         return out, flags
 
-    scores = scores.contiguous()
     _glm52_stable_topk_kernel[(rows,)](
         scores,
         lengths,
@@ -197,6 +201,154 @@ def select_canonical_logical_topk_fused(
         num_warps=8,
     )
     return out, flags
+
+
+def select_canonical_paged_topk_fused(
+    scores: torch.Tensor,
+    lengths: torch.Tensor,
+    topk: int,
+    *,
+    page_table: torch.Tensor,
+    page_size: int,
+    cu_seqlens_q: torch.Tensor | None = None,
+    row_starts: torch.Tensor | None = None,
+    batch_idx_list: list[int] | torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Select canonical logical indices and map them to physical KV slots.
+
+    This is the production PAGED transform for the qualified exact GLM-5.2
+    path.  Selection order remains ascending request-local logical order; page
+    allocation order is never used to reorder winners.  The compact page table
+    is sufficient for decode graphs that intentionally omit ``page_table_1``.
+    """
+
+    if scores.device.type != "cuda":
+        raise ValueError("exact GLM-5.2 PAGED top-k requires CUDA scores")
+    if topk != 2048:
+        raise ValueError(f"exact GLM-5.2 PAGED top-k requires topk=2048, got {topk}")
+    if lengths.ndim != 1 or lengths.shape[0] != scores.shape[0]:
+        raise ValueError(
+            "exact GLM-5.2 PAGED lengths must have one entry per score row"
+        )
+    if row_starts is not None and (
+        row_starts.ndim != 1 or row_starts.shape[0] != scores.shape[0]
+    ):
+        raise ValueError(
+            "exact GLM-5.2 PAGED row_starts must have one entry per score row"
+        )
+    if (
+        page_table.device != scores.device
+        or page_table.dtype != torch.int32
+        or page_table.ndim != 2
+    ):
+        raise ValueError(
+            "exact GLM-5.2 PAGED mapping requires a rank-two CUDA int32 page table"
+        )
+    if page_size <= 0:
+        raise ValueError(
+            f"exact GLM-5.2 PAGED mapping requires positive page_size, got {page_size}"
+        )
+    lengths_i64 = lengths.to(device=scores.device, dtype=torch.int64)
+    starts_i64 = (
+        torch.zeros_like(lengths_i64)
+        if row_starts is None
+        else row_starts.to(device=scores.device, dtype=torch.int64)
+    )
+    torch._assert_async(
+        (
+            (lengths_i64 >= 0)
+            & (starts_i64 >= 0)
+            & (starts_i64 + lengths_i64 <= scores.shape[1])
+            & (lengths_i64 <= page_table.shape[1] * page_size)
+        ).all(),
+        "exact GLM-5.2 PAGED legal score interval is out of bounds",
+    )
+
+    selected, nan_flags = select_canonical_logical_topk_fused(
+        scores,
+        lengths_i64,
+        topk,
+        row_starts=starts_i64,
+    )
+    rows = scores.shape[0]
+    if rows == 0:
+        return selected, nan_flags
+
+    row_to_batch = None
+    if batch_idx_list is not None:
+        row_to_batch = torch.as_tensor(
+            batch_idx_list, dtype=torch.int64, device=scores.device
+        )
+        if row_to_batch.ndim != 1:
+            raise ValueError("exact GLM-5.2 batch_idx_list must be rank one")
+        if row_to_batch.shape[0] != rows:
+            if cu_seqlens_q is None:
+                raise RuntimeError(
+                    "exact GLM-5.2 PAGED row mapping requires cu_seqlens_q"
+                )
+            q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(
+                device=scores.device, dtype=torch.int64
+            )
+            if q_lens.shape[0] != row_to_batch.shape[0]:
+                raise ValueError(
+                    "exact GLM-5.2 batch mapping disagrees with cu_seqlens_q"
+                )
+            row_to_batch = torch.repeat_interleave(
+                row_to_batch, q_lens, output_size=rows
+            )
+    elif cu_seqlens_q is not None:
+        if cu_seqlens_q.ndim != 1 or cu_seqlens_q.shape[0] != page_table.shape[0] + 1:
+            raise ValueError(
+                "exact GLM-5.2 cu_seqlens_q must describe every page-table row"
+            )
+        num_batches = cu_seqlens_q.shape[0] - 1
+        decode_row_aligned = row_starts is None and rows == num_batches
+        if not decode_row_aligned:
+            q_lens = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(
+                device=scores.device, dtype=torch.int64
+            )
+            row_to_batch = torch.repeat_interleave(
+                torch.arange(num_batches, dtype=torch.int64, device=scores.device),
+                q_lens,
+                output_size=rows,
+            )
+    elif row_starts is not None:
+        raise RuntimeError(
+            "exact GLM-5.2 PAGED prefill requires query-to-request metadata"
+        )
+
+    if row_to_batch is None:
+        if page_table.shape[0] != rows:
+            raise ValueError(
+                "exact GLM-5.2 decode rows must align with page-table rows"
+            )
+        row_page_table = page_table
+    else:
+        if row_to_batch.shape != (rows,):
+            raise ValueError(
+                "exact GLM-5.2 query-to-request mapping has the wrong row count"
+            )
+        torch._assert_async(
+            ((row_to_batch >= 0) & (row_to_batch < page_table.shape[0])).all(),
+            "exact GLM-5.2 query-to-request mapping is out of bounds",
+        )
+        row_page_table = page_table.index_select(0, row_to_batch)
+
+    valid = selected >= 0
+    safe_logical = selected.clamp_min(0)
+    page_columns = torch.div(safe_logical, page_size, rounding_mode="floor")
+    torch._assert_async(
+        ((~valid) | (page_columns < row_page_table.shape[1])).all(),
+        "exact GLM-5.2 selected logical page is out of bounds",
+    )
+    physical_pages = torch.gather(row_page_table, 1, page_columns.to(dtype=torch.int64))
+    torch._assert_async(
+        ((~valid) | (physical_pages >= 0)).all(),
+        "exact GLM-5.2 selected logical page is unallocated",
+    )
+    physical = physical_pages * page_size + torch.remainder(safe_logical, page_size)
+    transformed = torch.where(valid, physical, -1).to(dtype=torch.int32)
+    return transformed, nan_flags
 
 
 @dataclass(frozen=True)
@@ -521,8 +673,8 @@ def _apply_glm52_exact_fastpath() -> None:
     bi_gemm_configs._force_bi_gemm_config_table(True)
     bi_gemm_configs._set_glm52_tier_a_enabled(True)
     logger.info(
-        "Exact GLM-5.2 zero-K3 serving resolved: fused selector+packer, "
-        "producer-dataflow plans, canonical_v3b MoE transport "
+        "Exact GLM-5.2 zero-K3 serving resolved: canonical fused DSA selector "
+        "with deterministic PAGED mapping, canonical_v3b MoE transport "
         "(CP prefill: v3), families=v2, Tier-A GEMM tables, "
         "model-tail status check, prebuilt RoPE cache only"
     )
@@ -535,4 +687,5 @@ __all__ = [
     "build_selection_plan",
     "pack_selected_kv_fused",
     "select_canonical_logical_topk_fused",
+    "select_canonical_paged_topk_fused",
 ]

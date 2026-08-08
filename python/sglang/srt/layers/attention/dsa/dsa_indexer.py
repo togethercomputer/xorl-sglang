@@ -589,7 +589,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # num_tokens (graph split-op contract) slices q/k/positions/out_cache_loc
         # to the unpadded count; the returned q_fp8/weights are sliced to match.
-        q_scale_gate = self.softmax_scale * self.n_heads**-0.5
+        head_scale = self.n_heads**-0.5
         out_cache_loc = forward_batch.out_cache_loc
         if num_tokens is not None:
             positions = positions[:num_tokens]
@@ -615,7 +615,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             return fused_q_indexer_rope_first_quant(
                 q.contiguous(),
                 weights_raw,
-                q_scale_gate,
+                head_scale,
+                self.softmax_scale,
                 self._indexer_cos_sin_cache,
                 positions,
             )
@@ -642,7 +643,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         q_fp8, weights = fused_q_indexer_rope_first_quant(
             q.contiguous(),
             weights_raw,
-            q_scale_gate,
+            head_scale,
+            self.softmax_scale,
             self._indexer_cos_sin_cache,
             positions,
         )

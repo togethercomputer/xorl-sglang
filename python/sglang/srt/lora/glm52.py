@@ -79,7 +79,7 @@ def _require_positive_int(config, name: str) -> int:
 def _validate_official_geometry(config, adapter_config: dict) -> dict[str, int]:
     if adapter_config.get("moe_hybrid_shared_lora") is not True:
         raise ValueError(
-            "GLM-5.2 XoRL shared-outer adapters require " "moe_hybrid_shared_lora=true."
+            "GLM-5.2 XoRL shared-outer adapters require moe_hybrid_shared_lora=true."
         )
 
     target_modules = adapter_config.get("target_modules")
@@ -149,9 +149,41 @@ def _validate_official_geometry(config, adapter_config: dict) -> dict[str, int]:
     rank = adapter_config.get("r")
     if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
         raise ValueError(
-            f"GLM-5.2 shared-outer LoRA requires a positive integer rank; "
-            f"got {rank!r}."
+            f"GLM-5.2 shared-outer LoRA requires a positive integer rank; got {rank!r}."
         )
+    if getattr(config, "_glm52_exact_mode", False):
+        alpha = adapter_config.get("lora_alpha")
+        dropout = adapter_config.get("lora_dropout", 0.0)
+        exact_mismatches = []
+        if rank != 1:
+            exact_mismatches.append(f"r={rank!r} (expected 1)")
+        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or alpha != 1:
+            exact_mismatches.append(f"lora_alpha={alpha!r} (expected 1)")
+        if (
+            isinstance(dropout, bool)
+            or not isinstance(dropout, (int, float))
+            or dropout != 0
+        ):
+            exact_mismatches.append(f"lora_dropout={dropout!r} (expected 0)")
+        for name, default in (
+            ("bias", "none"),
+            ("fan_in_fan_out", False),
+            ("use_dora", False),
+            ("use_rslora", False),
+        ):
+            value = adapter_config.get(name, default)
+            if value != default:
+                exact_mismatches.append(f"{name}={value!r} (expected {default!r})")
+        for name in ("alpha_pattern", "rank_pattern"):
+            value = adapter_config.get(name)
+            if value not in (None, {}):
+                exact_mismatches.append(f"{name} must be empty")
+        if exact_mismatches:
+            raise ValueError(
+                "The exact GLM-5.2 XORL active-LoRA contract requires the "
+                "complete rank-1/alpha-1 factor-only adapter: "
+                + ", ".join(exact_mismatches)
+            )
     geometry["rank"] = rank
     return geometry
 
@@ -464,7 +496,7 @@ class Glm52XorlSharedOuterValidator:
         spec = self._expected.get(name)
         if spec is None:
             raise ValueError(
-                "Unexpected tensor in GLM-5.2 XoRL shared-outer adapter: " f"{name!r}."
+                f"Unexpected tensor in GLM-5.2 XoRL shared-outer adapter: {name!r}."
             )
         if name in self._seen:
             raise ValueError(
@@ -497,6 +529,16 @@ class Glm52XorlSharedOuterValidator:
 def maybe_create_glm52_validator(
     config, adapter_config: dict
 ) -> Optional[Glm52XorlSharedOuterValidator]:
+    exact_glm52 = bool(
+        getattr(config, "_glm52_exact_mode", False)
+        and GLM52_ARCHITECTURE in _config_architectures(config)
+    )
+    if exact_glm52 and not is_glm52_xorl_shared_outer_adapter(config, adapter_config):
+        raise ValueError(
+            "The exact GLM-5.2 XORL active-LoRA contract requires "
+            "_sglang_lora_format='shared_outer'; ordinary, missing, or "
+            "partially identified adapter formats are not admitted."
+        )
     if not is_glm52_xorl_shared_outer_adapter(config, adapter_config):
         return None
     return Glm52XorlSharedOuterValidator(config, adapter_config)

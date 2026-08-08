@@ -17,11 +17,13 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
 from sglang.kernels.ops.attention.dsv4 import fused_q_indexer_rope_first_quant
 from sglang.kernels.ops.attention.fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 from sglang.kernels.ops.quantization.dsv32 import (
     fused_k_indexer_norm_rope,
     fused_k_indexer_norm_rope_store,
@@ -139,41 +141,56 @@ def test_k_store_matches_unfused(strided):
 
 
 # ----------------------------------------------------------------------------
-# Q kernel: rope-first + fp8 quant + head-gate fold
+# Q kernel: rope-first + the literal prefill UE8M0 codec + head-gate fold
 # ----------------------------------------------------------------------------
 @pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
-def test_q_rope_quant_matches_reference(pos_dtype):
+def test_q_rope_ue8m0_matches_unfused_prefill_codec(pos_dtype):
     _skip_if_unavailable()
     dev = "cuda"
     B, n_heads = 37, 64
-    cos, sin, cos_sin_cache, positions = _make_inputs(B, pos_dtype=pos_dtype)
+    _, _, cos_sin_cache, positions = _make_inputs(B, pos_dtype=pos_dtype)
     q = torch.randn(B, n_heads, HEAD_DIM, dtype=torch.bfloat16, device=dev)
     weight = torch.randn(B, n_heads, dtype=torch.bfloat16, device=dev)
-    weight_scale = 0.137
+    head_scale = n_heads**-0.5
+    softmax_scale = HEAD_DIM**-0.5
 
     q_fp8, weights_out = fused_q_indexer_rope_first_quant(
-        q, weight, weight_scale, cos_sin_cache, positions
+        q, weight, head_scale, softmax_scale, cos_sin_cache, positions
+    )
+
+    # Exercise the literal serving prefill sequence: the rotary module
+    # writes its result back to BF16, then act_quant applies the configured
+    # ceil-power-of-two UE8M0 query scale.
+    q_prefill = q.clone()
+    k_scratch = q[:, :1].clone()
+    apply_rope_with_cos_sin_cache_inplace(
+        q_prefill[..., :ROPE_DIM],
+        k_scratch[..., :ROPE_DIM],
+        cos_sin_cache,
+        positions,
+        is_neox=False,
+        rope_dim=ROPE_DIM,
+    )
+    q_ref_fp8, q_ref_scale = act_quant(q_prefill.contiguous(), HEAD_DIM, "ue8m0")
+
+    # With unit gates the fused output is the FP32 scale itself, which makes
+    # the otherwise-internal codec scale directly byte-comparable.
+    _, fused_scale = fused_q_indexer_rope_first_quant(
+        q,
+        torch.ones_like(weight),
+        1.0,
+        1.0,
+        cos_sin_cache,
+        positions,
+    )
+    weights_ref = (
+        (weight.float() * head_scale).unsqueeze(-1) * q_ref_scale * softmax_scale
     )
     torch.cuda.synchronize()
 
-    cp = cos[positions.long()][:, None, :]
-    sp = sin[positions.long()][:, None, :]
-    ref = _rope_first(q.float(), cp, sp)  # [B, n_heads, 128]
-    amax = ref.abs().amax(dim=-1, keepdim=True)
-    scale = torch.clamp(amax, min=1e-4) / FP8_MAX
-
-    # weights_out[b,h] = weight * weight_scale * scale
-    w_ref = weight.float() * weight_scale * scale.squeeze(-1)
-    torch.testing.assert_close(weights_out.squeeze(-1), w_ref, atol=1e-3, rtol=1e-3)
-
-    # dequantized q should match the rope result within fp8-e4m3 precision:
-    # round-to-nearest with 3 mantissa bits => <= 1/16 relative error, plus one
-    # scale step at the bottom of the range.
-    deq = q_fp8.float() * scale
-    err = (deq - ref).abs()
-    assert (
-        err <= 0.0625 * ref.abs() + scale
-    ).all(), f"max fp8 dequant error {err.max().item()}"
+    assert torch.equal(q_fp8.view(torch.uint8), q_ref_fp8.view(torch.uint8))
+    assert torch.equal(fused_scale.squeeze(-1), q_ref_scale.squeeze(-1))
+    assert torch.equal(weights_out, weights_ref)
 
 
 # ----------------------------------------------------------------------------
@@ -192,10 +209,10 @@ def test_q_strided_weight_matches_contiguous():
     assert not w_strided.is_contiguous()
 
     a_fp8, a_w = fused_q_indexer_rope_first_quant(
-        q, w_strided, 0.137, cos_sin_cache, positions
+        q, w_strided, 0.137, 0.217, cos_sin_cache, positions
     )
     b_fp8, b_w = fused_q_indexer_rope_first_quant(
-        q, w_contig, 0.137, cos_sin_cache, positions
+        q, w_contig, 0.137, 0.217, cos_sin_cache, positions
     )
     torch.cuda.synchronize()
     assert torch.equal(a_fp8, b_fp8)
@@ -246,14 +263,20 @@ def test_indexer_uses_replaced_rope_cache_for_fused_kernels():
     q_weight = torch.randn(B, n_heads, dtype=torch.bfloat16, device=dev, generator=g)
     weight_scale = 0.137
     q_fp8, weights_out = fused_q_indexer_rope_first_quant(
-        q, q_weight, weight_scale, indexer._indexer_cos_sin_cache, positions
+        q,
+        q_weight,
+        weight_scale,
+        1.0,
+        indexer._indexer_cos_sin_cache,
+        positions,
     )
     torch.cuda.synchronize()
 
     q_ref = _rope_first(
         q.float(), cos[positions.long()][:, None, :], sin[positions.long()][:, None, :]
-    )
-    scale = torch.clamp(q_ref.abs().amax(dim=-1, keepdim=True), min=1e-4) / FP8_MAX
+    ).to(torch.bfloat16)
+    amax = q_ref.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-4)
+    scale = torch.exp2(torch.ceil(torch.log2(amax / FP8_MAX)))
     torch.testing.assert_close(
         weights_out.squeeze(-1),
         q_weight.float() * weight_scale * scale.squeeze(-1),

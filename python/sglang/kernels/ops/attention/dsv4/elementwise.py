@@ -86,7 +86,10 @@ def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype):
 # drops the Hadamard rotation (kHadamard=false).
 @cache_once
 def _jit_main_q_indexer_rope_first_quant_module(dtype: torch.dtype):
-    args = make_cpp_args(dtype, is_arch_support_pdl(), True, False)
+    # V3.2/GLM uses the same literal query codec as the unfused indexer path:
+    # round the post-RoPE values through BF16, then quantize with UE8M0 scales.
+    # The generic V4 specialization keeps its original dynamic-scale codec.
+    args = make_cpp_args(dtype, is_arch_support_pdl(), True, False, True)
     return load_jit(
         make_name("main_q_indexer_rope_first_quant"),
         *args,
@@ -200,6 +203,7 @@ def fused_q_indexer_rope_hadamard_quant(
             weight,
             weights_out,
             float(weight_scale),
+            1.0,
             freqs_real,
             positions,
         )
@@ -209,11 +213,12 @@ def fused_q_indexer_rope_hadamard_quant(
 def fused_q_indexer_rope_first_quant(
     q_input: torch.Tensor,
     weight: torch.Tensor,
-    weight_scale: float,
+    head_scale: float,
+    softmax_scale: float,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """DeepSeek-V3.2 only. Indexer Q: RoPE on the leading dims + fp8 act-quant. CUDA only."""
+    """DeepSeek-V3.2 only. RoPE-first Q with literal query and gate scaling. CUDA only."""
     q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
     weights_out = torch.empty(
         (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
@@ -224,7 +229,8 @@ def fused_q_indexer_rope_first_quant(
         q_fp8,
         weight,
         weights_out,
-        float(weight_scale),
+        float(head_scale),
+        float(softmax_scale),
         cos_sin_cache,
         positions,
     )

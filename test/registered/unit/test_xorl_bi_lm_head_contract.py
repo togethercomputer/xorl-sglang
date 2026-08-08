@@ -25,12 +25,14 @@ from sglang.srt.layers.xorl_batch_invariant import (
     xorl_bi_sample_and_score,
     xorl_glm52_norm_site_family,
 )
+from sglang.srt.lora.layers import ParallelLMHeadWithLoRA
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
 from sglang.srt.managers.scheduler_components.logprob_result_processor import (
     SchedulerLogprobResultProcessor,
 )
+from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.srt.server_args import (
     RL_ON_POLICY_TARGET_CHOICES,
@@ -49,6 +51,38 @@ def _module_stub(name, **attributes):
     for attribute, value in attributes.items():
         setattr(module, attribute, value)
     return module
+
+
+class _TestParallelLMHeadWithLoRA(ParallelLMHeadWithLoRA):
+    def __init__(
+        self,
+        *,
+        weight,
+        backend_name="triton",
+        batch_info=object(),
+        set_lora=True,
+        a_buffer=None,
+        b_buffer=None,
+        callback=None,
+    ):
+        torch.nn.Module.__init__(self)
+        self.weight = weight
+        self.set_lora = set_lora
+        self.lora_backend = SimpleNamespace(
+            name=backend_name,
+            batch_info=batch_info,
+            _glm52_exact_batch_certified=True,
+        )
+        if a_buffer is not None:
+            self.lm_head_A_buffer = a_buffer
+        if b_buffer is not None:
+            self.lm_head_B_buffer = b_buffer
+        self.callback = callback
+
+    def apply_lora(self, base_output, hidden_states):
+        if self.callback is None:
+            raise AssertionError("test LoRA callback was not configured")
+        return self.callback(base_output, hidden_states)
 
 
 @contextmanager
@@ -369,18 +403,19 @@ class TestXorlBatchInvariantRMSNormDispatch(unittest.TestCase):
 class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
     @staticmethod
     def _sampling_info(n: int):
-        return SimpleNamespace(
+        return SamplingBatchInfo(
             temperatures=torch.ones((n, 1), dtype=torch.float32),
-            sampling_seed=torch.arange(1, n + 1, dtype=torch.int64),
+            top_ps=torch.ones(n, dtype=torch.float32),
+            top_ks=torch.full((n,), TOP_K_ALL, dtype=torch.int32),
+            min_ps=torch.zeros(n, dtype=torch.float32),
             is_all_greedy=False,
+            is_any_greedy=False,
             need_top_p_sampling=False,
             need_top_k_sampling=False,
             need_min_p_sampling=False,
-            has_custom_logit_processor=False,
-            acc_linear_penalties=None,
-            penalizer_orchestrator=None,
-            vocab_mask=None,
-            logit_bias=None,
+            vocab_size=32,
+            sampling_seed=torch.arange(1, n + 1, dtype=torch.int64),
+            device="cpu",
         )
 
     @staticmethod
@@ -522,6 +557,77 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                 self.assertTrue(torch.equal(trainer_lse, serving_lse))
                 self.assertTrue(torch.equal(trainer_selected, serving_selected))
 
+    def test_bi_head_composes_literal_rank_one_lora_after_exact_base(self):
+        hidden = torch.zeros((2, 16), dtype=torch.bfloat16)
+        weight = torch.zeros((32, 16), dtype=torch.bfloat16)
+        base_logits = torch.arange(64, dtype=torch.float32).reshape(2, 32)
+        captures = {}
+
+        def apply_lora(actual_base, actual_hidden):
+            captures["base"] = actual_base
+            captures["hidden"] = actual_hidden
+            actual_base.add_(2.0)
+            return actual_base
+
+        active_head = _TestParallelLMHeadWithLoRA(
+            weight=weight,
+            a_buffer=torch.zeros((2, 1, 16), dtype=torch.bfloat16),
+            b_buffer=torch.zeros((2, 32, 1), dtype=torch.bfloat16),
+            callback=apply_lora,
+        )
+
+        with (
+            _paired_family("v2"),
+            patch(
+                "sglang.srt.layers.xorl_batch_invariant.head_v2_full_logits_with_lse",
+                return_value=(base_logits, torch.zeros(2)),
+            ) as exact_base,
+            patch("torch.matmul", side_effect=AssertionError("ordinary matmul used")),
+        ):
+            actual = xorl_bi_lm_head(
+                hidden,
+                active_head,
+                use_fp32_lm_head=False,
+            )
+
+        self.assertIs(actual, base_logits)
+        self.assertIs(captures["base"], base_logits)
+        self.assertIs(captures["hidden"], hidden)
+        self.assertTrue(
+            torch.equal(
+                actual,
+                torch.arange(64, dtype=torch.float32).reshape(2, 32) + 2,
+            )
+        )
+        exact_base.assert_called_once_with(hidden, weight)
+
+    def test_bi_head_keeps_exact_base_for_inactive_lora_wrapper(self):
+        hidden = torch.zeros((1, 16), dtype=torch.bfloat16)
+        weight = torch.zeros((32, 16), dtype=torch.bfloat16)
+        base_logits = torch.zeros((1, 32), dtype=torch.float32)
+        inactive = _TestParallelLMHeadWithLoRA(
+            weight=weight,
+            set_lora=False,
+            batch_info=None,
+            callback=MagicMock(side_effect=AssertionError("inactive LoRA ran")),
+        )
+
+        with (
+            _paired_family("v2"),
+            patch(
+                "sglang.srt.layers.xorl_batch_invariant.head_v2_full_logits_with_lse",
+                return_value=(base_logits, torch.zeros(1)),
+            ),
+        ):
+            actual = xorl_bi_lm_head(
+                hidden,
+                inactive,
+                use_fp32_lm_head=False,
+            )
+
+        self.assertIs(actual, base_logits)
+        inactive.callback.assert_not_called()
+
     def test_bi_head_and_post_head_transforms_fail_closed(self):
         hidden = torch.zeros((1, 16), dtype=torch.bfloat16)
         weight = torch.zeros((32, 16), dtype=torch.bfloat16)
@@ -533,13 +639,34 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                 use_fp32_lm_head=True,
             )
 
-        lora_head = SimpleNamespace(
+        lora_head = _TestParallelLMHeadWithLoRA(
             weight=weight,
-            set_lora=lambda: None,
-            apply_lora=lambda: None,
+            backend_name="csgmv",
+            a_buffer=torch.zeros((2, 1, 16), dtype=torch.bfloat16),
+            b_buffer=torch.zeros((2, 32, 1), dtype=torch.bfloat16),
+            callback=lambda *_args: None,
         )
-        with self.assertRaisesRegex(RuntimeError, "LoRA-wrapped"):
-            xorl_bi_lm_head(hidden, lora_head, use_fp32_lm_head=False)
+        with (
+            _paired_family("v2"),
+            patch(
+                "sglang.srt.layers.xorl_batch_invariant.head_v2_full_logits_with_lse",
+                return_value=(
+                    torch.zeros((1, 32), dtype=torch.float32),
+                    torch.zeros(1),
+                ),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Triton LoRA backend"):
+                xorl_bi_lm_head(hidden, lora_head, use_fp32_lm_head=False)
+
+            rank_two_head = _TestParallelLMHeadWithLoRA(
+                weight=weight,
+                a_buffer=torch.zeros((2, 2, 16), dtype=torch.bfloat16),
+                b_buffer=torch.zeros((2, 32, 2), dtype=torch.bfloat16),
+                callback=lambda *_args: None,
+            )
+            with self.assertRaisesRegex(RuntimeError, "rank-one physical buffers"):
+                xorl_bi_lm_head(hidden, rank_two_head, use_fp32_lm_head=False)
 
         with self.assertRaisesRegex(RuntimeError, "embedding bias"):
             xorl_bi_lm_head(
@@ -781,6 +908,27 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
             "penalty": (
                 "penalizer_orchestrator",
                 SimpleNamespace(is_required=True),
+                "does not support penalties",
+            ),
+            "additive-penalty": (
+                "acc_additive_penalties",
+                torch.zeros((1, 8)),
+                "does not support penalties",
+            ),
+            "scaling-penalty": (
+                "acc_scaling_penalties",
+                torch.ones((1, 8)),
+                "does not support penalties",
+            ),
+            "grammar": ("grammars", [object()], "does not support penalties"),
+            "grammar-mask": (
+                "grammar_mask",
+                object(),
+                "does not support penalties",
+            ),
+            "logit-bias": (
+                "logit_bias",
+                torch.zeros((1, 8)),
                 "does not support penalties",
             ),
         }

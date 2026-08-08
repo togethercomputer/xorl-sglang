@@ -4473,13 +4473,27 @@ def reserve_rope_cache_for_long_sequences(
         or 2048
     )
 
-    # 2) Speculative decoding expansion
-    steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
-    draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
-    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+    # The exact GLM-5.2 numerical program is certified only for a RoPE table
+    # built whole during model construction. Mark every layer fail-closed
+    # before the reserve walk so a short cache raises at startup instead of
+    # silently switching to the incremental recipe.
+    glm52_exact_prebuilt_only = bool(
+        getattr(server_args, "glm52_exact_mode", False)
+    )
 
-    # 3) Align to reduce reallocation frequency
-    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+    if glm52_exact_prebuilt_only:
+        # Exact mode disables speculative decoding and admits precisely the
+        # configured context envelope. Generic growth margin/alignment must
+        # not turn an exactly-sized prebuilt table into a false startup error.
+        reserve = base_ctx
+    else:
+        # 2) Speculative decoding expansion
+        steps = int(getattr(server_args, "speculative_num_steps", 0) or 0)
+        draft = int(getattr(server_args, "speculative_num_draft_tokens", 0) or 0)
+        reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+
+        # 3) Align to reduce reallocation frequency
+        reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
 
     # Recursively expand all RoPE layers
     def reserve_rope_cache_recursive(module):
@@ -4487,6 +4501,8 @@ def reserve_rope_cache_for_long_sequences(
             if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
                 child, "cos_sin_cache"
             ):
+                if glm52_exact_prebuilt_only:
+                    child.glm52_exact_prebuilt_only = True
                 child._ensure_cos_sin_cache_length(reserve - 1)
             else:
                 reserve_rope_cache_recursive(child)

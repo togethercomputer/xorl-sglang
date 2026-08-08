@@ -97,6 +97,7 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
     paged_mqa_schedule_metadata: Optional[torch.Tensor] = None
     paged_mqa_ctx_lens_2d: Optional[torch.Tensor] = None
     force_unfused_topk: bool = False
+    glm52_exact_mode: bool = False
 
     def get_seqlens_int32(self) -> torch.Tensor:
         return self.attn_metadata.cache_seqlens_int32
@@ -154,6 +155,41 @@ class DSAIndexerMetadata(BaseIndexerMetadata):
             seq_lens_topk = ke_offset
         else:
             seq_lens_topk = self.get_seqlens_expanded()
+        if self.glm52_exact_mode:
+            if not self.topk_backend.is_sgl_kernel():
+                raise RuntimeError(
+                    "The exact GLM-5.2 PAGED top-k contract requires "
+                    "dsa_topk_backend=sgl-kernel."
+                )
+            if self.topk_transform_method != TopkTransformMethod.PAGED:
+                raise RuntimeError(
+                    "The exact GLM-5.2 BF16 KV contract requires PAGED top-k; "
+                    f"got {self.topk_transform_method.value}."
+                )
+            if self.force_unfused_topk:
+                raise RuntimeError(
+                    "The exact GLM-5.2 PAGED top-k contract cannot use the "
+                    "unfused logical-index consumer."
+                )
+            from sglang.srt.layers.attention.nsa.glm52_selector_fast import (
+                select_canonical_paged_topk_fused,
+            )
+
+            transformed, nan_flags = select_canonical_paged_topk_fused(
+                logits,
+                seq_lens_topk,
+                topk,
+                page_table=self.attn_metadata.real_page_table,
+                page_size=self.attn_metadata.page_size,
+                cu_seqlens_q=cu_seqlens_q_topk,
+                row_starts=ks,
+                batch_idx_list=batch_idx_list,
+            )
+            torch._assert_async(
+                (nan_flags == 0).all(),
+                "exact GLM-5.2 legal DSA score interval contains NaN",
+            )
+            return transformed
         return self.topk_backend.topk_transform(
             logits=logits,
             lengths=seq_lens_topk,

@@ -36,6 +36,7 @@ VALID_NAMESPACES = {
     "exec.mamba",
     "exec.overlap",
     "exec.offload",
+    "exec.weights",
     "exec.dllm",
     "exec.deterministic",
     "exec.features",

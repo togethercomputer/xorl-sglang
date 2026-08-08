@@ -83,6 +83,7 @@ class LoRAAdapter(nn.Module):
         self._glm52_validator = maybe_create_glm52_validator(
             base_hf_config, self.config.hf_config
         )
+        self._glm52_exact_adapter_certified = False
 
         self.layers: List[LoRALayer] = nn.ModuleList(
             [
@@ -160,6 +161,10 @@ class LoRAAdapter(nn.Module):
         if self._glm52_validator is not None:
             self._glm52_validator.finalize()
         self._normalize_weights()
+        self._glm52_exact_adapter_certified = bool(
+            self._glm52_validator is not None
+            and getattr(self.base_hf_config, "_glm52_exact_mode", False)
+        )
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
         for name, tensor in tensors.items():
@@ -168,6 +173,10 @@ class LoRAAdapter(nn.Module):
         if self._glm52_validator is not None:
             self._glm52_validator.finalize()
         self._normalize_weights()
+        self._glm52_exact_adapter_certified = bool(
+            self._glm52_validator is not None
+            and getattr(self.base_hf_config, "_glm52_exact_mode", False)
+        )
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
         from sglang.srt.lora.utils import get_normalized_target_modules

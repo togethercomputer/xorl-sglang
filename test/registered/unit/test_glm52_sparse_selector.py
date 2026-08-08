@@ -8,6 +8,7 @@ from sglang.srt.layers.attention.nsa.glm52_selector import (
     pack_selected_kv_static,
     select_canonical_logical_topk,
 )
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
@@ -16,7 +17,7 @@ from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestGlm52SparseSelector(unittest.TestCase):
@@ -141,6 +142,7 @@ class TestGlm52SparseSelector(unittest.TestCase):
         backend.use_fused_topk = False
         backend.hisparse_coordinator = None
         backend.dsa_topk_backend = DSATopKBackend.TORCH
+        backend.glm52_exact_mode = False
         backend.forward_metadata = SimpleNamespace(
             paged_mqa_schedule_metadata=None,
             paged_mqa_ctx_lens_2d=None,
@@ -162,6 +164,100 @@ class TestGlm52SparseSelector(unittest.TestCase):
         self.assertEqual(decode.topk_transform_method, TopkTransformMethod.PAGED)
         self.assertEqual(prefill.topk_backend, DSATopKBackend.TORCH)
         self.assertTrue(prefill.force_unfused_topk)
+        self.assertFalse(prefill.glm52_exact_mode)
+
+    @staticmethod
+    def _exact_metadata(**overrides):
+        values = {
+            "attn_metadata": SimpleNamespace(
+                cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+                dsa_seqlens_expanded=torch.tensor([3, 3], dtype=torch.int32),
+                page_size=64,
+                real_page_table=torch.tensor([[4], [7]], dtype=torch.int32),
+                topk_indices_offset=torch.zeros(2, dtype=torch.int32),
+            ),
+            "topk_transform_method": TopkTransformMethod.PAGED,
+            "topk_backend": DSATopKBackend.SGL_KERNEL,
+            "force_unfused_topk": False,
+            "glm52_exact_mode": True,
+        }
+        values.update(overrides)
+        return DSAIndexerMetadata(**values)
+
+    def test_exact_metadata_dispatches_canonical_paged_owner(self):
+        metadata = self._exact_metadata()
+        logits = torch.zeros((2, 8), dtype=torch.float32)
+        expected = torch.tensor([[41, 99, -1], [7, -1, -1]], dtype=torch.int32)
+        flags = torch.zeros(2, dtype=torch.int32)
+
+        with (
+            mock.patch(
+                "sglang.srt.layers.attention.nsa.glm52_selector_fast."
+                "select_canonical_paged_topk_fused",
+                return_value=(expected, flags),
+            ) as canonical,
+            mock.patch.object(
+                DSATopKBackend,
+                "topk_transform",
+                side_effect=AssertionError("generic top-k dispatched"),
+            ),
+        ):
+            actual = metadata.topk_transform(logits, 2048)
+
+        self.assertTrue(torch.equal(actual, expected))
+        canonical.assert_called_once()
+        kwargs = canonical.call_args.kwargs
+        self.assertIs(kwargs["page_table"], metadata.attn_metadata.real_page_table)
+        self.assertEqual(kwargs["page_size"], 64)
+
+    def test_exact_metadata_rejects_noncanonical_routes(self):
+        logits = torch.zeros((2, 8), dtype=torch.float32)
+        cases = (
+            (
+                self._exact_metadata(topk_backend=DSATopKBackend.TORCH),
+                "sgl-kernel",
+            ),
+            (
+                self._exact_metadata(topk_transform_method=TopkTransformMethod.RAGGED),
+                "requires PAGED",
+            ),
+            (self._exact_metadata(force_unfused_topk=True), "unfused"),
+        )
+        for metadata, message in cases:
+            with (
+                self.subTest(message=message),
+                self.assertRaisesRegex(RuntimeError, message),
+            ):
+                metadata.topk_transform(logits, 2048)
+
+    def test_exact_metadata_rejects_legal_nan_status(self):
+        metadata = self._exact_metadata()
+        logits = torch.zeros((2, 8), dtype=torch.float32)
+        transformed = torch.full((2, 2048), -1, dtype=torch.int32)
+        flags = torch.tensor([0, 1], dtype=torch.int32)
+
+        with (
+            mock.patch(
+                "sglang.srt.layers.attention.nsa.glm52_selector_fast."
+                "select_canonical_paged_topk_fused",
+                return_value=(transformed, flags),
+            ),
+            self.assertRaisesRegex(RuntimeError, "NaN"),
+        ):
+            metadata.topk_transform(logits, 2048)
+
+    def test_exact_dsa_metadata_preserves_physical_index_contract(self):
+        backend = self._backend()
+        backend.glm52_exact_mode = True
+        backend.use_fused_topk = True
+        backend.dsa_topk_backend = DSATopKBackend.SGL_KERNEL
+
+        metadata = backend.get_indexer_metadata(
+            1, SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+        )
+
+        self.assertTrue(metadata.glm52_exact_mode)
+        self.assertFalse(metadata.force_unfused_topk)
 
     def test_hisparse_decode_forces_unfused_current_dsa_topk(self):
         backend = self._backend()
@@ -169,7 +265,8 @@ class TestGlm52SparseSelector(unittest.TestCase):
         backend.hisparse_coordinator = object()
 
         decode = backend.get_indexer_metadata(
-            1, SimpleNamespace(
+            1,
+            SimpleNamespace(
                 forward_mode=SimpleNamespace(is_decode_or_idle=lambda: True)
             ),
         )

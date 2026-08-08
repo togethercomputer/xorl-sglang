@@ -10,15 +10,23 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.configs.model_config import ModelConfig  # noqa: E402
 from sglang.srt.distributed.canonical_moe import (  # noqa: E402
     SamplerParallelPlan,
 )
-from sglang.srt.layers.communicator import LayerCommunicator, ScatterMode  # noqa: E402
+from sglang.srt.layers import layernorm as layernorm_module  # noqa: E402
+from sglang.srt.layers.communicator import (  # noqa: E402
+    CommunicateContext,
+    LayerCommunicator,
+    LayerScatterModes,
+    ScatterMode,
+)
 from sglang.srt.layers.communicator_dsa_cp import (  # noqa: E402
     DSACPLayerCommunicator,
     DSAMLPOutputLayout,
 )
 from sglang.srt.models import deepseek_v2  # noqa: E402
+from sglang.srt.server_args import ServerArgs  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
@@ -39,6 +47,7 @@ class TestGlm52ExactOwners(CustomTestCase):
             kv_lora_rank=2,
             num_hidden_layers=2,
             mlp_layer_types=["sparse", "sparse"],
+            indexer_types=["full", "full"],
             n_routed_experts=8,
             first_k_dense_replace=0,
             moe_layer_freq=1,
@@ -46,6 +55,118 @@ class TestGlm52ExactOwners(CustomTestCase):
             _glm52_exact_mode=exact,
         )
         return config
+
+    def test_fresh_exact_config_runs_real_input_norm_through_dsa_communicator(self):
+        class FakeAttention(torch.nn.Module):
+            def __init__(self, **_kwargs):
+                super().__init__()
+
+            def prepare_qkv_latent(self, *_args, **_kwargs):
+                raise AssertionError("constructor test must not run attention")
+
+        def fake_moe_init(instance, *, config, **_kwargs):
+            torch.nn.Module.__init__(instance)
+            instance._glm52_canonical_contract = config._glm52_exact_mode
+
+        config = self._decoder_config(exact=False)
+        runner_config = SimpleNamespace(hf_config=config, hf_text_config=config)
+        server_args = ServerArgs(model_path="dummy")
+        server_args.glm52_exact_mode = True
+        build_from_server_args = ModelConfig.from_server_args
+        with patch(
+            "sglang.srt.configs.model_config.ModelConfig",
+            return_value=runner_config,
+        ):
+            fresh_config = build_from_server_args(server_args).hf_config
+
+        modes = LayerScatterModes(
+            layer_input_mode=ScatterMode.SCATTERED,
+            attn_mode=ScatterMode.SCATTERED,
+            mlp_mode=ScatterMode.SCATTERED,
+            middle_residual_mode=ScatterMode.SCATTERED,
+            layer_output_mode=ScatterMode.SCATTERED,
+        )
+        context = CommunicateContext(
+            process_group_sizes={mode: 1 for mode in ScatterMode},
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_dp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            tp_size=1,
+            tp_rank=0,
+        )
+        exact_contract = deepseek_v2._uses_glm52_exact_contract(fresh_config)
+        with (
+            patch.object(
+                deepseek_v2,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm=None),
+            ),
+            patch.object(deepseek_v2, "DeepseekV2AttentionMLA", FakeAttention),
+            patch.object(deepseek_v2.DeepseekV2MoE, "__init__", fake_moe_init),
+            patch.object(
+                deepseek_v2.LayerScatterModes,
+                "init_new",
+                return_value=modes,
+            ),
+            patch.object(CommunicateContext, "init_new", return_value=context),
+            patch(
+                "sglang.srt.layers.communicator.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm=None),
+            ),
+        ):
+            decoder = deepseek_v2.DeepseekV2DecoderLayer(
+                fresh_config,
+                layer_id=0,
+                dsa_enable_prefill_cp=True,
+                glm52_xorl_bi_contract=exact_contract,
+            )
+
+        self.assertTrue(exact_contract)
+        self.assertIsInstance(decoder.layer_communicator, DSACPLayerCommunicator)
+        self.assertEqual(
+            decoder.input_layernorm.batch_invariant_family,
+            "serving_no_residual",
+        )
+        self.assertEqual(
+            decoder.post_attention_layernorm.batch_invariant_family,
+            "serving_residual_tree",
+        )
+        self.assertEqual(
+            decoder.layer_communicator.mlp_output_layout,
+            DSAMLPOutputLayout.COMPLETE,
+        )
+
+        hidden_states = torch.zeros((1, 4), dtype=torch.bfloat16)
+        decoder.input_layernorm.to(dtype=torch.bfloat16)
+        decoder.input_layernorm._forward_method = decoder.input_layernorm.forward_cuda
+        with (
+            patch.object(
+                layernorm_module,
+                "is_batch_invariant_mode_enabled",
+                return_value=True,
+            ),
+            patch.object(
+                layernorm_module,
+                "get_global_server_args",
+                return_value=SimpleNamespace(glm52_exact_mode=True),
+            ),
+            patch.object(
+                layernorm_module,
+                "rms_norm_v2",
+                return_value=hidden_states,
+            ) as exact_norm,
+        ):
+            normalized, residual = decoder.layer_communicator.prepare_attn(
+                hidden_states,
+                None,
+                SimpleNamespace(),
+            )
+
+        self.assertIs(normalized, hidden_states)
+        self.assertIs(residual, hidden_states)
+        exact_norm.assert_called_once()
 
     def test_decoder_declares_exact_norm_and_complete_cp_owners_only_in_exact_mode(
         self,
@@ -74,7 +195,11 @@ class TestGlm52ExactOwners(CustomTestCase):
 
         modes = SimpleNamespace(mlp_mode=ScatterMode.FULL)
         with (
-            patch.object(deepseek_v2, "get_spec", return_value=SimpleNamespace(speculative_algorithm=None)),
+            patch.object(
+                deepseek_v2,
+                "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm=None),
+            ),
             patch.object(deepseek_v2, "DeepseekV2AttentionMLA", FakeAttention),
             patch.object(deepseek_v2.DeepseekV2MoE, "__init__", fake_moe_init),
             patch.object(deepseek_v2.LayerScatterModes, "init_new", return_value=modes),
@@ -159,7 +284,9 @@ class TestGlm52ExactOwners(CustomTestCase):
                 "canonicalize_glm52_local_partial_v3b",
                 return_value=output,
             ) as decode_v3b,
-            patch.object(deepseek_v2, "canonicalize_glm52_local_partial_v3") as prefill_v3,
+            patch.object(
+                deepseek_v2, "canonicalize_glm52_local_partial_v3"
+            ) as prefill_v3,
         ):
             actual = moe._canonicalize_glm52_partial(
                 local_partial,

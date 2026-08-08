@@ -10,17 +10,31 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 
 
-def _server_args_patch():
-    # The RoPE construction and growth paths consult the global server args
-    # for the rl-target inv_freq placement; unit scope supplies a stand-in.
+def _exec_config(
+    *,
+    rl_on_policy_target=None,
+    glm52_exact_mode=False,
+    qwen35_gdn_exact_mode=False,
+):
+    return SimpleNamespace(
+        deterministic=SimpleNamespace(
+            rl_on_policy_target=rl_on_policy_target,
+            glm52_exact_mode=glm52_exact_mode,
+            qwen35_gdn_exact_mode=qwen35_gdn_exact_mode,
+        )
+    )
+
+
+def _exec_patch(**kwargs):
+    # RoPE reads the resolved RuntimeContext namespace, not legacy globals.
     return patch(
-        "sglang.srt.layers.rotary_embedding.base.get_global_server_args",
-        return_value=SimpleNamespace(rl_on_policy_target=None),
+        "sglang.srt.layers.rotary_embedding.base.get_exec",
+        return_value=_exec_config(**kwargs),
     )
 
 
 def _rope(max_positions: int = 128) -> RotaryEmbedding:
-    with _server_args_patch():
+    with _exec_patch():
         return RotaryEmbedding(
             head_size=64,
             rotary_dim=64,
@@ -46,35 +60,23 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
         # trainers.
         rope = _rope(128)
         cases = (
-            (SimpleNamespace(glm52_exact_mode=True, rl_on_policy_target="xorl"), None),
+            ({"glm52_exact_mode": True, "rl_on_policy_target": "xorl"}, None),
             (
-                SimpleNamespace(qwen35_gdn_exact_mode=True, rl_on_policy_target="xorl"),
+                {"qwen35_gdn_exact_mode": True, "rl_on_policy_target": "xorl"},
                 torch.device("cpu"),
             ),
-            (
-                SimpleNamespace(
-                    rl_on_policy_target="another-trainer",
-                    enable_deterministic_inference=True,
-                ),
-                torch.device("cpu"),
-            ),
+            ({"rl_on_policy_target": "another-trainer"}, torch.device("cpu")),
         )
-        for server_args, expected in cases:
+        for exec_config, expected in cases:
             with (
-                self.subTest(server_args=server_args),
-                patch(
-                    "sglang.srt.layers.rotary_embedding.base.get_global_server_args",
-                    return_value=server_args,
-                ),
+                self.subTest(exec_config=exec_config),
+                _exec_patch(**exec_config),
             ):
                 self.assertEqual(rope._cos_sin_cache_device(), expected)
 
     def test_glm_inv_freq_is_cpu_computed_then_moved(self):
         rope = _rope(128)
-        with patch(
-            "sglang.srt.layers.rotary_embedding.base.get_global_server_args",
-            return_value=SimpleNamespace(glm52_exact_mode=True),
-        ):
+        with _exec_patch(rl_on_policy_target="xorl", glm52_exact_mode=True):
             inv_freq = rope._cos_sin_cache_inv_freq()
         expected = 1.0 / (
             10000 ** (torch.arange(0, 64, 2, dtype=torch.float, device="cpu") / 64)
@@ -85,11 +87,20 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
     def test_application_class_is_per_architecture(self):
         from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 
-        # RL targets apply rotation through the compiled Class-B expression;
+        # GLM applies rotation through the compiled Class-B expression;
         # Qwen3.5-family exact serving stays on the eager Class-A expression.
-        with patch(
-            "sglang.srt.layers.rotary_embedding.base.get_global_server_args",
-            return_value=SimpleNamespace(rl_on_policy_target="xorl"),
+        compiled_apply = object()
+        with (
+            _exec_patch(rl_on_policy_target="xorl", glm52_exact_mode=True),
+            patch(
+                "sglang.srt.layers.rotary_embedding.base.torch.compile",
+                return_value=lambda fn: compiled_apply,
+            ) as compile_mock,
+            patch.object(
+                RotaryEmbedding,
+                "_cos_sin_cache_out_device",
+                return_value=torch.device("cpu"),
+            ),
         ):
             compiled_rope = RotaryEmbedding(
                 head_size=64,
@@ -99,11 +110,19 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
                 is_neox_style=True,
                 dtype=torch.float32,
             )
-        self.assertIsNot(compiled_rope._apply_rotary_emb_wrapped, apply_rotary_emb)
-        with patch(
-            "sglang.srt.layers.rotary_embedding.base.get_global_server_args",
-            return_value=SimpleNamespace(
+        compile_mock.assert_called_once()
+        self.assertIs(compiled_rope._apply_rotary_emb_wrapped, compiled_apply)
+        with (
+            _exec_patch(
                 rl_on_policy_target="xorl", qwen35_gdn_exact_mode=True
+            ),
+            patch(
+                "sglang.srt.layers.rotary_embedding.base.torch.compile"
+            ) as compile_mock,
+            patch.object(
+                RotaryEmbedding,
+                "_cos_sin_cache_out_device",
+                return_value=torch.device("cpu"),
             ),
         ):
             eager_rope = RotaryEmbedding(
@@ -114,11 +133,12 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
                 is_neox_style=True,
                 dtype=torch.float32,
             )
+        compile_mock.assert_not_called()
         self.assertIs(eager_rope._apply_rotary_emb_wrapped, apply_rotary_emb)
 
     def test_default_path_still_grows_incrementally(self):
         rope = _rope(128)
-        with _server_args_patch():
+        with _exec_patch():
             rope._ensure_cos_sin_cache_length(4096)
         self.assertGreater(int(rope.cos_sin_cache.shape[0]), 4096)
 
@@ -140,6 +160,7 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
         server_args = SimpleNamespace(
             context_length=8192,
             rl_on_policy_target="xorl",
+            glm52_exact_mode=True,
             speculative_num_steps=0,
             speculative_num_draft_tokens=0,
         )
@@ -152,17 +173,18 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
             reserve_rope_cache_for_long_sequences(model, server_args, model_config)
 
     def test_startup_reserve_marks_and_passes_when_the_cache_covers_context(self):
-        model = _Host(_rope(65536))
+        model = _Host(_rope(8192))
         server_args = SimpleNamespace(
             context_length=8192,
             rl_on_policy_target="xorl",
+            glm52_exact_mode=True,
             speculative_num_steps=0,
             speculative_num_draft_tokens=0,
         )
         model_config = SimpleNamespace(
             context_len=8192,
             hf_config=SimpleNamespace(indexer_types=("full",)),
-            hf_text_config=SimpleNamespace(max_position_embeddings=65536),
+            hf_text_config=SimpleNamespace(max_position_embeddings=8192),
         )
         before = model.rope.cos_sin_cache.clone()
         reserve_rope_cache_for_long_sequences(model, server_args, model_config)
@@ -174,6 +196,7 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
         server_args = SimpleNamespace(
             context_length=8192,
             rl_on_policy_target=None,
+            glm52_exact_mode=False,
             speculative_num_steps=0,
             speculative_num_draft_tokens=0,
         )
@@ -182,7 +205,7 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
             hf_config=SimpleNamespace(indexer_types=None),
             hf_text_config=SimpleNamespace(max_position_embeddings=128),
         )
-        with _server_args_patch():
+        with _exec_patch():
             reserve_rope_cache_for_long_sequences(model, server_args, model_config)
         self.assertGreater(int(model.rope.cos_sin_cache.shape[0]), 8192)
 

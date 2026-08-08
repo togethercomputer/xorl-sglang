@@ -437,12 +437,14 @@ struct FusedKNormRopeFlashMLAKernel {
 struct FusedQIndexerRopeHadamardQuantParams {
   const void* __restrict__ q_input;  // (B, num_heads, 128) DType
   void* __restrict__ q_fp8;          // (B, num_heads, 128) fp8_e4m3
-  // weights_out[b, h] = weight[b, h] * weight_scale * q_scale[b, h].
-  // q_scale is computed internally and not exposed -- the only consumer of
-  // it is `weights_out`.
+  // Generic V4: weights_out = weight * weight_scale * q_scale.
+  // V3.2/GLM: weights_out = ((weight * weight_scale) * q_scale) * post_scale,
+  // preserving the unfused head-scale/query-scale/softmax-scale order.
+  // q_scale is computed internally and not exposed.
   const void* __restrict__ weight;  // (B, num_heads) DType
   float* __restrict__ weights_out;  // (B, num_heads) fp32 (== (B, H, 1) flat)
-  float weight_scale;               // scalar c4_indexer.weight_scale
+  float weight_scale;
+  float post_scale;
   // Template-dependent layout:
   //   kRopeFirst=false: (max_pos, 64) fp32 interleaved [cos0, sin0, ...]
   //   kRopeFirst=true : (max_pos, 64) fp32 halves [cos..., sin...]
@@ -454,7 +456,13 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <
+    typename DType,
+    typename PosT,
+    bool kUsePDL,
+    bool kRopeFirst = false,
+    bool kHadamard = true,
+    bool kUE8M0QueryCodec = false>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
   using namespace device;
 
@@ -565,6 +573,15 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
       data[i] *= kHadamardScale;
   }
 
+  // The V3.2/GLM unfused path writes RoPE back to a BF16 query tensor before
+  // act_quant consumes it. Preserve that rounding boundary in the fused
+  // specialization; otherwise decode scores a different query from prefill.
+  if constexpr (kUE8M0QueryCodec) {
+#pragma unroll
+    for (int i = 0; i < kVecSize; ++i)
+      data[i] = cast<float>(cast<DType>(data[i]));
+  }
+
   {
     float local_max = math::abs(data[0]);
 #pragma unroll
@@ -572,8 +589,17 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
       local_max = math::max(local_max, math::abs(data[i]));
     }
     const auto abs_max = warp::reduce_max(local_max);
-    const auto scale = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
-    const auto inv_scale = 1.0f / scale;
+    const auto scale_raw = fmaxf(1e-4f, abs_max) / math::FP8_E4M3_MAX;
+    float scale;
+    float inv_scale;
+    if constexpr (kUE8M0QueryCodec) {
+      const auto scale_ue8m0 = cast_to_ue8m0(scale_raw);
+      scale = __uint_as_float(static_cast<uint32_t>(scale_ue8m0) << 23);
+      inv_scale = inv_scale_ue8m0(scale_ue8m0);
+    } else {
+      scale = scale_raw;
+      inv_scale = 1.0f / scale;
+    }
     OutStorage result;
     result[0] = pack_fp8(data[0] * inv_scale, data[1] * inv_scale);
     result[1] = pack_fp8(data[2] * inv_scale, data[3] * inv_scale);
@@ -581,14 +607,21 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     // q_fp8 row pointer: 128 fp8 / row = 32 OutStorage / row, one per lane.
     auto out_row = static_cast<uint8_t*>(params.q_fp8) + work_id * kHeadDim;
     result.store(out_row, lane_id);
-    params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    if constexpr (kUE8M0QueryCodec) {
+      auto scaled_weight = __fmul_rn(weight_val, params.weight_scale);
+      scaled_weight = __fmul_rn(scaled_weight, scale);
+      params.weights_out[work_id] = __fmul_rn(scaled_weight, params.post_scale);
+    } else {
+      params.weights_out[work_id] = weight_val * params.weight_scale * scale;
+    }
   }
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true, bool kUE8M0QueryCodec = false>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
+  static constexpr auto kernel =
+      fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kUE8M0QueryCodec>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -596,6 +629,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView weights_out,
       double weight_scale,
+      double post_scale,
       const tvm::ffi::TensorView rope_cache,
       const tvm::ffi::TensorView positions) {
     using namespace host;
@@ -661,6 +695,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
         .weight = weight.data_ptr(),
         .weights_out = static_cast<float*>(weights_out.data_ptr()),
         .weight_scale = static_cast<float>(weight_scale),
+        .post_scale = static_cast<float>(post_scale),
         .rope_cache = static_cast<const float*>(rope_cache.data_ptr()),
         .positions = positions.data_ptr(),
         .weight_stride_batch = weight.stride(0),

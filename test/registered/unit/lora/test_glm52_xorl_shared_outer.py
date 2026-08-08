@@ -19,6 +19,7 @@ from sglang.srt.lora.glm52 import (
     GLM52_REQUIRED_TARGET_MODULES,
     Glm52XorlSharedOuterValidator,
     build_glm52_xorl_shared_outer_inventory,
+    maybe_create_glm52_validator,
     summarize_glm52_factor_roles,
 )
 from sglang.srt.lora.lora import LoRAAdapter
@@ -531,6 +532,81 @@ def _adapter_config():
     }
 
 
+def _exact_adapter_config():
+    adapter_config = _adapter_config()
+    adapter_config.update(
+        r=1,
+        lora_alpha=1,
+        lora_dropout=0.0,
+        fan_in_fan_out=False,
+        use_dora=False,
+        use_rslora=False,
+        alpha_pattern={},
+        rank_pattern={},
+    )
+    return adapter_config
+
+
+def _exact_official_config():
+    config = _official_config()
+    config._glm52_exact_mode = True
+    return config
+
+
+def test_exact_inventory_accepts_only_the_rank_one_alpha_one_factor_program():
+    specs = build_glm52_xorl_shared_outer_inventory(
+        _exact_official_config(), _exact_adapter_config()
+    )
+
+    assert len(specs) == GLM52_LOGICAL_FACTOR_COUNT
+    assert all(1 in spec.export_shape for spec in specs)
+
+
+@pytest.mark.parametrize("lora_format", (None, "ordinary", "per_expert"))
+def test_exact_mode_rejects_every_non_shared_outer_adapter_format(lora_format):
+    adapter_config = _exact_adapter_config()
+    if lora_format is None:
+        adapter_config.pop("_sglang_lora_format")
+    else:
+        adapter_config["_sglang_lora_format"] = lora_format
+
+    with pytest.raises(ValueError, match="requires _sglang_lora_format"):
+        maybe_create_glm52_validator(_exact_official_config(), adapter_config)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (
+        ("r", 2),
+        ("lora_alpha", 2),
+        ("lora_dropout", 0.1),
+        ("bias", "all"),
+        ("fan_in_fan_out", True),
+        ("use_dora", True),
+        ("use_rslora", True),
+        ("alpha_pattern", {"lm_head": 2}),
+        ("rank_pattern", {"lm_head": 2}),
+    ),
+)
+def test_exact_inventory_rejects_adapter_program_variants(name, value):
+    adapter_config = _exact_adapter_config()
+    adapter_config[name] = value
+
+    with pytest.raises(ValueError, match="exact GLM-5.2 XORL active-LoRA"):
+        build_glm52_xorl_shared_outer_inventory(
+            _exact_official_config(), adapter_config
+        )
+
+
+def test_functional_shared_outer_inventory_still_accepts_rank_two():
+    specs = build_glm52_xorl_shared_outer_inventory(
+        _official_config(), _adapter_config()
+    )
+
+    assert len(specs) == GLM52_LOGICAL_FACTOR_COUNT
+    assert any(2 in spec.export_shape for spec in specs)
+
+
 def test_inventory_has_exact_1700_raw_xorl_keys_and_role_counts():
     specs = build_glm52_xorl_shared_outer_inventory(
         _official_config(), _adapter_config()
@@ -849,6 +925,7 @@ def test_unique_generation_activation_graph_selection_and_unload_are_ordinary():
     manager = object.__new__(LoRAManager)
     native_fp8_base = object()
     manager.base_model = native_fp8_base
+    manager.base_hf_config = SimpleNamespace(_glm52_exact_mode=False)
     manager.max_loras_per_batch = 3
     manager.max_bs_in_cuda_graph = 4
     manager.memory_pool = _MemoryPool()
@@ -893,6 +970,89 @@ def test_unique_generation_activation_graph_selection_and_unload_are_ordinary():
     assert notified == [{1}]
     assert set(result.loaded_adapters) == {"generation-7"}
     assert manager.base_model is native_fp8_base
+
+
+def _exact_batch_manager():
+    manager = object.__new__(LoRAManager)
+    manager.base_hf_config = _exact_official_config()
+    manager.base_model = SimpleNamespace(num_fused_shared_experts=0)
+    manager.max_loras_per_batch = 3
+    manager.max_bs_in_cuda_graph = 16
+    manager.memory_pool = _MemoryPool()
+    manager.lora_backend = _Backend()
+    manager.loras = {
+        "generation-6": SimpleNamespace(
+            config=SimpleNamespace(r=1),
+            scaling=1.0,
+            _glm52_exact_adapter_certified=True,
+        )
+    }
+    manager.can_use_prefill_cuda_graph = lambda _batch: False
+    return manager
+
+
+def test_exact_batch_requires_one_resident_certified_rank_one_adapter(monkeypatch):
+    manager = _exact_batch_manager()
+    monkeypatch.setattr(
+        "sglang.srt.lora.lora_manager.get_is_capture_mode", lambda: False
+    )
+
+    active = SimpleNamespace(
+        batch_size=1,
+        forward_mode=_ForwardMode(True),
+        lora_ids=["generation-6"],
+    )
+    manager.prepare_lora_batch(active)
+    assert manager.lora_backend._glm52_exact_batch_certified is True
+    assert manager.lora_backend.calls[-1]["weight_indices"] == [1]
+    assert manager.lora_backend.calls[-1]["lora_ranks"] == [0, 1, 0]
+    assert manager.lora_backend.calls[-1]["scalings"] == [0, 1.0, 0]
+
+    for lora_ids, error in (
+        (["missing"], "missing or nonresident"),
+        (["generation-6", "generation-6"], "exactly one logical request"),
+        ([None, "generation-6"], "exactly one logical request"),
+    ):
+        with pytest.raises(RuntimeError, match=error):
+            manager.prepare_lora_batch(
+                SimpleNamespace(
+                    batch_size=len(lora_ids),
+                    forward_mode=_ForwardMode(True),
+                    lora_ids=lora_ids,
+                )
+            )
+        assert manager.lora_backend._glm52_exact_batch_certified is False
+
+    manager.loras["generation-6"]._glm52_exact_adapter_certified = False
+    with pytest.raises(RuntimeError, match="complete 1,700-factor inventory"):
+        manager.prepare_lora_batch(active)
+
+
+def test_exact_batch_allows_only_all_base_placeholders_during_graph_capture(
+    monkeypatch,
+):
+    manager = _exact_batch_manager()
+    monkeypatch.setattr(
+        "sglang.srt.lora.lora_manager.get_is_capture_mode", lambda: True
+    )
+
+    capture = SimpleNamespace(
+        batch_size=16,
+        forward_mode=_ForwardMode(True),
+        lora_ids=[None] * 16,
+    )
+    manager.prepare_lora_batch(capture)
+    assert manager.lora_backend._glm52_exact_batch_certified is True
+    assert manager.lora_backend.calls[-1]["weight_indices"] == [0] * 16
+
+    with pytest.raises(RuntimeError, match="synthetic base-slot placeholders"):
+        manager.prepare_lora_batch(
+            SimpleNamespace(
+                batch_size=16,
+                forward_mode=_ForwardMode(True),
+                lora_ids=[None] * 15 + ["generation-6"],
+            )
+        )
 
 
 def test_post_load_launch_contract_selects_shared_outer_triton_pool():
@@ -955,6 +1115,12 @@ def test_post_load_launch_contract_selects_shared_outer_triton_pool():
 
     manager.base_model.num_fused_shared_experts = 0
     manager._validate_glm52_runtime_layout(lora_config)
+
+    manager.base_hf_config = _exact_official_config()
+    ordinary_config = _exact_adapter_config()
+    ordinary_config.pop("_sglang_lora_format")
+    with pytest.raises(ValueError, match="ordinary or missing adapter formats"):
+        manager._validate_glm52_runtime_layout(LoRAConfig.from_dict(ordinary_config))
 
 
 def test_glm_model_declares_only_the_supported_complete_runtime_targets():

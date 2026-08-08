@@ -52,6 +52,7 @@ _EXEC_SUBS = (
     "mamba",
     "overlap",
     "offload",
+    "weights",
     "dllm",
     "deterministic",
     "features",

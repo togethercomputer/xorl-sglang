@@ -647,6 +647,25 @@ async def validate_json_request(raw_request: Request):
 ##### Native API endpoints #####
 
 
+def _health_generate_sampling_params(server_args) -> Dict[str, Union[int, float]]:
+    """Return a health request that is valid for the selected sampler contract."""
+    if getattr(server_args, "glm52_exact_mode", False):
+        random_seed = getattr(server_args, "random_seed", None)
+        return {
+            "max_new_tokens": 1,
+            "min_new_tokens": 0,
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "top_k": -1,
+            "min_p": 0.0,
+            "frequency_penalty": 0.0,
+            "presence_penalty": 0.0,
+            "repetition_penalty": 1.0,
+            "sampling_seed": 42 if random_seed is None else int(random_seed),
+        }
+    return {"max_new_tokens": 1, "temperature": 0.0}
+
+
 @app.get("/health")
 @app.get("/health_generate")
 async def health_generate(request: Request) -> Response:
@@ -670,7 +689,9 @@ async def health_generate(request: Request) -> Response:
     ):
         return Response(status_code=200)
 
-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
+    sampling_params = _health_generate_sampling_params(
+        _global_state.tokenizer_manager.server_args
+    )
     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
     # collide and crash the shared DetokenizerManager decode_status).
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"

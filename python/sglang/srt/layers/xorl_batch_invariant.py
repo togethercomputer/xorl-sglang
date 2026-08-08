@@ -139,6 +139,106 @@ def validate_xorl_bi_logit_transforms(
         )
 
 
+def _apply_xorl_exact_lora_lm_head(
+    hidden_states: torch.Tensor,
+    lm_head: Any,
+    base_logits: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the literal rank-one Triton LoRA head to exact FP32 base logits.
+
+    ``ParallelLMHeadWithLoRA.apply_lora`` is the serving implementation: its A
+    kernel accumulates in FP32 and stores BF16, then its B kernel rounds the
+    delta to BF16 before adding it to this FP32 base-logit buffer.  Keeping the
+    operation here makes the exact GLM path own the base head while reusing the
+    real adapter buffers, batch metadata, kernels, scaling, and in-place add.
+    """
+
+    from sglang.srt.lora.layers import ParallelLMHeadWithLoRA  # noqa: PLC0415
+
+    if not isinstance(lm_head, ParallelLMHeadWithLoRA):
+        if hasattr(lm_head, "set_lora") or hasattr(lm_head, "apply_lora"):
+            raise RuntimeError(
+                "The XORL exact active-LoRA LM-head contract accepts only the "
+                "real ParallelLMHeadWithLoRA wrapper."
+            )
+        return base_logits
+
+    backend = getattr(lm_head, "lora_backend", None)
+    if getattr(backend, "name", None) != "triton":
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires the Triton "
+            "LoRA backend."
+        )
+    lora_active = getattr(lm_head, "lora_active", None)
+    if not isinstance(lora_active, bool):
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires a boolean "
+            "lora_active state from ParallelLMHeadWithLoRA."
+        )
+    if not lora_active:
+        return base_logits
+    if getattr(backend, "_glm52_exact_batch_certified", False) is not True:
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires a certified "
+            "one-request GLM-5.2 batch."
+        )
+    if getattr(lm_head, "set_lora", None) is not True:
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires installed "
+            "LoRA buffers for an active request."
+        )
+    if getattr(backend, "batch_info", None) is None:
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires prepared "
+            "per-request LoRA batch metadata."
+        )
+
+    a_buffer = getattr(lm_head, "lm_head_A_buffer", None)
+    b_buffer = getattr(lm_head, "lm_head_B_buffer", None)
+    if not isinstance(a_buffer, torch.Tensor) or not isinstance(b_buffer, torch.Tensor):
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires live A/B "
+            "memory-pool tensors."
+        )
+    if a_buffer.dtype != torch.bfloat16 or b_buffer.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires BF16 A/B "
+            f"buffers, got {a_buffer.dtype} and {b_buffer.dtype}."
+        )
+    expected_a_tail = (1, hidden_states.shape[-1])
+    expected_b_tail = (lm_head.weight.shape[0], 1)
+    if (
+        a_buffer.ndim != 3
+        or tuple(a_buffer.shape[-2:]) != expected_a_tail
+        or b_buffer.ndim != 3
+        or tuple(b_buffer.shape[-2:]) != expected_b_tail
+        or a_buffer.shape[0] != b_buffer.shape[0]
+    ):
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires rank-one "
+            "physical buffers [slots,1,hidden] and [slots,local_vocab,1], got "
+            f"A={tuple(a_buffer.shape)} and B={tuple(b_buffer.shape)}."
+        )
+    if not a_buffer.is_contiguous() or not b_buffer.is_contiguous():
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires contiguous "
+            "physical A/B buffers."
+        )
+
+    result = lm_head.apply_lora(base_logits, hidden_states)
+    if (
+        result is not base_logits
+        or result.dtype != torch.float32
+        or tuple(result.shape) != tuple(base_logits.shape)
+        or not result.is_contiguous()
+    ):
+        raise RuntimeError(
+            "The XORL exact active-LoRA LM-head contract requires the literal "
+            "B kernel to update the contiguous FP32 base-logit buffer in place."
+        )
+    return result
+
+
 def xorl_bi_lm_head(
     hidden_states: torch.Tensor,
     lm_head: Any,
@@ -157,10 +257,6 @@ def xorl_bi_lm_head(
         raise RuntimeError(
             "The XORL batch-invariant LM-head contract does not support an embedding bias."
         )
-    if hasattr(lm_head, "set_lora") or hasattr(lm_head, "apply_lora"):
-        raise RuntimeError(
-            "The XORL batch-invariant LM-head contract does not support a LoRA-wrapped head."
-        )
     if not hasattr(lm_head, "weight"):
         raise RuntimeError(
             "The XORL batch-invariant LM-head contract requires a dense BF16 weight."
@@ -170,12 +266,25 @@ def xorl_bi_lm_head(
             "The XORL batch-invariant LM-head contract requires BF16 hidden states "
             f"and BF16 weights, got {hidden_states.dtype} and {lm_head.weight.dtype}."
         )
+    if not lm_head.weight.is_contiguous():
+        raise RuntimeError(
+            "The XORL batch-invariant LM-head contract requires a contiguous BF16 weight."
+        )
+    hidden_states = hidden_states.contiguous()
     family = resolve_or_validate_xorl_bi_family(family)
     if family == "v2":
         logits, _ = head_v2_full_logits_with_lse(hidden_states, lm_head.weight)
-        return logits
-    logits = bi_lm_head_full_logits(hidden_states, lm_head.weight)
-    return logits
+    else:
+        logits = bi_lm_head_full_logits(hidden_states, lm_head.weight)
+    if (
+        logits.dtype != torch.float32
+        or tuple(logits.shape) != (hidden_states.shape[0], lm_head.weight.shape[0])
+        or not logits.is_contiguous()
+    ):
+        raise RuntimeError(
+            "The XORL batch-invariant LM-head kernel returned an invalid local FP32 buffer."
+        )
+    return _apply_xorl_exact_lora_lm_head(hidden_states, lm_head, logits)
 
 
 def xorl_bi_sample_and_score(
@@ -224,12 +333,14 @@ def xorl_bi_sample_and_score(
             "The XORL batch-invariant sampler does not support custom logit processors."
         )
     if (
-        sampling_info.acc_linear_penalties is not None
+        sampling_info.acc_additive_penalties is not None
+        or sampling_info.acc_scaling_penalties is not None
         or (
             sampling_info.penalizer_orchestrator is not None
             and sampling_info.penalizer_orchestrator.is_required
         )
-        or sampling_info.vocab_mask is not None
+        or sampling_info.grammars
+        or sampling_info.grammar_mask is not None
         or sampling_info.logit_bias is not None
     ):
         raise RuntimeError(

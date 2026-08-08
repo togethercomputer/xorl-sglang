@@ -212,15 +212,8 @@ class TestGlm52ExactOwnerDispatch(CustomTestCase):
         quantized_head.assert_not_called()
         generic_matmul.assert_not_called()
 
-    def test_exact_lm_head_fails_closed_on_lora_scale_and_softcap(self):
-        """Unsupported post-head transforms and LM-head LoRA cannot fall back."""
-        processor, _, _ = self._make_logits_processor(True)
-        hidden_states = torch.zeros((1, 16), dtype=torch.bfloat16)
-        lm_head = MagicMock(spec=["set_lora", "apply_lora", "weight"])
-        lm_head.weight = torch.zeros((32, 16), dtype=torch.bfloat16)
-        with self.assertRaisesRegex(RuntimeError, "LoRA-wrapped"):
-            processor._compute_lm_head(hidden_states, lm_head)
-
+    def test_exact_lm_head_fails_closed_on_scale_and_softcap(self):
+        """Unsupported post-head transforms cannot bypass exact dispatch."""
         for kwargs, message in (
             ({"logit_scale": 0.5}, "does not support logit_scale"),
             (

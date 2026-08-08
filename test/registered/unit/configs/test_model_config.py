@@ -1,12 +1,15 @@
-"""Unit tests for hybrid attention model configuration."""
+"""Unit tests for model configuration."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.configs.model_config import (
+    ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -50,6 +53,46 @@ class TestEmbeddingGemmaConfig(CustomTestCase):
             model_type="gemma3_text", use_bidirectional_attention=False
         )
         self.assertFalse(is_embedding_gemma(config))
+
+
+class TestExactRuntimeContractConfig(CustomTestCase):
+    def test_fresh_runner_config_carries_the_resolved_glm52_target_contract(self):
+        build_from_server_args = ModelConfig.from_server_args
+
+        for exact_mode, is_draft_model, expected in (
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ):
+            with self.subTest(
+                exact_mode=exact_mode,
+                is_draft_model=is_draft_model,
+            ):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.glm52_exact_mode = exact_mode
+                runner_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(),
+                    hf_text_config=SimpleNamespace(),
+                )
+
+                with patch(
+                    "sglang.srt.configs.model_config.ModelConfig",
+                    return_value=runner_config,
+                ):
+                    result = build_from_server_args(
+                        server_args,
+                        is_draft_model=is_draft_model,
+                    )
+
+                self.assertIs(result, runner_config)
+                self.assertEqual(
+                    result.hf_config._glm52_exact_mode,
+                    expected,
+                )
+                self.assertEqual(
+                    result.hf_text_config._glm52_exact_mode,
+                    expected,
+                )
 
 
 if __name__ == "__main__":

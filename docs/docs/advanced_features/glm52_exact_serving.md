@@ -12,8 +12,14 @@ provenance, norm/head kernels, and canonical transport.
 
 The current serving envelope is one 16-rank replica across two 8-GPU nodes,
 CUDA graph bucket `[16]`, global admission 16, radix disabled, overlap disabled,
-and the official 78-block geometry (3 dense plus 75 MoE). Requests outside the
-prebuilt RoPE capacity fail rather than rebuilding the table through an
+and the official 78-block geometry (3 dense plus 75 MoE). It requires the
+official blockwise FP8 checkpoint layout (dynamic activations, 128-by-128
+weight blocks, and the published BF16 exclusion set), BF16 KV with 64-token
+pages, and rank-1 LoRA buffer capacity. The token envelope is 8,192 total and
+prefill tokens, one prefill request, and 16 running requests at a static-memory
+fraction of 0.82. Two-batch and single-batch overlap, alternate expert
+placement, and runtime FP8 exclusion overrides are rejected. Requests outside
+the prebuilt RoPE capacity fail rather than rebuilding the table through an
 unqualified growth path. Incompatible geometry, topology, precision, backend,
 graph/cache setting, or sampling transform fails before returning behavior
 logprobs.
