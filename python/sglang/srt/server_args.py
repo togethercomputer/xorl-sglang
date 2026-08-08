@@ -2443,6 +2443,11 @@ class ServerArgs:
         "The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         NS("exec.moe"),
     ] = None
+    enable_rdma_weight_updates: A[
+        bool,
+        "Initialize Mooncake for XoRL one-sided online weight updates.",
+        NS("exec.weights"),
+    ] = False
     enable_waterfill: A[
         bool,
         "Enable Waterfill: dispatch the fused shared expert as an extra routed expert slot to the least-loaded EP rank. Supports DeepEP and MegaMOE MoE A2A backends, implicitly enables shared-expert fusion, and supports --deepep-mode auto, normal, or low_latency when used with DeepEP. Use auto or low_latency for production DeepEP decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 with EP >= 2.",

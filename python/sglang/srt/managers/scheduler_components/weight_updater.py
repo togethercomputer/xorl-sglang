@@ -6,7 +6,7 @@ import time
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
 import msgspec
 import torch
@@ -156,10 +156,52 @@ class SchedulerWeightUpdaterManager:
 
     def prepare_weights_update(self, recv_req: PrepareWeightsUpdateReqInput):
         """Arm the receiver half of a two-phase distributed update."""
-        success, message = self.tp_worker.prepare_weights_update(recv_req)
+        result = self.tp_worker.prepare_weights_update(recv_req)
+        tensor_map_entries = None
+        session_id = None
+        if recv_req.transport == "p2p":
+            success, message, tensor_map_entries, session_id = result
+        else:
+            success, message = result
         if not success:
             logger.error(message)
-        return PrepareWeightsUpdateReqOutput(success=success, message=message)
+
+        tensor_map = None
+        receiver_infos = None
+        if recv_req.transport == "p2p" and success:
+            tensor_map = {"_per_rank": [tensor_map_entries]}
+            from sglang.srt.distributed import get_world_group
+
+            world_group = get_world_group()
+            world_size = world_group.world_size
+            if world_size > 1:
+                gathered_sids: List[Optional[str]] = [None] * world_size
+                try:
+                    torch.distributed.all_gather_object(
+                        gathered_sids, session_id, group=world_group.cpu_group
+                    )
+                    receiver_infos = [
+                        {"world_rank": rank, "session_id": sid}
+                        for rank, sid in enumerate(gathered_sids)
+                        if sid
+                    ]
+                except Exception as exc:
+                    logger.error(
+                        "[P2P] all_gather_object on session ids failed: %s", exc
+                    )
+                    receiver_infos = [
+                        {"world_rank": world_group.rank, "session_id": session_id}
+                    ]
+            else:
+                receiver_infos = [{"world_rank": 0, "session_id": session_id}]
+
+        return PrepareWeightsUpdateReqOutput(
+            success=success,
+            message=message,
+            tensor_map=tensor_map,
+            receiver_transfer_engine_infos=receiver_infos,
+            session_id=session_id,
+        )
 
     def complete_weights_update(self, recv_req: CompleteWeightsUpdateReqInput):
         """Apply weights received by a prior prepare call."""

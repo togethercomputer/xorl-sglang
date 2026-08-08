@@ -137,15 +137,31 @@ class MooncakeTransferEngine:
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
 
-    def register(self, ptr, length):
+    def _register_memory(
+        self, ptr: int, length: int, location: Optional[str] = None
+    ) -> int:
+        if location:
+            try:
+                return self.engine.register_memory(ptr, length, location)
+            except TypeError:
+                pass
+        return self.engine.register_memory(ptr, length)
+
+    def register(self, ptr, length, location: Optional[str] = None):
         try:
-            ret_value = self.engine.register_memory(ptr, length)
+            ret_value = self._register_memory(ptr, length, location)
         except Exception:
             # Mark register as failed
             ret_value = -1
 
         if ret_value != 0:
-            logger.debug("Mooncake memory registration %s failed.", ptr)
+            logger.debug(
+                "Mooncake memory registration %s length=%s location=%s failed.",
+                ptr,
+                length,
+                location or "<auto>",
+            )
+        return ret_value
 
     def deregister(self, ptr):
         try:
@@ -157,10 +173,28 @@ class MooncakeTransferEngine:
         if ret_value != 0:
             logger.debug("Mooncake memory deregistration %s failed.", ptr)
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
+    def _batch_register_memory(
+        self,
+        ptrs: List[int],
+        lengths: List[int],
+        location: Optional[str] = None,
+    ) -> int:
+        if location:
+            try:
+                return self.engine.batch_register_memory(ptrs, lengths, location)
+            except TypeError:
+                pass
+        return self.engine.batch_register_memory(ptrs, lengths)
+
+    def batch_register(
+        self,
+        ptrs: List[int],
+        lengths: List[int],
+        location: Optional[str] = None,
+    ) -> int:
         """Batch register multiple memory regions."""
         try:
-            ret_value = self.engine.batch_register_memory(ptrs, lengths)
+            ret_value = self._batch_register_memory(ptrs, lengths, location)
         except Exception:
             # Mark batch register as failed
             ret_value = -1
@@ -171,7 +205,10 @@ class MooncakeTransferEngine:
                 )
 
         if ret_value != 0:
-            logger.debug("Mooncake batch memory registration failed.")
+            logger.debug(
+                "Mooncake batch memory registration location=%s failed.",
+                location or "<auto>",
+            )
         return ret_value
 
     def batch_deregister(self, ptrs: List[int]) -> int:
@@ -329,6 +366,7 @@ def maybe_init_shared_mooncake_transfer_engine(
             server_args.language_only
             and server_args.encoder_transfer_backend == "mooncake"
         )
+        or server_args.enable_rdma_weight_updates
         or (
             server_args.enable_elastic_expert_backup
             and server_args.elastic_ep_backend is not None

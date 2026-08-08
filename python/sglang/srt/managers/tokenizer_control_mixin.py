@@ -476,7 +476,7 @@ class TokenizerControlMixin:
         self: TokenizerManager,
         obj: PrepareWeightsUpdateReqInput,
         request: Optional[fastapi.Request] = None,
-    ) -> Tuple[bool, str]:
+    ) -> PrepareWeightsUpdateReqOutput:
         self.auto_create_handle_loop()
         assert (
             self.server_args.dp_size == 1 or self.server_args.enable_dp_attention
@@ -490,7 +490,40 @@ class TokenizerControlMixin:
             success, message = FanOutCommunicator.merge_results(results)
             if not success:
                 self._weight_update_in_progress = False
-            return success, message
+
+            tensor_map = None
+            receiver_infos = None
+            if obj.transport == "p2p":
+                tensor_map = {}
+                receiver_infos = []
+                seen_receiver_infos = set()
+                for result in results:
+                    rank_entries = (
+                        (result.tensor_map or {}).get("_per_rank")
+                        if result.tensor_map
+                        else None
+                    )
+                    if rank_entries:
+                        for entry_list in rank_entries:
+                            for entry in entry_list or []:
+                                tensor_map.setdefault(entry["hf_name"], []).append(
+                                    entry
+                                )
+                    for info in result.receiver_transfer_engine_infos or []:
+                        key = (info.get("world_rank"), info.get("session_id"))
+                        if key not in seen_receiver_infos:
+                            seen_receiver_infos.add(key)
+                            receiver_infos.append(info)
+                tensor_map = tensor_map or None
+                receiver_infos = receiver_infos or None
+
+            return PrepareWeightsUpdateReqOutput(
+                success=success,
+                message=message,
+                tensor_map=tensor_map,
+                receiver_transfer_engine_infos=receiver_infos,
+                session_id=None,
+            )
         except Exception:
             self._weight_update_in_progress = False
             raise

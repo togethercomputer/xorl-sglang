@@ -157,6 +157,12 @@ class BaseTpWorker(ABC):
         return success, message
 
     def prepare_weights_update(self, recv_req: PrepareWeightsUpdateReqInput):
+        if recv_req.transport == "p2p":
+            return self.model_runner.weight_updater.prepare_weights_update_p2p(
+                group_name=recv_req.group_name,
+                return_tensor_map=recv_req.p2p_return_tensor_map,
+                invalidate_cache=recv_req.p2p_invalidate_cache,
+            )
         return self.model_runner.weight_updater.prepare_weights_update(
             buckets=recv_req.get_buckets(),
             group_name=recv_req.group_name,
@@ -165,6 +171,12 @@ class BaseTpWorker(ABC):
         )
 
     def complete_weights_update(self, recv_req: CompleteWeightsUpdateReqInput):
+        if recv_req.transport == "p2p":
+            return self.model_runner.weight_updater.complete_weights_update_p2p(
+                group_name=recv_req.group_name,
+                run_post_process_weights=recv_req.run_post_process_weights,
+                tied_weight_aliases=recv_req.p2p_tied_weight_aliases,
+            )
         return self.model_runner.weight_updater.complete_weights_update(
             recv_req.group_name
         )

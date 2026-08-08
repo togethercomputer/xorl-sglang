@@ -1719,6 +1719,9 @@ class PrepareWeightsUpdateReqInput(BaseReq, kw_only=True):
     group_name: str = "weight_update_group"
     load_format: Optional[str] = None
     transport: str = "nccl_broadcast"
+    sender_transfer_engine_info: Optional[Dict[str, Any]] = None
+    p2p_return_tensor_map: bool = True
+    p2p_invalidate_cache: bool = False
 
     def get_buckets(self) -> List[WeightBucket]:
         if self.buckets is not None:
@@ -1748,6 +1751,9 @@ class PrepareWeightsUpdateReqInput(BaseReq, kw_only=True):
 class PrepareWeightsUpdateReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    tensor_map: Optional[Dict[str, List[Dict[str, Any]]]] = None
+    receiver_transfer_engine_infos: Optional[List[Dict[str, Any]]] = None
+    session_id: Optional[str] = None
 
 
 class CompleteWeightsUpdateReqInput(BaseReq, kw_only=True):
@@ -1758,6 +1764,10 @@ class CompleteWeightsUpdateReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     torch_empty_cache: bool = False
     transport: str = "nccl_broadcast"
+    run_post_process_weights: bool = False
+    load_format: Optional[str] = None
+    session_id: Optional[str] = None
+    p2p_tied_weight_aliases: Optional[Dict[str, str]] = None
 
 
 class CompleteWeightsUpdateReqOutput(BaseReq, kw_only=True):

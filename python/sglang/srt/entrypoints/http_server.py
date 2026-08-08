@@ -1358,12 +1358,18 @@ async def prepare_weights_update(
     obj: Annotated[PrepareWeightsUpdateReqInput, Body()], request: Request
 ):
     """Arm a two-phase distributed-weight receiver before broadcast."""
-    success, message = await _global_state.tokenizer_manager.prepare_weights_update(
+    result = await _global_state.tokenizer_manager.prepare_weights_update(
         obj, request
     )
-    content = {"success": success, "message": message}
+    content = {"success": result.success, "message": result.message}
+    if obj.transport == "p2p":
+        content["tensor_map"] = result.tensor_map
+        content["receiver_transfer_engine_infos"] = (
+            result.receiver_transfer_engine_infos
+        )
+        content["session_id"] = result.session_id
     return ORJSONResponse(
-        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+        content, status_code=200 if result.success else HTTPStatus.BAD_REQUEST
     )
 
 

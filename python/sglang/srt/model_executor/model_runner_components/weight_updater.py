@@ -11,6 +11,9 @@ from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_executor.p2p_weight_update_receiver import (
+    P2PWeightUpdateReceiver,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -66,6 +69,44 @@ class WeightUpdater:
     _model_update_group: dict = field(default_factory=dict)
     _pending_weight_update_lock: Any = field(default_factory=threading.Lock)
     _pending_weight_update_state: dict[str, Any] = field(default_factory=dict)
+    _p2p_receiver: Any = field(default=None, compare=False)
+
+    def _get_p2p_receiver(self) -> P2PWeightUpdateReceiver:
+        receiver = self._p2p_receiver
+        if receiver is None:
+            receiver = P2PWeightUpdateReceiver(self.get_model_runner)
+            object.__setattr__(self, "_p2p_receiver", receiver)
+        return receiver
+
+    def prepare_weights_update_p2p(
+        self,
+        group_name: str,
+        *,
+        return_tensor_map: bool = True,
+        invalidate_cache: bool = False,
+    ):
+        self._assert_weight_cache_inactive("prepare_weights_update_p2p")
+        error = _unsupported_derived_weight_cache_error()
+        if error is not None:
+            return False, error, None, None
+        return self._get_p2p_receiver().prepare_weights_update_p2p(
+            group_name=group_name,
+            return_tensor_map=return_tensor_map,
+            invalidate_cache=invalidate_cache,
+        )
+
+    def complete_weights_update_p2p(
+        self,
+        group_name: str,
+        *,
+        run_post_process_weights: bool = False,
+        tied_weight_aliases: Optional[dict[str, str]] = None,
+    ) -> tuple[bool, str]:
+        return self._get_p2p_receiver().complete_weights_update_p2p(
+            group_name=group_name,
+            run_post_process_weights=run_post_process_weights,
+            tied_weight_aliases=tied_weight_aliases,
+        )
 
     def init_weights_update_group(
         self,
