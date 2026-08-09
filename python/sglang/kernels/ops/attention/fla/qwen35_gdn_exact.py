@@ -39,8 +39,8 @@ QWEN35_REQUIRED_BI_OPS = (
 
 # This tuple does not use the GLM numerical-family resolver. Its head/LSE,
 # router, ordered combine, and GDN kernels remain the qualified v1 program.
-# The explicit Qwen RMSNorm candidate may independently select the v2 tree so
-# the promotion A/B changes one numerical surface at a time.
+# Exact Qwen RMSNorm independently selects its qualified v2 tree; the remaining
+# head/LSE, router, ordered-combine, and GDN surfaces retain their v1 programs.
 
 _applied = False
 
@@ -53,7 +53,7 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
 
     is_moe = bool(server_args.qwen35_gdn_exact_is_moe)
     exact_graph = is_moe and not server_args.disable_cuda_graph
-    rmsnorm_family = getattr(server_args, "qwen35_rmsnorm_family", "v1")
+    rmsnorm_family = getattr(server_args, "qwen35_rmsnorm_family", "v2")
     if rmsnorm_family not in ("v1", "v2"):
         raise RuntimeError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
 

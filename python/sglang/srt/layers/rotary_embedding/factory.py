@@ -135,10 +135,9 @@ def get_rope(
         rope_scaling_args,
         dual_chunk_attention_args,
         dtype,
-        # The candidate installs a different application program on the shared
-        # module.  Keep it out of the qualified Class-A process cache so an A/B
-        # lifecycle in one interpreter cannot silently reuse the wrong path.
-        bool(getattr(get_exec().deterministic, "qwen35_rope_class_b_candidate", False)),
+        # Exact Qwen installs the architecture-selected Class-B application
+        # program on the shared module. Keep it isolated from generic entries.
+        bool(getattr(get_exec().deterministic, "qwen35_rope_class_b", False)),
     )
     cached = _get_live_rope_cache_entry(key)
     if cached is not None:

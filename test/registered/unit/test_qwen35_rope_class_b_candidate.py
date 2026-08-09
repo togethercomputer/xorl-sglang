@@ -7,22 +7,22 @@ import torch
 from sglang.srt.layers.rotary_embedding import base, mrope
 
 
-def _deterministic(*, candidate: bool) -> SimpleNamespace:
+def _deterministic() -> SimpleNamespace:
     return SimpleNamespace(
         rl_on_policy_target="xorl",
         glm52_exact_mode=False,
         qwen35_gdn_exact_mode=True,
-        qwen35_rope_class_b_candidate=candidate,
+        qwen35_rope_class_b=True,
     )
 
 
-def test_qwen35_class_b_candidate_keeps_cpu_fp32_table_provenance():
+def test_qwen35_class_b_keeps_cpu_fp32_table_provenance():
     with (
         patch.object(base, "_is_cuda", True),
         patch.object(
             base,
             "get_exec",
-            return_value=SimpleNamespace(deterministic=_deterministic(candidate=True)),
+            return_value=SimpleNamespace(deterministic=_deterministic()),
         ),
     ):
         rope = base.RotaryEmbedding(
@@ -45,13 +45,13 @@ def test_qwen35_class_b_candidate_keeps_cpu_fp32_table_provenance():
     assert torch.equal(rope.cos_sin_cache.cpu(), expected)
 
 
-def test_qwen35_class_b_candidate_rejects_multimodal_mrope_positions():
+def test_qwen35_class_b_rejects_multimodal_mrope_positions():
     rope = mrope.MRotaryEmbedding.__new__(mrope.MRotaryEmbedding)
     torch.nn.Module.__init__(rope)
     with patch.object(
         mrope,
         "get_exec",
-        return_value=SimpleNamespace(deterministic=_deterministic(candidate=True)),
+        return_value=SimpleNamespace(deterministic=_deterministic()),
     ):
         with pytest.raises(RuntimeError, match="does not support multimodal"):
             rope.forward_native(

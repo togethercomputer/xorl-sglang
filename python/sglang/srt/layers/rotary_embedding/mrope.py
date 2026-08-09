@@ -180,17 +180,17 @@ class MRotaryEmbedding(RotaryEmbedding):
         ), "save kv cache is not supported for MRotaryEmbedding."
         assert positions.ndim == 1 or positions.ndim == 2
 
-        class_b_candidate = bool(
+        class_b_enabled = bool(
             getattr(
                 get_exec().deterministic,
-                "qwen35_rope_class_b_candidate",
+                "qwen35_rope_class_b",
                 False,
             )
         )
-        if class_b_candidate and positions.ndim == 2:
+        if class_b_enabled and positions.ndim == 2:
             torch._assert_async(
                 (positions == positions[:1]).all(),
-                "Qwen3.5-family Class-B RoPE candidate does not support multimodal "
+                "Qwen3.5-family Class-B RoPE does not support multimodal "
                 "positions with distinct temporal/height/width axes",
             )
             positions = positions[0]
@@ -218,7 +218,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
         apply_rotary = (
-            self._apply_rotary_emb_wrapped if class_b_candidate else apply_rotary_emb
+            self._apply_rotary_emb_wrapped if class_b_enabled else apply_rotary_emb
         )
         query_rot = apply_rotary(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)

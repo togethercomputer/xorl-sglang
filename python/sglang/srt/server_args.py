@@ -445,8 +445,8 @@ def is_qwen35_gdn_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "qwen35_gdn_exact_mode", False))
 
 
-def is_qwen35_rope_class_b_candidate(server_args: ServerArgs) -> bool:
-    return bool(getattr(server_args, "qwen35_rope_class_b_candidate", False))
+def is_qwen35_rope_class_b(server_args: ServerArgs) -> bool:
+    return bool(getattr(server_args, "qwen35_rope_class_b", False))
 
 
 def _text_model_config(hf_config):
@@ -3417,26 +3417,12 @@ class ServerArgs:
     qwen35_gdn_exact_is_moe: A[bool, NS("exec.deterministic")] = dataclasses.field(
         init=False, default=False, repr=False
     )
-    qwen35_rope_class_b_candidate: A[
-        bool,
-        (
-            "Explicitly test Class-B RoPE in the exact Qwen3.5/Qwen3.6 XORL lane. "
-            "This is an unqualified A/B candidate; the default remains the certified "
-            "Class-A bi_fused_native program."
-        ),
-        NS("exec.deterministic"),
-    ] = False
-    qwen35_rmsnorm_family: A[
-        Literal["v1", "v2"],
-        Arg(
-            help=(
-                "Exact Qwen3.5/3.6 RMSNorm arithmetic. The qualified default is v1; "
-                "v2 is an opt-in candidate for zero-centered q/k, residual, and final norms."
-            ),
-            choices=["v1", "v2"],
-        ),
-        NS("exec.deterministic"),
-    ] = "v1"
+    qwen35_rope_class_b: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
+    )
+    qwen35_rmsnorm_family: A[Literal["v1", "v2"], NS("exec.deterministic")] = (
+        dataclasses.field(init=False, default="v1", repr=False)
+    )
 
     # -------------------------------------------------------------------------
     # KV canary
@@ -5718,26 +5704,16 @@ class ServerArgs:
         self.qwen35_gdn_exact_is_moe = (
             self.qwen35_gdn_exact_mode and model_arch in QWEN35_MOE_ARCHS
         )
-        if self.qwen35_rope_class_b_candidate and not self.qwen35_gdn_exact_mode:
-            raise ValueError(
-                "--qwen35-rope-class-b-candidate is supported only by the exact "
-                "Qwen3.5/Qwen3.6 XORL program"
-            )
+        self.qwen35_rope_class_b = self.qwen35_gdn_exact_mode
+        self.qwen35_rmsnorm_family = "v2" if self.qwen35_gdn_exact_mode else "v1"
         hf_config._qwen35_gdn_exact_mode = self.qwen35_gdn_exact_mode
         hf_config._qwen35_gdn_exact_is_moe = self.qwen35_gdn_exact_is_moe
-        hf_config._qwen35_rope_class_b_candidate = bool(
-            self.qwen35_rope_class_b_candidate
-        )
-        if not self.qwen35_gdn_exact_mode and self.qwen35_rmsnorm_family != "v1":
-            raise ValueError(
-                "--qwen35-rmsnorm-family v2 is supported only by the exact Qwen3.5/3.6 XORL target."
-            )
-        hf_config._qwen35_gdn_exact_mode = self.qwen35_gdn_exact_mode
-        hf_config._qwen35_gdn_exact_is_moe = self.qwen35_gdn_exact_is_moe
+        hf_config._qwen35_rope_class_b = self.qwen35_rope_class_b
         hf_config._qwen35_rmsnorm_family = self.qwen35_rmsnorm_family
         text_config = _text_model_config(hf_config)
         text_config._qwen35_gdn_exact_mode = self.qwen35_gdn_exact_mode
         text_config._qwen35_gdn_exact_is_moe = self.qwen35_gdn_exact_is_moe
+        text_config._qwen35_rope_class_b = self.qwen35_rope_class_b
         text_config._qwen35_rmsnorm_family = self.qwen35_rmsnorm_family
         self._validate_qwen35_gdn_exact_contract(hf_config)
         if not self.qwen35_gdn_exact_mode:
@@ -5757,12 +5733,10 @@ class ServerArgs:
             )
         self.dtype = "bfloat16"
         self.attention_backend = "fa4"
-        if self.qwen35_rope_class_b_candidate:
-            logger.info(
-                "Qwen3.5-family RoPE A/B candidate engaged: Class B compiled "
-                "fp32-chain application with the existing CPU-built fp32 table; "
-                "Class A remains the default"
-            )
+        logger.info(
+            "Qwen3.5-family exact numerics: Class-B RoPE with CPU-built fp32 "
+            "tables and compiled fp32-chain application; RMSNorm families-v2"
+        )
         if self.linear_attn_prefill_backend not in (None, "triton"):
             raise ValueError(
                 "The exact Qwen3.5-family XORL contract requires the triton "

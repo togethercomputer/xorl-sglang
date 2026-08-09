@@ -150,34 +150,32 @@ class RotaryEmbedding(BaseFusedOp):
         deterministic = get_exec().deterministic
         if deterministic.rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
-            # GLM-5.2 uses the compiled Class-B expression. Qwen3.5-family
-            # exact serving retains the eager Class-A program unless the
-            # explicit paired Class-B candidate is selected.
-            if (
-                not deterministic.qwen35_gdn_exact_mode
-                or getattr(deterministic, "qwen35_rope_class_b_candidate", False)
+            # Both GLM-5.2 and exact Qwen3.5-family serving use the compiled
+            # Class-B expression selected by their architecture contracts.
+            if not deterministic.qwen35_gdn_exact_mode or getattr(
+                deterministic, "qwen35_rope_class_b", False
             ):
                 self._apply_rotary_emb_wrapped = torch.compile(
                     dynamic=True,
                     disable=_is_npu,
                 )(apply_rotary_emb)
-        if getattr(deterministic, "qwen35_rope_class_b_candidate", False):
+        if getattr(deterministic, "qwen35_rope_class_b", False):
             if not deterministic.qwen35_gdn_exact_mode:
                 raise RuntimeError(
-                    "Qwen3.5-family Class-B RoPE candidate requires exact Qwen mode"
+                    "Qwen3.5-family Class-B RoPE requires exact Qwen mode"
                 )
             if not _is_cuda:
                 raise RuntimeError(
-                    "Qwen3.5-family Class-B RoPE candidate is qualified only on CUDA"
+                    "Qwen3.5-family Class-B RoPE is qualified only on CUDA"
                 )
             if dtype is not torch.bfloat16 or not is_neox_style:
                 raise RuntimeError(
-                    "Qwen3.5-family Class-B RoPE candidate requires BF16 and the "
+                    "Qwen3.5-family Class-B RoPE requires BF16 and the "
                     "Neox half-split feature layout"
                 )
             _pin_qwen35_class_b_compile_budget()
             logger.info(
-                "Qwen3.5-family Class-B RoPE candidate runtime engaged: "
+                "Qwen3.5-family Class-B RoPE runtime engaged: "
                 "CPU-built fp32 table + compiled fp32-chain application; "
                 "recompile_limit=%s accumulated_recompile_limit=%s "
                 "fail_on_recompile_limit_hit=%s",

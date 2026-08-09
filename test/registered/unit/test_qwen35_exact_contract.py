@@ -58,8 +58,11 @@ def test_qwen35_moe_plain_config_resolves_certified_topology():
 
     assert args.qwen35_gdn_exact_mode
     assert hf_config._qwen35_gdn_exact_mode
-    assert not args.qwen35_rope_class_b_candidate
-    assert not hf_config._qwen35_rope_class_b_candidate
+    assert args.qwen35_rope_class_b
+    assert hf_config._qwen35_rope_class_b
+    assert args.qwen35_rmsnorm_family == "v2"
+    assert hf_config._qwen35_rmsnorm_family == "v2"
+    assert hf_config.text_config._qwen35_rmsnorm_family == "v2"
     assert args.dtype == "bfloat16"
     assert args.attention_backend == "fa4"
     assert args.linear_attn_prefill_backend == "triton"
@@ -120,12 +123,11 @@ def test_qwen35_dense_resolves_only_the_certified_single_rank_topology():
 
 
 @pytest.mark.parametrize("moe", (False, True))
-def test_qwen35_rmsnorm_v2_is_an_explicit_exact_lane_candidate(moe):
+def test_qwen35_rmsnorm_v2_is_the_exact_lane_default(moe):
     hf_config = _qwen_config(moe=moe)
     args = _server_args(
         tp_size=8 if moe else 1,
         ep_size=1,
-        qwen35_rmsnorm_family="v2",
         disable_cuda_graph_padding=True,
     )
     args.cuda_graph_config = default_cuda_graph_config()
@@ -143,12 +145,12 @@ def test_qwen35_rmsnorm_v2_is_an_explicit_exact_lane_candidate(moe):
     assert hf_config.text_config._qwen35_rmsnorm_family == "v2"
 
 
-def test_non_qwen_rejects_qwen35_rmsnorm_v2():
-    args = _server_args(qwen35_rmsnorm_family="v2")
-    with pytest.raises(ValueError, match="supported only by the exact Qwen3.5/3.6"):
-        args._resolve_qwen35_gdn_exact_contract(
-            SimpleNamespace(), model_arch="LlamaForCausalLM"
-        )
+def test_non_qwen_keeps_conservative_norm_and_rope_defaults():
+    args = _server_args()
+    config = SimpleNamespace()
+    args._resolve_qwen35_gdn_exact_contract(config, model_arch="LlamaForCausalLM")
+    assert args.qwen35_rmsnorm_family == "v1"
+    assert not args.qwen35_rope_class_b
 
 
 @pytest.mark.parametrize(
@@ -200,31 +202,12 @@ def test_non_qwen_or_non_xorl_does_not_resolve_exact_mode():
     assert not non_xorl.qwen35_gdn_exact_mode
 
 
-@pytest.mark.parametrize(
-    ("model_arch", "rl_target"),
-    [
-        ("LlamaForCausalLM", "xorl"),
-        ("Qwen3_5MoeForConditionalGeneration", None),
-    ],
-)
-def test_qwen35_class_b_candidate_rejects_non_exact_lanes(model_arch, rl_target):
-    args = _server_args(
-        rl_on_policy_target=rl_target,
-        qwen35_rope_class_b_candidate=True,
-    )
-    with pytest.raises(ValueError, match="supported only by the exact Qwen"):
-        args._resolve_qwen35_gdn_exact_contract(
-            _qwen_config(moe=True), model_arch=model_arch
-        )
-
-
-def test_qwen35_class_b_candidate_is_explicit_and_preserves_exact_envelope():
+def test_qwen35_class_b_is_automatic_and_preserves_exact_envelope():
     hf_config = _qwen_config(moe=True)
     args = _server_args(
         tp_size=8,
         ep_size=1,
         disable_cuda_graph_padding=True,
-        qwen35_rope_class_b_candidate=True,
     )
     args.cuda_graph_config = default_cuda_graph_config()
     args._cuda_graph_config_locked = set()
@@ -234,8 +217,8 @@ def test_qwen35_class_b_candidate_is_explicit_and_preserves_exact_envelope():
     )
 
     assert args.qwen35_gdn_exact_mode
-    assert args.qwen35_rope_class_b_candidate
-    assert hf_config._qwen35_rope_class_b_candidate
+    assert args.qwen35_rope_class_b
+    assert hf_config._qwen35_rope_class_b
     assert args.dtype == "bfloat16"
     assert args.attention_backend == "fa4"
 
@@ -345,11 +328,11 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         set_combine.assert_called_once_with(False)
         startup.assert_called_once()
         startup_args = startup.call_args.args
-        assert startup_args[2] == "v1"
+        assert startup_args[2] == "v2"
         assert "conservative no-overlap/no-padding" in startup_args[1]
         rendered = startup_args[0] % startup_args[1:]
         assert "decode, conservative" in rendered
-        assert "rmsnorm_family=v1" in rendered
+        assert "rmsnorm_family=v2" in rendered
         force_family.assert_not_called()
 
 
@@ -611,50 +594,7 @@ def test_qwen35_exact_attention_gate_matches_explicit_bf16_composition():
     assert torch.equal(projection.call_args.args[0], expected)
 
 
-def test_qwen35_exact_rotary_replays_eager_bf16_rounding_with_text_positions():
-    import sglang.srt.models.qwen3_5 as qwen
-
-    rotary = SimpleNamespace(
-        cos_sin_cache=torch.zeros(16, 4, dtype=torch.float32),
-        rotary_dim=4,
-    )
-    layer = SimpleNamespace(
-        num_heads=2,
-        num_kv_heads=1,
-        head_dim=4,
-        rotary_emb=rotary,
-    )
-    query = torch.arange(24, dtype=torch.bfloat16).view(3, 8)
-    key = torch.arange(12, dtype=torch.bfloat16).view(3, 4)
-    positions = torch.tensor([[2, 3, 4], [2, 3, 4], [2, 3, 4]])
-
-    with (
-        patch.object(qwen, "_is_cuda", True),
-        patch.object(qwen, "_qwen35_exact_mode_enabled", return_value=True),
-        patch.object(
-            qwen,
-            "_qwen35_rope_class_b_candidate_enabled",
-            return_value=False,
-        ),
-        patch.object(
-            qwen,
-            "bi_fused_native_rope",
-            side_effect=lambda value, *_args: value.clone(),
-        ) as exact_rope,
-    ):
-        q_out, k_out = qwen.Qwen3_5AttentionDecoderLayer._apply_rotary(
-            layer, positions, query, key
-        )
-
-    assert torch.equal(q_out, query)
-    assert torch.equal(k_out, key)
-    assert exact_rope.call_count == 2
-    assert exact_rope.call_args_list[0].args[0].shape == (3, 2, 4)
-    assert exact_rope.call_args_list[1].args[0].shape == (3, 1, 4)
-    assert torch.equal(exact_rope.call_args_list[0].args[1], positions[0])
-
-
-def test_qwen35_class_b_candidate_uses_stock_compiled_rotary_with_scalar_text_positions():
+def test_qwen35_class_b_uses_stock_compiled_rotary_with_scalar_text_positions():
     import sglang.srt.models.qwen3_5 as qwen
 
     query = torch.arange(24, dtype=torch.bfloat16).view(3, 8)
@@ -675,13 +615,8 @@ def test_qwen35_class_b_candidate_uses_stock_compiled_rotary_with_scalar_text_po
         patch.object(qwen, "_qwen35_exact_mode_enabled", return_value=True),
         patch.object(
             qwen,
-            "_qwen35_rope_class_b_candidate_enabled",
+            "_qwen35_rope_class_b_enabled",
             return_value=True,
-        ),
-        patch.object(
-            qwen,
-            "bi_fused_native_rope",
-            side_effect=AssertionError("Class-B candidate must bypass Class A"),
         ),
     ):
         actual = qwen.Qwen3_5AttentionDecoderLayer._apply_rotary(

@@ -950,12 +950,12 @@ def _validate_qwen_v2_norm_tensor(
 ) -> None:
     if tensor.dtype != torch.bfloat16 or not tensor.is_cuda:
         raise RuntimeError(
-            f"The Qwen families-v2 RMSNorm candidate requires CUDA BF16 {name}; "
+            f"The Qwen families-v2 RMSNorm program requires CUDA BF16 {name}; "
             f"got device={tensor.device}, dtype={tensor.dtype}."
         )
     if shape is not None and tensor.shape != shape:
         raise RuntimeError(
-            f"The Qwen families-v2 RMSNorm candidate requires {name} shape {tuple(shape)}, "
+            f"The Qwen families-v2 RMSNorm program requires {name} shape {tuple(shape)}, "
             f"got {tuple(tensor.shape)}."
         )
 
@@ -1044,13 +1044,13 @@ class GemmaRMSNorm(BaseFusedOp):
                 or not is_batch_invariant_op_enabled("rms_norm")
             ):
                 raise RuntimeError(
-                    "The Qwen families-v2 RMSNorm candidate requires the exact batch-invariant "
+                    "The Qwen families-v2 RMSNorm program requires the exact batch-invariant "
                     "rms_norm contract to be engaged."
                 )
             _validate_qwen_v2_norm_tensor(x, name="input")
             if post_residual_addition is not None:
                 raise RuntimeError(
-                    "The Qwen families-v2 RMSNorm candidate does not admit post_residual_addition."
+                    "The Qwen families-v2 RMSNorm program does not admit post_residual_addition."
                 )
             original_shape = x.shape
             x_2d = x.reshape(-1, original_shape[-1])
@@ -1203,7 +1203,7 @@ class GemmaRMSNorm(BaseFusedOp):
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
         if self.xorl_batch_invariant_version == "v2":
             raise RuntimeError(
-                "The Qwen families-v2 RMSNorm candidate cannot use an allreduce-fused v1 norm path."
+                "The Qwen families-v2 RMSNorm program cannot use an allreduce-fused v1 norm path."
             )
         return _forward_with_allreduce_fusion(
             self,
@@ -1225,7 +1225,7 @@ class GemmaRMSNorm(BaseFusedOp):
         """Fused AR + RMSNorm + per-group FP8 quant (Gemma-style: weight + 1)."""
         if self.xorl_batch_invariant_version == "v2":
             raise RuntimeError(
-                "The Qwen families-v2 RMSNorm candidate cannot use an allreduce/quant-fused v1 norm path."
+                "The Qwen families-v2 RMSNorm program cannot use an allreduce/quant-fused v1 norm path."
             )
         return _forward_with_allreduce_fusion_quant_per_group(
             self,
