@@ -26,6 +26,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     Phi3LongRoPEScaledRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
@@ -134,6 +135,10 @@ def get_rope(
         rope_scaling_args,
         dual_chunk_attention_args,
         dtype,
+        # The candidate installs a different application program on the shared
+        # module.  Keep it out of the qualified Class-A process cache so an A/B
+        # lifecycle in one interpreter cannot silently reuse the wrong path.
+        bool(getattr(get_exec().deterministic, "qwen35_rope_class_b_candidate", False)),
     )
     cached = _get_live_rope_cache_entry(key)
     if cached is not None:

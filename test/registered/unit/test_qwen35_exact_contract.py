@@ -58,6 +58,8 @@ def test_qwen35_moe_plain_config_resolves_certified_topology():
 
     assert args.qwen35_gdn_exact_mode
     assert hf_config._qwen35_gdn_exact_mode
+    assert not args.qwen35_rope_class_b_candidate
+    assert not hf_config._qwen35_rope_class_b_candidate
     assert args.dtype == "bfloat16"
     assert args.attention_backend == "fa4"
     assert args.linear_attn_prefill_backend == "triton"
@@ -164,6 +166,46 @@ def test_non_qwen_or_non_xorl_does_not_resolve_exact_mode():
         hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
     )
     assert not non_xorl.qwen35_gdn_exact_mode
+
+
+@pytest.mark.parametrize(
+    ("model_arch", "rl_target"),
+    [
+        ("LlamaForCausalLM", "xorl"),
+        ("Qwen3_5MoeForConditionalGeneration", None),
+    ],
+)
+def test_qwen35_class_b_candidate_rejects_non_exact_lanes(model_arch, rl_target):
+    args = _server_args(
+        rl_on_policy_target=rl_target,
+        qwen35_rope_class_b_candidate=True,
+    )
+    with pytest.raises(ValueError, match="supported only by the exact Qwen"):
+        args._resolve_qwen35_gdn_exact_contract(
+            _qwen_config(moe=True), model_arch=model_arch
+        )
+
+
+def test_qwen35_class_b_candidate_is_explicit_and_preserves_exact_envelope():
+    hf_config = _qwen_config(moe=True)
+    args = _server_args(
+        tp_size=8,
+        ep_size=1,
+        disable_cuda_graph_padding=True,
+        qwen35_rope_class_b_candidate=True,
+    )
+    args.cuda_graph_config = default_cuda_graph_config()
+    args._cuda_graph_config_locked = set()
+
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
+    )
+
+    assert args.qwen35_gdn_exact_mode
+    assert args.qwen35_rope_class_b_candidate
+    assert hf_config._qwen35_rope_class_b_candidate
+    assert args.dtype == "bfloat16"
+    assert args.attention_backend == "fa4"
 
 
 @pytest.mark.parametrize("name", ("tp_size", "dp_size", "ep_size", "pp_size"))
@@ -498,6 +540,11 @@ def test_qwen35_exact_rotary_replays_eager_bf16_rounding_with_text_positions():
         patch.object(qwen, "_qwen35_exact_mode_enabled", return_value=True),
         patch.object(
             qwen,
+            "_qwen35_rope_class_b_candidate_enabled",
+            return_value=False,
+        ),
+        patch.object(
+            qwen,
             "bi_fused_native_rope",
             side_effect=lambda value, *_args: value.clone(),
         ) as exact_rope,
@@ -512,6 +559,47 @@ def test_qwen35_exact_rotary_replays_eager_bf16_rounding_with_text_positions():
     assert exact_rope.call_args_list[0].args[0].shape == (3, 2, 4)
     assert exact_rope.call_args_list[1].args[0].shape == (3, 1, 4)
     assert torch.equal(exact_rope.call_args_list[0].args[1], positions[0])
+
+
+def test_qwen35_class_b_candidate_uses_stock_compiled_rotary_with_scalar_text_positions():
+    import sglang.srt.models.qwen3_5 as qwen
+
+    query = torch.arange(24, dtype=torch.bfloat16).view(3, 8)
+    key = torch.arange(12, dtype=torch.bfloat16).view(3, 4)
+    expected = (query + 1, key + 1)
+    rotary = MagicMock(return_value=expected)
+    rotary.is_neox_style = True
+    layer = SimpleNamespace(
+        num_heads=2,
+        num_kv_heads=1,
+        head_dim=4,
+        rotary_emb=rotary,
+    )
+    positions = torch.tensor([[2, 3, 4], [2, 3, 4], [2, 3, 4]])
+
+    with (
+        patch.object(qwen, "_is_cuda", True),
+        patch.object(qwen, "_qwen35_exact_mode_enabled", return_value=True),
+        patch.object(
+            qwen,
+            "_qwen35_rope_class_b_candidate_enabled",
+            return_value=True,
+        ),
+        patch.object(
+            qwen,
+            "bi_fused_native_rope",
+            side_effect=AssertionError("Class-B candidate must bypass Class A"),
+        ),
+    ):
+        actual = qwen.Qwen3_5AttentionDecoderLayer._apply_rotary(
+            layer, positions, query, key
+        )
+
+    assert all(torch.equal(a, b) for a, b in zip(actual, expected, strict=True))
+    rotary.assert_called_once()
+    assert torch.equal(rotary.call_args.args[0], positions[0])
+    assert rotary.call_args.args[1] is query
+    assert rotary.call_args.args[2] is key
 
 def _exact_logits_processor(vocab_size=32):
     from sglang.srt.layers.logits_processor import LogitsProcessor

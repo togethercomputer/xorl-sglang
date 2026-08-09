@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_QWEN35_CLASS_B_RECOMPILE_LIMIT = 2048
+_QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT = 8192
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -41,6 +44,20 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mps = is_mps()
+
+
+def _pin_qwen35_class_b_compile_budget() -> None:
+    """Prevent an exact Class-B run from silently falling back to eager Class A."""
+    config = torch._dynamo.config
+    config.recompile_limit = max(
+        getattr(config, "recompile_limit", 0), _QWEN35_CLASS_B_RECOMPILE_LIMIT
+    )
+    config.accumulated_recompile_limit = max(
+        getattr(config, "accumulated_recompile_limit", 0),
+        _QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT,
+    )
+    if hasattr(config, "fail_on_recompile_limit_hit"):
+        config.fail_on_recompile_limit_hit = True
 
 if _is_cuda:
     from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
@@ -134,12 +151,40 @@ class RotaryEmbedding(BaseFusedOp):
         if deterministic.rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
             # GLM-5.2 uses the compiled Class-B expression. Qwen3.5-family
-            # exact serving intentionally retains the eager Class-A program.
-            if not deterministic.qwen35_gdn_exact_mode:
+            # exact serving retains the eager Class-A program unless the
+            # explicit paired Class-B candidate is selected.
+            if (
+                not deterministic.qwen35_gdn_exact_mode
+                or getattr(deterministic, "qwen35_rope_class_b_candidate", False)
+            ):
                 self._apply_rotary_emb_wrapped = torch.compile(
                     dynamic=True,
                     disable=_is_npu,
                 )(apply_rotary_emb)
+        if getattr(deterministic, "qwen35_rope_class_b_candidate", False):
+            if not deterministic.qwen35_gdn_exact_mode:
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE candidate requires exact Qwen mode"
+                )
+            if not _is_cuda:
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE candidate is qualified only on CUDA"
+                )
+            if dtype is not torch.bfloat16 or not is_neox_style:
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE candidate requires BF16 and the "
+                    "Neox half-split feature layout"
+                )
+            _pin_qwen35_class_b_compile_budget()
+            logger.info(
+                "Qwen3.5-family Class-B RoPE candidate runtime engaged: "
+                "CPU-built fp32 table + compiled fp32-chain application; "
+                "recompile_limit=%s accumulated_recompile_limit=%s "
+                "fail_on_recompile_limit_hit=%s",
+                torch._dynamo.config.recompile_limit,
+                torch._dynamo.config.accumulated_recompile_limit,
+                getattr(torch._dynamo.config, "fail_on_recompile_limit_hit", None),
+            )
         self.position_cos, self.position_sin = None, None
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:

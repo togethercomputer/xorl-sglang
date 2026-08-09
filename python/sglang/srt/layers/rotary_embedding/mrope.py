@@ -180,6 +180,21 @@ class MRotaryEmbedding(RotaryEmbedding):
         ), "save kv cache is not supported for MRotaryEmbedding."
         assert positions.ndim == 1 or positions.ndim == 2
 
+        class_b_candidate = bool(
+            getattr(
+                get_exec().deterministic,
+                "qwen35_rope_class_b_candidate",
+                False,
+            )
+        )
+        if class_b_candidate and positions.ndim == 2:
+            torch._assert_async(
+                (positions == positions[:1]).all(),
+                "Qwen3.5-family Class-B RoPE candidate does not support multimodal "
+                "positions with distinct temporal/height/width axes",
+            )
+            positions = positions[0]
+
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
         if positions.ndim == 2:
@@ -202,7 +217,10 @@ class MRotaryEmbedding(RotaryEmbedding):
         query = query.view(seq_len_q, -1, self.head_size)
         query_rot = query[..., : self.rotary_dim]
         query_pass = query[..., self.rotary_dim :]
-        query_rot = apply_rotary_emb(query_rot, cos, sin, self.is_neox_style)
+        apply_rotary = (
+            self._apply_rotary_emb_wrapped if class_b_candidate else apply_rotary_emb
+        )
+        query_rot = apply_rotary(query_rot, cos, sin, self.is_neox_style)
         query = torch.cat((query_rot, query_pass), dim=-1).reshape(query_shape)
 
         seq_len_k = key.shape[0]
@@ -210,7 +228,7 @@ class MRotaryEmbedding(RotaryEmbedding):
         key = key.view(seq_len_k, -1, self.head_size)
         key_rot = key[..., : self.rotary_dim]
         key_pass = key[..., self.rotary_dim :]
-        key_rot = apply_rotary_emb(key_rot, cos, sin, self.is_neox_style)
+        key_rot = apply_rotary(key_rot, cos, sin, self.is_neox_style)
         key = torch.cat((key_rot, key_pass), dim=-1).reshape(key_shape)
         return query, key
 

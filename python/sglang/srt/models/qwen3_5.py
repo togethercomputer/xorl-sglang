@@ -98,7 +98,11 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_stream,
 )
-from sglang.srt.server_args import get_global_server_args, is_qwen35_gdn_exact_mode
+from sglang.srt.server_args import (
+    get_global_server_args,
+    is_qwen35_gdn_exact_mode,
+    is_qwen35_rope_class_b_candidate,
+)
 
 # Utils
 from sglang.srt.utils import (
@@ -146,6 +150,10 @@ def _disable_shared_experts_fusion() -> bool:
 
 def _qwen35_exact_mode_enabled() -> bool:
     return is_qwen35_gdn_exact_mode(get_global_server_args())
+
+
+def _qwen35_rope_class_b_candidate_enabled() -> bool:
+    return is_qwen35_rope_class_b_candidate(get_global_server_args())
 
 
 if _is_cuda:
@@ -1034,7 +1042,37 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if _is_cuda and _qwen35_exact_mode_enabled():
             seq_len = q.shape[0]
+            class_b_candidate = _qwen35_rope_class_b_candidate_enabled()
+            if class_b_candidate:
+                if positions.ndim not in (1, 2):
+                    raise RuntimeError(
+                        "Qwen3.5-family Class-B RoPE candidate requires scalar "
+                        f"text positions; got rank {positions.ndim}"
+                    )
+                if positions.ndim == 2:
+                    torch._assert_async(
+                        (positions == positions[:1]).all(),
+                        "Qwen3.5-family Class-B RoPE candidate does not support "
+                        "multimodal positions with distinct temporal/height/width axes",
+                    )
             exact_positions = positions.reshape(-1)[:seq_len]
+            if exact_positions.numel() != seq_len:
+                raise RuntimeError(
+                    "Exact Qwen3.5-family RoPE requires one scalar position per token; "
+                    f"got {positions.numel()} positions for {seq_len} tokens"
+                )
+            if class_b_candidate:
+                if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:
+                    raise RuntimeError(
+                        "Qwen3.5-family Class-B RoPE candidate requires BF16 q/k; "
+                        f"got q={q.dtype}, k={k.dtype}"
+                    )
+                if not self.rotary_emb.is_neox_style:
+                    raise RuntimeError(
+                        "Qwen3.5-family Class-B RoPE candidate supports only the "
+                        "qualified Neox half-split feature layout"
+                    )
+                return self.rotary_emb(exact_positions, q, k)
             q_shape = q.shape
             k_shape = k.shape
             q = bi_fused_native_rope(
