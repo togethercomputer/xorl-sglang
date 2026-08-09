@@ -73,7 +73,6 @@ class TestMistralLarge3(unittest.TestCase):
                 MISTRAL_LARGE3_FP8_MODEL_PATH,
                 tp_size=8,
                 extra_args=base_args + eagle_args,
-                env={"SGLANG_ENABLE_SPEC_V2": "1"},
                 variant="TP8+MTP",
             ),
             # Variant: "nvfp4" - NVFP4 model + TP=8 + trtllm_mla backend
@@ -90,7 +89,7 @@ class TestMistralLarge3(unittest.TestCase):
             test_name="Mistral-Large-3",
             accuracy_params=AccuracyTestParams(dataset="gsm8k", baseline_accuracy=0.85),
             performance_params=PerformanceTestParams(
-                profile_dir="performance_profiles_mistral_large3",
+                result_dir="performance_results_mistral_large3",
             ),
         )
 

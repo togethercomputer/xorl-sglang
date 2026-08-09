@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.6.4.post1/vllm/distributed/communication_op.py
 
 from typing import Any, Dict, Optional, Tuple, Union
@@ -5,12 +7,64 @@ from typing import Any, Dict, Optional, Tuple, Union
 import torch
 import torch.distributed
 
-from .parallel_state import get_tp_group
+from .parallel_state import (
+    get_attn_tp_group,
+    get_moe_ep_group,
+    get_moe_tp_group,
+    get_tp_group,
+)
+
+
+# Installed by the Qwen3.5-family exact architecture resolver. The transport
+# remains an all-gather; only the local, reverse-rank BF16 addition chain is
+# fused when the resolved contract enables it.
+_ORDERED_COMBINE_FUSED_ENABLED = False
+
+
+def set_ordered_combine_fused_enabled(enabled: bool) -> None:
+    global _ORDERED_COMBINE_FUSED_ENABLED
+    _ORDERED_COMBINE_FUSED_ENABLED = bool(enabled)
 
 
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_)
+
+
+def tensor_model_parallel_ordered_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce through a fixed reverse-rank BF16 addition chain."""
+    group = get_tp_group()
+    if group.world_size == 1 or input_.numel() == 0:
+        return input_
+
+    input_ = input_.contiguous()
+    gathered = torch.empty(
+        (group.world_size * input_.shape[0], *input_.shape[1:]),
+        dtype=input_.dtype,
+        device=input_.device,
+    )
+    # Use the coordinator so its capture-aware communicator records the
+    # collective. A direct torch.distributed call can replay only the local
+    # contribution from a full CUDA graph.
+    group.all_gather_into_tensor(gathered, input_)
+    partials = gathered.view(group.world_size, *input_.shape)
+    if _ORDERED_COMBINE_FUSED_ENABLED:
+        from sglang.srt.distributed.ordered_combine_fused import (
+            fused_ordered_combine,
+        )
+
+        fused = fused_ordered_combine(partials)
+        if fused is not None:
+            return fused
+    result = partials[-1]
+    for rank in range(group.world_size - 2, -1, -1):
+        result = result + partials[rank]
+    return result
+
+
+def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across model parallel group."""
+    return get_tp_group().quant_all_reduce(input_)
 
 
 def tensor_model_parallel_fused_allreduce_rmsnorm(
@@ -26,6 +80,29 @@ def tensor_model_parallel_fused_allreduce_rmsnorm(
     or return None so callers can run generic fallback paths.
     """
     return get_tp_group().fused_allreduce_rmsnorm(input_, residual_inp_, weight_, eps)
+
+
+def tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
+    input_: torch.Tensor,
+    residual_inp_: torch.Tensor,
+    weight_: torch.Tensor,
+    eps: float,
+    group_size: int = 128,
+    emit_bf16: bool = False,
+) -> Optional[Tuple[torch.Tensor, ...]]:
+    """Fused TP all-reduce + RMSNorm + per-group FP8 quant (ROCm/aiter).
+
+    Returns ``(fp8_output, residual_out, per_group_scale)`` by default, or
+    ``(fp8_output, residual_out, per_group_scale, bf16_output)`` when
+    ``emit_bf16=True`` (kernel writes both fp8 and the pre-quantization bf16
+    normed output — no extra kernel). ``None`` when the backend cannot
+    service the request (non-AMD, custom AR disabled, shape unsupported).
+    Callers MUST handle ``None`` by falling back to the separate
+    fused-AR-RMSNorm + per-group-quant path.
+    """
+    return get_tp_group().fused_allreduce_rmsnorm_quant_per_group(
+        input_, residual_inp_, weight_, eps, group_size, emit_bf16=emit_bf16
+    )
 
 
 def tensor_model_parallel_all_gather(
@@ -48,3 +125,25 @@ def broadcast_tensor_dict(
     if not torch.distributed.is_initialized():
         return tensor_dict
     return get_tp_group().broadcast_tensor_dict(tensor_dict, src)
+
+
+def attention_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across attention parallel group."""
+    return get_attn_tp_group().all_reduce(input_)
+
+
+def attention_tensor_model_parallel_quant_all_reduce(
+    input_: torch.Tensor,
+) -> torch.Tensor:
+    """All-reduce the input tensor across attention parallel group."""
+    return get_attn_tp_group().quant_all_reduce(input_)
+
+
+def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe parallel group."""
+    return get_moe_tp_group().all_reduce(input_)
+
+
+def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe expert parallel group."""
+    return get_moe_ep_group().all_reduce(input_)

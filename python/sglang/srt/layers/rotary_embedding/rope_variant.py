@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.utils import (
     apply_rotary_pos_emb_native,
@@ -21,7 +22,6 @@ from sglang.srt.layers.rotary_embedding.yarn import (
     yarn_get_mscale,
     yarn_linear_ramp_mask,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import cpu_has_amx_support, get_device, is_cuda, is_hip, is_npu
 
 _is_cuda = is_cuda()
@@ -377,8 +377,9 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             self._forward_method = self.forward_native
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
+        device = self._cos_sin_cache_work_device(self.device)
         pos_freqs = self.base ** (
-            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=self.device)
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=device)
             / self.rotary_dim
         )
         inv_freq_extrapolation = 1.0 / pos_freqs
@@ -393,7 +394,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_mask = (
             1
             - yarn_linear_ramp_mask(
-                low, high, self.rotary_dim // 2, dtype=torch.float, device=self.device
+                low, high, self.rotary_dim // 2, dtype=torch.float, device=device
             )
         ) * self.extrapolation_factor
         inv_freq = (
@@ -402,20 +403,28 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         return inv_freq
 
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
-        inv_freq = self._compute_inv_freq(self.scaling_factor)
-        t = torch.arange(
+    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
+        return self._compute_inv_freq(self.scaling_factor)
+
+    def _cos_sin_cache_mscale(self) -> float:
+        return self.mscale
+
+    def _cos_sin_cache_positions(self) -> torch.Tensor:
+        return torch.arange(
             self.max_position_embeddings * self.scaling_factor,
-            device=self.device,
+            device=self._cos_sin_cache_work_device(self.device),
             dtype=torch.float32,
         )
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos() * self.mscale
-        sin = freqs.sin() * self.mscale
-        cache = torch.cat((cos, sin), dim=-1)
-        emb = torch.cat((freqs, freqs), dim=-1)
-        self.cos_cached_total = torch.cos(emb) * self.mscale
-        self.sin_cached_total = torch.sin(emb) * self.mscale
+
+    def _build_cos_sin_cache(self) -> torch.Tensor:
+        cache = super()._build_cos_sin_cache()
+        if _is_npu:
+            # These NPU-only buffers hold the same rows at doubled width;
+            # derive them from the finished table so they preserve its device
+            # and provenance without duplicating the cache on other backends.
+            cos, sin = cache.chunk(2, dim=-1)
+            self.cos_cached_total = torch.cat((cos, cos), dim=-1)
+            self.sin_cached_total = torch.cat((sin, sin), dim=-1)
         return cache
 
     def get_cos_cached_total(self):
@@ -660,21 +669,14 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
-        max_len = self.max_position_embeddings
+    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
         base = self.base * self.scaling_alpha ** (
             self.rotary_dim / (self.rotary_dim - 2)
         )
-        inv_freq = self._compute_inv_freq(base)
-        t = torch.arange(max_len, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
+        return self._compute_inv_freq(base)
 
 
-class DualChunkRotaryEmbedding(MultiPlatformOp):
+class DualChunkRotaryEmbedding(BaseFusedOp):
     """Rotary positional embedding for Dual Chunk Attention."""
 
     def __init__(
@@ -751,6 +753,11 @@ class DualChunkRotaryEmbedding(MultiPlatformOp):
             (q_inter_freqs.cos(), q_inter_freqs.sin()), dim=-1
         ).to(dtype=self.dtype, device=self.device)
         return q_cache, qc_cache, k_cache, qc_no_clamp_cache, q_inter_cache
+
+    def forward_native(self, *args, **kwargs):
+        # This op overrides forward() directly; there is no separate
+        # pure-torch reference path.
+        raise NotImplementedError("DualChunkRotaryEmbedding has no native path")
 
     def forward(
         self,
@@ -853,16 +860,78 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
+    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
         max_len = self.max_position_embeddings * self.scaling_factor
         base = self.base * (
             (self.scaling_factor * max_len / self.max_position_embeddings)
             - (self.scaling_factor - 1)
         ) ** (self.rotary_dim / (self.rotary_dim - 2))
-        inv_freq = self._compute_inv_freq(base)
-        t = torch.arange(max_len, dtype=torch.float)
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
+        return self._compute_inv_freq(base)
+
+    def _cos_sin_cache_positions(self) -> torch.Tensor:
+        return torch.arange(
+            self.max_position_embeddings * self.scaling_factor, dtype=torch.float
+        )
+
+
+class Gemma4RotaryEmbedding(RotaryEmbedding):
+    """Gemma4-specific RoPE with cross-mixing.
+
+    Instead of rotating the first `rotary_dim` dimensions contiguously,
+    splits the head into two halves and applies rotation across both.
+
+    For a head_dim of D and rotary_dim of R:
+    - Standard RoPE rotates: [0, R)
+    - Gemma4 RoPE rotates: [0, R/2) cross-mixed with [D/2, D/2 + R/2)
+    """
+
+    def __init__(
+        self,
+        head_size: int,
+        rotary_dim: int,
+        max_position_embeddings: int,
+        base: float,
+        is_neox_style: bool,
+        dtype: torch.dtype,
+    ) -> None:
+        # Store angles before calling super().__init__
+        # rotary_dim is already scaled by partial_rotary_factor in get_rope
+        # For Gemma4: head_size=512, partial_rotary_factor=0.25 -> rotary_dim=128
+        self.rope_angles = rotary_dim // 2  # Number of rotation angles per half
+        self.nope_angles = (head_size // 2) - self.rope_angles  # Non-rotated per half
+
+        super().__init__(
+            head_size,
+            head_size,
+            max_position_embeddings,
+            base,
+            is_neox_style,
+            dtype,
+        )
+
+    def _compute_inv_freq(self, base: float) -> torch.Tensor:
+        """Compute frequencies only for the rotated dimensions.
+
+        Non-rotated dims are padded with 0.0 to produce identity rotation.
+        """
+        freq_exponents = (
+            torch.arange(0, 2 * self.rope_angles, 2, dtype=torch.float) / self.head_size
+        )
+        inv_freq = 1.0 / (base**freq_exponents)
+
+        # Zero-pad for non-rotated dims (identity rotation: cos=1, sin=0)
+        if self.nope_angles > 0:
+            inv_freq = torch.cat(
+                [
+                    inv_freq,
+                    torch.zeros(self.nope_angles, dtype=torch.float),
+                ]
+            )
+        return inv_freq
+
+    def extra_repr(self) -> str:
+        s = f"head_size={self.head_size}, rotary_dim={self.rotary_dim}"
+        s += f", rope_angles={self.rope_angles}, nope_angles={self.nope_angles}"
+        s += f", max_position_embeddings={self.max_position_embeddings}"
+        s += f", base={self.base}, is_neox_style={self.is_neox_style}"
+        return s

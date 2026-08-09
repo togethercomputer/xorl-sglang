@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 class RemoteInstanceWeightLoaderBackend(str, enum.Enum):
     NCCL = "nccl"
     TRANSFER_ENGINE = "transfer_engine"
+    MODELEXPRESS = "modelexpress"
 
 
 def trigger_init_weights_send_group_for_remote_instance_request(
@@ -105,21 +106,6 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
         return None, None
 
 
-def parse_remote_instance_transfer_engine_info_from_scheduler_infos(scheduler_infos):
-    remote_instance_transfer_engine_info = {}
-    for data in scheduler_infos:
-        if (
-            "tp_rank" in data
-            and "remote_instance_transfer_engine_session_id" in data
-            and "remote_instance_transfer_engine_weights_info_dict" in data
-        ):
-            remote_instance_transfer_engine_info[data["tp_rank"]] = (
-                data["remote_instance_transfer_engine_session_id"],
-                data["remote_instance_transfer_engine_weights_info_dict"],
-            )
-    return remote_instance_transfer_engine_info
-
-
 def register_memory_region(model, transfer_engine):
     if importlib.util.find_spec("torch") is None:
         return register_memory_region_v1(model, transfer_engine)
@@ -139,13 +125,10 @@ def register_memory_region_v1(model, transfer_engine):
             raise RuntimeError(
                 f"register memory failed for weight {name}, error: {ret}"
             )
-        # Store 5 elements: data_ptr, numel, element_size, shape, dtype
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),
             weight.element_size(),
-            list(weight.shape),
-            str(weight.dtype).replace("torch.", ""),
         )
 
     end_tic = time.time()
@@ -159,13 +142,10 @@ def register_memory_region_v2(model, transfer_engine):
     weight_mr_dict = {}
     weight_addr_set = set()
     for name, weight in model.named_parameters():
-        # Store 5 elements: data_ptr, numel, element_size, shape, dtype
         weight_mr_dict[name] = (
             weight.data_ptr(),
             weight.numel(),
             weight.element_size(),
-            list(weight.shape),
-            str(weight.dtype).replace("torch.", ""),
         )
         weight_addr_set.add(weight.data_ptr())
 

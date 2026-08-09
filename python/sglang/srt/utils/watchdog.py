@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import sys
 import threading
 import time
 from contextlib import contextmanager
-from typing import Callable, Optional
+from multiprocessing import Process
+from typing import Callable, List, Optional
 
 import psutil
 
-from sglang.srt.utils.common import pyspy_dump_schedulers
+from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
 
@@ -42,14 +44,6 @@ class Watchdog:
     def disable(self):
         yield
 
-    def pause(self):
-        """Pause watchdog monitoring during expected blocking operations."""
-        pass
-
-    def resume(self):
-        """Resume watchdog monitoring after blocking operations complete."""
-        pass
-
 
 class _WatchdogReal(Watchdog):
     def __init__(
@@ -61,13 +55,12 @@ class _WatchdogReal(Watchdog):
     ):
         self._counter = 0
         self._active = True
-        self._paused = False
         self._test_stuck_time = test_stuck_time
         self._test_stuck_triggered = False
         self._raw = WatchdogRaw(
             debug_name=debug_name,
             get_counter=lambda: self._counter,
-            is_active=lambda: self._active and not self._paused,
+            is_active=lambda: self._active,
             watchdog_timeout=watchdog_timeout,
             soft=soft,
         )
@@ -101,17 +94,6 @@ class _WatchdogReal(Watchdog):
         finally:
             assert not self._active
             self._active = True
-
-    def pause(self):
-        """Pause watchdog monitoring during expected blocking operations."""
-        self._paused = True
-        logger.debug(f"Watchdog {self._raw.debug_name} paused")
-
-    def resume(self):
-        """Resume watchdog monitoring after blocking operations complete."""
-        self._paused = False
-        self._counter += 1  # Reset the counter to prevent immediate timeout
-        logger.debug(f"Watchdog {self._raw.debug_name} resumed")
 
 
 class _WatchdogNoop(Watchdog):
@@ -179,3 +161,63 @@ class WatchdogRaw:
             # Wait for some time so that the parent process can print the error.
             time.sleep(5)
             self.parent_process.send_signal(signal.SIGQUIT)
+
+
+class SubprocessWatchdog:
+    """Monitors subprocess liveness and triggers SIGQUIT when a crash is detected.
+
+    When a subprocess crashes (e.g., NCCL timeout causing C++ std::terminate()),
+    Python exception handlers never run, leaving the main process as a zombie
+    service. This watchdog polls subprocess liveness in a daemon thread and
+    sends SIGQUIT to trigger proper cleanup.
+
+    See: https://github.com/sgl-project/sglang/issues/18421
+    """
+
+    def __init__(
+        self,
+        processes: List[Process],
+        process_names: Optional[List[str]] = None,
+        interval: float = 1.0,
+    ):
+        self._processes = processes
+        self._names = process_names or [f"process_{i}" for i in range(len(processes))]
+        self._interval = interval
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        if self._thread is not None or not self._processes:
+            return
+        self._thread = threading.Thread(
+            target=self._monitor_loop, daemon=True, name="subprocess-watchdog"
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self._interval * 2)
+            self._thread = None
+
+    def _monitor_loop(self) -> None:
+        try:
+            while not self._stop_event.wait(self._interval):
+                if self._check_processes():
+                    return
+        except Exception as e:
+            logger.error(f"SubprocessWatchdog thread crashed: {e}", exc_info=True)
+
+    def _check_processes(self) -> bool:
+        for proc, name in zip(self._processes, self._names):
+            if proc.is_alive() or proc.exitcode == 0:
+                continue
+
+            logger.error(
+                f"Subprocess {name} (pid={proc.pid}) crashed "
+                f"with exit code {proc.exitcode}. "
+                f"Triggering SIGQUIT for cleanup..."
+            )
+            os.kill(os.getpid(), signal.SIGQUIT)
+            return True
+        return False

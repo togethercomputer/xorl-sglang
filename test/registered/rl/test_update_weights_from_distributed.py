@@ -1,5 +1,3 @@
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-
 """Test distributed weight updates.
 
 This test suite simulates a distributed training environment to ensure
@@ -17,6 +15,7 @@ distributed setup.
 
 import gc
 import os
+import queue
 import random
 import time
 import unittest
@@ -26,25 +25,27 @@ import numpy as np
 import requests
 import torch
 import torch.multiprocessing as mp
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
 
 import sglang as sgl
 from sglang.srt.utils import init_custom_process_group
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    find_available_port,
     is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
 )
 from sglang.utils import terminate_process
 
-register_cuda_ci(est_time=103, suite="stage-b-test-large-2-gpu")
-register_amd_ci(est_time=103, suite="stage-b-test-large-2-gpu-amd")
+register_cuda_ci(est_time=137, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=400, suite="stage-b-test-2-gpu-large-amd")
 
 mp.set_start_method("spawn", force=True)
 
@@ -116,6 +117,215 @@ def _warmup_update(
                 "load_format": load_format,
                 "flush_cache": not (pause_generation_mode == "in_place"),
             },
+        )
+
+
+def _require_http_success(response, endpoint):
+    assert response.status_code == 200, (
+        f"{endpoint} returned HTTP {response.status_code}: {response.text}"
+    )
+    payload = response.json()
+    assert payload["success"] is True, f"{endpoint} failed: {payload}"
+    return payload
+
+
+def _get_server_weight(url, name, size):
+    response = requests.post(
+        f"{url}/get_weights_by_name",
+        json={"name": name, "truncate_size": size},
+        timeout=60,
+    )
+    assert response.status_code == 200, (
+        f"get_weights_by_name returned HTTP {response.status_code}: {response.text}"
+    )
+    weight = response.json()
+    assert isinstance(weight, list) and len(weight) == size
+    return weight
+
+
+def _run_two_phase_sender(
+    world_size,
+    master_port,
+    parameter_name,
+    parameter_shape,
+    phase_barrier,
+    teardown_barrier,
+    result_queue,
+):
+    os.environ["NCCL_CUMEM_ENABLE"] = "0"
+    os.environ["NCCL_NVLS_ENABLE"] = "0"
+    torch.cuda.set_device(0)
+    group = init_custom_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{master_port}",
+        world_size=world_size,
+        rank=0,
+        group_name="test_two_phase_parameter_update_group",
+    )
+    trace = {}
+    try:
+        for cycle, value in enumerate((0.0, 1.0)):
+            source = torch.full(
+                parameter_shape,
+                value,
+                dtype=torch.bfloat16,
+                device="cuda:0",
+            )
+            bucket = FlattenedTensorBucket(named_tensors=[(parameter_name, source)])
+
+            # The receiver reaches this barrier only after prepare returned.
+            phase_barrier.wait(timeout=300)
+            trace[f"broadcast_started_{cycle}"] = time.monotonic_ns()
+            torch.distributed.broadcast(
+                bucket.get_flattened_tensor(),
+                src=0,
+                group=group,
+            )
+            torch.cuda.synchronize()
+            trace[f"broadcast_finished_{cycle}"] = time.monotonic_ns()
+
+            # Fence complete until the synchronous send and CUDA work finished.
+            phase_barrier.wait(timeout=300)
+
+        teardown_barrier.wait(timeout=60)
+        result_queue.put(("sender", trace))
+    finally:
+        torch.distributed.destroy_process_group(group)
+
+
+def _run_two_phase_server(
+    world_size,
+    master_port,
+    server_url,
+    parameter_name,
+    parameter_shape,
+    phase_barrier,
+    teardown_barrier,
+    result_queue,
+):
+    process = popen_launch_server(
+        DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+        server_url,
+        timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+        other_args=(
+            "--base-gpu-id",
+            "1",
+            "--tp-size",
+            "1",
+            "--cuda-graph-max-bs-decode",
+            "2",
+        ),
+    )
+    group_initialized = False
+    trace = {}
+    weights = {}
+    try:
+        weights["pre"] = _get_server_weight(
+            server_url, parameter_name, parameter_shape[0]
+        )
+        response = requests.post(
+            f"{server_url}/init_weights_update_group",
+            json={
+                "master_address": "localhost",
+                "master_port": str(master_port),
+                "rank_offset": 1,
+                "world_size": world_size,
+                "group_name": "test_two_phase_parameter_update_group",
+                "backend": "nccl",
+            },
+            timeout=120,
+        )
+        _require_http_success(response, "init_weights_update_group")
+        group_initialized = True
+
+        for cycle in range(2):
+            response = requests.post(
+                f"{server_url}/prepare_weights_update",
+                json={
+                    "buckets": [
+                        {
+                            "names": [parameter_name],
+                            "dtypes": ["bfloat16"],
+                            "shapes": [parameter_shape],
+                        }
+                    ],
+                    "num_buckets": 1,
+                    "group_name": "test_two_phase_parameter_update_group",
+                    "load_format": "flattened_bucket",
+                    "transport": "nccl_broadcast",
+                },
+                timeout=120,
+            )
+            _require_http_success(response, "prepare_weights_update")
+            trace[f"prepare_returned_{cycle}"] = time.monotonic_ns()
+
+            # Release the sender only after the real HTTP prepare has returned.
+            phase_barrier.wait(timeout=300)
+            # Wait for the sender's synchronous broadcast and CUDA fence.
+            phase_barrier.wait(timeout=300)
+
+            trace[f"complete_started_{cycle}"] = time.monotonic_ns()
+            response = requests.post(
+                f"{server_url}/complete_weights_update",
+                json={
+                    "group_name": "test_two_phase_parameter_update_group",
+                    "flush_cache": True,
+                    "transport": "nccl_broadcast",
+                },
+                timeout=360,
+            )
+            _require_http_success(response, "complete_weights_update")
+            trace[f"complete_returned_{cycle}"] = time.monotonic_ns()
+            weights[f"post_{cycle}"] = _get_server_weight(
+                server_url, parameter_name, parameter_shape[0]
+            )
+
+        teardown_barrier.wait(timeout=60)
+        result_queue.put(("server", {"trace": trace, "weights": weights}))
+    finally:
+        if group_initialized:
+            try:
+                requests.post(
+                    f"{server_url}/destroy_weights_update_group",
+                    json={"group_name": "test_two_phase_parameter_update_group"},
+                    timeout=60,
+                )
+            except requests.RequestException:
+                pass
+        terminate_process(process)
+
+
+def _run_two_phase_update_process(
+    rank,
+    world_size,
+    master_port,
+    server_url,
+    parameter_name,
+    parameter_shape,
+    phase_barrier,
+    teardown_barrier,
+    result_queue,
+):
+    if rank == 0:
+        _run_two_phase_sender(
+            world_size,
+            master_port,
+            parameter_name,
+            parameter_shape,
+            phase_barrier,
+            teardown_barrier,
+            result_queue,
+        )
+    else:
+        _run_two_phase_server(
+            world_size,
+            master_port,
+            server_url,
+            parameter_name,
+            parameter_shape,
+            phase_barrier,
+            teardown_barrier,
+            result_queue,
         )
 
 
@@ -315,7 +525,7 @@ def init_process_sgl(
             model_path=model_name,
             base_gpu_id=base_gpu_id,
             tp_size=tp_size,
-            cuda_graph_max_bs=2,
+            cuda_graph_max_bs_decode=2,
         )
     else:
         if rank == 1:
@@ -334,7 +544,7 @@ def init_process_sgl(
                 str(base_gpu_id),
                 "--tp-size",
                 str(tp_size),
-                "--cuda-graph-max-bs",
+                "--cuda-graph-max-bs-decode",
                 2,
             ),
         )
@@ -396,7 +606,8 @@ def init_process_sgl(
             return response.json()
 
         with ThreadPoolExecutor(32) as executor:
-            futures = [executor.submit(run_decode, 1000) for _ in range(32)]
+            for _ in range(32):
+                executor.submit(run_decode, 1000)
             time.sleep(2)
 
     # The last parameter is lm_head.weight, which is tied
@@ -573,7 +784,7 @@ def test_update_weights_from_distributed(
         try:
             key, value = param_queue.get(timeout=5)
             results[key] = value
-        except Exception as e:
+        except Exception:
             if all(not p.is_alive() for p in context.processes):
                 break
 
@@ -635,9 +846,9 @@ def test_update_weights_from_distributed(
                 f"sgl_dp_2_instruct_params rank {i}",
             )
 
-    assert len(params["hf_instruct"]) == len(
-        params["hf_base"]
-    ), "hf_instruct_params and hf_base_params have different lengths"
+    assert len(params["hf_instruct"]) == len(params["hf_base"]), (
+        "hf_instruct_params and hf_base_params have different lengths"
+    )
 
     # Check if the weights of lm_head are tied with embed_tokens.
     params_to_check = [
@@ -687,18 +898,18 @@ def test_update_weights_from_distributed(
     # On local H100, it's 1 / 2
     time_limit = 3 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 6
 
-    assert (
-        params["broadcast_time"] < time_limit
-    ), f"broadcast_time exceeds time limit {time_limit}s"
+    assert params["broadcast_time"] < time_limit, (
+        f"broadcast_time exceeds time limit {time_limit}s"
+    )
 
-    assert (
-        params["update_sgl_dp_1_time"] < time_limit
-    ), f"update_sgl_dp_one_time exceeds time limit {time_limit}s"
+    assert params["update_sgl_dp_1_time"] < time_limit, (
+        f"update_sgl_dp_one_time exceeds time limit {time_limit}s"
+    )
 
     if dp_size == 2:
-        assert (
-            params["update_sgl_dp_2_time"] < time_limit
-        ), f"update_sgl_dp_two_time exceeds time limit {time_limit}s"
+        assert params["update_sgl_dp_2_time"] < time_limit, (
+            f"update_sgl_dp_two_time exceeds time limit {time_limit}s"
+        )
 
     # Delete the context and close the parameter queue.
     del context
@@ -709,9 +920,103 @@ def test_update_weights_from_distributed(
 
 
 class TestUpdateWeightsFromDistributed(CustomTestCase):
+    def test_prepare_receive_complete_weights_update(self):
+        assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
+
+        parameter_name = "model.norm.weight"
+        parameter_shape = [
+            AutoConfig.from_pretrained(DEFAULT_SMALL_MODEL_NAME_FOR_TEST).hidden_size
+        ]
+        master_port = find_available_port(29500)
+        server_url = f"http://127.0.0.1:{find_available_port(31000)}"
+        phase_barrier = mp.Barrier(2)
+        teardown_barrier = mp.Barrier(2)
+        result_queue = mp.Queue()
+
+        context = mp.spawn(
+            _run_two_phase_update_process,
+            args=(
+                2,
+                master_port,
+                server_url,
+                parameter_name,
+                parameter_shape,
+                phase_barrier,
+                teardown_barrier,
+                result_queue,
+            ),
+            nprocs=2,
+            join=False,
+        )
+        deadline = time.monotonic() + DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH + 360
+
+        def terminate_workers():
+            for process in context.processes:
+                if process.is_alive():
+                    process.terminate()
+            for process in context.processes:
+                process.join(timeout=30)
+
+        # Drain both records while workers are live. A multiprocessing Queue
+        # flushes through a feeder thread, and joining before reading can
+        # deadlock when the observed weight payload exceeds the pipe capacity.
+        results = {}
+        while len(results) < 2:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_workers()
+                self.fail("Timed out waiting for two-phase weight update results")
+            try:
+                role, payload = result_queue.get(timeout=min(1, remaining))
+            except queue.Empty:
+                if context.join(timeout=0):
+                    self.fail(
+                        "Two-phase weight update workers exited before publishing "
+                        "both results"
+                    )
+                continue
+            self.assertNotIn(role, results, f"Duplicate two-phase result role: {role}")
+            results[role] = payload
+
+        while not context.join(timeout=1):
+            if time.monotonic() >= deadline:
+                terminate_workers()
+                self.fail("Timed out waiting for the two-phase weight update test")
+
+        self.assertEqual(set(results), {"sender", "server"})
+        sender_trace = results["sender"]
+        server_trace = results["server"]["trace"]
+        weights = results["server"]["weights"]
+
+        for cycle in range(2):
+            self.assertLessEqual(
+                server_trace[f"prepare_returned_{cycle}"],
+                sender_trace[f"broadcast_started_{cycle}"],
+            )
+            self.assertLessEqual(
+                sender_trace[f"broadcast_started_{cycle}"],
+                sender_trace[f"broadcast_finished_{cycle}"],
+            )
+            self.assertLessEqual(
+                sender_trace[f"broadcast_finished_{cycle}"],
+                server_trace[f"complete_started_{cycle}"],
+            )
+            self.assertLessEqual(
+                server_trace[f"complete_started_{cycle}"],
+                server_trace[f"complete_returned_{cycle}"],
+            )
+
+        expected_first = np.zeros(parameter_shape, dtype=np.float32)
+        expected_second = np.ones(parameter_shape, dtype=np.float32)
+        self.assertFalse(np.array_equal(weights["pre"], expected_first))
+        np.testing.assert_array_equal(weights["post_0"], expected_first)
+        np.testing.assert_array_equal(weights["post_1"], expected_second)
+        self.assertFalse(np.array_equal(weights["post_0"], weights["post_1"]))
+
+        result_queue.close()
+        result_queue.join_thread()
 
     def test_update_weights_from_distributed(self):
-
         assert torch.cuda.device_count() >= 2, "At least 2 GPUs are required"
         # test_suits : tp, dp, model_name, backend
         if is_in_ci():

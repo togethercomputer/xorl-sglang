@@ -1,6 +1,4 @@
-"""
-Unit tests for Jinja chat template utils.
-"""
+"""Unit tests for srt/parser/jinja_template_utils.py"""
 
 import unittest
 
@@ -11,7 +9,8 @@ from sglang.srt.parser.jinja_template_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=7, suite="stage-a-cpu-only")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-c-test-cpu")
 
 
 class TestTemplateContentFormatDetection(CustomTestCase):
@@ -93,46 +92,6 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         {%- else %}
 <|assistant|>
 {{ msg.content }}
-        {%- endif %}
-    {%- endif %}
-{%- endfor %}
-{% if add_generation_prompt %}<|assistant|>
-{% endif %}
-        """
-
-        result = detect_jinja_template_content_format(msg_content_pattern)
-        self.assertEqual(result, "openai")
-
-    def test_detect_m_content_pattern(self):
-        """Test detection of template with m.content pattern (should be 'openai' format)."""
-        msg_content_pattern = """
-[gMASK]<sop>
-{%- for m in messages %}
-    {%- if m.role == 'system' %}
-<|system|>
-{{ m.content }}
-    {%- elif m.role == 'user' %}
-<|user|>{{ '\n' }}
-        {%- if m.content is string %}
-{{ m.content }}
-        {%- else %}
-            {%- for item in m.content %}
-                {%- if item.type == 'video' or 'video' in item %}
-<|begin_of_video|><|video|><|end_of_video|>
-                {%- elif item.type == 'image' or 'image' in item %}
-<|begin_of_image|><|image|><|end_of_image|>
-                {%- elif item.type == 'text' %}
-{{ item.text }}
-                {%- endif %}
-            {%- endfor %}
-        {%- endif %}
-    {%- elif m.role == 'assistant' %}
-        {%- if m.metadata %}
-<|assistant|>{{ m.metadata }}
-{{ m.content }}
-        {%- else %}
-<|assistant|>
-{{ m.content }}
         {%- endif %}
     {%- endif %}
 {%- endfor %}
@@ -307,6 +266,217 @@ class TestTemplateContentFormatDetection(CustomTestCase):
         # None values should be filtered out
         expected_keys = {"role", "content"}
         self.assertEqual(set(result.keys()), expected_keys)
+
+    def test_process_content_with_video(self):
+        """Test content processing with video_url content."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Watch this:"},
+                {"type": "video_url", "video_url": {"url": "http://example.com/v.mp4"}},
+            ],
+        }
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+        result = process_content_for_template_format(
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        )
+        self.assertEqual(len(video_data), 1)
+        self.assertEqual(video_data[0], "http://example.com/v.mp4")
+        self.assertEqual(result["content"][1], {"type": "video"})
+
+    def test_process_content_video_with_max_dynamic_patch(self):
+        """Test video_url with max_dynamic_patch stores structured dict."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {
+                        "url": "http://example.com/v.mp4",
+                        "max_dynamic_patch": 4,
+                    },
+                },
+            ],
+        }
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+        result = process_content_for_template_format(
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        )
+        self.assertEqual(len(video_data), 1)
+        self.assertIsInstance(video_data[0], dict)
+        self.assertEqual(video_data[0]["max_dynamic_patch"], 4)
+
+    def test_process_content_v32_encoding(self):
+        """Test v32 encoding mode flattens text and ignores structured content parts."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Hello"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "http://example.com/img.jpg"},
+                },
+                {"type": "text", "text": "World"},
+            ],
+        }
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+        result = process_content_for_template_format(
+            msg_dict,
+            "openai",
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+            use_dpsk_v32_encoding=True,
+        )
+        # v32 encoding: content is joined text, not list
+        self.assertEqual(result["content"], "Hello World")
+        # Image data is still extracted
+        self.assertEqual(len(image_data), 1)
+
+    def test_process_content_v32_encoding_accepts_responses_input_text(self):
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": "Hello"},
+                {
+                    "type": "input_image",
+                    "image_url": "http://example.com/img.jpg",
+                    "detail": "auto",
+                },
+                {"type": "input_text", "text": "World"},
+            ],
+        }
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+        result = process_content_for_template_format(
+            msg_dict,
+            "openai",
+            image_data,
+            video_data,
+            audio_data,
+            modalities,
+            use_dpsk_v32_encoding=True,
+        )
+
+        self.assertEqual(result["content"], "Hello World")
+        self.assertEqual(len(image_data), 1)
+        self.assertEqual(image_data[0].url, "http://example.com/img.jpg")
+
+    def test_process_content_invalid_format_raises(self):
+        """Test that invalid content_format raises ValueError."""
+        msg_dict = {
+            "role": "user",
+            "content": [{"type": "text", "text": "Hi"}],
+        }
+        with self.assertRaises(ValueError):
+            process_content_for_template_format(
+                msg_dict, "invalid_format", [], [], [], []
+            )
+
+    def test_process_content_video_with_modalities(self):
+        """Test that video content with modalities field is extracted."""
+        msg_dict = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "http://example.com/v.mp4"},
+                    "modalities": ["video"],
+                },
+            ],
+        }
+        image_data = []
+        video_data = []
+        audio_data = []
+        modalities = []
+        result = process_content_for_template_format(
+            msg_dict, "openai", image_data, video_data, audio_data, modalities
+        )
+        self.assertEqual(len(modalities), 1)
+        self.assertEqual(modalities[0], ["video"])
+
+    def test_detect_template_with_filter(self):
+        """Test that content access through a Jinja filter is detected as openai."""
+        # Template with | trim filter on content iteration
+        template = """
+{%- for message in messages %}
+    {%- for content in message['content'] | trim %}
+        {{- content }}
+    {%- endfor %}
+{%- endfor %}
+        """
+        result = detect_jinja_template_content_format(template)
+        self.assertEqual(result, "openai")
+
+    def test_detect_template_with_is_test(self):
+        """Test that 'is string' test on content triggers openai detection."""
+        # Template with 'is string' test that also iterates content
+        template = """
+{%- for message in messages %}
+    {%- if message['content'] is string %}
+        {{- message['content'] }}
+    {%- else %}
+        {%- for item in message['content'] %}
+            {{- item }}
+        {%- endfor %}
+    {%- endif %}
+{%- endfor %}
+        """
+        result = detect_jinja_template_content_format(template)
+        self.assertEqual(result, "openai")
+
+    def test_detect_template_with_slice(self):
+        """Test that content access through slice is detected as openai."""
+        template = """
+{%- for message in messages %}
+    {%- for item in message['content'][:5] %}
+        {{- item }}
+    {%- endfor %}
+{%- endfor %}
+        """
+        result = detect_jinja_template_content_format(template)
+        self.assertEqual(result, "openai")
+
+    def test_detect_template_no_content_loop_is_string(self):
+        """Test that template without content iteration returns string format."""
+        template = """
+{%- for message in messages %}
+    {{- message['role'] }}: {{ message['content'] }}
+{%- endfor %}
+        """
+        # No "image"/"audio"/"video" keyword, no content loop → string
+        result = detect_jinja_template_content_format(template)
+        self.assertEqual(result, "string")
+
+    def test_detect_msg_content_without_multimodal_keywords(self):
+        """Test AST detection of 'for item in msg.content' without keyword shortcut.
+        Templates that contain 'image'/'video'/'audio'/'vision' take a shortcut.
+        This template deliberately avoids those keywords to test the AST path."""
+        template = """
+{%- for msg in messages %}
+    {%- if msg.content is string %}
+        {{- msg.content }}
+    {%- else %}
+        {%- for item in msg.content %}
+            {{- item.text }}
+        {%- endfor %}
+    {%- endif %}
+{%- endfor %}
+        """
+        result = detect_jinja_template_content_format(template)
+        self.assertEqual(result, "openai")
 
 
 if __name__ == "__main__":

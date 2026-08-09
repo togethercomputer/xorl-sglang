@@ -7,12 +7,14 @@ import re
 
 # All the CUDA versions that the wheels will cover
 SUPPORTED_CUDA_VERSIONS = ["129", "130"]
-DEFAULT_CUDA_VERSION = "129"
+DEFAULT_CUDA_VERSION = "130"
 
 
 def check_wheel_cuda_version(path_name, target_cuda_version):
-    # Pass ROCm wheel
-    if re.search(f"rocm", path_name):
+    # Skip non-CUDA backend wheels (rocm, musa, ...). Their +<backend><ver>
+    # local-version tags don't match the CUDA wheel regex below, and they are
+    # published by the dedicated release-rocm*/release-musa* jobs.
+    if re.search(r"\+(rocm|musa)", path_name):
         return False
 
     # For other CUDA versions, the wheel path name will contain the cuda version suffix, e.g. sglang_kernel-0.4.0+cu130-cp310-abi3-manylinux2014_x86_64.whl
@@ -32,7 +34,7 @@ def update_wheel_index(cuda_version=DEFAULT_CUDA_VERSION, rocm_version=None):
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
-    for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
+    for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
         # Skip the wheel if mismatches the passed in cuda_version
         if not check_wheel_cuda_version(path.name, cuda_version):
             continue
@@ -51,7 +53,7 @@ def _update_non_cuda_wheel_index(backend, version):
     index_dir.mkdir(exist_ok=True, parents=True)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
-    for path in sorted(pathlib.Path("sgl-kernel/dist").glob("*.whl")):
+    for path in sorted(pathlib.Path("python/sglang/kernels/aot/dist").glob("*.whl")):
         # Skip the wheel if not for this backend
         if re.search(f"{backend}", path.name) is None:
             continue

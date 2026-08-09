@@ -13,11 +13,27 @@
 # ==============================================================================
 """Pydantic models for OpenAI API protocol"""
 
+from __future__ import annotations
+
 import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeAlias, Union
+from typing import (
+    Annotated,
+    Any,
+    Dict,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Protocol,
+    Tuple,
+    TypeAlias,
+    Union,
+    get_args,
+    runtime_checkable,
+)
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
@@ -28,9 +44,9 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
     field_validator,
     model_serializer,
@@ -77,11 +93,46 @@ class ErrorResponse(BaseModel):
     code: int
 
 
+@runtime_checkable
+class ParsedResponseFields(Protocol):
+    """Protocol for parsed response fields from custom renderers."""
+
+    content: Optional[str]
+    tool_calls: Optional[List[Dict]]
+    reasoning_content: Optional[str]
+
+
+class ResponseParserProtocol(Protocol):
+    """Protocol for custom response parsers.
+
+    Implementations parse model output tokens into structured OpenAI response fields.
+    """
+
+    def parse_response(
+        self, output_ids: List[int]
+    ) -> Union[ParsedResponseFields, ErrorResponse]:
+        """Parse complete response from output token IDs."""
+        ...
+
+    def build_streaming_sse_chunks(
+        self,
+        output_ids: List[int],
+        index: int,
+        chunk_id: str,
+        model: str,
+        usage: Optional[Dict],
+    ) -> Tuple[List[str], bool, Optional[str]]:
+        """Parse streaming tokens and build SSE chunks.
+
+        Returns: (sse_chunks, has_tool_calls, error_message)
+        """
+        ...
+
+
 class LogProbs(BaseModel):
     text_offset: List[int] = Field(default_factory=list)
     token_logprobs: List[Optional[float]] = Field(default_factory=list)
     tokens: List[str] = Field(default_factory=list)
-    token_ids: List[int] = Field(default_factory=list)
     top_logprobs: List[Optional[Dict[str, float]]] = Field(default_factory=list)
 
 
@@ -93,7 +144,6 @@ class TopLogprob(BaseModel):
 
 class ChatCompletionTokenLogprob(BaseModel):
     token: str
-    token_id: int
     bytes: List[int]
     logprob: float
     top_logprobs: List[TopLogprob]
@@ -128,6 +178,20 @@ class PromptTokensDetails(BaseModel):
     """Details about prompt tokens."""
 
     cached_tokens: int = 0
+    # Multimodal prompt token counts (only populated when present in the prompt)
+    image_tokens: Optional[int] = None
+    audio_tokens: Optional[int] = None
+    video_tokens: Optional[int] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Drop multimodal fields when absent so text-only/cache-only responses
+        # keep the original {"cached_tokens": N} shape.
+        for key in ("image_tokens", "audio_tokens", "video_tokens"):
+            if data.get(key) is None:
+                data.pop(key, None)
+        return data
 
 
 class UsageInfo(BaseModel):
@@ -149,7 +213,7 @@ class JsonSchemaResponseFormat(BaseModel):
     description: Optional[str] = None
     # use alias to workaround pydantic conflict
     schema_: Optional[Dict[str, object]] = Field(alias="schema", default=None)
-    strict: Optional[bool] = False
+    strict: Optional[bool] = None
 
 
 class ResponseFormat(BaseModel):
@@ -168,6 +232,7 @@ class LegacyStructuralTagResponseFormat(BaseModel):
     type: Literal["structural_tag"]
     structures: List[StructuresResponseFormat]
     triggers: List[str]
+    at_least_one: bool = False
 
 
 StructuralTagResponseFormat: TypeAlias = Union[
@@ -273,9 +338,11 @@ class CompletionRequest(BaseModel):
     temperature: float = 1.0
     top_p: float = 1.0
     user: Optional[str] = None
-    return_hidden_states: bool = False
+    return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
+    return_token_ids: bool = False
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: int = -1
@@ -291,10 +358,13 @@ class CompletionRequest(BaseModel):
     ignore_eos: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     response_format: Optional[Union[ResponseFormat, StructuralTagResponseFormat]] = None
     custom_params: Optional[Dict] = None
     custom_logit_processor: Optional[str] = None
+
+    images_config: Optional[Dict] = None
 
     # For PD disaggregation
     bootstrap_host: Optional[Union[List[str], str]] = None
@@ -357,12 +427,18 @@ class CompletionResponseChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    token_ids: Optional[List[int]] = None
+    prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
         return data
 
 
@@ -391,12 +467,18 @@ class CompletionResponseStreamChoice(BaseModel):
     finish_reason: Optional[Literal["stop", "length", "content_filter", "abort"]] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    token_ids: Optional[List[int]] = None
+    prompt_token_ids: Optional[List[int]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
         return data
 
 
@@ -420,6 +502,20 @@ class CompletionStreamResponse(BaseModel):
 class ChatCompletionMessageContentTextPart(BaseModel):
     type: Literal["text"]
     text: str
+
+
+class ChatCompletionMessageContentThinkingPart(BaseModel):
+    type: Literal["thinking", "reasoning"]
+    thinking: Optional[str] = None
+    text: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if (self.thinking is None) == (self.text is None):
+            raise ValueError(
+                "thinking parts require exactly one of 'thinking' or 'text'"
+            )
+        return self
 
 
 class ChatCompletionMessageContentImageURL(BaseModel):
@@ -455,11 +551,24 @@ class ChatCompletionMessageContentAudioPart(BaseModel):
     audio_url: ChatCompletionMessageContentAudioURL
 
 
+class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
+    # GLM-specific extension used alongside `defer_loading` tools. The chat
+    # template looks up `tools[*].function.name == tr.name` and renders the
+    # referenced tool schemas inline for the current turn. Not part of any
+    # OpenAI API; included here so Pydantic accepts the content through the
+    # Chat Completions path (the Anthropic endpoint translates its
+    # `tool_name` field to `name` before forwarding).
+    type: Literal["tool_reference"]
+    name: str
+
+
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
+    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
+    ChatCompletionMessageContentToolReferenceBlock,
 ]
 
 # Rerank content types for multimodal reranking (e.g., Qwen3-VL-Reranker)
@@ -488,8 +597,14 @@ class ToolCall(BaseModel):
     function: FunctionResponse
 
 
+_GenericMessageRole = Literal[
+    "system", "assistant", "tool", "function", "developer", "latest_reminder"
+]
+_GENERIC_MESSAGE_ROLES: Tuple[str, ...] = get_args(_GenericMessageRole)
+
+
 class ChatCompletionMessageGenericParam(BaseModel):
-    role: Literal["system", "assistant", "tool", "function", "developer"]
+    role: _GenericMessageRole
     content: Union[str, List[ChatCompletionMessageContentPart], None] = Field(
         default=None
     )
@@ -504,17 +619,36 @@ class ChatCompletionMessageGenericParam(BaseModel):
     def _normalize_role(cls, v):
         if isinstance(v, str):
             v_lower = v.lower()
-            if v_lower not in {"system", "assistant", "tool", "function", "developer"}:
-                raise ValueError(
-                    "'role' must be one of 'system', 'developer', 'assistant', 'tool', or 'function' (case-insensitive)."
-                )
+            if v_lower not in _GENERIC_MESSAGE_ROLES:
+                allowed = ", ".join(repr(r) for r in _GENERIC_MESSAGE_ROLES)
+                raise ValueError(f"'role' must be one of {allowed} (case-insensitive).")
             return v_lower
         raise ValueError("'role' must be a string")
+
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if self.role != "assistant" and isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
 
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
+
+    @model_validator(mode="after")
+    def validate_thinking_parts_role(self):
+        if isinstance(self.content, list):
+            for part in self.content:
+                if isinstance(part, ChatCompletionMessageContentThinkingPart):
+                    raise ValueError(
+                        "thinking content parts are only valid in assistant messages"
+                    )
+        return self
 
 
 ChatCompletionMessageParam = Union[
@@ -529,6 +663,14 @@ class Function(BaseModel):
     name: str
     parameters: Optional[object] = None
     strict: bool = False
+    defer_loading: Optional[bool] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        if self.defer_loading is None:
+            data.pop("defer_loading", None)
+        return data
 
 
 class Tool(BaseModel):
@@ -536,6 +678,18 @@ class Tool(BaseModel):
 
     type: str = Field(default="function", examples=["function"])
     function: Function
+    defer_loading: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _propagate_defer_loading(self) -> Tool:
+        if self.defer_loading is not None and self.function.defer_loading is None:
+            self.function.defer_loading = self.defer_loading
+        return self
+
+
+# Tool is defined after the message params that reference it, so the forward
+# reference has to be resolved explicitly.
+ChatCompletionMessageGenericParam.model_rebuild()
 
 
 class ToolChoiceFuncName(BaseModel):
@@ -549,6 +703,35 @@ class ToolChoice(BaseModel):
 
     function: ToolChoiceFuncName
     type: Literal["function"] = Field(default="function", examples=["function"])
+
+
+# OpenAI-spec string tiers for reasoning effort (current Responses/Chat API):
+# none/minimal/low/medium/high/xhigh/max. Used as-is by /v1/responses.
+ReasoningEffortTier = Literal[
+    "none", "minimal", "low", "medium", "high", "xhigh", "max"
+]
+# Chat Completions and /v1/tokenize additionally accept a fine-grained float in
+# [0.0, 0.99] as an sglang extension (not part of the OpenAI schema, so the
+# /v1/responses surface deliberately keeps the string tiers only). Single-sourced
+# so these surfaces cannot drift apart.
+ReasoningEffortType = Optional[
+    Union[
+        ReasoningEffortTier,
+        Annotated[float, Field(ge=0.0, le=0.99, allow_inf_nan=False)],
+    ]
+]
+
+
+def _has_message_level_tools(messages: Any) -> bool:
+    if not isinstance(messages, list):
+        return False
+    return any(
+        isinstance(message, dict)
+        and isinstance(message.get("role"), str)
+        and message["role"].lower() in ("system", "developer")
+        and bool(message.get("tools"))
+        for message in messages
+    )
 
 
 class ChatCompletionRequest(BaseModel):
@@ -587,23 +770,41 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
-    return_hidden_states: bool = False
+    parallel_tool_calls: bool = True
+    return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
+    routed_experts_start_len: int = 0
     return_cached_tokens_details: bool = False
-    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = Field(
-        default="medium",
+    return_prompt_token_ids: bool = False
+    return_token_ids: bool = False
+    return_meta_info: bool = False
+    reasoning_effort: ReasoningEffortType = Field(
+        default=None,
         description="Constrains effort on reasoning for reasoning models. "
+        "Accepts string levels ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max') or a "
+        "float in [0.0, 0.99] for fine-grained control. "
         "'none' disables reasoning entirely, 'low' is the least effort, 'high' is the most effort. "
         "Reducing reasoning effort can result in faster responses and fewer tokens used on reasoning "
         "in a response. 'none' defaults thinking and enable_thinking to false in "
-        "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path.",
+        "chat_template_kwargs (unless explicitly overridden). Not supported in the harmony path."
+        "'max' is an sglang extension to the OpenAI schema for "
+        "models that expose a maximum-effort tier above 'high'; models that don't "
+        "support it treat it the same as 'high'.",
+    )
+    task: Optional[
+        Literal["action", "query", "authority", "domain", "title", "read_url"]
+    ] = Field(
+        default=None,
+        description="DeepSeek-V4 quick instruction task. When set, the last "
+        "user/developer message is treated as a single-shot classification prompt "
+        "and the corresponding task special token (e.g. `<｜domain｜>`) is appended "
+        "before generation. Only honored by the dsv4 chat encoder; ignored otherwise.",
     )
 
     # Extra parameters for SRT backend only and will be ignored by OpenAI models.
     top_k: Optional[int] = None
     min_p: Optional[float] = None
     min_tokens: int = 0
-    logprob_start_len: Optional[int] = None
     regex: Optional[str] = None
     ebnf: Optional[str] = None
     repetition_penalty: Optional[float] = None
@@ -614,18 +815,27 @@ class ChatCompletionRequest(BaseModel):
     continue_final_message: bool = False
     skip_special_tokens: bool = True
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    session_id: Optional[str] = None
     session_params: Optional[Dict] = None
     separate_reasoning: bool = True
     stream_reasoning: bool = True
     chat_template_kwargs: Optional[Dict] = None
 
-    # SGLang multimodal tiling controls (extensions)
+    # SGLang multimodal controls (extensions)
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    use_audio_in_video: bool = False
+
+    images_config: Optional[Dict] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
     custom_params: Optional[Dict] = None
+
+    # Pre-computed prompt token IDs: when provided, bypasses chat template
+    # tokenization entirely.  Messages are still used to derive stop tokens
+    # and tool_call_constraint.
+    input_ids: Optional[List[int]] = None
 
     # For request id
     rid: Optional[Union[List[str], str]] = None
@@ -648,9 +858,6 @@ class ChatCompletionRequest(BaseModel):
     # Deprecated: use routed_dp_rank instead
     data_parallel_rank: Optional[int] = None
 
-    # Input ids, if provided, it will override the message input.
-    input_ids: Optional[Union[List[List[int]], List[int]]] = None
-
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -669,21 +876,52 @@ class ChatCompletionRequest(BaseModel):
     @classmethod
     def set_tool_choice_default(cls, values):
         if values.get("tool_choice") is None:
-            if values.get("tools") is None:
+            if values.get("tools") is None and not _has_message_level_tools(
+                values.get("messages")
+            ):
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
         return values
 
+    @field_validator("reasoning_effort", mode="before")
+    @classmethod
+    def validate_reasoning_effort_type(cls, value):
+        if isinstance(value, bool):
+            raise ValueError("reasoning_effort must not be a boolean")
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def normalize_reasoning_inputs(cls, values: Dict):
         r = values.get("reasoning")
+        thinking = None
 
         if r is not None and isinstance(r, dict):
-            effort = r.get("effort") or r.get("reasoning_effort")
-            if effort in {"none", "low", "medium", "high"}:
+            effort = r.get("effort")
+            if effort is None:
+                effort = r.get("reasoning_effort")
+            if isinstance(effort, str) and effort in {
+                "none",
+                "minimal",
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max",
+            }:
                 values["reasoning_effort"] = effort
+            elif isinstance(effort, (int, float)) and not isinstance(effort, bool):
+                values["reasoning_effort"] = float(effort)
+            elif isinstance(effort, str):
+                # Keep parity with the top-level reasoning_effort field, whose
+                # lax union coerces numeric strings; range checks then apply.
+                try:
+                    values["reasoning_effort"] = float(effort)
+                except ValueError as exc:
+                    raise ValueError(f"invalid reasoning effort: {effort!r}") from exc
+            elif effort is not None:
+                raise ValueError(f"invalid reasoning effort: {effort!r}")
 
             enabled = (
                 r.get("enabled")
@@ -693,21 +931,21 @@ class ChatCompletionRequest(BaseModel):
             if isinstance(enabled, str):
                 enabled = enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
             if enabled:
-                ctk = values.get("chat_template_kwargs")
-                if not isinstance(ctk, dict):
-                    ctk = {}
-                ctk.setdefault("thinking", True)
-                values["chat_template_kwargs"] = ctk
+                thinking = True
 
-        if values.get("reasoning_effort") == "none":
+        effort = values.get("reasoning_effort")
+        if effort is not None:
+            thinking = effort != "none"
+
+        if thinking is not None:
             ctk = values.get("chat_template_kwargs")
             if not isinstance(ctk, dict):
                 ctk = {}
             # different models check different keys:
             # - "thinking" for deepseek-v3, kimi_k2
             # - "enable_thinking" for qwen3, glm45, nemotron_3, interns1
-            ctk.setdefault("thinking", False)
-            ctk.setdefault("enable_thinking", False)
+            ctk.setdefault("thinking", thinking)
+            ctk.setdefault("enable_thinking", thinking)
             values["chat_template_kwargs"] = ctk
 
         return values
@@ -730,11 +968,10 @@ class ChatCompletionRequest(BaseModel):
 
         if schema:
             name_ = schema.get("title", "Schema")
-            strict_ = False
+            strict_ = None
             if "properties" in schema and "strict" in schema["properties"]:
                 item = schema["properties"].pop("strict", None)
-                if item and item.get("default", False):
-                    strict_ = True
+                strict_ = bool(item and item.get("default", False))
 
             response_format["json_schema"] = {
                 "name": name_,
@@ -746,9 +983,10 @@ class ChatCompletionRequest(BaseModel):
 
     def to_sampling_params(
         self,
+        stop: List[str],
         model_generation_config: Dict[str, Any],
-        stop: Optional[List[str]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        renderer_handles_response_format: bool = False,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -796,9 +1034,15 @@ class ChatCompletionRequest(BaseModel):
         }
 
         if self.response_format and self.response_format.type == "json_schema":
-            sampling_params["json_schema"] = convert_json_schema_to_str(
-                self.response_format.json_schema.schema_
-            )
+            # strict=false may only go unconstrained when the renderer forwards
+            # response_format to the model; plain chat templates never see it.
+            if (
+                self.response_format.json_schema.strict is not False
+                or not renderer_handles_response_format
+            ):
+                sampling_params["json_schema"] = convert_json_schema_to_str(
+                    self.response_format.json_schema.schema_
+                )
         elif self.response_format and self.response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
         elif self.response_format and self.response_format.type == "structural_tag":
@@ -842,7 +1086,6 @@ class ChatMessage(BaseModel):
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
-    input_token_ids: Optional[List[int]] = None
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
@@ -851,12 +1094,21 @@ class ChatCompletionResponseChoice(BaseModel):
     ] = None
     matched_stop: Union[None, int, str] = None
     hidden_states: Optional[object] = None
+    prompt_token_ids: Optional[List[int]] = None
+    token_ids: Optional[List[int]] = None
+    meta_info: Optional[Dict[str, Any]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
         if self.hidden_states is None:
             data.pop("hidden_states", None)
+        if self.prompt_token_ids is None:
+            data.pop("prompt_token_ids", None)
+        if self.token_ids is None:
+            data.pop("token_ids", None)
+        if self.meta_info is None:
+            data.pop("meta_info", None)
         return data
 
 
@@ -948,10 +1200,15 @@ class EmbeddingRequest(BaseModel):
     priority: Optional[int] = None
     # LoRA adapter path(s)
     lora_path: Optional[Union[List[Optional[str]], Optional[str]]] = None
+    # Placeholder token id used to locate embedding override positions in input token IDs.
+    embed_override_token_id: Optional[int] = None
+    # Per-input embedding overrides (null entries skip that input).
+    # Shape: [num_inputs][num_replacements][hidden_size]
+    embed_overrides: Optional[List[Optional[List[List[float]]]]] = None
 
 
 class EmbeddingObject(BaseModel):
-    embedding: List[float]
+    embedding: Union[List[float], str]
     index: int
     object: str = "embedding"
 
@@ -1001,11 +1258,22 @@ class ScoringRequest(BaseModel):
     items: Optional[Union[str, List[str], List[List[int]]]] = (
         None  # Item text(s) or pre-tokenized token IDs
     )
+    # Placeholder token id used to locate embedding override positions in query/items.
+    embed_override_token_id: Optional[int] = None
+    # Query embedding overrides.
+    query_embed_overrides: Optional[List[List[float]]] = (
+        None  # [num_query_embed_overrides][hidden_size]
+    )
+    # Per-item embedding overrides (null entries skip that item).
+    item_embed_overrides: Optional[List[Optional[List[List[float]]]]] = (
+        None  # [num_items][num_item_embed_overrides][hidden_size]
+    )
     label_token_ids: Optional[List[int]] = (
         None  # Token IDs to compute probabilities for
     )
     apply_softmax: bool = False
     item_first: bool = False
+    return_pooled_hidden_states: bool = False
     model: str = DEFAULT_MODEL_NAME
 
 
@@ -1013,6 +1281,7 @@ class ScoringResponse(BaseModel):
     scores: List[
         List[float]
     ]  # List of lists of probabilities, each in the order of label_token_ids
+    pooled_hidden_states: Optional[List[Optional[List[float]]]] = None
     model: str
     usage: Optional[UsageInfo] = None
     object: str = "scoring"
@@ -1078,12 +1347,38 @@ class RerankResponse(BaseModel):
 class TokenizeRequest(BaseModel):
     """Request schema for the /tokenize endpoint."""
 
+    model_config = ConfigDict(extra="allow")
+
     model: str = DEFAULT_MODEL_NAME
-    prompt: Union[str, List[str]]
+    prompt: Optional[Union[str, List[str]]] = None
+    messages: Optional[List[ChatCompletionMessageParam]] = None
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
+        Field(default=None, examples=["auto"])
+    )
+    reasoning_effort: ReasoningEffortType = None
+    continue_final_message: bool = False
+    chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
     )
+
+    @model_validator(mode="after")
+    def validate_tokenize_input(self) -> TokenizeRequest:
+        if (self.prompt is None) == (self.messages is None):
+            raise ValueError("Exactly one of 'prompt' or 'messages' must be provided.")
+        return self
+
+    def to_chat_completion_request(self) -> ChatCompletionRequest:
+        data = self.model_dump(
+            exclude={"prompt", "add_special_tokens"},
+            exclude_none=True,
+        )
+        extra = getattr(self, "__pydantic_extra__", None)
+        if extra:
+            data.update(extra)
+        return ChatCompletionRequest.model_validate(data)
 
 
 class TokenizeResponse(BaseModel):
@@ -1127,18 +1422,52 @@ OpenAIServingRequest = Union[
 class ResponseReasoningParam(BaseModel):
     """Reasoning parameters for responses."""
 
-    effort: Optional[Literal["low", "medium", "high"]] = Field(
+    effort: Optional[ReasoningEffortTier] = Field(
         default="medium",
-        description="Constrains effort on reasoning for reasoning models.",
+        description="Constrains effort on reasoning for reasoning models. "
+        "Accepts the OpenAI string tiers "
+        "('none','minimal','low','medium','high','xhigh','max').",
     )
+    summary: Optional[Literal["auto", "concise", "detailed"]] = Field(
+        default=None,
+        description="Include a summary of the model's reasoning trace on the response.",
+    )
+
+
+# Only ``function`` / ``web_search*`` / ``code_interpreter`` are wired to
+# execution paths; the rest pass validation so clients aren't rejected.
+RESPONSE_TOOL_TYPES = Literal[
+    "function",
+    "web_search",
+    "web_search_preview",
+    "code_interpreter",
+    "file_search",
+    "image_generation",
+    "computer_use_preview",
+    "local_shell",
+    "mcp",
+    "custom",
+    "namespace",
+    "tool_search",
+]
 
 
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
-    )
+    type: RESPONSE_TOOL_TYPES = Field(description="Type of tool to enable")
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    strict: bool = False
+    # Inner schemas for ``namespace`` tools.
+    tools: Optional[List[Dict[str, Any]]] = None
+
+    @model_validator(mode="after")
+    def validate_function_tool(self) -> ResponseTool:
+        if self.type == "function" and not self.name:
+            raise ValueError("Function tools must include a name.")
+        return self
 
 
 ResponseInputOutputItem: TypeAlias = Union[
@@ -1165,7 +1494,9 @@ class ResponsesRequest(BaseModel):
             ]
         ]
     ] = None
-    input: Union[str, List[ResponseInputOutputItem]]
+    # Accept dict-shaped items as the loose arm; downstream normalization
+    # handles replayed shapes that don't satisfy every openai TypedDict.
+    input: Union[str, List[ResponseInputOutputItem], List[Dict[str, Any]]]
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
     max_tool_calls: Optional[int] = None
@@ -1190,6 +1521,7 @@ class ResponsesRequest(BaseModel):
         default_factory=lambda: f"resp_{uuid.uuid4().hex}",
         description="The request_id related to this request. If the caller does not set it, a random uuid will be generated.",
     )
+    session_id: Optional[str] = None
     priority: int = Field(default=0, description="Request priority")
     extra_key: Optional[str] = Field(
         default=None,
@@ -1199,13 +1531,13 @@ class ResponsesRequest(BaseModel):
         default=None, description="Cache salt for request caching"
     )
 
-    # SGLang-specific sampling parameters
+    # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
     stop: Optional[Union[str, List[str]]] = None
-    top_k: int = -1
-    min_p: float = 0.0
-    repetition_penalty: float = 1.0
+    top_k: Optional[int] = None
+    min_p: Optional[float] = None
+    repetition_penalty: Optional[float] = None
 
     # Default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
@@ -1216,8 +1548,57 @@ class ResponsesRequest(BaseModel):
         "repetition_penalty": 1.0,
     }
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_responses_input(cls, values):
+        if not isinstance(values, dict):
+            return values
+
+        input_value = values.get("input")
+        if not isinstance(input_value, list):
+            return values
+
+        values = values.copy()
+        values["input"] = [
+            cls._normalize_input_item_for_validation(item) for item in input_value
+        ]
+        return values
+
+    @staticmethod
+    def _normalize_input_item_for_validation(item):
+        if not isinstance(item, dict):
+            return item
+
+        content = item.get("content")
+        if not isinstance(content, list):
+            return item
+
+        item = item.copy()
+        item["content"] = [
+            ResponsesRequest._normalize_content_part_for_validation(part)
+            for part in content
+        ]
+        return item
+
+    @staticmethod
+    def _normalize_content_part_for_validation(part):
+        if not isinstance(part, dict):
+            return part
+
+        part_type = part.get("type")
+        if part_type != "input_image" or part.get("detail") is not None:
+            return part
+
+        part = part.copy()
+        part["detail"] = "auto"
+        return part
+
     def to_sampling_params(
-        self, default_max_tokens: int, default_params: Optional[Dict] = None
+        self,
+        default_max_tokens: int,
+        default_params: Optional[Dict] = None,
+        stop: Optional[Union[str, List[str]]] = None,
+        tool_call_constraint: Optional[ToolCallConstraint] = None,
     ) -> Dict[str, Any]:
         """Convert to sampling parameters for generation."""
         if default_params is None:
@@ -1229,10 +1610,9 @@ class ResponsesRequest(BaseModel):
         else:
             max_tokens = default_max_tokens
 
-        # Avoid exceed the context length by minus 2 token
+        # Headroom for BOS/EOS the engine appends on top of prompt+budget.
         max_tokens -= 2
 
-        # Get parameters with defaults
         temperature = self.temperature
         if temperature is None:
             temperature = default_params.get(
@@ -1243,22 +1623,50 @@ class ResponsesRequest(BaseModel):
         if top_p is None:
             top_p = default_params.get("top_p", self._DEFAULT_SAMPLING_PARAMS["top_p"])
 
-        params = {
+        # Omit None entries so they fall through to ``--preferred-sampling-params``
+        # rather than overriding it with a literal default.
+        params: dict[str, Any] = {
             "max_new_tokens": max_tokens,
             "temperature": temperature,
             "top_p": top_p,
             "frequency_penalty": self.frequency_penalty,
             "presence_penalty": self.presence_penalty,
-            "stop": self.stop,
-            "top_k": self.top_k,
-            "min_p": self.min_p,
-            "repetition_penalty": self.repetition_penalty,
+            "stop": self.stop if stop is None else stop,
         }
+        if self.top_k is not None:
+            params["top_k"] = self.top_k
+        if self.min_p is not None:
+            params["min_p"] = self.min_p
+        if self.repetition_penalty is not None:
+            params["repetition_penalty"] = self.repetition_penalty
 
         # Apply any additional default parameters
         for key, value in default_params.items():
             if key not in params or params[key] is None:
                 params[key] = value
+
+        has_existing_constraints = (
+            params.get("regex")
+            or params.get("ebnf")
+            or params.get("structural_tag")
+            or params.get("json_schema")
+        )
+        if tool_call_constraint and has_existing_constraints:
+            # Refuse rather than silently drop the tool-call grammar.
+            raise ValueError(
+                "Cannot combine tool calls with constrained decoding "
+                "(regex / ebnf / structural_tag / json_schema). Remove one."
+            )
+        if tool_call_constraint:
+            constraint_type, constraint_value = tool_call_constraint
+            if constraint_type in ("structural_tag", "json_schema"):
+                params[constraint_type] = convert_json_schema_to_str(
+                    constraint_value.model_dump(by_alias=True)
+                    if hasattr(constraint_value, "model_dump")
+                    else constraint_value
+                )
+            else:
+                params[constraint_type] = constraint_value
 
         return params
 
@@ -1318,7 +1726,7 @@ class ResponsesResponse(BaseModel):
         ],
         status: str,
         usage: Optional[UsageInfo],
-    ) -> "ResponsesResponse":
+    ) -> ResponsesResponse:
         """Create a response from a request."""
 
         # Determine if the output is plain text only to set text.format
@@ -1362,7 +1770,11 @@ class ResponsesResponse(BaseModel):
             output=output,
             status=status,
             usage=usage,
-            parallel_tool_calls=request.parallel_tool_calls or True,
+            parallel_tool_calls=(
+                request.parallel_tool_calls
+                if request.parallel_tool_calls is not None
+                else True
+            ),
             tool_choice=request.tool_choice,
             tools=request.tools,
             # fields for parity with v1/responses
@@ -1394,22 +1806,6 @@ class RequestResponseMetadata(BaseModel):
 
 @dataclass
 class MessageProcessingResult:
-    """Result of processing chat messages and applying templates.
-
-    This dataclass encapsulates all the outputs from message processing including
-    prompt generation, multimodal data extraction, and constraint preparation.
-    Used internally by OpenAIServingChat to pass processed data between methods.
-
-    Args:
-        prompt: The final text prompt after applying chat template
-        prompt_ids: Either the text prompt (str) or tokenized IDs (List[int])
-        image_data: Extracted image data from messages, if any
-        audio_data: Extracted audio data from messages, if any
-        modalities: List of modality types present in the messages
-        stop: Combined stop strings from template and request
-        tool_call_constraint: Optional constraint for structured tool calls
-    """
-
     prompt: str
     prompt_ids: Union[str, List[int]]
     image_data: Optional[Any]
@@ -1418,6 +1814,7 @@ class MessageProcessingResult:
     modalities: List[str]
     stop: List[str]
     tool_call_constraint: Optional[ToolCallConstraint] = None
+    require_reasoning: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):
@@ -1450,6 +1847,7 @@ class TranscriptionRequest(BaseModel):
     language: Optional[str] = None
     response_format: str = "json"
     temperature: float = 0.0
+    timestamp_granularities: Optional[List[str]] = None
     stream: bool = False
     # Internal fields (not from API)
     audio_data: Optional[bytes] = None
@@ -1467,6 +1865,26 @@ class TranscriptionResponse(BaseModel):
     """Non-streaming transcription response (OpenAI-compatible)."""
 
     text: str
+    usage: Optional[TranscriptionUsage] = None
+
+
+class TranscriptionSegment(BaseModel):
+    """A segment with timestamp information."""
+
+    id: int
+    start: float
+    end: float
+    text: str
+
+
+class TranscriptionVerboseResponse(BaseModel):
+    """Verbose transcription response with timestamps (OpenAI-compatible)."""
+
+    task: str = "transcribe"
+    language: Optional[str] = None
+    duration: Optional[float] = None
+    text: str
+    segments: List[TranscriptionSegment] = []
     usage: Optional[TranscriptionUsage] = None
 
 
