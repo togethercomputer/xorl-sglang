@@ -96,6 +96,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_server_args,
     get_stream,
 )
 from sglang.srt.server_args import (
@@ -157,10 +158,27 @@ def _qwen35_rope_class_b_candidate_enabled() -> bool:
 
 
 def _qwen35_rmsnorm_family(config) -> str:
-    family = getattr(config, "_qwen35_rmsnorm_family", "v1")
+    configured_family = getattr(config, "_qwen35_rmsnorm_family", None)
+    try:
+        runtime_args = get_server_args()
+    except ValueError:
+        runtime_args = None
+    runtime_exact = runtime_args is not None and is_qwen35_gdn_exact_mode(runtime_args)
+    if runtime_exact:
+        runtime_family = runtime_args.qwen35_rmsnorm_family
+        if configured_family is not None and configured_family != runtime_family:
+            raise RuntimeError(
+                "Qwen RMSNorm family drifted between the model config and runtime: "
+                f"config={configured_family!r}, runtime={runtime_family!r}."
+            )
+        family = runtime_family
+    else:
+        family = configured_family or "v1"
     if family not in ("v1", "v2"):
         raise ValueError(f"Unsupported Qwen3.5/3.6 RMSNorm family: {family!r}")
-    if family == "v2" and not bool(getattr(config, "_qwen35_gdn_exact_mode", False)):
+    if family == "v2" and not (
+        runtime_exact or bool(getattr(config, "_qwen35_gdn_exact_mode", False))
+    ):
         raise RuntimeError(
             "Qwen families-v2 RMSNorm is admitted only in the exact XORL serving lane."
         )

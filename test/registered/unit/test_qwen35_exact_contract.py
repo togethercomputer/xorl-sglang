@@ -344,6 +344,12 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         set_head.assert_called_once_with(False)
         set_combine.assert_called_once_with(False)
         startup.assert_called_once()
+        startup_args = startup.call_args.args
+        assert startup_args[2] == "v1"
+        assert "conservative no-overlap/no-padding" in startup_args[1]
+        rendered = startup_args[0] % startup_args[1:]
+        assert "decode, conservative" in rendered
+        assert "rmsnorm_family=v1" in rendered
         force_family.assert_not_called()
 
 
@@ -503,6 +509,17 @@ def test_qwen35_gemma_norm_v2_rejects_silent_v1_bypasses():
             norm.forward_cuda(x)
     with pytest.raises(RuntimeError, match="allreduce-fused v1"):
         norm.forward_with_allreduce_fusion(x, x)
+
+
+def test_qwen35_rmsnorm_family_survives_worker_config_reconstruction():
+    import sglang.srt.models.qwen3_5 as qwen
+
+    runtime_args = SimpleNamespace(
+        qwen35_gdn_exact_mode=True,
+        qwen35_rmsnorm_family="v2",
+    )
+    with patch.object(qwen, "get_server_args", return_value=runtime_args):
+        assert qwen._qwen35_rmsnorm_family(SimpleNamespace()) == "v2"
 
 
 @pytest.mark.parametrize("use_fused", (False, True))

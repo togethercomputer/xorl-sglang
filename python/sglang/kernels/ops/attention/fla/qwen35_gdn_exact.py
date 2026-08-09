@@ -110,13 +110,13 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
         "Exact Qwen3.5-family zero-K3 serving resolved: BI GDN "
         "prefill/rescan decode%s, rows-per-block pin, contract lm-head + "
         "decode rescore; rmsnorm_family=%s; resolved tuple=%s",
-        rmsnorm_family,
         (
             ", conservative no-overlap/no-padding partial-chunk-rescan graph "
             "program; Wave-3 fast mechanisms held behind live zero-K3 promotion"
             if is_moe
             else " (conservative eager tuple; MoE Wave-3 fast paths disabled)"
         ),
+        rmsnorm_family,
         (
             "qwen3.6-moe:tp8/dp8/ep8/pp1,graph32,no-radix,full-prefill"
             if is_moe
