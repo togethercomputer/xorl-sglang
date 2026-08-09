@@ -15,7 +15,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Optional, Tuple, Union
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -945,15 +945,37 @@ class LayerNorm(BaseFusedOp):
             return self.forward_native(x)
 
 
+def _validate_qwen_v2_norm_tensor(
+    tensor: torch.Tensor, *, name: str, shape: torch.Size | None = None
+) -> None:
+    if tensor.dtype != torch.bfloat16 or not tensor.is_cuda:
+        raise RuntimeError(
+            f"The Qwen families-v2 RMSNorm candidate requires CUDA BF16 {name}; "
+            f"got device={tensor.device}, dtype={tensor.dtype}."
+        )
+    if shape is not None and tensor.shape != shape:
+        raise RuntimeError(
+            f"The Qwen families-v2 RMSNorm candidate requires {name} shape {tuple(shape)}, "
+            f"got {tuple(tensor.shape)}."
+        )
+
+
 class GemmaRMSNorm(BaseFusedOp):
     def __init__(
         self,
         hidden_size: int,
         eps: float = 1e-6,
+        xorl_batch_invariant_version: Optional[Literal["v1", "v2"]] = None,
     ) -> None:
         super().__init__()
+        if xorl_batch_invariant_version not in (None, "v1", "v2"):
+            raise ValueError(
+                "GemmaRMSNorm xorl_batch_invariant_version must be None, 'v1', or 'v2'; "
+                f"got {xorl_batch_invariant_version!r}."
+            )
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self.xorl_batch_invariant_version = xorl_batch_invariant_version
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
@@ -1016,6 +1038,45 @@ class GemmaRMSNorm(BaseFusedOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.xorl_batch_invariant_version == "v2":
+            if (
+                not is_batch_invariant_mode_enabled()
+                or not is_batch_invariant_op_enabled("rms_norm")
+            ):
+                raise RuntimeError(
+                    "The Qwen families-v2 RMSNorm candidate requires the exact batch-invariant "
+                    "rms_norm contract to be engaged."
+                )
+            _validate_qwen_v2_norm_tensor(x, name="input")
+            if post_residual_addition is not None:
+                raise RuntimeError(
+                    "The Qwen families-v2 RMSNorm candidate does not admit post_residual_addition."
+                )
+            original_shape = x.shape
+            x_2d = x.reshape(-1, original_shape[-1])
+            if x_2d.stride(-1) != 1:
+                x_2d = x_2d.contiguous()
+            if residual is None:
+                out = rms_norm_v2(
+                    x_2d,
+                    self.weight.data,
+                    self.variance_epsilon,
+                    zero_centered=True,
+                )
+                return out.reshape(original_shape)
+            _validate_qwen_v2_norm_tensor(residual, name="residual", shape=x.shape)
+            residual_2d = residual.reshape(-1, original_shape[-1])
+            if residual_2d.stride(-1) != 1:
+                residual_2d = residual_2d.contiguous()
+            out, residual_out = rms_norm_v2(
+                x_2d,
+                self.weight.data,
+                self.variance_epsilon,
+                residual=residual_2d,
+                zero_centered=True,
+            )
+            return out.reshape(original_shape), residual_out.reshape(original_shape)
+
         if is_batch_invariant_mode_enabled() and is_batch_invariant_op_enabled(
             "rms_norm"
         ):
@@ -1140,6 +1201,10 @@ class GemmaRMSNorm(BaseFusedOp):
         use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
+        if self.xorl_batch_invariant_version == "v2":
+            raise RuntimeError(
+                "The Qwen families-v2 RMSNorm candidate cannot use an allreduce-fused v1 norm path."
+            )
         return _forward_with_allreduce_fusion(
             self,
             x,
@@ -1158,6 +1223,10 @@ class GemmaRMSNorm(BaseFusedOp):
         keep_bf16: bool = False,
     ):
         """Fused AR + RMSNorm + per-group FP8 quant (Gemma-style: weight + 1)."""
+        if self.xorl_batch_invariant_version == "v2":
+            raise RuntimeError(
+                "The Qwen families-v2 RMSNorm candidate cannot use an allreduce/quant-fused v1 norm path."
+            )
         return _forward_with_allreduce_fusion_quant_per_group(
             self,
             x,

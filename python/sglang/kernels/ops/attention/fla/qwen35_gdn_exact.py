@@ -37,10 +37,10 @@ QWEN35_REQUIRED_BI_OPS = (
     "rms_norm",
 )
 
-# This tuple does not use the GLM numerical-family resolver. Its sensitive
-# sites are selected directly: Gemma-style family-1 RMSNorm through the
-# registered BI op, the v1 head/LSE functions, the BI router, the explicit
-# ordered combine, and the GDN kernels below. Do not add a second family knob.
+# This tuple does not use the GLM numerical-family resolver. Its head/LSE,
+# router, ordered combine, and GDN kernels remain the qualified v1 program.
+# The explicit Qwen RMSNorm candidate may independently select the v2 tree so
+# the promotion A/B changes one numerical surface at a time.
 
 _applied = False
 
@@ -53,6 +53,9 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
 
     is_moe = bool(server_args.qwen35_gdn_exact_is_moe)
     exact_graph = is_moe and not server_args.disable_cuda_graph
+    rmsnorm_family = getattr(server_args, "qwen35_rmsnorm_family", "v1")
+    if rmsnorm_family not in ("v1", "v2"):
+        raise RuntimeError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
 
     from sglang.srt.batch_invariant_ops import batch_invariant_ops as _bi_ops
     from sglang.srt.batch_invariant_ops import bi_gemm_configs as _gemm_configs
@@ -106,7 +109,8 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     logger.info(
         "Exact Qwen3.5-family zero-K3 serving resolved: BI GDN "
         "prefill/rescan decode%s, rows-per-block pin, contract lm-head + "
-        "decode rescore; resolved tuple=%s",
+        "decode rescore; rmsnorm_family=%s; resolved tuple=%s",
+        rmsnorm_family,
         (
             ", conservative no-overlap/no-padding partial-chunk-rescan graph "
             "program; Wave-3 fast mechanisms held behind live zero-K3 promotion"

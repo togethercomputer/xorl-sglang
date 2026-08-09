@@ -156,6 +156,17 @@ def _qwen35_rope_class_b_candidate_enabled() -> bool:
     return is_qwen35_rope_class_b_candidate(get_global_server_args())
 
 
+def _qwen35_rmsnorm_family(config) -> str:
+    family = getattr(config, "_qwen35_rmsnorm_family", "v1")
+    if family not in ("v1", "v2"):
+        raise ValueError(f"Unsupported Qwen3.5/3.6 RMSNorm family: {family!r}")
+    if family == "v2" and not bool(getattr(config, "_qwen35_gdn_exact_mode", False)):
+        raise RuntimeError(
+            "Qwen families-v2 RMSNorm is admitted only in the exact XORL serving lane."
+        )
+    return family
+
+
 if _is_cuda:
     from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
         fused_qk_gemma_rmsnorm_rope_gate,
@@ -468,9 +479,9 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                             cpu_split_sizes.append(
                                 int(target_size_sim * split_sizes[i] / split_size_sum)
                             )
-                        assert (
-                            sum(cpu_split_sizes) == target_size_sim
-                        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
+                        assert sum(cpu_split_sizes) == target_size_sim, (
+                            f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
+                        )
                         chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
                     else:
                         chunks = loaded_weight.split(split_sizes, dim=split_dim)
@@ -760,9 +771,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        rmsnorm_family = _qwen35_rmsnorm_family(config)
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
         )
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
@@ -884,10 +902,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
+        rmsnorm_family = _qwen35_rmsnorm_family(config)
         self.use_fused_qk_norm_rope = bool(
             _is_cuda
             and self.attn_output_gate
             and get_exec().kernel.enable_fused_qk_norm_rope
+            and rmsnorm_family != "v2"
         )
 
         self.rotary_emb = get_rope(
@@ -974,13 +994,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
+        )
+        self.k_norm = GemmaRMSNorm(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
+        )
 
         # Standard attention layers benefit from a fused quant epilogue only
         # when qkv_proj can consume the returned quantized tuple.
@@ -1465,7 +1499,11 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Final normalization
         if self.pp_group.is_last_rank:
-            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = GemmaRMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                xorl_batch_invariant_version=_qwen35_rmsnorm_family(config),
+            )
         else:
             self.norm = PPMissingLayer()
 

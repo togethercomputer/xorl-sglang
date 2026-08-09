@@ -3426,6 +3426,17 @@ class ServerArgs:
         ),
         NS("exec.deterministic"),
     ] = False
+    qwen35_rmsnorm_family: A[
+        Literal["v1", "v2"],
+        Arg(
+            help=(
+                "Exact Qwen3.5/3.6 RMSNorm arithmetic. The qualified default is v1; "
+                "v2 is an opt-in candidate for zero-centered q/k, residual, and final norms."
+            ),
+            choices=["v1", "v2"],
+        ),
+        NS("exec.deterministic"),
+    ] = "v1"
 
     # -------------------------------------------------------------------------
     # KV canary
@@ -5717,6 +5728,17 @@ class ServerArgs:
         hf_config._qwen35_rope_class_b_candidate = bool(
             self.qwen35_rope_class_b_candidate
         )
+        if not self.qwen35_gdn_exact_mode and self.qwen35_rmsnorm_family != "v1":
+            raise ValueError(
+                "--qwen35-rmsnorm-family v2 is supported only by the exact Qwen3.5/3.6 XORL target."
+            )
+        hf_config._qwen35_gdn_exact_mode = self.qwen35_gdn_exact_mode
+        hf_config._qwen35_gdn_exact_is_moe = self.qwen35_gdn_exact_is_moe
+        hf_config._qwen35_rmsnorm_family = self.qwen35_rmsnorm_family
+        text_config = _text_model_config(hf_config)
+        text_config._qwen35_gdn_exact_mode = self.qwen35_gdn_exact_mode
+        text_config._qwen35_gdn_exact_is_moe = self.qwen35_gdn_exact_is_moe
+        text_config._qwen35_rmsnorm_family = self.qwen35_rmsnorm_family
         self._validate_qwen35_gdn_exact_contract(hf_config)
         if not self.qwen35_gdn_exact_mode:
             return

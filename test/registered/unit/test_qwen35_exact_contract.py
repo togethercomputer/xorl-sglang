@@ -119,6 +119,38 @@ def test_qwen35_dense_resolves_only_the_certified_single_rank_topology():
     assert args.disable_radix_cache
 
 
+@pytest.mark.parametrize("moe", (False, True))
+def test_qwen35_rmsnorm_v2_is_an_explicit_exact_lane_candidate(moe):
+    hf_config = _qwen_config(moe=moe)
+    args = _server_args(
+        tp_size=8 if moe else 1,
+        ep_size=1,
+        qwen35_rmsnorm_family="v2",
+        disable_cuda_graph_padding=True,
+    )
+    args.cuda_graph_config = default_cuda_graph_config()
+    args._cuda_graph_config_locked = set()
+    architecture = (
+        "Qwen3_5MoeForConditionalGeneration"
+        if moe
+        else "Qwen3_5ForConditionalGeneration"
+    )
+
+    args._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=architecture)
+
+    assert args.qwen35_rmsnorm_family == "v2"
+    assert hf_config._qwen35_rmsnorm_family == "v2"
+    assert hf_config.text_config._qwen35_rmsnorm_family == "v2"
+
+
+def test_non_qwen_rejects_qwen35_rmsnorm_v2():
+    args = _server_args(qwen35_rmsnorm_family="v2")
+    with pytest.raises(ValueError, match="supported only by the exact Qwen3.5/3.6"):
+        args._resolve_qwen35_gdn_exact_contract(
+            SimpleNamespace(), model_arch="LlamaForCausalLM"
+        )
+
+
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
@@ -427,6 +459,52 @@ def test_qwen35_gemma_norm_routes_the_certified_family_split():
         assert torch.equal(residual_out, x + residual)
 
 
+def test_qwen35_gemma_norm_v2_routes_no_residual_and_residual_sites_to_one_tree():
+    import sglang.srt.layers.layernorm as layernorm
+
+    norm = layernorm.GemmaRMSNorm(4, xorl_batch_invariant_version="v2")
+    x = torch.tensor([[1.0, 2.0, 3.0, 4.0]], dtype=torch.bfloat16)
+    residual = torch.tensor([[4.0, 3.0, 2.0, 1.0]], dtype=torch.bfloat16)
+    calls = []
+
+    def fake_v2(hidden, weight, eps, *, residual=None, zero_centered=False):
+        calls.append(
+            (residual is not None, zero_centered, hidden.shape, weight.shape, eps)
+        )
+        if residual is None:
+            return hidden + 1
+        residual_out = hidden + residual
+        return residual_out + 1, residual_out
+
+    with (
+        patch.object(layernorm, "is_batch_invariant_mode_enabled", return_value=True),
+        patch.object(layernorm, "is_batch_invariant_op_enabled", return_value=True),
+        patch.object(layernorm, "_validate_qwen_v2_norm_tensor"),
+        patch.object(layernorm, "rms_norm_v2", side_effect=fake_v2),
+    ):
+        assert torch.equal(norm.forward_cuda(x), x + 1)
+        out, residual_out = norm.forward_cuda(x, residual)
+
+    assert torch.equal(residual_out, x + residual)
+    assert torch.equal(out, x + residual + 1)
+    assert calls == [
+        (False, True, torch.Size([1, 4]), torch.Size([4]), 1e-6),
+        (True, True, torch.Size([1, 4]), torch.Size([4]), 1e-6),
+    ]
+
+
+def test_qwen35_gemma_norm_v2_rejects_silent_v1_bypasses():
+    import sglang.srt.layers.layernorm as layernorm
+
+    norm = layernorm.GemmaRMSNorm(4, xorl_batch_invariant_version="v2")
+    x = torch.ones(1, 4, dtype=torch.bfloat16)
+    with patch.object(layernorm, "is_batch_invariant_mode_enabled", return_value=False):
+        with pytest.raises(RuntimeError, match="contract to be engaged"):
+            norm.forward_cuda(x)
+    with pytest.raises(RuntimeError, match="allreduce-fused v1"):
+        norm.forward_with_allreduce_fusion(x, x)
+
+
 @pytest.mark.parametrize("use_fused", (False, True))
 def test_qwen35_full_attention_honors_fused_qk_norm_rope_flag(use_fused):
     import sglang.srt.models.qwen3_5 as qwen
@@ -475,12 +553,8 @@ def test_qwen35_exact_attention_gate_matches_explicit_bf16_composition():
     q = torch.zeros(1, 4, dtype=torch.bfloat16)
     k = torch.zeros(1, 2, dtype=torch.bfloat16)
     v = torch.zeros(1, 2, dtype=torch.bfloat16)
-    gate = torch.tensor(
-        [[[0.25, -0.75], [1.25, -1.75]]], dtype=torch.bfloat16
-    )
-    core = torch.tensor(
-        [[0.03125, -0.0625, 0.125, -0.25]], dtype=torch.bfloat16
-    )
+    gate = torch.tensor([[[0.25, -0.75], [1.25, -1.75]]], dtype=torch.bfloat16)
+    core = torch.tensor([[0.03125, -0.0625, 0.125, -0.25]], dtype=torch.bfloat16)
     expected = core.reshape(1, -1).contiguous() * torch.sigmoid(gate.reshape(1, -1))
     projection = MagicMock(side_effect=lambda value: (value, None))
     layer = SimpleNamespace(
@@ -504,7 +578,9 @@ def test_qwen35_exact_attention_gate_matches_explicit_bf16_composition():
         patch.object(
             qwen,
             "fused_sigmoid_mul",
-            side_effect=AssertionError("exact Qwen must not use fused sigmoid-multiply"),
+            side_effect=AssertionError(
+                "exact Qwen must not use fused sigmoid-multiply"
+            ),
         ),
     ):
         output = qwen.Qwen3_5AttentionDecoderLayer.self_attention(
@@ -600,6 +676,7 @@ def test_qwen35_class_b_candidate_uses_stock_compiled_rotary_with_scalar_text_po
     assert torch.equal(rotary.call_args.args[0], positions[0])
     assert rotary.call_args.args[1] is query
     assert rotary.call_args.args[2] is key
+
 
 def _exact_logits_processor(vocab_size=32):
     from sglang.srt.layers.logits_processor import LogitsProcessor
