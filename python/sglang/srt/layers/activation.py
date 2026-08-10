@@ -141,10 +141,10 @@ class SiluAndMul(BaseFusedOp):
 
     def forward_exact(self, x: torch.Tensor) -> torch.Tensor:
         from sglang.srt.batch_invariant_ops.bi_silu_and_mul import (  # noqa: PLC0415
-            exact_silu_and_mul,
+            fp32_silu_and_mul,
         )
 
-        return exact_silu_and_mul(x)
+        return fp32_silu_and_mul(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
