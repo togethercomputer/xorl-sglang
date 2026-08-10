@@ -445,6 +445,10 @@ def is_qwen35_gdn_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "qwen35_gdn_exact_mode", False))
 
 
+def is_qwen3_dense_exact_mode(server_args: ServerArgs) -> bool:
+    return bool(getattr(server_args, "qwen3_dense_exact_mode", False))
+
+
 def is_qwen35_rope_class_b(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "qwen35_rope_class_b", False))
 
@@ -463,6 +467,10 @@ def _validate_exact_model_geometry(
     mismatches = []
     for name, expected_value in expected.items():
         actual_value = getattr(config, name, None)
+        if name == "rope_theta" and actual_value is None:
+            rope_parameters = getattr(config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                actual_value = rope_parameters.get("rope_theta")
         if actual_value != expected_value:
             mismatches.append(f"{name}={actual_value!r} (expected {expected_value!r})")
     if mismatches:
@@ -571,6 +579,10 @@ def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | Non
         )
 
         return QWEN35_REQUIRED_BI_OPS
+    if is_qwen3_dense_exact_mode(server_args):
+        # Qwen3-8B owns its norm, activation, lm-head, and probability
+        # reductions. Only trunk matrix products use the generic BI interpose.
+        return ("addmm", "bmm", "mm")
     return None
 
 
@@ -3423,6 +3435,9 @@ class ServerArgs:
     qwen35_rmsnorm_family: A[Literal["v1", "v2"], NS("exec.deterministic")] = (
         dataclasses.field(init=False, default="v1", repr=False)
     )
+    qwen3_dense_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
+    )
 
     # -------------------------------------------------------------------------
     # KV canary
@@ -5893,6 +5908,84 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
+    def _resolve_qwen3_dense_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+    ) -> None:
+        self.qwen3_dense_exact_mode = (
+            self.rl_on_policy_target == XORL_RL_TARGET
+            and model_arch == "Qwen3ForCausalLM"
+        )
+        hf_config._qwen3_dense_exact_mode = self.qwen3_dense_exact_mode
+        if not self.qwen3_dense_exact_mode:
+            return
+
+        _validate_exact_model_geometry(
+            hf_config,
+            contract_name="Qwen3-8B",
+            expected={
+                "hidden_size": 4096,
+                "intermediate_size": 12288,
+                "num_hidden_layers": 36,
+                "num_attention_heads": 32,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "vocab_size": 151936,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 1_000_000,
+                "max_position_embeddings": 40960,
+                "hidden_act": "silu",
+                "tie_word_embeddings": False,
+                "attention_bias": False,
+                "use_sliding_window": False,
+            },
+        )
+        if self.dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError("The exact Qwen3-8B XORL contract requires BF16 dtype")
+        if self.quantization is not None:
+            raise ValueError(
+                "The exact Qwen3-8B XORL contract requires unquantized weights"
+            )
+        if self.attention_backend not in (None, "fa4"):
+            raise ValueError(
+                "The exact Qwen3-8B XORL contract requires the FA4 backend"
+            )
+        topology = (self.tp_size, self.dp_size, self.ep_size, self.pp_size)
+        if topology != (1, 1, 1, 1):
+            raise ValueError(
+                "The exact Qwen3-8B XORL contract is admitted at "
+                f"TP1/DP1/EP1/PP1; got TP{self.tp_size}/DP{self.dp_size}/"
+                f"EP{self.ep_size}/PP{self.pp_size}"
+            )
+        if (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "The exact Qwen3-8B XORL contract does not support speculative "
+                "or draft decoding"
+            )
+
+        self.dtype = "bfloat16"
+        self.attention_backend = "fa4"
+        self.enable_fp32_lm_head = False
+        self.enable_fp32_router = False
+        self.enable_deterministic_inference = True
+        self.sampling_backend = "pytorch"
+        self.sampling_defaults = "openai"
+        self.disable_custom_all_reduce = True
+        # The generic server warmup issues a greedy request.  The exact XORL
+        # sampler deliberately admits only multinomial sampling, so graph
+        # capture is the applicable warmup for this program.
+        self.skip_server_warmup = True
+        logger.info(
+            "Qwen3-8B exact numerics: Class-B RoPE, RMSNorm families-v2, "
+            "shape-aware exact SwiGLU, and the families-v2 BF16 lm-head"
+        )
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
@@ -5915,6 +6008,7 @@ class ServerArgs:
             is_dsa_model=is_deepseek_dsa(hf_config),
         )
         self._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=model_arch)
+        self._resolve_qwen3_dense_exact_contract(hf_config, model_arch=model_arch)
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(

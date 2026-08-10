@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.srt.batch_invariant_ops import RMS_NORM_FAMILY_RESIDUAL_TREE
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -60,6 +61,16 @@ Qwen2Config = None
 logger = logging.getLogger(__name__)
 
 
+def _is_qwen3_dense_exact_runtime() -> bool:
+    return bool(
+        getattr(
+            get_exec().deterministic,
+            "qwen3_dense_exact_mode",
+            False,
+        )
+    )
+
+
 class Qwen2MLP(nn.Module):
     def __init__(
         self,
@@ -86,8 +97,7 @@ class Qwen2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -320,6 +330,7 @@ class Qwen2Model(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
+        qwen3_exact = _is_qwen3_dense_exact_runtime()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -330,7 +341,10 @@ class Qwen2Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if get_exec().deterministic.rl_on_policy_target is not None
+                    if (
+                        get_exec().deterministic.rl_on_policy_target is not None
+                        and not qwen3_exact
+                    )
                     else None
                 ),
             )
@@ -360,7 +374,9 @@ class Qwen2Model(nn.Module):
         )
         if self.pp_group.is_last_rank:
             norm_kwargs = (
-                dict(
+                {"batch_invariant_family": RMS_NORM_FAMILY_RESIDUAL_TREE}
+                if qwen3_exact
+                else dict(
                     weight_dtype=torch.float32,
                     cast_x_before_out_mul=True,
                     override_orig_dtype=torch.float32,
@@ -395,7 +411,6 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -459,7 +474,7 @@ class Qwen2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling " "factor attribute!"
+                    "Self attention has no KV cache scaling factor attribute!"
                 )
 
 

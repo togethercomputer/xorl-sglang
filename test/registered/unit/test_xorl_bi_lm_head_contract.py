@@ -772,6 +772,28 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                     )
                     self.assertIs(output.next_token_logprobs, selected_logprobs)
 
+    def test_sampler_accepts_absent_optional_logprob_lists(self):
+        output = SimpleNamespace(
+            next_token_logits=torch.zeros((1, 32), dtype=torch.float32),
+            next_token_logprobs=None,
+        )
+        expected = torch.tensor([3], dtype=torch.int32)
+
+        actual = xorl_bi_sample_and_score(
+            output,
+            self._sampling_info(1),
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            positions=torch.tensor([0]),
+            sample_from_logprobs=lambda *_args: expected,
+            sync_token_ids=lambda *_args: None,
+            enable_deterministic=True,
+            return_original_logprob=False,
+        )
+
+        self.assertIs(actual, expected)
+
     def test_extend_response_consumes_sampled_id_logprob_pair(self):
         scheduler = _scheduler_response_processor()
         req = self._response_req()

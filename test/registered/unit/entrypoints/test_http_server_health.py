@@ -47,6 +47,22 @@ class TestHealthGenerateSamplingParams(unittest.TestCase):
 
         self.assertEqual(params["sampling_seed"], 42)
 
+    def test_qwen3_dense_exact_health_request_uses_strict_multinomial_contract(self):
+        params = _health_generate_sampling_params(
+            SimpleNamespace(
+                glm52_exact_mode=False,
+                qwen3_dense_exact_mode=True,
+                random_seed=300008,
+            )
+        )
+        normalized = SamplingParams(**params)
+
+        self.assertEqual(normalized.temperature, 1.0)
+        self.assertEqual(normalized.top_p, 1.0)
+        self.assertEqual(normalized.top_k, TOP_K_ALL)
+        self.assertEqual(normalized.min_p, 0.0)
+        self.assertEqual(normalized.sampling_seed, 300008)
+
 
 class TestHealthGenerateEndpoint(unittest.IsolatedAsyncioTestCase):
     async def test_glm52_exact_endpoint_submits_the_contract_request(self):

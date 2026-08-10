@@ -43,7 +43,11 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.layers.xorl_batch_invariant import (
     resolve_or_validate_xorl_bi_family,
 )
-from sglang.srt.server_args import get_global_server_args, is_glm52_exact_mode
+from sglang.srt.server_args import (
+    get_global_server_args,
+    is_glm52_exact_mode,
+    is_qwen3_dense_exact_mode,
+)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -443,7 +447,10 @@ class RMSNorm(BaseFusedOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if is_glm52_exact_mode(get_global_server_args()):
+            server_args = get_global_server_args()
+            if is_glm52_exact_mode(server_args) or is_qwen3_dense_exact_mode(
+                server_args
+            ):
                 return self._forward_xorl_batch_invariant(
                     x,
                     residual,

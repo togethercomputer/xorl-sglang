@@ -649,7 +649,9 @@ async def validate_json_request(raw_request: Request):
 
 def _health_generate_sampling_params(server_args) -> Dict[str, Union[int, float]]:
     """Return a health request that is valid for the selected sampler contract."""
-    if getattr(server_args, "glm52_exact_mode", False):
+    if getattr(server_args, "glm52_exact_mode", False) or getattr(
+        server_args, "qwen3_dense_exact_mode", False
+    ):
         random_seed = getattr(server_args, "random_seed", None)
         return {
             "max_new_tokens": 1,

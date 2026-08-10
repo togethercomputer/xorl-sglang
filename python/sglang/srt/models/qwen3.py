@@ -8,6 +8,10 @@ from torch import nn
 from sglang.srt.distributed import (
     get_pp_group,
 )
+from sglang.srt.batch_invariant_ops import (
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+)
 from sglang.srt.layers.communicator import LayerCommunicator, LayerScatterModes
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
@@ -106,8 +110,11 @@ class Qwen3Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_parallel().tp_rank
 
+        qwen3_exact = getattr(get_exec().deterministic, "qwen3_dense_exact_mode", False)
         norm_kwargs = (
-            dict(
+            dict(batch_invariant_family=RMS_NORM_FAMILY_NO_RESIDUAL)
+            if qwen3_exact
+            else dict(
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
             )
@@ -355,8 +362,11 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
+        qwen3_exact = getattr(get_exec().deterministic, "qwen3_dense_exact_mode", False)
         norm_kwargs = (
-            dict(
+            None
+            if qwen3_exact
+            else dict(
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
                 override_orig_dtype=torch.float32,
@@ -366,10 +376,28 @@ class Qwen3DecoderLayer(nn.Module):
             else {}
         )
         self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            **(
+                {
+                    "batch_invariant_family": (
+                        RMS_NORM_FAMILY_NO_RESIDUAL
+                        if layer_id == 0
+                        else RMS_NORM_FAMILY_RESIDUAL_TREE
+                    )
+                }
+                if qwen3_exact
+                else norm_kwargs
+            ),
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            **(
+                {"batch_invariant_family": RMS_NORM_FAMILY_RESIDUAL_TREE}
+                if qwen3_exact
+                else norm_kwargs
+            ),
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(

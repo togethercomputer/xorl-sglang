@@ -22,7 +22,11 @@ from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import is_glm52_exact_mode, is_qwen35_gdn_exact_mode
+from sglang.srt.server_args import (
+    is_glm52_exact_mode,
+    is_qwen3_dense_exact_mode,
+    is_qwen35_gdn_exact_mode,
+)
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -79,14 +83,13 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
+        self._qwen3_dense_exact_mode = is_qwen3_dense_exact_mode(get_server_args())
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
-        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(
-            get_server_args()
-        )
+        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(get_server_args())
         self.return_original_logprob = (
             False
             if self.use_qwen35_bi_decode_rescore
@@ -134,7 +137,7 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
-        if self._glm52_exact_mode:
+        if self._glm52_exact_mode or getattr(self, "_qwen3_dense_exact_mode", False):
             return xorl_bi_sample_and_score(
                 logits_output,
                 sampling_info,
@@ -146,6 +149,7 @@ class Sampler(nn.Module):
                 sync_token_ids=self._sync_token_ids_across_tp,
                 enable_deterministic=self.enable_deterministic,
                 return_original_logprob=SGLANG_RETURN_ORIGINAL_LOGPROB,
+                family="v2",
             )
 
         logits = logits_output.next_token_logits
@@ -375,9 +379,9 @@ class Sampler(nn.Module):
         else:
             backend = get_exec().kernel.sampling_backend
             if backend == "flashinfer":
-                assert (
-                    sampling_info.sampling_seed is None
-                ), "Sampling seed is not supported for flashinfer backend"
+                assert sampling_info.sampling_seed is None, (
+                    "Sampling seed is not supported for flashinfer backend"
+                )
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -531,9 +535,9 @@ class Sampler(nn.Module):
         Used for deterministic sampling with simple cases (no top-k/top-p/min-p).
         Requires sampling_seed to be set in sampling_info.
         """
-        assert (
-            sampling_info.sampling_seed is not None
-        ), "sampling_seed is required for sampling from logprobs"
+        assert sampling_info.sampling_seed is not None, (
+            "sampling_seed is required for sampling from logprobs"
+        )
         sampled_index = multinomial_with_seed(
             logprobs, sampling_info.sampling_seed, positions
         )
@@ -561,9 +565,9 @@ class Sampler(nn.Module):
                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:
-            assert (
-                self.use_ascend_backend
-            ), "Only ascend backend supports sampling from logits"
+            assert self.use_ascend_backend, (
+                "Only ascend backend supports sampling from logits"
+            )
             batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
                 logits,
                 sampling_info.top_ks,
@@ -695,9 +699,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert (
-            sampling_seed is None
-        ), "With sampling seed, multinomial_with_seed will provide wrong results"
+        assert sampling_seed is None, (
+            "With sampling seed, multinomial_with_seed will provide wrong results"
+        )
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 

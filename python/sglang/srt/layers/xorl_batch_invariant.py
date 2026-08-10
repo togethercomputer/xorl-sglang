@@ -351,8 +351,8 @@ def xorl_bi_sample_and_score(
         raise RuntimeError(
             "The XORL batch-invariant sampler rejects SGLANG_RETURN_ORIGINAL_LOGPROB."
         )
-    if any(x > 0 for x in top_logprobs_nums) or any(
-        token_ids is not None for token_ids in token_ids_logprobs
+    if any(x > 0 for x in (top_logprobs_nums or ())) or any(
+        token_ids is not None for token_ids in (token_ids_logprobs or ())
     ):
         raise RuntimeError(
             "The XORL batch-invariant sampler only returns the sampled token logprob."
