@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
 from sglang.kernels.ops.attention.fla import qwen35_gdn_exact as exact
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -13,6 +14,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 def _server_args(**overrides):
@@ -336,16 +340,16 @@ def test_qwen35_dense_rejects_unsupported_capabilities(name, value):
 
 
 def test_qwen35_private_resolver_installs_one_tuple_once():
-    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
-    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
-    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
-    import sglang.srt.distributed.communication_op as communication
     import sglang.kernels.ops.attention.fla.bi_gdn_decode as decode
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_fast as fast
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_incr as incremental
     import sglang.kernels.ops.attention.fla.bi_gdn_incr_lazy_heal as heal
     import sglang.kernels.ops.attention.fla.bi_gdn_prefill as prefill
     import sglang.kernels.ops.attention.fla.layernorm_gated as norm
+    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
+    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
+    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
+    import sglang.srt.distributed.communication_op as communication
     import sglang.srt.layers.xorl_batch_invariant as xorl_family
 
     active_flags = [
@@ -422,15 +426,15 @@ def test_qwen35_public_module_has_no_partial_selection_api():
 
 
 def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
-    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
-    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
-    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
-    import sglang.srt.distributed.communication_op as communication
     import sglang.kernels.ops.attention.fla.bi_gdn_decode as decode
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_fast as fast
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_incr as incremental
     import sglang.kernels.ops.attention.fla.bi_gdn_incr_lazy_heal as heal
     import sglang.kernels.ops.attention.fla.bi_gdn_prefill as prefill
+    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
+    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
+    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
+    import sglang.srt.distributed.communication_op as communication
 
     with (
         patch.object(exact, "_applied", False),
@@ -906,8 +910,8 @@ def test_qwen35_sampler_contract_rescore_uses_temperature_and_fast_head():
 
 
 def test_qwen35_sampler_forward_overwrites_stock_logprob_with_contract_value():
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     import sglang.srt.layers.sampler as sampler_module
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
     sampler = sampler_module.Sampler.__new__(sampler_module.Sampler)
     torch.nn.Module.__init__(sampler)

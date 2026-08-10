@@ -20,6 +20,8 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import tqdm
+from transformers import PretrainedConfig
+
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
@@ -59,7 +61,6 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
 )
 from sglang.srt.utils import bind_or_assign, get_bool_env_var, log_info_on_rank0
-from transformers import PretrainedConfig
 
 if _use_aiter_gfx95:
     from sglang.srt.layers.quantization.quark.utils import quark_post_load_weights

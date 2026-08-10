@@ -49,6 +49,7 @@ import torch
 import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
+
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -65,7 +66,6 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
-
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:

@@ -15,17 +15,22 @@ from sglang.srt.model_executor.p2p_weight_update import (
 from sglang.srt.model_executor.p2p_weight_update_receiver import (
     P2PWeightUpdateReceiver,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 def test_p2p_receiver_hf_name_helpers_support_bound_calls():
     receiver = object.__new__(P2PWeightUpdateReceiver)
 
-    assert receiver._derive_hf_name(
-        "model.layers.0.self_attn.qkv_proj", "q_proj"
-    ) == "model.layers.0.self_attn.q_proj.weight"
-    assert receiver._guess_merged_subnames(
-        "model.layers.0.mlp.gate_up_proj", 2
-    ) == ["gate_proj", "up_proj"]
+    assert (
+        receiver._derive_hf_name("model.layers.0.self_attn.qkv_proj", "q_proj")
+        == "model.layers.0.self_attn.q_proj.weight"
+    )
+    assert receiver._guess_merged_subnames("model.layers.0.mlp.gate_up_proj", 2) == [
+        "gate_proj",
+        "up_proj",
+    ]
 
 
 def test_p2p_regions_from_memory_snapshot_selects_active_blocks():

@@ -57,16 +57,16 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     if rmsnorm_family not in ("v1", "v2"):
         raise RuntimeError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
 
-    from sglang.srt.batch_invariant_ops import batch_invariant_ops as _bi_ops
-    from sglang.srt.batch_invariant_ops import bi_gemm_configs as _gemm_configs
-    from sglang.srt.batch_invariant_ops import bi_gemm_tiera as _tiera
-    from sglang.srt.distributed import communication_op as _comm
     from sglang.kernels.ops.attention.fla import bi_gdn_decode as _decode
     from sglang.kernels.ops.attention.fla import bi_gdn_decode_fast as _fast
     from sglang.kernels.ops.attention.fla import bi_gdn_decode_incr as _incr
     from sglang.kernels.ops.attention.fla import bi_gdn_incr_lazy_heal as _heal
     from sglang.kernels.ops.attention.fla import bi_gdn_prefill as _prefill
     from sglang.kernels.ops.attention.fla import layernorm_gated as _norm_gated
+    from sglang.srt.batch_invariant_ops import batch_invariant_ops as _bi_ops
+    from sglang.srt.batch_invariant_ops import bi_gemm_configs as _gemm_configs
+    from sglang.srt.batch_invariant_ops import bi_gemm_tiera as _tiera
+    from sglang.srt.distributed import communication_op as _comm
 
     if not _bi_ops.ENABLE_JIT_DEEPGEMM:
         raise RuntimeError(

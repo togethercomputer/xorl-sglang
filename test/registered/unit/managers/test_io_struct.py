@@ -4,6 +4,7 @@ from typing import Annotated
 
 from fastapi import Body, FastAPI
 from pydantic import TypeAdapter
+
 from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     PrepareWeightsUpdateReqInput,
@@ -19,7 +20,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
 )
-
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")

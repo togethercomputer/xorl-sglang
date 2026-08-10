@@ -3,17 +3,18 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
-from sglang.srt.layers.attention.nsa.glm52_selector import (
-    pack_selected_kv_dynamic,
-    pack_selected_kv_static,
-    select_canonical_logical_topk,
-)
+
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.layers.attention.nsa.glm52_selector import (
+    pack_selected_kv_dynamic,
+    pack_selected_kv_static,
+    select_canonical_logical_topk,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 

@@ -2,23 +2,26 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.layers.attention.nsa.utils import can_cp_split
+from sglang.srt.layers.attention.dsa.utils import can_dsa_cp_split
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestCanCpSplit(unittest.TestCase):
-    def call_round_robin(self, seq_len, cp_size, use_nsa, forward_batch):
+class TestCanDsaCpSplit(unittest.TestCase):
+    def call_round_robin(self, seq_len, cp_size, use_dsa, forward_batch):
         with (
             patch(
-                "sglang.srt.layers.attention.nsa.utils.is_nsa_enable_prefill_cp",
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_enable_prefill_cp",
                 return_value=True,
             ),
             patch(
-                "sglang.srt.layers.attention.nsa.utils.is_nsa_prefill_cp_round_robin_split",
+                "sglang.srt.layers.attention.dsa.utils.is_dsa_prefill_cp_round_robin_split",
                 return_value=True,
             ),
         ):
-            return can_cp_split(seq_len, cp_size, use_nsa, forward_batch)
+            return can_dsa_cp_split(seq_len, cp_size, use_dsa, forward_batch)
 
     def test_decode_seq_len_one_cp8_returns_false_without_divisibility_assert(self):
         batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)

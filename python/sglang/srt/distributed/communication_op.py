@@ -14,7 +14,6 @@ from .parallel_state import (
     get_tp_group,
 )
 
-
 # Installed by the Qwen3.5-family exact architecture resolver. The transport
 # remains an all-gather; only the local, reverse-rank BF16 addition chain is
 # fused when the resolved contract enables it.

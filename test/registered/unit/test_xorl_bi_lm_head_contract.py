@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.batch_invariant_ops import bi_families_v2
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     disable_batch_invariant_mode,

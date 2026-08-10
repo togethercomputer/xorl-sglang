@@ -27,7 +27,9 @@ def _fp32_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
 def two_round_silu_and_mul_reference(input_tensor: torch.Tensor) -> torch.Tensor:
     """Execute the former program with a BF16 boundary after SiLU."""
     intermediate_size = input_tensor.shape[-1] // 2
-    activated = F.silu(input_tensor[..., :intermediate_size].float()).to(input_tensor.dtype)
+    activated = F.silu(input_tensor[..., :intermediate_size].float()).to(
+        input_tensor.dtype
+    )
     return (activated * input_tensor[..., intermediate_size:]).to(input_tensor.dtype)
 
 

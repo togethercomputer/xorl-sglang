@@ -390,9 +390,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
-                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
-            )
+            assert (
+                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()

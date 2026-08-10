@@ -22,12 +22,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
+from sglang.srt.batch_invariant_ops import RMS_NORM_FAMILY_RESIDUAL_TREE
 from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
 )
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.batch_invariant_ops import RMS_NORM_FAMILY_RESIDUAL_TREE
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -376,14 +376,16 @@ class Qwen2Model(nn.Module):
             norm_kwargs = (
                 {"batch_invariant_family": RMS_NORM_FAMILY_RESIDUAL_TREE}
                 if qwen3_exact
-                else dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                    override_orig_dtype=torch.float32,
-                    fp32_residual=True,
+                else (
+                    dict(
+                        weight_dtype=torch.float32,
+                        cast_x_before_out_mul=True,
+                        override_orig_dtype=torch.float32,
+                        fp32_residual=True,
+                    )
+                    if get_exec().deterministic.rl_on_policy_target is not None
+                    else {}
                 )
-                if get_exec().deterministic.rl_on_policy_target is not None
-                else {}
             )
             self.norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs

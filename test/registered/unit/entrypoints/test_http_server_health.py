@@ -8,7 +8,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.http_server import _health_generate_sampling_params
 from sglang.srt.managers.tokenizer_manager import ServerStatus
-from sglang.srt.sampling.sampling_params import SamplingParams, TOP_K_ALL
+from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")

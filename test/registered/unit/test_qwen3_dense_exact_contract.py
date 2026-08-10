@@ -5,6 +5,9 @@ from types import SimpleNamespace
 import pytest
 
 from sglang.srt.server_args import ServerArgs, _exact_batch_invariant_ops
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _config(**overrides):

@@ -34,15 +34,15 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_v2,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.xorl_batch_invariant import (
+    resolve_or_validate_xorl_bi_family,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.layers.xorl_batch_invariant import (
-    resolve_or_validate_xorl_bi_family,
-)
 from sglang.srt.server_args import (
     get_global_server_args,
     is_glm52_exact_mode,

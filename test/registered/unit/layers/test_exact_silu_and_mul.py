@@ -9,6 +9,9 @@ from sglang.srt.batch_invariant_ops.bi_silu_and_mul import (
     fp32_silu_and_mul,
 )
 from sglang.srt.layers.activation import SiluAndMul
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 
 
 def _one_round_reference(input_tensor: torch.Tensor) -> torch.Tensor:

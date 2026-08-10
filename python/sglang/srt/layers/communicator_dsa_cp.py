@@ -37,7 +37,9 @@ from sglang.srt.layers.dp_attention import (
     attn_cp_reduce_scatter_tensor,
     get_local_dp_buffer,
 )
-from sglang.srt.layers.glm52_positions import CanonicalMoEPositions
+from sglang.srt.layers.glm52_positions import (
+    CanonicalMoEPositions,
+)
 from sglang.srt.layers.glm52_positions import (
     align_glm52_moe_positions as _align_glm52_moe_positions,
 )

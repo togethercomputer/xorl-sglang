@@ -6,9 +6,10 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 import sglang.srt.layers.attention.nsa.glm52_selector_fast as fast_module
 import sglang.srt.server_args as server_args_module
-import torch
 from sglang.srt.batch_invariant_ops import bi_gemm_configs
 from sglang.srt.distributed.canonical_moe import CanonicalDeferredStatusBook
 from sglang.srt.layers.attention.nsa.glm52_selector import (

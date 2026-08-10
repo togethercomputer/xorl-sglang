@@ -129,7 +129,9 @@ def _rms_norm_v2_kernel(
         if HAS_RESIDUAL:
             s = tl.load(
                 res_out_ptr + row * stride_res_out + cols, mask=mask, other=0.0
-            ).to(tl.float32)  # the rounded sum: bit-identical to what was squared
+            ).to(
+                tl.float32
+            )  # the rounded sum: bit-identical to what was squared
         else:
             s = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(
                 tl.float32
@@ -611,9 +613,9 @@ def _head_v2_merge(m_buf, l_buf, sel):
 
 def _head_v2_check_inputs(hidden, weight, token_ids, temperature):
     assert hidden.ndim == 2 and weight.ndim == 2 and hidden.shape[1] == weight.shape[1]
-    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-        "the head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
-    )
+    assert (
+        hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    ), "the head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
     assert hidden.is_cuda
     hidden = hidden.contiguous()
     M = hidden.shape[0]

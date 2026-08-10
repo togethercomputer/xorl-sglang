@@ -512,9 +512,7 @@ def _validate_exact_qwen3_dense_capabilities(hf_config) -> None:
 
     rope_scaling = getattr(config, "rope_scaling", None)
     if isinstance(rope_scaling, dict):
-        rope_type = rope_scaling.get(
-            "rope_type", rope_scaling.get("type", "default")
-        )
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
         unsupported_keys = set(rope_scaling) - {"rope_type", "type", "rope_theta"}
         if rope_type not in (None, "default") or unsupported_keys:
             mismatches.append(
@@ -543,9 +541,7 @@ def _validate_exact_qwen3_dense_capabilities(hf_config) -> None:
         or isinstance(rms_norm_eps, bool)
         or rms_norm_eps <= 0
     ):
-        mismatches.append(
-            f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)"
-        )
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
 
     num_attention_heads = getattr(config, "num_attention_heads", None)
     num_key_value_heads = getattr(config, "num_key_value_heads", None)
@@ -612,9 +608,7 @@ def _validate_exact_qwen35_dense_capabilities(hf_config) -> None:
         or isinstance(rms_norm_eps, bool)
         or rms_norm_eps <= 0
     ):
-        mismatches.append(
-            f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)"
-        )
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
 
     rope_parameters = getattr(config, "rope_parameters", None)
     rope_theta = getattr(config, "rope_theta", None)
@@ -672,9 +666,7 @@ def _validate_exact_qwen35_dense_capabilities(hf_config) -> None:
             for layer_idx in range(num_hidden_layers)
         )
         if tuple(layer_types) != expected_layer_types:
-            mismatches.append(
-                "layer_types does not match full_attention_interval=4"
-            )
+            mismatches.append("layer_types does not match full_attention_interval=4")
 
     if mismatches:
         raise ValueError(
@@ -5510,9 +5502,7 @@ class ServerArgs:
                 f"rope_parameters={rope_parameters!r}"
             )
         if getattr(config, "cli_factor", 1) != 1:
-            raise ValueError(
-                "The exact GLM-5.2 XORL contract requires cli_factor=1"
-            )
+            raise ValueError("The exact GLM-5.2 XORL contract requires cli_factor=1")
         if getattr(config, "num_hash_layers", 0) not in (None, 0):
             raise ValueError(
                 "The exact GLM-5.2 XORL contract requires num_hash_layers=0"
@@ -6018,9 +6008,13 @@ class ServerArgs:
             # radix tree persists the matching GDN checkpoint metadata.
             self.disable_radix_cache = True
             exact_decode_graph_bs = list(range(1, 33))
-            if self.cuda_graph_bs_decode is not None and self.cuda_graph_bs_decode not in (
-                [32],
-                exact_decode_graph_bs,
+            if (
+                self.cuda_graph_bs_decode is not None
+                and self.cuda_graph_bs_decode
+                not in (
+                    [32],
+                    exact_decode_graph_bs,
+                )
             ):
                 raise ValueError(
                     "The exact Qwen3.6 MoE XORL contract requires decode CUDA "
@@ -9018,8 +9012,7 @@ class ServerArgs:
                     )
 
             if (
-                attention_backend
-                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
                 and not is_glm_dsa_backend
             ):
                 # Currently, only certain backends support radix cache. Support for other backends is in progress

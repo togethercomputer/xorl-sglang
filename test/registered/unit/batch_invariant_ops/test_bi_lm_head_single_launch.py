@@ -13,6 +13,10 @@ contract on the same operands.
 import pytest
 import torch
 
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
+
 if not torch.cuda.is_available():
     pytest.skip("requires a CUDA device", allow_module_level=True)
 

@@ -2,6 +2,7 @@
 
 import pytest
 import torch
+
 from sglang.kernels.ops.attention.fla.bi_gdn_decode import BIGDNDecodeCache
 from sglang.kernels.ops.attention.fla.bi_gdn_decode_incr import (
     BIGDNIncrDecodeRunner,
@@ -9,6 +10,9 @@ from sglang.kernels.ops.attention.fla.bi_gdn_decode_incr import (
 from sglang.kernels.ops.attention.fla.bi_gdn_incr_lazy_heal import (
     warm_slots_batched,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -63,4 +67,6 @@ def test_batched_warm_persists_every_slim_cache_row():
         "gcum",
         "v_new",
     ):
-        assert torch.equal(getattr(reference_rows, name), getattr(batched_rows, name)), name
+        assert torch.equal(
+            getattr(reference_rows, name), getattr(batched_rows, name)
+        ), name

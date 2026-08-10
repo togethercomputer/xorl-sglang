@@ -5,6 +5,9 @@ import pytest
 import torch
 
 from sglang.srt.layers.rotary_embedding import base, mrope
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _deterministic() -> SimpleNamespace:
@@ -34,10 +37,7 @@ def test_qwen35_class_b_keeps_cpu_fp32_table_provenance():
             dtype=torch.bfloat16,
         )
 
-    inv_freq = 1.0 / (
-        500000
-        ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8)
-    )
+    inv_freq = 1.0 / (500000 ** (torch.arange(0, 8, 2, dtype=torch.float32) / 8))
     positions = torch.arange(16, dtype=torch.float32)
     freqs = torch.einsum("i,j -> ij", positions, inv_freq)
     expected = torch.cat((freqs.cos(), freqs.sin()), dim=-1)

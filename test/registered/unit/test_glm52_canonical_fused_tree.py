@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+
 from sglang.srt.distributed.canonical_moe import (
     GLM52_CANONICAL_MOE_V3B_VERSION,
     CanonicalTransport,
