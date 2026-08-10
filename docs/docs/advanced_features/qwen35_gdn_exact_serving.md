@@ -36,6 +36,10 @@ There is nothing to configure. The stack engages as a unit:
   Chunked prefill is likewise disabled because a continuation at an arbitrary
   prompt offset does not carry that complete exact GDN seed; each prompt is
   prefetched in one forward from prefix zero.
+  The tuple pins the static-memory fraction to `0.38`. Cached-row graph capture
+  retains incremental slabs for every live GDN slot, so the remaining HBM is
+  deliberately reserved for full-width prefill activations rather than added
+  to the KV pool. This capacity choice does not change the numerical program.
   Incompatible graph settings fail loudly. The separate dense
   Qwen3.5 TP1 contract runs eager with radix disabled and does not arm the
   graph-only incremental state.

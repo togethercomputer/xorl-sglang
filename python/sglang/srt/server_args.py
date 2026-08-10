@@ -6068,13 +6068,22 @@ class ServerArgs:
                 "_mem_fraction_static_user_supplied",
                 self.mem_fraction_static is not None,
             )
-            if mem_fraction_explicit and self.mem_fraction_static != 0.40:
+            # Cached-row graph capture retains the per-slot incremental slabs.
+            # At 0.40, a full 256-request batch of varied Wordle prompts left
+            # less than one GiB available for the fused-MoE prefill temporary.
+            # Reserve two additional percentage points for activation headroom;
+            # this changes pool capacity only, not the numerical program.
+            qwen35_moe_mem_fraction_static = 0.38
+            if (
+                mem_fraction_explicit
+                and self.mem_fraction_static != qwen35_moe_mem_fraction_static
+            ):
                 raise ValueError(
                     "The exact Qwen3.6 MoE XORL contract requires "
-                    "--mem-fraction-static 0.40; got "
+                    "--mem-fraction-static 0.38; got "
                     f"{self.mem_fraction_static}"
                 )
-            self.mem_fraction_static = 0.40
+            self.mem_fraction_static = qwen35_moe_mem_fraction_static
             if self.max_running_requests is None:
                 self.max_running_requests = 256
             elif self.max_running_requests != 256:

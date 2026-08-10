@@ -108,7 +108,7 @@ def test_qwen35_moe_plain_config_resolves_certified_topology():
     assert args.max_queued_requests == 512
     assert args.chunked_prefill_size == -1
     assert args.max_prefill_tokens == 32768
-    assert args.mem_fraction_static == 0.40
+    assert args.mem_fraction_static == 0.38
     assert not args.disable_cuda_graph
     assert args.disable_radix_cache
 
@@ -181,7 +181,7 @@ def test_non_qwen_keeps_conservative_norm_and_rope_defaults():
         ("speculative_algorithm", "EAGLE", "speculative"),
         ("disable_cuda_graph", True, "CUDA graph bucket"),
         ("max_running_requests", 16, "max-running-requests 256"),
-        ("mem_fraction_static", 0.5, "mem-fraction-static 0.40"),
+        ("mem_fraction_static", 0.40, "mem-fraction-static 0.38"),
         ("max_mamba_cache_size", 512, "max-mamba-cache-size 1280"),
     ],
 )
