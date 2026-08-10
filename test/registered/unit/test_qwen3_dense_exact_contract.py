@@ -1,4 +1,4 @@
-"""Contract tests for exact dense Qwen3-8B serving."""
+"""Contract tests for exact dense Qwen3 serving."""
 
 from types import SimpleNamespace
 
@@ -23,6 +23,8 @@ def _config(**overrides):
         "tie_word_embeddings": False,
         "attention_bias": False,
         "use_sliding_window": False,
+        "attention_dropout": 0.0,
+        "rope_scaling": None,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -36,7 +38,7 @@ def _args(**overrides):
     return args
 
 
-def test_qwen3_8b_resolves_architecture_owned_exact_program():
+def test_dense_qwen3_resolves_architecture_owned_exact_program():
     config = _config()
     args = _args()
 
@@ -58,7 +60,7 @@ def test_qwen3_8b_resolves_architecture_owned_exact_program():
     assert _exact_batch_invariant_ops(args) == ("addmm", "bmm", "mm")
 
 
-def test_qwen3_8b_accepts_transformers_v5_rope_parameters():
+def test_dense_qwen3_accepts_transformers_v5_rope_parameters():
     config = _config(rope_theta=None, rope_parameters={"rope_theta": 1_000_000})
     args = _args()
 
@@ -70,7 +72,7 @@ def test_qwen3_8b_accepts_transformers_v5_rope_parameters():
     assert args.qwen3_dense_exact_mode
 
 
-def test_qwen3_8b_model_construction_uses_runtime_contract(monkeypatch):
+def test_dense_qwen3_model_construction_uses_runtime_contract(monkeypatch):
     from sglang.srt.models import qwen2
 
     runtime = SimpleNamespace(
@@ -91,7 +93,7 @@ def test_qwen3_8b_model_construction_uses_runtime_contract(monkeypatch):
         ("speculative_algorithm", "EAGLE", "speculative"),
     ],
 )
-def test_qwen3_8b_rejects_unqualified_program(name, value, message):
+def test_dense_qwen3_rejects_unqualified_program(name, value, message):
     args = _args(**{name: value})
     with pytest.raises(ValueError, match=message):
         args._resolve_qwen3_dense_exact_contract(
@@ -100,7 +102,77 @@ def test_qwen3_8b_rejects_unqualified_program(name, value, message):
         )
 
 
-def test_other_architecture_or_target_does_not_engage_qwen3_8b_contract():
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        {
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "tie_word_embeddings": True,
+        },
+        {
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "tie_word_embeddings": True,
+        },
+        {
+            "hidden_size": 2560,
+            "intermediate_size": 9728,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "rope_theta": 5_000_000,
+            "max_position_embeddings": 262144,
+            "tie_word_embeddings": True,
+        },
+        {
+            "hidden_size": 5120,
+            "intermediate_size": 25600,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+        },
+    ],
+)
+def test_dense_qwen3_accepts_family_geometries(geometry):
+    args = _args()
+    args._resolve_qwen3_dense_exact_contract(
+        _config(**geometry),
+        model_arch="Qwen3ForCausalLM",
+    )
+    assert args.qwen3_dense_exact_mode
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"hidden_act": "gelu"},
+        {"head_dim": 64},
+        {"attention_bias": True},
+        {"attention_dropout": 0.1},
+        {"use_sliding_window": True},
+        {"rope_scaling": {"rope_type": "yarn", "factor": 4.0}},
+        {"num_key_value_heads": 7},
+        {"hidden_size": 0},
+    ],
+)
+def test_dense_qwen3_rejects_unsupported_capabilities(override):
+    with pytest.raises(
+        ValueError, match="does not support this architecture configuration"
+    ):
+        _args()._resolve_qwen3_dense_exact_contract(
+            _config(**override),
+            model_arch="Qwen3ForCausalLM",
+        )
+
+
+def test_other_architecture_or_target_does_not_engage_dense_qwen3_contract():
     config = _config()
     args = _args()
     args._resolve_qwen3_dense_exact_contract(config, model_arch="LlamaForCausalLM")

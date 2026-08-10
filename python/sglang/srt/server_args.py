@@ -480,6 +480,94 @@ def _validate_exact_model_geometry(
         )
 
 
+def _validate_exact_qwen3_dense_capabilities(hf_config) -> None:
+    config = _text_model_config(hf_config)
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "use_sliding_window": False,
+        "attention_dropout": 0.0,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get(
+            "rope_type", rope_scaling.get("type", "default")
+        )
+        unsupported_keys = set(rope_scaling) - {"rope_type", "type", "rope_theta"}
+        if rope_type not in (None, "default") or unsupported_keys:
+            mismatches.append(
+                f"rope_scaling={rope_scaling!r} (only default RoPE is supported)"
+            )
+    elif rope_scaling:
+        mismatches.append(
+            f"rope_scaling={rope_scaling!r} (only default RoPE is supported)"
+        )
+
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get("rope_theta")
+    if (
+        not isinstance(rope_theta, (int, float))
+        or isinstance(rope_theta, bool)
+        or rope_theta <= 0
+    ):
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if (
+        not isinstance(rms_norm_eps, (int, float))
+        or isinstance(rms_norm_eps, bool)
+        or rms_norm_eps <= 0
+    ):
+        mismatches.append(
+            f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)"
+        )
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    if mismatches:
+        raise ValueError(
+            "The exact dense Qwen3 XORL contract does not support this "
+            f"architecture configuration: {', '.join(mismatches)}"
+        )
+
+
 def _glm52_expected_fp8_unquantized_modules() -> set[str]:
     """Return the official GLM-5.2 FP8 checkpoint's BF16 module layout."""
 
@@ -580,7 +668,7 @@ def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | Non
 
         return QWEN35_REQUIRED_BI_OPS
     if is_qwen3_dense_exact_mode(server_args):
-        # Qwen3-8B owns its norm, activation, lm-head, and probability
+        # Dense Qwen3 owns its norm, activation, lm-head, and probability
         # reductions. Only trunk matrix products use the generic BI interpose.
         return ("addmm", "bmm", "mm")
     return None
@@ -5922,40 +6010,21 @@ class ServerArgs:
         if not self.qwen3_dense_exact_mode:
             return
 
-        _validate_exact_model_geometry(
-            hf_config,
-            contract_name="Qwen3-8B",
-            expected={
-                "hidden_size": 4096,
-                "intermediate_size": 12288,
-                "num_hidden_layers": 36,
-                "num_attention_heads": 32,
-                "num_key_value_heads": 8,
-                "head_dim": 128,
-                "vocab_size": 151936,
-                "rms_norm_eps": 1e-6,
-                "rope_theta": 1_000_000,
-                "max_position_embeddings": 40960,
-                "hidden_act": "silu",
-                "tie_word_embeddings": False,
-                "attention_bias": False,
-                "use_sliding_window": False,
-            },
-        )
+        _validate_exact_qwen3_dense_capabilities(hf_config)
         if self.dtype not in ("auto", "bf16", "bfloat16"):
-            raise ValueError("The exact Qwen3-8B XORL contract requires BF16 dtype")
+            raise ValueError("The exact dense Qwen3 XORL contract requires BF16 dtype")
         if self.quantization is not None:
             raise ValueError(
-                "The exact Qwen3-8B XORL contract requires unquantized weights"
+                "The exact dense Qwen3 XORL contract requires unquantized weights"
             )
         if self.attention_backend not in (None, "fa4"):
             raise ValueError(
-                "The exact Qwen3-8B XORL contract requires the FA4 backend"
+                "The exact dense Qwen3 XORL contract requires the FA4 backend"
             )
         topology = (self.tp_size, self.dp_size, self.ep_size, self.pp_size)
         if topology != (1, 1, 1, 1):
             raise ValueError(
-                "The exact Qwen3-8B XORL contract is admitted at "
+                "The exact dense Qwen3 XORL contract is admitted at "
                 f"TP1/DP1/EP1/PP1; got TP{self.tp_size}/DP{self.dp_size}/"
                 f"EP{self.ep_size}/PP{self.pp_size}"
             )
@@ -5965,7 +6034,7 @@ class ServerArgs:
             or self.enable_multi_layer_eagle
         ):
             raise ValueError(
-                "The exact Qwen3-8B XORL contract does not support speculative "
+                "The exact dense Qwen3 XORL contract does not support speculative "
                 "or draft decoding"
             )
 
@@ -5982,7 +6051,7 @@ class ServerArgs:
         # capture is the applicable warmup for this program.
         self.skip_server_warmup = True
         logger.info(
-            "Qwen3-8B exact numerics: Class-B RoPE, RMSNorm families-v2, "
+            "Dense Qwen3 exact numerics: Class-B RoPE, RMSNorm families-v2, "
             "shape-aware exact SwiGLU, and the families-v2 BF16 lm-head"
         )
 
