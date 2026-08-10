@@ -15,24 +15,15 @@ from .parallel_state import (
 )
 
 
-# Installed by the Qwen3.5-family exact architecture resolver. The transport
-# remains an all-gather; only the local, reverse-rank BF16 addition chain is
-# fused when the resolved contract enables it.
-_ORDERED_COMBINE_FUSED_ENABLED = False
-
-
-def set_ordered_combine_fused_enabled(enabled: bool) -> None:
-    global _ORDERED_COMBINE_FUSED_ENABLED
-    _ORDERED_COMBINE_FUSED_ENABLED = bool(enabled)
-
-
 def tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across model parallel group."""
     return get_tp_group().all_reduce(input_)
 
 
-def tensor_model_parallel_ordered_all_reduce(input_: torch.Tensor) -> torch.Tensor:
-    """All-reduce through a fixed reverse-rank BF16 addition chain."""
+def tensor_model_parallel_canonical_moe_all_reduce(
+    input_: torch.Tensor,
+) -> torch.Tensor:
+    """Raw all-gather followed by the canonical logical-contributor fold."""
     group = get_tp_group()
     if group.world_size == 1 or input_.numel() == 0:
         return input_
@@ -48,18 +39,9 @@ def tensor_model_parallel_ordered_all_reduce(input_: torch.Tensor) -> torch.Tens
     # contribution from a full CUDA graph.
     group.all_gather_into_tensor(gathered, input_)
     partials = gathered.view(group.world_size, *input_.shape)
-    if _ORDERED_COMBINE_FUSED_ENABLED:
-        from sglang.srt.distributed.ordered_combine_fused import (
-            fused_ordered_combine,
-        )
+    from sglang.srt.distributed.canonical_moe import canonical_moe_fold_v1
 
-        fused = fused_ordered_combine(partials)
-        if fused is not None:
-            return fused
-    result = partials[-1]
-    for rank in range(group.world_size - 2, -1, -1):
-        result = result + partials[rank]
-    return result
+    return canonical_moe_fold_v1(partials)
 
 
 def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:

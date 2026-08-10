@@ -1,4 +1,4 @@
-"""Canonical BF16 MoE contribution folding for the GLM-5.2 serving lane."""
+"""Canonical BF16 MoE contribution folding for exact serving lanes."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from sglang.srt.distributed.canonical_moe_kernels import (
     fused_balanced_adjacent_bf16_tree,
 )
 
+CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_v1"
 GLM52_CANONICAL_MOE_VERSION = "canonical_moe_reduce_v1"
 GLM52_CANONICAL_MOE_V3_VERSION = "glm52_canonical_moe_reduce_v3"
 GLM52_CANONICAL_MOE_V3B_VERSION = "glm52_canonical_moe_reduce_v3b"
@@ -582,6 +583,62 @@ def _fused_tree_or_cpu_reference(
     return output
 
 
+def canonical_moe_fold_v1(
+    partials_by_physical_ordinal: torch.Tensor,
+    *,
+    logical_to_physical: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fold logically identified contributions with the version-1 BF16 tree.
+
+    Raw transport may deliver contributors in a physical order. Callers either
+    pass ``logical_to_physical`` or, when physical and logical ordinals are
+    identical, leave it unset. The fused CUDA implementation and the eager CPU
+    implementation are independent from the trainer implementation but obey
+    the same versioned arithmetic contract.
+    """
+    partials = partials_by_physical_ordinal
+    if partials.ndim < 2:
+        raise ValueError(
+            "Canonical MoE fold requires contributor and payload dimensions"
+        )
+    if partials.dtype is not torch.bfloat16:
+        raise TypeError("Canonical MoE fold requires BF16 partials")
+    contributors = partials.shape[0]
+    if contributors not in (2, 4, 8, 16):
+        raise ValueError("Canonical MoE fold requires 2, 4, 8, or 16 contributors")
+
+    identity_order = logical_to_physical is None
+    if identity_order:
+        logical_to_physical = torch.empty(
+            (contributors,), dtype=torch.int64, device=partials.device
+        )
+    elif (
+        logical_to_physical.shape != (contributors,)
+        or logical_to_physical.dtype is not torch.int64
+        or logical_to_physical.device != partials.device
+        or not logical_to_physical.is_contiguous()
+    ):
+        raise ValueError(
+            "logical_to_physical must be a contiguous int64 tensor on the partial device"
+        )
+    if output is None:
+        output = torch.empty_like(partials[0])
+    elif (
+        output.shape != partials.shape[1:]
+        or output.dtype is not partials.dtype
+        or output.device != partials.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError("Canonical MoE fold output metadata does not match partials")
+    return _fused_tree_or_cpu_reference(
+        partials,
+        logical_to_physical,
+        identity_order=identity_order,
+        output=output,
+    )
+
+
 def canonical_moe_reference(
     partials: torch.Tensor, slots: CanonicalRowSlots
 ) -> torch.Tensor:
@@ -835,10 +892,9 @@ def canonicalize_glm52_local_partial_v3b(
     )
 
     identity_order = plan.physical_to_logical == tuple(range(plan.contributor_count))
-    folded = _fused_tree_or_cpu_reference(
+    folded = canonical_moe_fold_v1(
         workspace.collective,
-        workspace.logical_to_group,
-        identity_order=identity_order,
+        logical_to_physical=(None if identity_order else workspace.logical_to_group),
         output=workspace.result,
     )
 
@@ -853,6 +909,7 @@ def canonicalize_glm52_local_partial_v3b(
 
 
 __all__ = [
+    "CANONICAL_MOE_FOLD_VERSION",
     "GLM52_CANONICAL_MOE_V3B_VERSION",
     "GLM52_CANONICAL_MOE_V3_VERSION",
     "GLM52_CANONICAL_MOE_VERSION",
@@ -865,6 +922,7 @@ __all__ = [
     "CanonicalMoEWorkspace",
     "CanonicalMoEV3Workspace",
     "SamplerParallelPlan",
+    "canonical_moe_fold_v1",
     "canonical_moe_reference",
     "canonicalize_glm52_local_partial",
     "canonicalize_glm52_local_partial_v3",

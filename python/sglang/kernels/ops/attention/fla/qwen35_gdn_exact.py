@@ -37,10 +37,9 @@ QWEN35_REQUIRED_BI_OPS = (
     "rms_norm",
 )
 
-# This tuple does not use the GLM numerical-family resolver. Its head/LSE,
-# router, ordered combine, and GDN kernels remain the qualified v1 program.
-# Exact Qwen RMSNorm independently selects its qualified v2 tree; the remaining
-# head/LSE, router, ordered-combine, and GDN surfaces retain their v1 programs.
+# This tuple does not use the GLM numerical-family resolver. Exact Qwen MoE
+# structurally uses the common canonical contributor fold; its head/LSE,
+# router, and GDN kernels remain independently resolved.
 
 _applied = False
 
@@ -60,7 +59,7 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     from sglang.srt.batch_invariant_ops import batch_invariant_ops as _bi_ops
     from sglang.srt.batch_invariant_ops import bi_gemm_configs as _gemm_configs
     from sglang.srt.batch_invariant_ops import bi_gemm_tiera as _tiera
-    from sglang.srt.distributed import communication_op as _comm
+    from sglang.srt.distributed.canonical_moe import CANONICAL_MOE_FOLD_VERSION
     from sglang.kernels.ops.attention.fla import bi_gdn_decode as _decode
     from sglang.kernels.ops.attention.fla import bi_gdn_decode_fast as _fast
     from sglang.kernels.ops.attention.fla import bi_gdn_decode_incr as _incr
@@ -104,12 +103,11 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     _tiera.set_tiera_enabled(False)
     _bi_ops.set_router_renorm_fused_enabled(False)
     _bi_ops.set_bi_head_fastpath_enabled(False)
-    _comm.set_ordered_combine_fused_enabled(False)
 
     logger.info(
         "Exact Qwen3.5-family zero-K3 serving resolved: BI GDN "
         "prefill/rescan decode%s, rows-per-block pin, contract lm-head + "
-        "decode rescore; rmsnorm_family=%s; resolved tuple=%s",
+        "decode rescore; rmsnorm_family=%s; moe_fold=%s; resolved tuple=%s",
         (
             ", conservative no-overlap/no-padding partial-chunk-rescan graph "
             "program; Wave-3 fast mechanisms held behind live zero-K3 promotion"
@@ -117,6 +115,7 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
             else " (conservative eager tuple; MoE Wave-3 fast paths disabled)"
         ),
         rmsnorm_family,
+        CANONICAL_MOE_FOLD_VERSION if is_moe else "none",
         (
             "qwen3.6-moe:tp8/dp8/ep8/pp1,graph32,no-radix,full-prefill"
             if is_moe
