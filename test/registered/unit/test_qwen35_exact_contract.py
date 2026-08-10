@@ -350,19 +350,21 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
 
     active_flags = [
         (prefill, "BI_GDN_PREFILL_ENABLED"),
+        (prefill, "BI_GDN_SOLVE_TRIL_DECODE"),
         (decode, "BI_GDN_DECODE_ENABLED"),
         (decode, "BI_GDN_BS1_STATIC"),
         (decode, "BI_GDN_DECODE_GRAPH"),
         (fast, "BI_GDN_DECODE_FAST_ENABLED"),
-    ]
-    held_flags = [
-        (prefill, "BI_GDN_SOLVE_TRIL_DECODE"),
+        (fast, "BI_GDN_SOLVE_TRIL_DECODE"),
         (fast, "BI_GDN_FUSE_SMALL_ENABLED"),
+        (incremental, "BI_GDN_SOLVE_TRIL_DECODE"),
         (incremental, "BI_GDN_DECODE_INCR_ENABLED"),
         (incremental, "BI_GDN_INCR_DEFER_ENABLED"),
         (incremental, "BI_GDN_VNEW_SLIM_ENABLED"),
+        (heal, "BI_GDN_SOLVE_TRIL_DECODE"),
         (heal, "BI_GDN_LAZY_HEAL_ENABLED"),
     ]
+    held_flags = []
     with ExitStack() as stack:
         stack.enter_context(patch.object(exact, "_applied", False))
         stack.enter_context(patch.object(bi_ops, "ENABLE_JIT_DEEPGEMM", True))
@@ -400,16 +402,16 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         assert not any(getattr(module, name) for module, name in held_flags)
         force_table.assert_called_once_with(True)
         set_norm.assert_called_once_with(4)
-        set_tiera.assert_called_once_with(False)
-        set_router.assert_called_once_with(False)
-        set_head.assert_called_once_with(False)
-        set_combine.assert_called_once_with(False)
+        set_tiera.assert_called_once_with(True)
+        set_router.assert_called_once_with(True)
+        set_head.assert_called_once_with(True)
+        set_combine.assert_called_once_with(True)
         startup.assert_called_once()
         startup_args = startup.call_args.args
         assert startup_args[2] == "v2"
-        assert "conservative no-overlap/no-padding" in startup_args[1]
+        assert "cached-row incremental graph decode" in startup_args[1]
         rendered = startup_args[0] % startup_args[1:]
-        assert "decode, conservative" in rendered
+        assert "decode, cached-row incremental" in rendered
         assert "rmsnorm_family=v2" in rendered
         force_family.assert_not_called()
 
@@ -490,11 +492,33 @@ def test_gdn_backend_reads_architecture_resolver_flags_at_call_time():
         patch.object(backend, "is_cuda", return_value=True),
         patch.object(backend._bi_decode_mod, "BI_GDN_DECODE_ENABLED", True),
         patch.object(backend._bi_fast_mod, "BI_GDN_DECODE_FAST_ENABLED", True),
+        patch.object(backend._bi_incr_mod, "BI_GDN_DECODE_INCR_ENABLED", True),
+        patch.object(backend._bi_incr_mod, "BI_GDN_INCR_DEFER_ENABLED", True),
+        patch.object(backend._bi_heal_mod, "BI_GDN_LAZY_HEAL_ENABLED", True),
         patch.object(backend._bi_prefill_mod, "BI_GDN_PREFILL_ENABLED", True),
     ):
         assert backend._bi_gdn_decode_enabled()
         assert backend._bi_gdn_decode_fast_enabled()
+        assert backend._bi_gdn_decode_incr_enabled()
+        assert backend._bi_gdn_incr_defer_enabled()
+        assert backend._bi_gdn_lazy_heal_enabled()
         assert backend._bi_gdn_prefill_enabled()
+
+
+def test_gdn_backend_selects_cached_row_runner_atomically():
+    import sglang.srt.layers.attention.linear.gdn_backend as backend
+
+    sentinel = object()
+    with (
+        patch.object(backend, "is_cuda", return_value=True),
+        patch.object(backend._bi_fast_mod, "BI_GDN_DECODE_FAST_ENABLED", True),
+        patch.object(backend._bi_incr_mod, "BI_GDN_DECODE_INCR_ENABLED", True),
+        patch.object(backend, "BIGDNIncrDecodeRunner", return_value=sentinel) as incr,
+        patch.object(backend, "BIGDNFastDecodeRunner") as rescan,
+    ):
+        assert backend._make_bi_gdn_decode_runner() is sentinel
+        incr.assert_called_once_with()
+        rescan.assert_not_called()
 
 
 def test_qwen35_gemma_norm_routes_the_certified_family_split():

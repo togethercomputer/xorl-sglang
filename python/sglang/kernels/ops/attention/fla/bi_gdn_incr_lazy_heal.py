@@ -262,6 +262,13 @@ def _warm_slots_batched_impl(runner, cache, todo) -> None:
     _commit_rows(ai16, state.Ai16, idx, fl32, n)
     _commit_rows(w, state.w, idx, fl32, n)
     _commit_rows(u, state.u, idx, fl32, n)
+    if runner.defer_writeback and runner.slim_vnew:
+        # W3.2 consumes the cached cumulative-g rows directly on the next
+        # incremental graph step.  The original batched-warm composition
+        # computed this slab but failed to persist it, leaving stale rows and
+        # causing the width-160 public qualification mismatch.
+        assert state.gcum is not None
+        _commit_rows(gcum, state.gcum, idx, fl32, n)
 
     if runner.defer_writeback:
         # the DEFER v_new warm through the STOCK fwd_h driver (P1: rows == the
