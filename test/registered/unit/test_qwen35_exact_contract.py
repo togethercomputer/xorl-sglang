@@ -23,14 +23,25 @@ def _server_args(**overrides):
     return args
 
 
-def _qwen_config(*, moe: bool):
+def _qwen_config(*, moe: bool, **overrides):
     layers = 40 if moe else 24
-    text_config = SimpleNamespace(
+    values = dict(
         hidden_size=2048 if moe else 1024,
+        intermediate_size=3584,
         num_hidden_layers=layers,
         num_attention_heads=16 if moe else 8,
         num_key_value_heads=2,
         vocab_size=248320,
+        max_position_embeddings=262144,
+        head_dim=256,
+        hidden_act="silu",
+        attention_bias=False,
+        attention_dropout=0.0,
+        use_sliding_window=False,
+        rms_norm_eps=1e-6,
+        rope_theta=10000000.0,
+        partial_rotary_factor=0.25,
+        attn_output_gate=True,
         linear_num_key_heads=16,
         linear_num_value_heads=32 if moe else 16,
         linear_key_head_dim=128,
@@ -38,6 +49,8 @@ def _qwen_config(*, moe: bool):
         linear_conv_kernel_dim=4,
         full_attention_interval=4,
     )
+    values.update(overrides)
+    text_config = SimpleNamespace(**values)
     if moe:
         text_config.num_experts = 256
         text_config.num_experts_per_tok = 8
@@ -243,18 +256,83 @@ def test_qwen35_moe_rejects_explicit_non_graph32_program():
         )
 
 
-@pytest.mark.parametrize("moe", (False, True))
-def test_qwen35_rejects_architecture_alias_with_unqualified_geometry(moe):
-    hf_config = _qwen_config(moe=moe)
+def test_qwen35_moe_rejects_architecture_alias_with_unqualified_geometry():
+    hf_config = _qwen_config(moe=True)
     hf_config.text_config.hidden_size += 1
-    args = _server_args(tp_size=8 if moe else 1)
-    architecture = (
-        "Qwen3_5MoeForConditionalGeneration"
-        if moe
-        else "Qwen3_5ForConditionalGeneration"
-    )
+    args = _server_args(tp_size=8)
     with pytest.raises(ValueError, match="qualified model geometry.*hidden_size"):
-        args._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=architecture)
+        args._resolve_qwen35_gdn_exact_contract(
+            hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
+        )
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        dict(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=24,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            linear_num_value_heads=16,
+        ),
+        dict(
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            linear_num_value_heads=32,
+        ),
+        dict(
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            linear_num_value_heads=32,
+        ),
+        dict(
+            hidden_size=5120,
+            intermediate_size=17408,
+            num_hidden_layers=64,
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            linear_num_value_heads=48,
+        ),
+    ],
+)
+def test_qwen35_dense_admits_family_geometries(geometry):
+    hf_config = _qwen_config(moe=False, **geometry)
+    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=1)
+
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config, model_arch="Qwen3_5ForConditionalGeneration"
+    )
+
+    assert args.qwen35_gdn_exact_mode
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("head_dim", 128),
+        ("attention_bias", True),
+        ("linear_num_key_heads", 8),
+        ("linear_num_value_heads", 24),
+        ("linear_conv_kernel_dim", 3),
+        ("full_attention_interval", 8),
+    ],
+)
+def test_qwen35_dense_rejects_unsupported_capabilities(name, value):
+    hf_config = _qwen_config(moe=False, **{name: value})
+    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=1)
+
+    with pytest.raises(ValueError, match=rf"does not support.*{name}"):
+        args._resolve_qwen35_gdn_exact_contract(
+            hf_config, model_arch="Qwen3_5ForConditionalGeneration"
+        )
 
 
 def test_qwen35_private_resolver_installs_one_tuple_once():

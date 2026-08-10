@@ -568,6 +568,121 @@ def _validate_exact_qwen3_dense_capabilities(hf_config) -> None:
         )
 
 
+def _validate_exact_qwen35_dense_capabilities(hf_config) -> None:
+    config = _text_model_config(hf_config)
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+        "linear_num_value_heads",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 256,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+    if getattr(config, "use_sliding_window", False):
+        mismatches.append("use_sliding_window=True (requires False)")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if (
+        not isinstance(rms_norm_eps, (int, float))
+        or isinstance(rms_norm_eps, bool)
+        or rms_norm_eps <= 0
+    ):
+        mismatches.append(
+            f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)"
+        )
+
+    rope_parameters = getattr(config, "rope_parameters", None)
+    rope_theta = getattr(config, "rope_theta", None)
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+    if isinstance(rope_parameters, dict):
+        if rope_theta is None:
+            rope_theta = rope_parameters.get("rope_theta")
+        if partial_rotary_factor is None:
+            partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
+    if (
+        not isinstance(rope_theta, (int, float))
+        or isinstance(rope_theta, bool)
+        or rope_theta <= 0
+    ):
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+    if partial_rotary_factor != 0.25:
+        mismatches.append(
+            f"partial_rotary_factor={partial_rotary_factor!r} (requires 0.25)"
+        )
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    linear_num_value_heads = getattr(config, "linear_num_value_heads", None)
+    if (
+        isinstance(linear_num_value_heads, int)
+        and linear_num_value_heads > 0
+        and linear_num_value_heads % 16 != 0
+    ):
+        mismatches.append(
+            f"linear_num_value_heads={linear_num_value_heads!r} "
+            "(requires a multiple of 16)"
+        )
+
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    layer_types = getattr(config, "layer_types", None)
+    if (
+        isinstance(num_hidden_layers, int)
+        and num_hidden_layers > 0
+        and layer_types is not None
+    ):
+        expected_layer_types = tuple(
+            "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
+            for layer_idx in range(num_hidden_layers)
+        )
+        if tuple(layer_types) != expected_layer_types:
+            mismatches.append(
+                "layer_types does not match full_attention_interval=4"
+            )
+
+    if mismatches:
+        raise ValueError(
+            "The exact dense Qwen3.5 XORL contract does not support this "
+            f"architecture configuration: {', '.join(mismatches)}"
+        )
+
+
 def _glm52_expected_fp8_unquantized_modules() -> set[str]:
     """Return the official GLM-5.2 FP8 checkpoint's BF16 module layout."""
 
@@ -5755,30 +5870,28 @@ class ServerArgs:
         if not self.qwen35_gdn_exact_mode:
             return
         config = _text_model_config(hf_config)
-        expected = {
-            "hidden_size": 2048 if self.qwen35_gdn_exact_is_moe else 1024,
-            "num_hidden_layers": 40 if self.qwen35_gdn_exact_is_moe else 24,
-            "num_attention_heads": 16 if self.qwen35_gdn_exact_is_moe else 8,
-            "num_key_value_heads": 2,
-            "vocab_size": 248320,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 32 if self.qwen35_gdn_exact_is_moe else 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "full_attention_interval": 4,
-        }
         if self.qwen35_gdn_exact_is_moe:
-            expected.update(num_experts=256, num_experts_per_tok=8)
-        _validate_exact_model_geometry(
-            config,
-            contract_name=(
-                "Qwen3.6-35B-A3B"
-                if self.qwen35_gdn_exact_is_moe
-                else "Qwen3.5-0.8B"
-            ),
-            expected=expected,
-        )
+            _validate_exact_model_geometry(
+                config,
+                contract_name="Qwen3.6-35B-A3B",
+                expected={
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "vocab_size": 248320,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 32,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 4,
+                    "full_attention_interval": 4,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                },
+            )
+        else:
+            _validate_exact_qwen35_dense_capabilities(config)
         if (
             self.speculative_algorithm is not None
             or self.speculative_draft_model_path is not None
