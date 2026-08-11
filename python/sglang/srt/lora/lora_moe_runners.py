@@ -110,7 +110,14 @@ def _naive_moe_lora_align_block_size(
             end = seg_indptr_list[seg_idx + 1]
             for m in range(start, end):
                 for k in range(top_k):
-                    pairs.append((topk_ids_list[m][k], m * top_k + k))
+                    expert_id = topk_ids_list[m][k]
+                    # StandardDispatcher localizes EP routes before the LoRA
+                    # runner and marks non-local routes with -1.  The GPU
+                    # aligner already treats those as invalid; the small-batch
+                    # CPU aligner must do the same instead of materializing a
+                    # bogus expert -1 block for decode.
+                    if 0 <= expert_id < num_experts:
+                        pairs.append((expert_id, m * top_k + k))
 
         if not pairs:
             continue

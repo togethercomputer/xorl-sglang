@@ -28,6 +28,7 @@ from torch import nn
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.dsv4 import maybe_create_dsv4_flash_validator
 from sglang.srt.lora.glm52 import maybe_create_glm52_validator
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
@@ -84,6 +85,11 @@ class LoRAAdapter(nn.Module):
             base_hf_config, self.config.hf_config
         )
         self._glm52_exact_adapter_certified = False
+        self._dsv4_flash_validator = maybe_create_dsv4_flash_validator(
+            base_hf_config, self.config.hf_config
+        )
+        self._dsv4_flash_exact_adapter_certified = False
+        self._dsv4_flash_exact_all_zero = False
 
         self.layers: List[LoRALayer] = nn.ModuleList(
             [
@@ -160,10 +166,20 @@ class LoRAAdapter(nn.Module):
 
         if self._glm52_validator is not None:
             self._glm52_validator.finalize()
+        if self._dsv4_flash_validator is not None:
+            self._dsv4_flash_validator.finalize()
         self._normalize_weights()
         self._glm52_exact_adapter_certified = bool(
             self._glm52_validator is not None
             and getattr(self.base_hf_config, "_glm52_exact_mode", False)
+        )
+        self._dsv4_flash_exact_adapter_certified = bool(
+            self._dsv4_flash_validator is not None
+            and getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False)
+        )
+        self._dsv4_flash_exact_all_zero = bool(
+            self._dsv4_flash_exact_adapter_certified
+            and self._dsv4_flash_validator.all_zero
         )
 
     def initialize_weights_from_tensors(self, tensors: Dict[str, torch.Tensor]):
@@ -172,10 +188,20 @@ class LoRAAdapter(nn.Module):
 
         if self._glm52_validator is not None:
             self._glm52_validator.finalize()
+        if self._dsv4_flash_validator is not None:
+            self._dsv4_flash_validator.finalize()
         self._normalize_weights()
         self._glm52_exact_adapter_certified = bool(
             self._glm52_validator is not None
             and getattr(self.base_hf_config, "_glm52_exact_mode", False)
+        )
+        self._dsv4_flash_exact_adapter_certified = bool(
+            self._dsv4_flash_validator is not None
+            and getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False)
+        )
+        self._dsv4_flash_exact_all_zero = bool(
+            self._dsv4_flash_exact_adapter_certified
+            and self._dsv4_flash_validator.all_zero
         )
 
     def _process_weight(self, name: str, loaded_weight: torch.Tensor):
@@ -183,6 +209,8 @@ class LoRAAdapter(nn.Module):
 
         if self._glm52_validator is not None:
             self._glm52_validator.observe(name, loaded_weight)
+        if self._dsv4_flash_validator is not None:
+            self._dsv4_flash_validator.observe(name, loaded_weight)
 
         normalized_target_modules = get_normalized_target_modules(
             self.config.target_modules

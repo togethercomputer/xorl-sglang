@@ -34,6 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
+from sglang.srt.lora.dsv4 import is_dsv4_flash_exact_adapter
 from sglang.srt.lora.glm52 import is_glm52_xorl_shared_outer_adapter
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
@@ -121,6 +122,10 @@ class LoRAManager:
             device=self.device,
             server_args=server_args,
         )
+        self.lora_backend._dsv4_flash_exact_mode = bool(
+            getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False)
+        )
+        self.lora_backend._dsv4_flash_exact_batch_certified = False
 
         # Initialize mutable internal state of the LoRAManager.
         self.init_state(
@@ -352,6 +357,7 @@ class LoRAManager:
         memory_pool = getattr(self, "memory_pool", None)
         if memory_pool is not None:
             self._validate_glm52_runtime_layout(lora_config)
+            self._validate_dsv4_flash_runtime_layout(lora_config)
         incompatible = memory_pool and not memory_pool.can_support(lora_config)
         if incompatible:
             raise ValueError(
@@ -395,6 +401,76 @@ class LoRAManager:
                 "GLM-5.2 XoRL adapters require unfused shared-expert modules. "
                 "Start the server with --disable-shared-experts-fusion."
             )
+
+    def _validate_dsv4_flash_runtime_layout(self, lora_config: LoRAConfig) -> None:
+        identified = is_dsv4_flash_exact_adapter(
+            self.base_hf_config, lora_config.hf_config
+        )
+        if (
+            getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False)
+            and not identified
+        ):
+            raise ValueError(
+                "The exact DSV4-Flash active-LoRA contract requires "
+                "_sglang_lora_format='dsv4_expert_banks'; ordinary or missing "
+                "adapter formats are not admitted."
+            )
+        if not identified:
+            return
+        if getattr(self, "experts_shared_outer_loras", False):
+            raise ValueError(
+                "DSV4-Flash per-expert A/B banks require a non-shared-outer "
+                "LoRA memory pool."
+            )
+        if getattr(self.base_model, "num_fused_shared_experts", 0) != 0:
+            raise ValueError(
+                "DSV4-Flash exact adapters require unfused shared-expert "
+                "modules. Start with --disable-shared-experts-fusion."
+            )
+
+    def _validate_dsv4_flash_exact_batch(self, forward_batch: ForwardBatch) -> None:
+        self.lora_backend._dsv4_flash_exact_batch_certified = False
+        if not getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
+            return
+        # ``ForwardMode.is_cuda_graph()`` means that a mode *can* be captured;
+        # eager decode uses the same ``DECODE`` enum.  Reject only an actual
+        # capture or a batch backed by initialized decode-graph metadata.
+        uses_decode_cuda_graph = (
+            hasattr(self, "max_bs_in_cuda_graph")
+            and forward_batch.batch_size <= self.max_bs_in_cuda_graph
+            and forward_batch.forward_mode.is_cuda_graph()
+        )
+        if get_is_capture_mode() or uses_decode_cuda_graph:
+            raise RuntimeError(
+                "The exact DSV4-Flash active-LoRA contract admits eager execution only."
+            )
+        lora_ids = list(forward_batch.lora_ids)
+        if len(lora_ids) != 1:
+            raise RuntimeError(
+                "The exact DSV4-Flash active-LoRA contract admits exactly one "
+                f"logical request, got {len(lora_ids)}."
+            )
+        uid = lora_ids[0]
+        if uid is None:
+            self.lora_backend._dsv4_flash_exact_batch_certified = True
+            return
+        adapter = self.loras.get(uid)
+        if adapter is None or uid not in self.memory_pool.uid_to_buffer_id:
+            raise RuntimeError(
+                "The exact DSV4-Flash active-LoRA request references a missing "
+                f"or nonresident adapter UID: {uid!r}."
+            )
+        if not getattr(adapter, "_dsv4_flash_exact_adapter_certified", False):
+            raise RuntimeError(
+                "The exact DSV4-Flash active-LoRA request requires an adapter "
+                "certified from the complete 948-factor inventory."
+            )
+        if adapter.config.r != 1 or adapter.scaling != 1:
+            raise RuntimeError(
+                "The exact DSV4-Flash active-LoRA request requires rank 1 and "
+                f"unit scaling, got rank={adapter.config.r}, scaling={adapter.scaling}."
+            )
+        self.lora_backend._dsv4_flash_exact_batch_certified = True
 
     def _validate_glm52_active_adapters(self, forward_batch: ForwardBatch) -> None:
         """Reject stale adapter references without restricting normal batching."""
@@ -527,6 +603,8 @@ class LoRAManager:
         take the base path instead of reading the previous batch's stale
         metadata."""
         self.lora_backend.reset_batch_state()
+        if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
+            self.lora_backend._dsv4_flash_exact_batch_certified = False
 
     @contextmanager
     def glm52_context_parallel_lora_batch(
@@ -792,6 +870,9 @@ class LoRAManager:
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
         self._validate_glm52_active_adapters(forward_batch)
+        if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
+            self.lora_backend._dsv4_flash_exact_batch_certified = False
+        self._validate_dsv4_flash_exact_batch(forward_batch)
         bs = forward_batch.batch_size
 
         use_cuda_graph = (
@@ -814,6 +895,24 @@ class LoRAManager:
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
                 lora = self.loras[uid]
+                # A DSV4-Flash adapter is marked all-zero only after every one
+                # of the required 948 BF16 tensors has passed the exact
+                # inventory validator.  Treat that certified identity adapter
+                # as an inactive rank-zero slot.  This makes A1 execute the
+                # literal base path instead of launching numerically pointless
+                # LoRA kernels whose routed Marlin prefill reductions are not
+                # bitwise stable for all route distributions.
+                if (
+                    getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False)
+                    and getattr(lora, "_dsv4_flash_exact_all_zero", False)
+                ):
+                    if None not in self.memory_pool.uid_to_buffer_id:
+                        raise RuntimeError(
+                            "The exact DSV4-Flash all-zero adapter requires a "
+                            "resident base-model LoRA slot."
+                        )
+                    weight_indices[i] = self.memory_pool.get_buffer_id(None)
+                    continue
                 lora_ranks[weight_indices[i]] = lora.config.r
                 scalings[weight_indices[i]] = lora.scaling
         # Do in-place updates when CUDA graph is enabled and the batch forward mode
@@ -829,6 +928,8 @@ class LoRAManager:
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
         )
+        if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
+            self.lora_backend._dsv4_flash_exact_batch_certified = True
 
     def update_lora_info(self):
         """

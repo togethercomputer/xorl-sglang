@@ -10,6 +10,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.utils.common import is_blackwell_supported, is_sm90_supported
 
+
 # Import SGLang's standard PDL support detection
 
 
@@ -23,6 +24,18 @@ def _get_ptr(lora_weights: list[torch.Tensor], device: torch.device):
     Refer to:
     https://github.com/triton-lang/triton/blob/release/3.1.x/python/tutorials/08-grouped-gemm.py
     """
+    # The Triton kernel dereferences these tensors through ``ptr_tensor`` rather
+    # than receiving them as ordinary tensor arguments.  Consequently PyTorch's
+    # caching allocator cannot infer that their storages are still in use.  This
+    # matters for callers which construct per-forward views/copies (for example
+    # the exact DSV4 trainer): without an explicit stream record, the allocator
+    # may recycle a LoRA buffer while the asynchronous kernel is still reading
+    # it.  Record on every lookup, including cache hits, because liveness is a
+    # property of each launch rather than of the pointer-table entry.
+    stream = torch.cuda.current_stream(device)
+    for lora_weight in lora_weights:
+        lora_weight.record_stream(stream)
+
     key = tuple(lora_weight.data_ptr() for lora_weight in lora_weights)
 
     if (ptr_tensor := _LORA_PTR_DICT.get(key)) is not None:

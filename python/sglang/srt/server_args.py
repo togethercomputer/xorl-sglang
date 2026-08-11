@@ -441,6 +441,10 @@ def is_glm52_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "glm52_exact_mode", False))
 
 
+def is_dsv4_flash_exact_mode(server_args: ServerArgs) -> bool:
+    return bool(getattr(server_args, "dsv4_flash_exact_mode", False))
+
+
 def is_qwen35_gdn_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "qwen35_gdn_exact_mode", False))
 
@@ -760,6 +764,34 @@ def _validate_glm52_exact_quantization_config(hf_config) -> None:
         raise ValueError(
             "The exact GLM-5.2 XORL contract only admits the qualified FP8 "
             f"checkpoint layout; mismatched fields: {', '.join(mismatches)}"
+        )
+
+
+def _validate_dsv4_flash_exact_quantization_config(hf_config) -> None:
+    config = _text_model_config(hf_config)
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        raise ValueError(
+            "The exact DSV4-Flash XORL contract requires the official dynamic "
+            "block-FP8 checkpoint config."
+        )
+    expected = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    }
+    mismatches = [
+        f"quantization_config.{name}={quantization_config.get(name)!r} "
+        f"(expected {value!r})"
+        for name, value in expected.items()
+        if quantization_config.get(name) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "The exact DSV4-Flash XORL contract only admits the official "
+            f"FP8/MXFP4 checkpoint layout; mismatched fields: {', '.join(mismatches)}"
         )
 
 
@@ -3618,6 +3650,9 @@ class ServerArgs:
     glm52_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
         init=False, default=False, repr=False
     )
+    dsv4_flash_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
+    )
     qwen35_gdn_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
         init=False, default=False, repr=False
     )
@@ -4010,6 +4045,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._validate_dsv4_flash_exact_resolved_contract()
         self._validate_glm52_exact_resolved_contract()
 
     def _handle_return_hidden_states_mode(self):
@@ -5411,6 +5447,317 @@ class ServerArgs:
 
         validate_hisparse_kv_cache_dtype(self)
 
+    def _validate_dsv4_flash_exact_contract(self) -> None:
+        if not self.dsv4_flash_exact_mode:
+            return
+        if (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "The exact DSV4-Flash XORL contract does not support "
+                "speculative, draft, or MTP decoding."
+            )
+
+    def _resolve_dsv4_flash_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+    ) -> None:
+        self.dsv4_flash_exact_mode = (
+            self.rl_on_policy_target == XORL_RL_TARGET
+            and model_arch == "DeepseekV4ForCausalLM"
+        )
+        config = _text_model_config(hf_config)
+        hf_config._dsv4_flash_exact_mode = self.dsv4_flash_exact_mode
+        config._dsv4_flash_exact_mode = self.dsv4_flash_exact_mode
+        self._validate_dsv4_flash_exact_contract()
+        if not self.dsv4_flash_exact_mode:
+            return
+
+        _validate_exact_model_geometry(
+            config,
+            contract_name="DSV4-Flash",
+            expected={
+                "model_type": "deepseek_v4",
+                "vocab_size": 129280,
+                "hidden_size": 4096,
+                "num_hidden_layers": 43,
+                "num_attention_heads": 64,
+                "num_key_value_heads": 1,
+                "head_dim": 512,
+                "qk_rope_head_dim": 64,
+                "q_lora_rank": 1024,
+                "o_groups": 8,
+                "o_lora_rank": 1024,
+                "sliding_window": 128,
+                "index_n_heads": 64,
+                "index_head_dim": 128,
+                "index_topk": 512,
+                "moe_intermediate_size": 2048,
+                "n_routed_experts": 256,
+                "n_shared_experts": 1,
+                "num_experts_per_tok": 6,
+                "num_hash_layers": 3,
+                "hc_mult": 4,
+                "hc_sinkhorn_iters": 20,
+                "hc_eps": 1e-6,
+                "compress_rope_theta": 160000,
+                "routed_scaling_factor": 1.5,
+                "scoring_func": "sqrtsoftplus",
+                "topk_method": "noaux_tc",
+                "norm_topk_prob": True,
+                "hidden_act": "silu",
+                "swiglu_limit": 10.0,
+                "attention_bias": False,
+                "attention_dropout": 0.0,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": False,
+                "expert_dtype": "fp4",
+                "num_nextn_predict_layers": 1,
+            },
+        )
+        from sglang.srt.lora.dsv4 import (
+            DSV4_FLASH_COMPRESS_RATIOS,
+            DSV4_FLASH_REQUIRED_TARGET_MODULES,
+        )
+
+        if tuple(getattr(config, "compress_ratios", ()) or ()) != (
+            DSV4_FLASH_COMPRESS_RATIOS
+        ):
+            raise ValueError(
+                "The exact DSV4-Flash XORL contract requires the official "
+                "C0/C4/C128 compress-ratio schedule."
+            )
+        rope = getattr(config, "rope_parameters", None)
+        if not isinstance(rope, dict):
+            rope = getattr(config, "rope_scaling", None)
+        rope_expected = {
+            "factor": 16.0,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+        }
+        rope_mismatches = [
+            f"{name}={rope.get(name)!r} (expected {value!r})"
+            for name, value in rope_expected.items()
+            if not isinstance(rope, dict) or rope.get(name) != value
+        ]
+        if not isinstance(rope, dict) or rope.get(
+            "rope_type", rope.get("type")
+        ) != "yarn":
+            rope_mismatches.append("rope type is not 'yarn'")
+        if rope_mismatches:
+            raise ValueError(
+                "The exact DSV4-Flash XORL contract requires the official YaRN "
+                f"program: {', '.join(rope_mismatches)}"
+            )
+        _validate_dsv4_flash_exact_quantization_config(config)
+
+        if self.lora_target_modules is not None:
+            configured_targets = set(self.lora_target_modules)
+            if configured_targets != DSV4_FLASH_REQUIRED_TARGET_MODULES:
+                raise ValueError(
+                    "The exact DSV4-Flash XORL contract requires the complete "
+                    f"LoRA target set; got {sorted(configured_targets)}."
+                )
+        if self.enable_lora is not True:
+            raise ValueError(
+                "The exact DSV4-Flash XORL contract requires enable_lora=true "
+                "so the complete memory-pool layout exists before dynamic load."
+            )
+        if not self.lora_paths:
+            self.lora_target_modules = set(DSV4_FLASH_REQUIRED_TARGET_MODULES)
+
+        exact_program = {
+            "dtype": (self.dtype, ("auto", "bf16", "bfloat16")),
+            "quantization": (self.quantization, (None, "fp8")),
+            "kv_cache_dtype": (
+                self.kv_cache_dtype,
+                ("auto", "fp8_e4m3"),
+            ),
+            "attention_backend": (self.attention_backend, (None, "dsv4")),
+            "prefill_attention_backend": (
+                self.prefill_attention_backend,
+                (None, "dsv4"),
+            ),
+            "decode_attention_backend": (
+                self.decode_attention_backend,
+                (None, "dsv4"),
+            ),
+            "page_size": (self.page_size, (None, 256)),
+            "nnodes": (self.nnodes, (1,)),
+            "tp_size": (self.tp_size, (8,)),
+            "dp_size": (self.dp_size, (8,)),
+            "ep_size": (self.ep_size, (8,)),
+            "pp_size": (self.pp_size, (1,)),
+            "moe_dp_size": (self.moe_dp_size, (1,)),
+            "attn_cp_size": (self.attn_cp_size, (1,)),
+            "dcp_size": (self.dcp_size, (1,)),
+            "enable_dp_attention": (self.enable_dp_attention, (True,)),
+            "enable_cp_decode_attn_tp": (
+                self.enable_cp_decode_attn_tp,
+                (False,),
+            ),
+            "enable_prefill_cp": (self.enable_prefill_cp, (False,)),
+            "enable_prefill_context_parallel": (
+                self.enable_prefill_context_parallel,
+                (False,),
+            ),
+            "enable_dsa_prefill_context_parallel": (
+                self.enable_dsa_prefill_context_parallel,
+                (False,),
+            ),
+            "moe_a2a_backend": (self.moe_a2a_backend, ("none",)),
+            "moe_runner_backend": (
+                self.moe_runner_backend,
+                ("auto", "marlin"),
+            ),
+            "flashinfer_mxfp4_moe_precision": (
+                self.flashinfer_mxfp4_moe_precision,
+                ("default",),
+            ),
+            "fp8_gemm_runner_backend": (
+                self.fp8_gemm_runner_backend,
+                ("auto", "triton"),
+            ),
+            "moe_dense_tp_size": (self.moe_dense_tp_size, (None, 1)),
+            "ep_num_redundant_experts": (
+                self.ep_num_redundant_experts,
+                (0,),
+            ),
+            "ep_dispatch_algorithm": (self.ep_dispatch_algorithm, (None,)),
+            "init_expert_location": (self.init_expert_location, ("trivial",)),
+            "enable_eplb": (self.enable_eplb, (False,)),
+            "enable_hisparse": (self.enable_hisparse, (False,)),
+            "enable_deepseek_v4_fp4_indexer": (
+                self.enable_deepseek_v4_fp4_indexer,
+                (False,),
+            ),
+            "disaggregation_mode": (self.disaggregation_mode, ("null",)),
+            "sampling_backend": (self.sampling_backend, (None, "pytorch")),
+            "sampling_defaults": (self.sampling_defaults, ("model", "openai")),
+            "chunked_prefill_size": (
+                self.chunked_prefill_size,
+                (None, -1, 8192),
+            ),
+            "max_prefill_tokens": (
+                self.max_prefill_tokens,
+                (8192, 16384),
+            ),
+            "prefill_max_requests": (
+                self.prefill_max_requests,
+                (None, 1),
+            ),
+            "max_total_tokens": (self.max_total_tokens, (None, 8192)),
+            "max_running_requests": (
+                self.max_running_requests,
+                (None, 8),
+            ),
+            "model_impl": (self.model_impl, ("auto", "sglang")),
+            "device": (self.device, (None, "cuda")),
+            "is_embedding": (self.is_embedding, (False,)),
+            "enable_torch_compile": (self.enable_torch_compile, (False,)),
+            "enable_two_batch_overlap": (
+                self.enable_two_batch_overlap,
+                (False,),
+            ),
+            "enable_single_batch_overlap": (
+                self.enable_single_batch_overlap,
+                (False,),
+            ),
+            "max_lora_rank": (self.max_lora_rank, (None, 1)),
+            "lora_backend": (self.lora_backend, ("csgmv", "triton")),
+            "experts_shared_outer_loras": (
+                self.experts_shared_outer_loras,
+                (None, False),
+            ),
+            "enable_lora_overlap_loading": (
+                self.enable_lora_overlap_loading,
+                (None, False),
+            ),
+            "lora_use_virtual_experts": (
+                self.lora_use_virtual_experts,
+                (False,),
+            ),
+        }
+        incompatible = [
+            f"{name}={value!r}"
+            for name, (value, allowed) in exact_program.items()
+            if value not in allowed
+        ]
+        if self.cuda_graph_bs_decode is not None:
+            incompatible.append(
+                f"cuda_graph_bs_decode={self.cuda_graph_bs_decode!r}"
+            )
+        if self.cuda_graph_max_bs_decode is not None:
+            incompatible.append(
+                f"cuda_graph_max_bs_decode={self.cuda_graph_max_bs_decode!r}"
+            )
+        if isinstance(self.cuda_graph_config, CudaGraphConfig):
+            locked = getattr(self, "_cuda_graph_config_locked", set())
+            for phase in (Phase.DECODE, Phase.PREFILL):
+                backend = getattr(self.cuda_graph_config, phase).backend
+                if (
+                    (phase, "backend") in locked
+                    and backend != Backend.DISABLED
+                ):
+                    incompatible.append(
+                        f"cuda_graph_config[{phase}].backend={backend!r}"
+                    )
+        if incompatible:
+            raise ValueError(
+                "The exact DSV4-Flash XORL contract rejects incompatible "
+                f"runtime settings: {', '.join(incompatible)}"
+            )
+
+        self.dtype = "bfloat16"
+        self.quantization = "fp8"
+        self.kv_cache_dtype = "fp8_e4m3"
+        self.attention_backend = "dsv4"
+        self.prefill_attention_backend = None
+        self.decode_attention_backend = None
+        self.page_size = 256
+        self.sampling_backend = "pytorch"
+        self.sampling_defaults = "openai"
+        self.chunked_prefill_size = -1
+        self.max_prefill_tokens = 8192
+        self.prefill_max_requests = 1
+        self.max_total_tokens = 8192
+        # This limit is global.  DP-attention divides it by attn_dp_size when
+        # allocating each request pool, so TP8/DP8 needs eight slots to retain
+        # the exact single-request-per-rank execution lane.
+        self.max_running_requests = 8
+        self.mem_fraction_static = 0.82
+        self.model_impl = "sglang"
+        self.device = "cuda"
+        self.max_lora_rank = 1
+        self.lora_backend = "triton"
+        self.experts_shared_outer_loras = False
+        self.enable_lora_overlap_loading = False
+        self.lora_use_virtual_experts = False
+        self.lora_strict_loading = True
+        self.moe_runner_backend = "marlin"
+        self.flashinfer_mxfp4_moe_precision = "default"
+        self.fp8_gemm_runner_backend = "triton"
+        self.moe_dense_tp_size = 1
+        self.enable_dp_lm_head = True
+        self.enable_deterministic_inference = True
+        self.disable_shared_experts_fusion = True
+        self.disable_custom_all_reduce = True
+        self.disable_overlap_schedule = True
+        self.disable_piecewise_cuda_graph = True
+        self.disable_cuda_graph = True
+        self.disable_cuda_graph_padding = True
+        self.disable_radix_cache = True
+        if isinstance(self.cuda_graph_config, CudaGraphConfig):
+            self.cuda_graph_config.decode.backend = Backend.DISABLED
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+            self._cuda_graph_config_locked.add((Phase.DECODE, "backend"))
+            self._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
+
     def _validate_glm52_exact_contract(self) -> None:
         if not self.glm52_exact_mode:
             return
@@ -5747,6 +6094,124 @@ class ServerArgs:
             self._cuda_graph_config_locked.add((Phase.DECODE, "bs"))
             self._cuda_graph_config_locked.add((Phase.DECODE, "max_bs"))
             self._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
+
+    def _validate_dsv4_flash_exact_resolved_contract(self) -> None:
+        """Reject late resolution drift from the first DSV4 exact lane."""
+
+        if not self.dsv4_flash_exact_mode:
+            return
+        expected = {
+            "dtype": "bfloat16",
+            "quantization": "fp8",
+            "kv_cache_dtype": "fp8_e4m3",
+            "attention_backend": "dsv4",
+            "page_size": 256,
+            "nnodes": 1,
+            "tp_size": 8,
+            "dp_size": 8,
+            "ep_size": 8,
+            "pp_size": 1,
+            "moe_dp_size": 1,
+            "attn_cp_size": 1,
+            "dcp_size": 1,
+            "enable_dp_attention": True,
+            "enable_dp_lm_head": True,
+            "enable_cp_decode_attn_tp": False,
+            "enable_prefill_cp": False,
+            "enable_prefill_context_parallel": False,
+            "enable_dsa_prefill_context_parallel": False,
+            "moe_a2a_backend": "none",
+            "moe_runner_backend": "marlin",
+            "flashinfer_mxfp4_moe_precision": "default",
+            "fp8_gemm_runner_backend": "triton",
+            "moe_dense_tp_size": 1,
+            "ep_num_redundant_experts": 0,
+            "ep_dispatch_algorithm": None,
+            "init_expert_location": "trivial",
+            "enable_eplb": False,
+            "enable_hisparse": False,
+            "enable_deepseek_v4_fp4_indexer": False,
+            "disaggregation_mode": "null",
+            "sampling_backend": "pytorch",
+            "sampling_defaults": "openai",
+            "chunked_prefill_size": -1,
+            "max_prefill_tokens": 8192,
+            "prefill_max_requests": 1,
+            "max_total_tokens": 8192,
+            # Global DP-attention capacity: eight global slots become one
+            # request-pool slot on each of the eight attention-DP ranks.
+            "max_running_requests": 8,
+            "model_impl": "sglang",
+            "device": "cuda",
+            "is_embedding": False,
+            "enable_torch_compile": False,
+            "enable_two_batch_overlap": False,
+            "enable_single_batch_overlap": False,
+            "max_lora_rank": 1,
+            "lora_backend": "triton",
+            "experts_shared_outer_loras": False,
+            "enable_lora_overlap_loading": False,
+            "lora_use_virtual_experts": False,
+            "lora_strict_loading": True,
+            "enable_deterministic_inference": True,
+            "disable_shared_experts_fusion": True,
+            "disable_custom_all_reduce": True,
+            "disable_overlap_schedule": True,
+            "disable_piecewise_cuda_graph": True,
+            "disable_cuda_graph": True,
+            "disable_cuda_graph_padding": True,
+            "disable_radix_cache": True,
+        }
+        mismatches = [
+            f"{name}={getattr(self, name, None)!r} (expected {value!r})"
+            for name, value in expected.items()
+            if getattr(self, name, None) != value
+        ]
+        if self.cuda_graph_bs_decode is not None:
+            mismatches.append(
+                f"cuda_graph_bs_decode={self.cuda_graph_bs_decode!r} (expected None)"
+            )
+        if self.cuda_graph_max_bs_decode is not None:
+            mismatches.append(
+                "cuda_graph_max_bs_decode="
+                f"{self.cuda_graph_max_bs_decode!r} (expected None)"
+            )
+        if not isinstance(self.cuda_graph_config, CudaGraphConfig):
+            mismatches.append("cuda_graph_config is not resolved")
+        else:
+            graph_expected = {
+                "decode.backend": (
+                    self.cuda_graph_config.decode.backend,
+                    Backend.DISABLED,
+                ),
+                "prefill.backend": (
+                    self.cuda_graph_config.prefill.backend,
+                    Backend.DISABLED,
+                ),
+            }
+            mismatches.extend(
+                f"cuda_graph_config.{name}={value!r} (expected {wanted!r})"
+                for name, (value, wanted) in graph_expected.items()
+                if value != wanted
+            )
+        if envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+            mismatches.append("SGLANG_OPT_FUSE_WQA_WKV is enabled")
+        exact_disabled_envs = (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS,
+            envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS,
+            envs.SGLANG_OPT_MOE_QUANT_ONCE,
+            envs.SGLANG_SHARED_EXPERT_TP1,
+        )
+        mismatches.extend(
+            f"{setting.name} is enabled"
+            for setting in exact_disabled_envs
+            if setting.get()
+        )
+        if mismatches:
+            raise ValueError(
+                "The exact DSV4-Flash XORL contract drifted after runtime "
+                f"resolution: {', '.join(mismatches)}"
+            )
 
     def _validate_glm52_exact_resolved_contract(self) -> None:
         """Fail if a late resolution pass changed the certified GLM program."""
@@ -6217,6 +6682,10 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        self._resolve_dsv4_flash_exact_contract(
+            hf_config,
+            model_arch=model_arch,
+        )
         self._resolve_glm52_exact_contract(
             hf_config,
             model_arch=model_arch,

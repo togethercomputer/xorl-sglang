@@ -50,6 +50,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.lora.dsv4 import validate_dsv4_flash_exact_request_routing
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -417,6 +418,32 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
     fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
+
+
+def _build_raw_token_logprobs_b64_fields(
+    input_values: List[Optional[float]],
+    output_values: List[Optional[float]],
+) -> Dict[str, Any]:
+    """Encode selected-token logprobs without a JSON float round trip.
+
+    Positions with no defined logprob (normally the first prompt token) are
+    represented by the canonical NumPy float32 NaN.  Length fields preserve
+    the position mapping and make the wire format independently auditable.
+    """
+
+    def _encode(values: List[Optional[float]]) -> str:
+        arr = np.asarray(
+            [np.nan if value is None else value for value in values], dtype="<f4"
+        )
+        return pybase64.b64encode(arr.tobytes()).decode("utf-8")
+
+    return {
+        "input_token_logprobs_raw_b64": _encode(input_values),
+        "input_token_logprobs_raw_length": len(input_values),
+        "output_token_logprobs_raw_b64": _encode(output_values),
+        "output_token_logprobs_raw_length": len(output_values),
+        "token_logprobs_raw_b64_dtype": "float32_le",
+    }
 
 
 class InputFormat(Enum):
@@ -807,6 +834,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        if (
+            isinstance(obj, GenerateReqInput)
+            and self.server_args.dsv4_flash_exact_mode
+        ):
+            validate_dsv4_flash_exact_request_routing(obj.routed_dp_rank)
         if (
             isinstance(obj, GenerateReqInput)
             and obj.max_thinking_tokens is not None
@@ -2604,6 +2636,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info["input_token_logprobs"] = state.input_token_logprobs
         meta_info["output_token_logprobs"] = state.output_token_logprobs
         meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs)
+        if state.obj.return_raw_token_logprobs_b64:
+            meta_info.update(
+                _build_raw_token_logprobs_b64_fields(
+                    state.input_token_logprobs_val,
+                    state.output_token_logprobs_val,
+                )
+            )
 
         # 2. Handle top logprobs
         if top_logprobs_num > 0:

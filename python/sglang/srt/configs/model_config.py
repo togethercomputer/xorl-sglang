@@ -580,6 +580,12 @@ class ModelConfig:
         glm52_exact_mode = bool(server_args.glm52_exact_mode) and not is_draft_model
         model_config.hf_config._glm52_exact_mode = glm52_exact_mode
         model_config.hf_text_config._glm52_exact_mode = glm52_exact_mode
+        dsv4_flash_exact_mode = (
+            bool(getattr(server_args, "dsv4_flash_exact_mode", False))
+            and not is_draft_model
+        )
+        model_config.hf_config._dsv4_flash_exact_mode = dsv4_flash_exact_mode
+        model_config.hf_text_config._dsv4_flash_exact_mode = dsv4_flash_exact_mode
         return model_config
 
     def _config_draft_model(self):

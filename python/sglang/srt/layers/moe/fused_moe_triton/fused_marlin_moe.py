@@ -119,6 +119,46 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+def select_marlin_moe_block_size_m(
+    *,
+    num_tokens: int,
+    topk: int,
+    local_experts: int,
+    global_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    is_mxfp4_marlin: bool,
+    clamp_limit: Optional[float],
+) -> int:
+    """Select Marlin's row block, pinning the admitted DSV4 exact geometry.
+
+    The generic density heuristic selects blocks 8-32 at admitted DSV4 widths.
+    On SM90, repeated hot routes can then assign one expert to multiple Marlin
+    row blocks, whose partial completion order is not byte-stable.  A
+    shape-matched M=48 discriminator proves blocks 8/16/32 diverge while 48/64
+    are stable and produce the same bytes.  Pin 64 to keep one block per expert
+    through the retained four- and 64-decision lane; unrelated Marlin models
+    retain their established choice.
+    """
+
+    block_size_m = 8
+    for candidate in (8, 16, 32, 48, 64):
+        block_size_m = candidate
+        if num_tokens * topk / local_experts / candidate < 0.9:
+            break
+    if (
+        is_mxfp4_marlin
+        and global_experts == 256
+        and local_experts == 32
+        and hidden_size == 4096
+        and intermediate_size == 2048
+        and topk == 6
+        and clamp_limit == 10.0
+    ):
+        return 64
+    return block_size_m
+
+
 def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
@@ -235,14 +275,18 @@ def fused_marlin_moe(
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
-
     if global_num_experts == -1:
         global_num_experts = E
+    block_size_m = select_marlin_moe_block_size_m(
+        num_tokens=M,
+        topk=topk,
+        local_experts=E,
+        global_experts=global_num_experts,
+        hidden_size=K,
+        intermediate_size=N,
+        is_mxfp4_marlin=is_mxfp4_marlin,
+        clamp_limit=clamp_limit,
+    )
     if (
         M == 1
         and topk <= 32
