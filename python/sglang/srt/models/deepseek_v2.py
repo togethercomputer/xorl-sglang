@@ -1196,7 +1196,6 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
-
     def _post_experts_all_reduce(self, final_hidden_states):
         """Post-experts TP sum; the DSV4 exact lane pins the canonical fold.
 

@@ -466,12 +466,8 @@ def should_use_dp_reduce_scatterv():
     """
     try:
         server_args = get_server_args()
-        qwen35_exact_mode = bool(
-            getattr(server_args, "qwen35_gdn_exact_mode", False)
-        )
-        dsv4_exact_mode = bool(
-            getattr(server_args, "dsv4_flash_exact_mode", False)
-        )
+        qwen35_exact_mode = bool(getattr(server_args, "qwen35_gdn_exact_mode", False))
+        dsv4_exact_mode = bool(getattr(server_args, "dsv4_flash_exact_mode", False))
     except ValueError:
         # Some unit-level utility callers intentionally have no published
         # ServerArgs. They retain the stock optimization behavior.

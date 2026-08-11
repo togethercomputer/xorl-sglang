@@ -384,6 +384,66 @@ def test_small_batch_moe_lora_alignment_skips_ep_sentinels() -> None:
     assert expert_ids[4] != -1
 
 
+def test_dsv4_exact_marlin_geometry_is_narrow_and_fail_closed() -> None:
+    from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+        DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS,
+        is_dsv4_exact_pinned_marlin_geometry,
+    )
+
+    admitted = {
+        "is_mxfp4_marlin": True,
+        "global_experts": 256,
+        "local_experts": 32,
+        "hidden_size": 4096,
+        "intermediate_size": 2048,
+        "topk": 6,
+        "clamp_limit": 10.0,
+    }
+    assert DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS == 10
+    assert is_dsv4_exact_pinned_marlin_geometry(**admitted)
+
+    for field, value in {
+        "is_mxfp4_marlin": False,
+        "global_experts": 255,
+        "local_experts": 31,
+        "hidden_size": 4095,
+        "intermediate_size": 2047,
+        "topk": 5,
+        "clamp_limit": 9.0,
+    }.items():
+        candidate = dict(admitted)
+        candidate[field] = value
+        assert not is_dsv4_exact_pinned_marlin_geometry(**candidate)
+
+
+def test_chunked_moe_lora_info_rebases_segments_and_slices_tokens() -> None:
+    from sglang.srt.lora.lora_moe_runners import LoRAInfo, slice_moe_lora_info
+
+    weights = torch.zeros(1, 1, 1, 1)
+    info = LoRAInfo(
+        gate_up_lora_a_weights=weights,
+        gate_up_lora_b_weights=weights,
+        down_lora_a_weights=weights,
+        down_lora_b_weights=weights,
+        seg_indptr=torch.tensor([0, 3, 8, 12], dtype=torch.int32),
+        req_to_lora=torch.tensor([0, 1, 0], dtype=torch.int32),
+        lora_ranks=torch.tensor([1, 1], dtype=torch.int32),
+        adapter_enabled=torch.tensor([True, True]),
+        token_lora_mapping=torch.tensor([0] * 3 + [1] * 5 + [0] * 4),
+        max_lora_rank=1,
+        num_experts=1,
+    )
+
+    sliced = slice_moe_lora_info(info, 4, 10)
+
+    assert sliced is not None
+    assert sliced.seg_indptr.tolist() == [0, 0, 4, 6]
+    assert sliced.req_to_lora is info.req_to_lora
+    assert sliced.token_lora_mapping.tolist() == [1, 1, 1, 1, 0, 0]
+    assert sliced.gate_up_lora_a_weights is weights
+    assert slice_moe_lora_info(None, 0, 1) is None
+
+
 def test_exact_batch_admits_eager_decode_but_rejects_real_decode_graph() -> None:
     from sglang.srt.lora.lora_manager import LoRAManager
     from sglang.srt.model_executor.forward_batch_info import ForwardMode

@@ -482,7 +482,9 @@ def _add_lora_down_delta(
         )
 
 
-def slice_moe_lora_info(lora_info: LoRAInfo | None, start: int, stop: int) -> LoRAInfo | None:
+def slice_moe_lora_info(
+    lora_info: LoRAInfo | None, start: int, stop: int
+) -> LoRAInfo | None:
     """Per-token slice of a LoRAInfo for the DSV4 exact chunked Marlin launches.
 
     ``token_lora_mapping`` is per token and slices directly; ``seg_indptr``
