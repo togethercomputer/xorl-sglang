@@ -125,7 +125,7 @@ class SchedulerBatchResultProcessor:
         Logs a soft warning if the resulting tensor's row count differs from
         the expected `seqlen - 1 - start_len`, to catch silent regressions.
         """
-        if not req.return_routed_experts:
+        if not (req.return_routed_experts or req.return_expert_logits):
             return
         capturer = get_global_experts_capturer()
         if capturer is None:
@@ -138,6 +138,13 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
             start_len=start_len,
         )
+        if req.return_expert_logits:
+            req.expert_logits = capturer.get_expert_logits(
+                req_pool_idx=req.req_pool_idx,
+                seqlen=seqlen,
+                req_to_token_pool=self.req_to_token_pool,
+                start_len=start_len,
+            )
 
         expected_rows = max(0, seqlen - 1 - start_len)
         if (

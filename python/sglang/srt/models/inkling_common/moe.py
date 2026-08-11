@@ -448,7 +448,11 @@ class InklingGate(nn.Module):
         # draft blocks are forced dense; give the gate an allow_capture flag if a draft
         # ever carries MoE.
         if (cap := get_global_experts_capturer()) is not None:
-            cap.capture(layer_id=self.layer_id, topk_indices=topk_indices)
+            cap.capture(
+                layer_id=self.layer_id,
+                topk_indices=topk_indices,
+                topk_weights=topk_weights,
+            )
         if self.norm_after_topk:
             if self.gate_activation == "sigmoid" and self.global_scale is not None:
                 routed_weights, shared_gammas = renorm_topk_logits_scaled(

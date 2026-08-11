@@ -253,6 +253,9 @@ def _handle_output_by_index(output, i):
             routed_experts=_extract_field_by_index(
                 output, "routed_experts", i, check_length=False
             ),
+            expert_logits=_extract_field_by_index(
+                output, "expert_logits", i, check_length=False
+            ),
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False
             ),
@@ -369,6 +372,9 @@ def _handle_output_by_index(output, i):
             ),
             routed_experts=_extract_field_by_index(
                 output, "routed_experts", i, check_length=False
+            ),
+            expert_logits=_extract_field_by_index(
+                output, "expert_logits", i, check_length=False
             ),
             indexer_topk=_extract_field_by_index(
                 output, "indexer_topk", i, check_length=False

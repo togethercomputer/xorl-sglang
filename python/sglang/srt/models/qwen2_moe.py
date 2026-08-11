@@ -536,6 +536,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config,
             self.topk.layer_id,
             selected_experts,
+            routing_weights,
         )
         return StandardTopKOutput(
             topk_weights=routing_weights,

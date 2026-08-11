@@ -1884,6 +1884,7 @@ def capture_routed_experts_if_allowed(
     topk_config: TopKConfig,
     layer_id: Optional[int],
     topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
 ) -> None:
     """Single capture site for every backend, gated by the per-config opt-out.
 
@@ -1896,6 +1897,7 @@ def capture_routed_experts_if_allowed(
         cap.capture(
             layer_id=layer_id,
             topk_indices=topk_ids,
+            topk_weights=topk_weights,
         )
 
 
@@ -1915,7 +1917,9 @@ def _post_process_topk_ids(
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    capture_routed_experts_if_allowed(
+        topk_config, layer_id, topk_ids, topk_weights
+    )
     recorder_topk_ids = None
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
@@ -2345,7 +2349,9 @@ def build_precomputed_topk_output(
 
     Only valid when :func:`precomputed_topk_postprocess_is_noop` holds.
     """
-    capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
+    capture_routed_experts_if_allowed(
+        topk_config, layer_id, topk_ids, topk_weights
+    )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
     # router_logits is only read by the BYPASSED formats and by the
     # shared-expert append (excluded above); STANDARD consumers take ids/weights.

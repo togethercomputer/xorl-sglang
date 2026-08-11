@@ -25,10 +25,11 @@ class BaseDeviceCache:
         topk_size: int,
         device: str,
         name: str,
+        dtype: torch.dtype = torch.int32,
     ):
         self.buffer = torch.zeros(
             (max_batch_size, num_layers, topk_size),
-            dtype=torch.int32,
+            dtype=dtype,
             device=device,
         )
         self.num_layers = num_layers
@@ -52,10 +53,17 @@ class BaseDeviceCache:
 
 
 class BaseHostCache:
-    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str):
+    def __init__(
+        self,
+        num_tokens: int,
+        num_layers: int,
+        topk_size: int,
+        name: str,
+        dtype: torch.dtype = torch.int32,
+    ):
         self.buffer = torch.zeros(
             (num_tokens, num_layers, topk_size),
-            dtype=torch.int32,
+            dtype=dtype,
             device="cpu",
             pin_memory=True,
         )
