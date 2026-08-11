@@ -44,7 +44,6 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
-
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
@@ -125,6 +124,8 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    is_glm52_exact_mode,
+    is_qwen35_gdn_exact_mode,
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.utils import (
@@ -150,11 +151,65 @@ from sglang.srt.utils.request_logger import RequestLogger
 from sglang.srt.utils.watchdog import Watchdog
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _get_bi_decode_strict_ingress_violations(
+    obj: GenerateReqInput,
+    preferred_sampling_params: Optional[Dict[str, Any]] = None,
+    *,
+    require_unit_temperature: bool = False,
+    sampled_logprob_only: bool = False,
+) -> List[str]:
+    """Return request transforms that the exact decode path cannot rescore."""
+    sampling_params = dict(preferred_sampling_params or {})
+    sampling_params.update(obj.sampling_params or {})
+
+    violations = []
+    plain_sampling_defaults = {
+        "top_p": 1.0,
+        "min_p": 0.0,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "min_new_tokens": 0,
+    }
+    for name, expected in plain_sampling_defaults.items():
+        value = sampling_params.get(name, expected)
+        if value != expected:
+            violations.append(f"{name}={value!r}")
+
+    top_k = sampling_params.get("top_k", -1)
+    if top_k not in (-1, None):
+        violations.append(f"top_k={top_k!r}")
+
+    if require_unit_temperature:
+        temperature = sampling_params.get("temperature", 1.0)
+        if temperature != 1.0:
+            violations.append(f"temperature={temperature!r}")
+
+    for name in ("json_schema", "regex", "ebnf", "structural_tag", "logit_bias"):
+        if sampling_params.get(name) is not None:
+            violations.append(f"{name}=set")
+
+    if sampling_params.get("mtp_enabled", False):
+        violations.append("mtp_enabled=True")
+    if obj.custom_logit_processor is not None:
+        violations.append("custom_logit_processor=set")
+    if obj.session_params is not None:
+        violations.append("session_params=set")
+    if sampled_logprob_only:
+        if obj.top_logprobs_num not in (None, 0):
+            violations.append(f"top_logprobs_num={obj.top_logprobs_num!r}")
+        if obj.token_ids_logprob:
+            violations.append("token_ids_logprob=set")
+
+    return violations
 
 
 def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
@@ -1188,6 +1243,30 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"of tokens in the input messages or the completion to fit within the limit."
                 )
                 raise ValueError(error_msg)
+
+        # Reject exact-lane request transforms before they can trip the
+        # batch-level, scheduler-fatal sampler assertions on the GPU.
+        exact_qwen = is_qwen35_gdn_exact_mode(self.server_args)
+        exact_glm = is_glm52_exact_mode(self.server_args)
+        if (exact_qwen or exact_glm) and isinstance(obj, GenerateReqInput):
+            violations = _get_bi_decode_strict_ingress_violations(
+                obj,
+                self.preferred_sampling_params,
+                require_unit_temperature=exact_glm,
+                sampled_logprob_only=exact_glm,
+            )
+            if violations:
+                contract_name = "GLM-5.2" if exact_glm else "Qwen3.5-family"
+                temperature_contract = (
+                    "unit-temperature" if exact_glm else "plain-temperature"
+                )
+                raise ValueError(
+                    f"This server runs the exact {contract_name} RL on-policy "
+                    f"decode contract; requests must use {temperature_contract} "
+                    "sampling without top-k/top-p/min-p, penalties, grammar, "
+                    "logit bias, custom processors, or MTP (incompatible "
+                    "fields: " + ", ".join(violations) + ")"
+                )
 
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
