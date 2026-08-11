@@ -13,6 +13,7 @@ from sglang.srt.batch_invariant_ops import (
     head_v2_selected_logprob_from_logits,
 )
 
+
 XorlBiFamily = Literal["v1", "v2"]
 XorlGlm52NormSite = Literal["q_a", "kv_a", "input", "post_attention", "final"]
 BI_FAMILIES_V2_CONTRACT = "xorl_batch_invariant_families_v2"
@@ -290,8 +291,8 @@ def xorl_bi_sample_and_score(
     sampling_info: Any,
     *,
     return_logprob: bool,
-    top_logprobs_nums: List[int],
-    token_ids_logprobs: List[List[int]],
+    top_logprobs_nums: List[int] | None,
+    token_ids_logprobs: List[List[int] | None] | None,
     positions: torch.Tensor,
     sample_from_logprobs: Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor],
     sync_token_ids: Callable[[torch.Tensor, Any], None],
