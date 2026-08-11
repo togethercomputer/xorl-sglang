@@ -16,7 +16,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
 def _server_args(**overrides):
@@ -349,7 +349,6 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
     import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
     import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
     import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
-    import sglang.srt.distributed.communication_op as communication
     import sglang.srt.layers.xorl_batch_invariant as xorl_family
 
     active_flags = [
@@ -390,9 +389,6 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         set_head = stack.enter_context(
             patch.object(bi_ops, "set_bi_head_fastpath_enabled")
         )
-        set_combine = stack.enter_context(
-            patch.object(communication, "set_ordered_combine_fused_enabled")
-        )
         startup = stack.enter_context(patch.object(exact.logger, "info"))
         force_family = stack.enter_context(
             patch.object(xorl_family, "force_xorl_bi_family")
@@ -412,7 +408,6 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         set_tiera.assert_called_once_with(False)
         set_router.assert_called_once_with(False)
         set_head.assert_called_once_with(False)
-        set_combine.assert_called_once_with(False)
         startup.assert_called_once()
         startup_args = startup.call_args.args
         assert startup_args[2] == "v2"
@@ -420,6 +415,7 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         rendered = startup_args[0] % startup_args[1:]
         assert "decode, conservative" in rendered
         assert "rmsnorm_family=v2" in rendered
+        assert "moe_fold=canonical_moe_fold_v1" in rendered
         force_family.assert_not_called()
 
 
@@ -437,7 +433,6 @@ def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
     import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
     import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
     import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
-    import sglang.srt.distributed.communication_op as communication
 
     with (
         patch.object(exact, "_applied", False),
@@ -455,7 +450,6 @@ def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
         patch.object(tiera, "set_tiera_enabled") as tier_a,
         patch.object(bi_ops, "set_router_renorm_fused_enabled") as router,
         patch.object(bi_ops, "set_bi_head_fastpath_enabled") as head,
-        patch.object(communication, "set_ordered_combine_fused_enabled") as combine,
     ):
         exact._apply_qwen35_gdn_exact(
             SimpleNamespace(
@@ -476,7 +470,6 @@ def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
         tier_a.assert_called_once_with(False)
         router.assert_called_once_with(False)
         head.assert_called_once_with(False)
-        combine.assert_called_once_with(False)
 
 
 def test_model_runner_resolves_qwen_exact_bi_ops_before_construction():
