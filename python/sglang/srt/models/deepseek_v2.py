@@ -55,7 +55,6 @@ from sglang.srt.distributed import (
     divide,
     get_pp_group,
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_ordered_all_reduce,
 )
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDeferredStatusBook,
@@ -691,9 +690,6 @@ class DeepseekV2MoE(nn.Module):
             top_k_for_moe = config.num_experts_per_tok + self.num_fused_shared_experts
 
         self.config = config
-        self._dsv4_exact_ordered_combine = bool(
-            getattr(config, "_dsv4_flash_exact_mode", False)
-        )
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
@@ -1184,25 +1180,12 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
-
-
-    def _post_experts_all_reduce(self, final_hidden_states):
-        """Post-experts TP sum; the DSV4 exact lane pins the ordered chain.
-
-        The stock NCCL all_reduce has a topology-dependent reduction order.
-        The XoRL exact contract requires the fixed reverse-rank BF16 chain so
-        the trainer's EP combine (exchange + chain sum) can reproduce the
-        serving bytes.
-        """
-        if self._dsv4_exact_ordered_combine:
-            return tensor_model_parallel_ordered_all_reduce(final_hidden_states)
-        return tensor_model_parallel_all_reduce(final_hidden_states)
 
     def forward_normal(
         self,
@@ -1350,7 +1333,7 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
@@ -1523,7 +1506,7 @@ class DeepseekV2MoE(nn.Module):
             True,  # is_vnni
         )
         if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
-            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
