@@ -1,13 +1,55 @@
 use serde_json::json;
+use smg::protocols::generate::GenerateRequest;
 
 use crate::common::{
     mock_worker::{HealthStatus, MockWorkerConfig, WorkerType},
-    WorkerTestContext,
+    AppTestContext, WorkerTestContext,
 };
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
+
     use super::*;
+
+    #[tokio::test]
+    async fn test_non_streaming_generate_body_is_proxied_incrementally() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 0,
+            worker_type: WorkerType::Regular,
+            health_status: HealthStatus::Healthy,
+            response_delay_ms: 0,
+            fail_rate: 0.0,
+        }])
+        .await;
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "text": "__slow_chunked_nonstream__",
+            "stream": false
+        }))
+        .unwrap();
+
+        let response = ctx.router.route_generate(None, &request, None).await;
+        assert!(response.status().is_success());
+
+        let started = tokio::time::Instant::now();
+        let mut body = response.into_body().into_data_stream();
+        let first = body.next().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"{\"text\":\"");
+        assert!(
+            started.elapsed() < tokio::time::Duration::from_millis(100),
+            "the gateway buffered the non-streaming upstream body"
+        );
+
+        let mut complete = first.to_vec();
+        while let Some(chunk) = body.next().await {
+            complete.extend_from_slice(&chunk.unwrap());
+        }
+        assert!(started.elapsed() >= tokio::time::Duration::from_millis(250));
+        let decoded: serde_json::Value = serde_json::from_slice(&complete).unwrap();
+        assert_eq!(decoded["text"], "routed-expert-payload");
+
+        ctx.shutdown().await;
+    }
 
     #[tokio::test]
     async fn test_generate_streaming() {

@@ -592,23 +592,28 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, preserve headers
+            // A non-streaming API response can still be very large.  In
+            // particular, batched RL requests may return routed-expert ids
+            // and selected router weights for every token and layer.  Do not
+            // materialize that body in the gateway with `res.bytes()`: many
+            // concurrent responses otherwise multiply a tens-of-megabytes
+            // payload into gigabytes of resident memory.
+            //
+            // Keep the public response non-streaming JSON, but proxy its HTTP
+            // body with backpressure as bytes arrive from the worker.  The
+            // downstream client sees the same status, headers, and JSON bytes;
+            // only the gateway's buffering behavior changes.
             let response_headers = header_utils::preserve_response_headers(res.headers());
+            let body = Body::from_stream(res.bytes_stream());
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
 
-            let response = match res.bytes().await {
-                Ok(body) => {
-                    let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    *response.headers_mut() = response_headers;
-                    response
-                }
-                Err(e) => {
-                    let error_msg = format!("Failed to get response body: {}", e);
-                    error::internal_error("read_response_body_failed", error_msg)
-                }
-            };
-
-            // load_guard dropped here automatically after response body is read
+            // The response now outlives this function, so keep load accounting
+            // attached until the body is consumed or the client disconnects.
+            if let Some(guard) = load_guard {
+                response = AttachedBody::wrap_response(response, guard);
+            }
             response
         } else {
             // Preserve headers for streaming response
