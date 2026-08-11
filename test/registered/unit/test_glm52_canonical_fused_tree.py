@@ -160,19 +160,27 @@ class TestGlm52CanonicalFusedTree(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_shared_fold_replays_in_cuda_graph(self):
-        partials = _partials(8, seed=8080, shape=(64, 32)).cuda()
-        canonical_moe_fold_v1(partials)
-        torch.cuda.synchronize()
+        for contributors in (8, 16):
+            with self.subTest(contributors=contributors):
+                partials = _partials(
+                    contributors,
+                    seed=8080 + contributors,
+                    shape=(64, 32),
+                ).cuda()
+                canonical_moe_fold_v1(partials)
+                torch.cuda.synchronize()
 
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            folded = canonical_moe_fold_v1(partials)
-        first = folded.clone()
-        partials[0].add_(8.0)
-        graph.replay()
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    folded = canonical_moe_fold_v1(partials)
+                first = folded.clone()
+                partials[0].add_(8.0)
+                graph.replay()
 
-        self.assertFalse(torch.equal(first, folded))
-        self.assertTrue(torch.equal(folded, _balanced_adjacent_tree(partials)))
+                self.assertFalse(torch.equal(first, folded))
+                self.assertTrue(
+                    torch.equal(folded, _balanced_adjacent_tree(partials))
+                )
 
     def test_exact_transport_is_the_certified_v3b_and_nothing_slower(self):
         try:
