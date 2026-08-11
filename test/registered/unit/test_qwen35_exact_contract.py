@@ -354,11 +354,13 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
 
     active_flags = [
         (prefill, "BI_GDN_PREFILL_ENABLED"),
-        (prefill, "BI_GDN_SOLVE_TRIL_DECODE"),
         (decode, "BI_GDN_DECODE_ENABLED"),
         (decode, "BI_GDN_BS1_STATIC"),
         (decode, "BI_GDN_DECODE_GRAPH"),
         (fast, "BI_GDN_DECODE_FAST_ENABLED"),
+    ]
+    held_flags = [
+        (prefill, "BI_GDN_SOLVE_TRIL_DECODE"),
         (fast, "BI_GDN_SOLVE_TRIL_DECODE"),
         (fast, "BI_GDN_FUSE_SMALL_ENABLED"),
         (incremental, "BI_GDN_SOLVE_TRIL_DECODE"),
@@ -368,12 +370,13 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         (heal, "BI_GDN_SOLVE_TRIL_DECODE"),
         (heal, "BI_GDN_LAZY_HEAL_ENABLED"),
     ]
-    held_flags = []
     with ExitStack() as stack:
         stack.enter_context(patch.object(exact, "_applied", False))
         stack.enter_context(patch.object(bi_ops, "ENABLE_JIT_DEEPGEMM", True))
-        for module, name in active_flags + held_flags:
+        for module, name in active_flags:
             stack.enter_context(patch.object(module, name, False))
+        for module, name in held_flags:
+            stack.enter_context(patch.object(module, name, True))
         force_table = stack.enter_context(
             patch.object(gemm_configs, "_force_bi_gemm_config_table")
         )
@@ -406,16 +409,16 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         assert not any(getattr(module, name) for module, name in held_flags)
         force_table.assert_called_once_with(True)
         set_norm.assert_called_once_with(4)
-        set_tiera.assert_called_once_with(True)
-        set_router.assert_called_once_with(True)
-        set_head.assert_called_once_with(True)
-        set_combine.assert_called_once_with(True)
+        set_tiera.assert_called_once_with(False)
+        set_router.assert_called_once_with(False)
+        set_head.assert_called_once_with(False)
+        set_combine.assert_called_once_with(False)
         startup.assert_called_once()
         startup_args = startup.call_args.args
         assert startup_args[2] == "v2"
-        assert "cached-row incremental graph decode" in startup_args[1]
+        assert "conservative no-overlap/no-padding" in startup_args[1]
         rendered = startup_args[0] % startup_args[1:]
-        assert "decode, cached-row incremental" in rendered
+        assert "decode, conservative" in rendered
         assert "rmsnorm_family=v2" in rendered
         force_family.assert_not_called()
 
