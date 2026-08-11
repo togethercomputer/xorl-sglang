@@ -457,22 +457,29 @@ def should_use_dp_reduce_scatterv():
     valid only when each attention-DP shard has a single rank (attention TP=1).
     Configurations with partial attention TP fall back to all-reduce + dp_scatter.
 
-    The Qwen3.5-family exact contract also falls back. NCCL reduce_scatterv's
-    floating-point reduction order depends on the destination DP rank, so the
-    same request routed to two DP ranks can return different BF16 MoE values.
-    Exact mode instead runs the model's fixed-order all-reduce and then performs
+    The Qwen3.5-family and DSV4-Flash exact contracts also fall back. NCCL
+    reduce_scatterv's floating-point reduction order depends on the
+    destination DP rank, so the same request routed to two DP ranks can
+    return different BF16 MoE values. Exact mode instead runs the model's
+    fixed-order combine (the canonical adjacent-pair fold) and then performs
     a non-reducing DP scatter.
     """
     try:
+        server_args = get_server_args()
         qwen35_exact_mode = bool(
-            getattr(get_server_args(), "qwen35_gdn_exact_mode", False)
+            getattr(server_args, "qwen35_gdn_exact_mode", False)
+        )
+        dsv4_exact_mode = bool(
+            getattr(server_args, "dsv4_flash_exact_mode", False)
         )
     except ValueError:
         # Some unit-level utility callers intentionally have no published
         # ServerArgs. They retain the stock optimization behavior.
         qwen35_exact_mode = False
+        dsv4_exact_mode = False
     return (
         not qwen35_exact_mode
+        and not dsv4_exact_mode
         and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         and get_moe_a2a_backend().is_none()
         and is_dp_attention_enabled()
