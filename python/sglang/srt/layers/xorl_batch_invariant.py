@@ -2,6 +2,7 @@ import logging
 from typing import Any, Callable, List, Literal
 
 import torch
+
 from sglang.srt.batch_invariant_ops import (
     RMS_NORM_FAMILY_NO_RESIDUAL,
     RMS_NORM_FAMILY_RESIDUAL_TREE,
@@ -11,7 +12,6 @@ from sglang.srt.batch_invariant_ops import (
     head_v2_full_logits_with_lse,
     head_v2_selected_logprob_from_logits,
 )
-
 
 XorlBiFamily = Literal["v1", "v2"]
 XorlGlm52NormSite = Literal["q_a", "kv_a", "input", "post_attention", "final"]
@@ -352,9 +352,7 @@ def xorl_bi_sample_and_score(
         raise RuntimeError(
             "The XORL batch-invariant sampler rejects SGLANG_RETURN_ORIGINAL_LOGPROB."
         )
-    if (
-        top_logprobs_nums is not None and any(x > 0 for x in top_logprobs_nums)
-    ) or (
+    if (top_logprobs_nums is not None and any(x > 0 for x in top_logprobs_nums)) or (
         token_ids_logprobs is not None
         and any(token_ids is not None for token_ids in token_ids_logprobs)
     ):

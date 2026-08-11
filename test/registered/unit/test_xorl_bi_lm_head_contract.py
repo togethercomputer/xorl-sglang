@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.batch_invariant_ops import bi_families_v2
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     disable_batch_invariant_mode,
@@ -42,7 +43,6 @@ from sglang.srt.server_args import (
     is_glm52_exact_mode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-
 
 register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
 

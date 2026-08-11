@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+
 from sglang.srt.distributed.canonical_moe import (
     CANONICAL_MOE_FOLD_VERSION,
     GLM52_CANONICAL_MOE_V3B_VERSION,
@@ -178,9 +179,7 @@ class TestGlm52CanonicalFusedTree(unittest.TestCase):
                 graph.replay()
 
                 self.assertFalse(torch.equal(first, folded))
-                self.assertTrue(
-                    torch.equal(folded, _balanced_adjacent_tree(partials))
-                )
+                self.assertTrue(torch.equal(folded, _balanced_adjacent_tree(partials)))
 
     def test_exact_transport_is_the_certified_v3b_and_nothing_slower(self):
         try:

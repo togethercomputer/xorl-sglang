@@ -4,6 +4,8 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
+from torch import nn
+
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     is_bi_head_fastpath_enabled,
@@ -29,8 +31,6 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
 )
-from torch import nn
-
 
 if is_cuda():
     from flashinfer.sampling import (
@@ -84,9 +84,7 @@ class Sampler(nn.Module):
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
-        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(
-            get_server_args()
-        )
+        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(get_server_args())
         self.return_original_logprob = (
             False
             if self.use_qwen35_bi_decode_rescore

@@ -6,9 +6,10 @@ from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
+
 import sglang.srt.layers.attention.nsa.glm52_selector_fast as fast_module
 import sglang.srt.server_args as server_args_module
-import torch
 from sglang.srt.batch_invariant_ops import bi_gemm_configs
 from sglang.srt.distributed.canonical_moe import CanonicalDeferredStatusBook
 from sglang.srt.layers.attention.nsa.glm52_selector import (
@@ -22,7 +23,6 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
-
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
