@@ -153,9 +153,7 @@ class MarlinLoraRunnerCore:
         intermediate_cache1 = intermediate_cache13[: M * topk * 2 * N].view(
             M * topk, 2 * N
         )
-        intermediate_cache3 = intermediate_cache13[: M * topk * K].view(
-            M * topk, K
-        )
+        intermediate_cache3 = intermediate_cache13[: M * topk * K].view(M * topk, K)
         intermediate_cache1 = moe_wna16_marlin_gemm(
             hidden_states,
             intermediate_cache1,

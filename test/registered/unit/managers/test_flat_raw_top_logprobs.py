@@ -141,9 +141,7 @@ class TestFlatRawTopLogprobsValidation(CustomTestCase):
 
 class TestRawSelectedTokenLogprobs(CustomTestCase):
     def test_b64_is_literal_little_endian_float32(self):
-        fields = _build_raw_token_logprobs_b64_fields(
-            [None, -0.5, -0.25], [-0.125]
-        )
+        fields = _build_raw_token_logprobs_b64_fields([None, -0.5, -0.25], [-0.125])
         input_values = np.frombuffer(
             base64.b64decode(fields["input_token_logprobs_raw_b64"]),
             dtype="<f4",
@@ -153,7 +151,9 @@ class TestRawSelectedTokenLogprobs(CustomTestCase):
             dtype="<f4",
         )
         self.assertTrue(np.isnan(input_values[0]))
-        np.testing.assert_array_equal(input_values[1:], np.asarray([-0.5, -0.25], dtype="<f4"))
+        np.testing.assert_array_equal(
+            input_values[1:], np.asarray([-0.5, -0.25], dtype="<f4")
+        )
         np.testing.assert_array_equal(output_values, np.asarray([-0.125], dtype="<f4"))
         self.assertEqual(fields["input_token_logprobs_raw_length"], 3)
         self.assertEqual(fields["output_token_logprobs_raw_length"], 1)

@@ -15,7 +15,6 @@ from typing import Iterable, Optional
 
 import torch
 
-
 DSV4_FLASH_ARCHITECTURE = "DeepseekV4ForCausalLM"
 DSV4_FLASH_LOGICAL_FACTOR_COUNT = 948
 DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT = 345
@@ -303,17 +302,25 @@ def _add_routed_specs(
                 "A",
                 (num_experts, rank, input_dim),
                 "[expert,rank,in]",
-                "gate_rank[0:r]" if slot == "w1" else "up_rank[r:2r]" if slot == "w3" else "full",
+                (
+                    "gate_rank[0:r]"
+                    if slot == "w1"
+                    else "up_rank[r:2r]" if slot == "w3" else "full"
+                ),
             ),
             (
                 "B",
                 (num_experts, output_dim, rank),
                 "[expert,out,rank]",
-                "gate_output[0:intermediate]"
-                if slot == "w1"
-                else "up_output[intermediate:2*intermediate]"
-                if slot == "w3"
-                else "full",
+                (
+                    "gate_output[0:intermediate]"
+                    if slot == "w1"
+                    else (
+                        "up_output[intermediate:2*intermediate]"
+                        if slot == "w3"
+                        else "full"
+                    )
+                ),
             ),
         ):
             key = f"{_ADAPTER_PREFIX}{target}.{_factor_suffix(factor)}"
@@ -424,8 +431,12 @@ def build_dsv4_flash_exact_inventory(
             f"{DSV4_FLASH_LOGICAL_FACTOR_COUNT} factors, got {len(specs)}."
         )
     if len({spec.export_key for spec in specs}) != len(specs):
-        raise AssertionError("DSV4-Flash LoRA inventory contains duplicate export keys.")
-    routed_banks = {spec.layer_id for spec in specs if spec.role.startswith("routed_expert.")}
+        raise AssertionError(
+            "DSV4-Flash LoRA inventory contains duplicate export keys."
+        )
+    routed_banks = {
+        spec.layer_id for spec in specs if spec.role.startswith("routed_expert.")
+    }
     if len(routed_banks) != DSV4_FLASH_ROUTED_BANK_COUNT:
         raise AssertionError(
             "Internal DSV4-Flash routed-bank inventory error: expected "
@@ -452,7 +463,9 @@ class Dsv4FlashExactValidator:
     def observe(self, name: str, tensor: torch.Tensor) -> None:
         spec = self._expected.get(name)
         if spec is None:
-            raise ValueError(f"Unexpected tensor in DSV4-Flash exact adapter: {name!r}.")
+            raise ValueError(
+                f"Unexpected tensor in DSV4-Flash exact adapter: {name!r}."
+            )
         if name in self._seen:
             raise ValueError(f"Duplicate tensor in DSV4-Flash exact adapter: {name!r}.")
         if tuple(tensor.shape) != spec.export_shape:

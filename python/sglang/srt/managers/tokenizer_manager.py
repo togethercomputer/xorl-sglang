@@ -834,10 +834,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
-        if (
-            isinstance(obj, GenerateReqInput)
-            and self.server_args.dsv4_flash_exact_mode
-        ):
+        if isinstance(obj, GenerateReqInput) and self.server_args.dsv4_flash_exact_mode:
             validate_dsv4_flash_exact_request_routing(obj.routed_dp_rank)
         if (
             isinstance(obj, GenerateReqInput)

@@ -902,10 +902,9 @@ class LoRAManager:
                 # literal base path instead of launching numerically pointless
                 # LoRA kernels whose routed Marlin prefill reductions are not
                 # bitwise stable for all route distributions.
-                if (
-                    getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False)
-                    and getattr(lora, "_dsv4_flash_exact_all_zero", False)
-                ):
+                if getattr(
+                    self.base_hf_config, "_dsv4_flash_exact_mode", False
+                ) and getattr(lora, "_dsv4_flash_exact_all_zero", False):
                     if None not in self.memory_pool.uid_to_buffer_id:
                         raise RuntimeError(
                             "The exact DSV4-Flash all-zero adapter requires a "

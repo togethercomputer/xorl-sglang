@@ -1,8 +1,7 @@
 import importlib.util
 import sys
 from pathlib import Path
-from types import ModuleType
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -19,6 +18,9 @@ from sglang.srt.lora.dsv4 import (
     summarize_dsv4_flash_factor_roles,
     validate_dsv4_flash_exact_request_routing,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
 
 def _load_lora_utils_for_cpu_contract_test():
@@ -125,9 +127,20 @@ def test_inventory_has_exact_factor_count_roles_and_shapes() -> None:
     assert by_key[f"{prefix}.self_attn.wq_a.lora_A.weight"].export_shape == (1, 4096)
     assert by_key[f"{prefix}.self_attn.wq_b.lora_B.weight"].export_shape == (32768, 1)
     assert by_key[f"{prefix}.self_attn.wo_a.lora_B.weight"].export_shape == (8192, 1)
-    assert by_key[f"{prefix}.mlp.experts.w1.lora_A.weight"].export_shape == (256, 1, 4096)
-    assert by_key[f"{prefix}.mlp.experts.w2.lora_B.weight"].export_shape == (256, 4096, 1)
-    assert by_key["base_model.model.lm_head.lora_embedding_B"].export_shape == (129280, 1)
+    assert by_key[f"{prefix}.mlp.experts.w1.lora_A.weight"].export_shape == (
+        256,
+        1,
+        4096,
+    )
+    assert by_key[f"{prefix}.mlp.experts.w2.lora_B.weight"].export_shape == (
+        256,
+        4096,
+        1,
+    )
+    assert by_key["base_model.model.lm_head.lora_embedding_B"].export_shape == (
+        129280,
+        1,
+    )
 
 
 def test_exact_mode_rejects_missing_format_partial_targets_and_wrong_rank() -> None:
@@ -162,7 +175,9 @@ def test_streaming_validator_rejects_shape_dtype_extra_duplicate_and_missing() -
 
     validator = Dsv4FlashExactValidator(config, adapter)
     with pytest.raises(ValueError, match="dtype"):
-        validator.observe(first.export_key, torch.empty(first.export_shape, dtype=torch.float32))
+        validator.observe(
+            first.export_key, torch.empty(first.export_shape, dtype=torch.float32)
+        )
 
     validator = Dsv4FlashExactValidator(config, adapter)
     with pytest.raises(ValueError, match="Unexpected tensor"):
@@ -183,7 +198,9 @@ def test_streaming_validator_distinguishes_zero_from_nonzero_adapter() -> None:
     specs = build_dsv4_flash_exact_inventory(config, adapter)
     validator = Dsv4FlashExactValidator(config, adapter)
     first, second = specs[:2]
-    validator.observe(first.export_key, torch.zeros(first.export_shape, dtype=torch.bfloat16))
+    validator.observe(
+        first.export_key, torch.zeros(first.export_shape, dtype=torch.bfloat16)
+    )
     assert validator.all_zero is True
     value = torch.zeros(second.export_shape, dtype=torch.bfloat16)
     value.flatten()[0] = 1

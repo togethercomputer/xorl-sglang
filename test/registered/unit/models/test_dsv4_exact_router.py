@@ -2,6 +2,10 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+
 
 def test_deterministic_dsv4_router_keeps_fp32_serving_gemm(monkeypatch) -> None:
     from sglang.kernels.ops.attention import dsv4 as dsv4_ops

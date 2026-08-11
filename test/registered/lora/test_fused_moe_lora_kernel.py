@@ -4,6 +4,7 @@ import sys
 
 import pytest
 import torch
+
 from sglang.kernels.ops.moe import fused_moe_lora_kernel
 from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
 
@@ -13,7 +14,6 @@ from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
 from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
 from sglang.srt.utils import set_random_seed
 from sglang.test.ci.ci_register import register_cuda_ci
-
 
 # ==============================================================================
 

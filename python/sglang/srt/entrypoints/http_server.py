@@ -2330,9 +2330,11 @@ def _execute_server_warmup(server_args: ServerArgs):
         # warm up precisely that admitted request instead of the generic DP batch.
         if isinstance(json_data.get("text"), list):
             json_data["text"] = json_data["text"][0]
-        if isinstance(json_data.get("input_ids"), list) and json_data[
-            "input_ids"
-        ] and isinstance(json_data["input_ids"][0], list):
+        if (
+            isinstance(json_data.get("input_ids"), list)
+            and json_data["input_ids"]
+            and isinstance(json_data["input_ids"][0], list)
+        ):
             json_data["input_ids"] = json_data["input_ids"][0]
         json_data["routed_dp_rank"] = 0
 

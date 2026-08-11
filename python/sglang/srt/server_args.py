@@ -5545,9 +5545,10 @@ class ServerArgs:
             for name, value in rope_expected.items()
             if not isinstance(rope, dict) or rope.get(name) != value
         ]
-        if not isinstance(rope, dict) or rope.get(
-            "rope_type", rope.get("type")
-        ) != "yarn":
+        if (
+            not isinstance(rope, dict)
+            or rope.get("rope_type", rope.get("type")) != "yarn"
+        ):
             rope_mismatches.append("rope type is not 'yarn'")
         if rope_mismatches:
             raise ValueError(
@@ -5689,9 +5690,7 @@ class ServerArgs:
             if value not in allowed
         ]
         if self.cuda_graph_bs_decode is not None:
-            incompatible.append(
-                f"cuda_graph_bs_decode={self.cuda_graph_bs_decode!r}"
-            )
+            incompatible.append(f"cuda_graph_bs_decode={self.cuda_graph_bs_decode!r}")
         if self.cuda_graph_max_bs_decode is not None:
             incompatible.append(
                 f"cuda_graph_max_bs_decode={self.cuda_graph_max_bs_decode!r}"
@@ -5700,10 +5699,7 @@ class ServerArgs:
             locked = getattr(self, "_cuda_graph_config_locked", set())
             for phase in (Phase.DECODE, Phase.PREFILL):
                 backend = getattr(self.cuda_graph_config, phase).backend
-                if (
-                    (phase, "backend") in locked
-                    and backend != Backend.DISABLED
-                ):
+                if (phase, "backend") in locked and backend != Backend.DISABLED:
                     incompatible.append(
                         f"cuda_graph_config[{phase}].backend={backend!r}"
                     )
