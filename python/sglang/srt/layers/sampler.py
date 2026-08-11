@@ -35,8 +35,6 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
 )
-from torch import nn
-
 
 if is_cuda():
     from flashinfer.sampling import (
