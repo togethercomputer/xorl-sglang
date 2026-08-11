@@ -16,7 +16,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=2, suite="stage-a-test-cpu")
 
 
