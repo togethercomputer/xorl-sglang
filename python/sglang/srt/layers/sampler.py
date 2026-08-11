@@ -4,12 +4,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-from torch import nn
-
+from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     is_bi_head_fastpath_enabled,
 )
-from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -31,6 +29,8 @@ from sglang.srt.utils.common import (
     is_musa,
     is_npu,
 )
+from torch import nn
+
 
 if is_cuda():
     from flashinfer.sampling import (
@@ -116,8 +116,8 @@ class Sampler(nn.Module):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         return_logprob: bool,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
+        top_logprobs_nums: Optional[List[int]],
+        token_ids_logprobs: Optional[List[Optional[List[int]]]],
         positions: torch.Tensor,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
