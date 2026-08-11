@@ -553,13 +553,19 @@ def _exact_official_config():
     return config
 
 
-def test_exact_inventory_accepts_only_the_rank_one_alpha_one_factor_program():
+@pytest.mark.parametrize(
+    ("rank", "alpha"),
+    ((1, 1), (2, 3), (3, 7), (7, 11), (16, 32), (31, 47), (64, 128)),
+)
+def test_exact_inventory_accepts_positive_rank_and_alpha(rank, alpha):
+    adapter_config = _exact_adapter_config()
+    adapter_config.update(r=rank, lora_alpha=alpha)
     specs = build_glm52_xorl_shared_outer_inventory(
-        _exact_official_config(), _exact_adapter_config()
+        _exact_official_config(), adapter_config
     )
 
     assert len(specs) == GLM52_LOGICAL_FACTOR_COUNT
-    assert all(1 in spec.export_shape for spec in specs)
+    assert all(rank in spec.export_shape for spec in specs)
 
 
 @pytest.mark.parametrize("lora_format", (None, "ordinary", "per_expert"))
@@ -577,8 +583,8 @@ def test_exact_mode_rejects_every_non_shared_outer_adapter_format(lora_format):
 @pytest.mark.parametrize(
     ("name", "value"),
     (
-        ("r", 2),
-        ("lora_alpha", 2),
+        ("r", 0),
+        ("lora_alpha", 0),
         ("lora_dropout", 0.1),
         ("bias", "all"),
         ("fan_in_fan_out", True),
@@ -592,7 +598,7 @@ def test_exact_inventory_rejects_adapter_program_variants(name, value):
     adapter_config = _exact_adapter_config()
     adapter_config[name] = value
 
-    with pytest.raises(ValueError, match="exact GLM-5.2 XORL active-LoRA"):
+    with pytest.raises(ValueError, match="GLM-5.2"):
         build_glm52_xorl_shared_outer_inventory(
             _exact_official_config(), adapter_config
         )
@@ -982,8 +988,8 @@ def _exact_batch_manager():
     manager.lora_backend = _Backend()
     manager.loras = {
         "generation-6": SimpleNamespace(
-            config=SimpleNamespace(r=1),
-            scaling=1.0,
+            config=SimpleNamespace(r=3, lora_alpha=7),
+            scaling=7 / 3,
             _glm52_exact_adapter_certified=True,
         )
     }
@@ -991,7 +997,7 @@ def _exact_batch_manager():
     return manager
 
 
-def test_exact_batch_requires_one_resident_certified_rank_one_adapter(monkeypatch):
+def test_exact_batch_requires_one_resident_certified_positive_rank_adapter(monkeypatch):
     manager = _exact_batch_manager()
     monkeypatch.setattr(
         "sglang.srt.lora.lora_manager.get_is_capture_mode", lambda: False
@@ -1005,8 +1011,8 @@ def test_exact_batch_requires_one_resident_certified_rank_one_adapter(monkeypatc
     manager.prepare_lora_batch(active)
     assert manager.lora_backend._glm52_exact_batch_certified is True
     assert manager.lora_backend.calls[-1]["weight_indices"] == [1]
-    assert manager.lora_backend.calls[-1]["lora_ranks"] == [0, 1, 0]
-    assert manager.lora_backend.calls[-1]["scalings"] == [0, 1.0, 0]
+    assert manager.lora_backend.calls[-1]["lora_ranks"] == [0, 3, 0]
+    assert manager.lora_backend.calls[-1]["scalings"] == [0, 7 / 3, 0]
 
     for lora_ids, error in (
         (["missing"], "missing or nonresident"),

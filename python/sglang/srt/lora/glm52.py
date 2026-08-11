@@ -155,10 +155,14 @@ def _validate_official_geometry(config, adapter_config: dict) -> dict[str, int]:
         alpha = adapter_config.get("lora_alpha")
         dropout = adapter_config.get("lora_dropout", 0.0)
         exact_mismatches = []
-        if rank != 1:
-            exact_mismatches.append(f"r={rank!r} (expected 1)")
-        if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or alpha != 1:
-            exact_mismatches.append(f"lora_alpha={alpha!r} (expected 1)")
+        if (
+            isinstance(alpha, bool)
+            or not isinstance(alpha, (int, float))
+            or alpha <= 0
+        ):
+            exact_mismatches.append(
+                f"lora_alpha={alpha!r} (expected a positive number)"
+            )
         if (
             isinstance(dropout, bool)
             or not isinstance(dropout, (int, float))

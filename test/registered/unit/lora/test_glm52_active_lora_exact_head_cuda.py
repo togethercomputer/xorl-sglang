@@ -298,10 +298,13 @@ def test_decode_graph_captured_with_base_metadata_replays_active_rank_one_exactl
     ("tp_rank", "expected_vocab_range"),
     ((0, (0, 32)), (15, (480, 512))),
 )
+@pytest.mark.parametrize(("rank", "alpha"), ((1, 1), (3, 7), (16, 32), (31, 47)))
 def test_lm_head_loader_replicates_a_and_loads_exact_b_shard_bytes(
     monkeypatch,
     tp_rank: int,
     expected_vocab_range: tuple[int, int],
+    rank: int,
+    alpha: int,
 ):
     """The real CUDA pool keeps A whole and loads this TP rank's B bytes."""
 
@@ -335,17 +338,17 @@ def test_lm_head_loader_replicates_a_and_loads_exact_b_shard_bytes(
     )
     lora_config = LoRAConfig.from_dict(
         {
-            "lora_alpha": 1,
+            "lora_alpha": alpha,
             "peft_type": "LORA",
-            "r": 1,
+            "r": rank,
             "target_modules": ["lm_head"],
         }
     )
     generator = torch.Generator(device=device).manual_seed(1703)
-    exported_a = _rand_bf16((1, hidden_size), generator)
-    exported_b = _rand_bf16((vocab_size, 1), generator)
+    exported_a = _rand_bf16((rank, hidden_size), generator)
+    exported_b = _rand_bf16((vocab_size, rank), generator)
     adapter = LoRAAdapter(
-        "active-rank-one",
+        f"active-rank-{rank}",
         lora_config,
         base_config,
         load_config=None,
@@ -357,7 +360,7 @@ def test_lm_head_loader_replicates_a_and_loads_exact_b_shard_bytes(
             "base_model.model.lm_head.lora_embedding_B": exported_b,
         }
     )
-    assert adapter.scaling == 1.0
+    assert adapter.scaling == alpha / rank
 
     with torch.device(device):
         base_head = ParallelLMHead(
@@ -380,14 +383,14 @@ def test_lm_head_loader_replicates_a_and_loads_exact_b_shard_bytes(
         tp_size=tp_size,
         tp_rank=tp_rank,
         attn_tp_size=tp_size,
-        max_lora_rank=1,
+        max_lora_rank=rank,
         target_modules={"lm_head"},
         base_model=base_model,
         eviction_policy="lru",
         lora_added_tokens_size=0,
     )
     pool.load_lora_weight_to_buffer(
-        "active-rank-one",
+        f"active-rank-{rank}",
         0,
         adapter,
         lora_modules=[{}],

@@ -660,14 +660,14 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Triton LoRA backend"):
                 xorl_bi_lm_head(hidden, lora_head, use_fp32_lm_head=False)
 
-            rank_two_head = _TestParallelLMHeadWithLoRA(
+            zero_rank_head = _TestParallelLMHeadWithLoRA(
                 weight=weight,
-                a_buffer=torch.zeros((2, 2, 16), dtype=torch.bfloat16),
-                b_buffer=torch.zeros((2, 32, 2), dtype=torch.bfloat16),
+                a_buffer=torch.zeros((2, 0, 16), dtype=torch.bfloat16),
+                b_buffer=torch.zeros((2, 32, 0), dtype=torch.bfloat16),
                 callback=lambda *_args: None,
             )
-            with self.assertRaisesRegex(RuntimeError, "rank-one physical buffers"):
-                xorl_bi_lm_head(hidden, rank_two_head, use_fp32_lm_head=False)
+            with self.assertRaisesRegex(RuntimeError, "physical buffers"):
+                xorl_bi_lm_head(hidden, zero_rank_head, use_fp32_lm_head=False)
 
         with self.assertRaisesRegex(RuntimeError, "embedding bias"):
             xorl_bi_lm_head(

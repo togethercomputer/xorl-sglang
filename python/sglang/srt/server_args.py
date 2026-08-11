@@ -5538,6 +5538,7 @@ class ServerArgs:
             # Dynamic POST loading needs the fixed complete memory-pool layout
             # even when no adapter is present at server startup.
             self.lora_target_modules = set(GLM52_REQUIRED_TARGET_MODULES)
+        requested_max_lora_rank = self.max_lora_rank
         exact_program = {
             "moe_runner_backend": (self.moe_runner_backend, ("auto", "triton")),
             "fp8_gemm_runner_backend": (
@@ -5597,7 +5598,6 @@ class ServerArgs:
                 (None,),
             ),
             "msprobe_dump_config": (self.msprobe_dump_config, (None,)),
-            "max_lora_rank": (self.max_lora_rank, (None, 1)),
             "lora_backend": (self.lora_backend, ("csgmv", "triton")),
             "experts_shared_outer_loras": (
                 self.experts_shared_outer_loras,
@@ -5628,6 +5628,15 @@ class ServerArgs:
             for name, (value, allowed) in exact_program.items()
             if value not in allowed
         ]
+        if requested_max_lora_rank is not None and (
+            isinstance(requested_max_lora_rank, bool)
+            or not isinstance(requested_max_lora_rank, int)
+            or requested_max_lora_rank <= 0
+        ):
+            incompatible.append(
+                f"max_lora_rank={requested_max_lora_rank!r} "
+                "(expected a positive integer)"
+            )
         if self.disable_cuda_graph:
             incompatible.append("disable_cuda_graph=True")
         if self.cuda_graph_bs_decode not in (None, [16]):
@@ -5693,7 +5702,9 @@ class ServerArgs:
         self.mem_fraction_static = 0.82
         self.model_impl = "sglang"
         self.device = "cuda"
-        self.max_lora_rank = 1
+        self.max_lora_rank = (
+            1 if requested_max_lora_rank is None else requested_max_lora_rank
+        )
         self.lora_backend = "triton"
         self.experts_shared_outer_loras = True
         self.enable_lora_overlap_loading = False
@@ -5793,7 +5804,6 @@ class ServerArgs:
             "enable_single_batch_overlap": False,
             "debug_tensor_dump_output_folder": None,
             "msprobe_dump_config": None,
-            "max_lora_rank": 1,
             "lora_backend": "triton",
             "experts_shared_outer_loras": True,
             "enable_lora_overlap_loading": False,
@@ -5808,6 +5818,15 @@ class ServerArgs:
             for name, value in expected.items()
             if getattr(self, name, None) != value
         ]
+        if (
+            isinstance(self.max_lora_rank, bool)
+            or not isinstance(self.max_lora_rank, int)
+            or self.max_lora_rank <= 0
+        ):
+            mismatches.append(
+                f"max_lora_rank={self.max_lora_rank!r} "
+                "(expected a positive integer)"
+            )
         if self.node_rank not in (0, 1):
             mismatches.append(f"node_rank={self.node_rank!r} (expected 0 or 1)")
         if not isinstance(self.cuda_graph_config, CudaGraphConfig):

@@ -430,10 +430,23 @@ class LoRAManager:
                 "The exact GLM-5.2 active-LoRA request requires an adapter "
                 "certified from the complete 1,700-factor inventory."
             )
-        if adapter.config.r != 1 or adapter.scaling != 1:
+        rank = adapter.config.r
+        alpha = adapter.config.lora_alpha
+        expected_scaling = (
+            float(alpha) / float(rank)
+            if isinstance(rank, int)
+            and not isinstance(rank, bool)
+            and rank > 0
+            and isinstance(alpha, (int, float))
+            and not isinstance(alpha, bool)
+            and alpha > 0
+            else None
+        )
+        if expected_scaling is None or adapter.scaling != expected_scaling:
             raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA request requires rank 1 and "
-                f"unit scaling, got rank={adapter.config.r}, scaling={adapter.scaling}."
+                "The exact GLM-5.2 active-LoRA request requires a positive integer "
+                "rank, positive alpha, and scaling=alpha/rank; "
+                f"got rank={rank}, alpha={alpha}, scaling={adapter.scaling}."
             )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
