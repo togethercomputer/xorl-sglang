@@ -649,7 +649,9 @@ async def validate_json_request(raw_request: Request):
 
 def _health_generate_sampling_params(server_args) -> Dict[str, Union[int, float]]:
     """Return a health request that is valid for the selected sampler contract."""
-    if getattr(server_args, "glm52_exact_mode", False):
+    if getattr(server_args, "glm52_exact_mode", False) or getattr(
+        server_args, "dsv4_flash_exact_mode", False
+    ):
         random_seed = getattr(server_args, "random_seed", None)
         return {
             "max_new_tokens": 1,
@@ -2322,6 +2324,17 @@ def _execute_server_warmup(server_args: ServerArgs):
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
+
+    if server_args.dsv4_flash_exact_mode:
+        # The first exact DSV4 lane owns one invariant MAX_LEN row at DP rank 0;
+        # warm up precisely that admitted request instead of the generic DP batch.
+        if isinstance(json_data.get("text"), list):
+            json_data["text"] = json_data["text"][0]
+        if isinstance(json_data.get("input_ids"), list) and json_data[
+            "input_ids"
+        ] and isinstance(json_data["input_ids"][0], list):
+            json_data["input_ids"] = json_data["input_ids"][0]
+        json_data["routed_dp_rank"] = 0
 
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:

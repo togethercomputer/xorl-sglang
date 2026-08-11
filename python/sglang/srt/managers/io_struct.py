@@ -214,6 +214,10 @@ class GenerateReqInput:
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Return the selected-token input/output logprob buffers as contiguous
+    # little-endian FP32 bytes.  This is an evidence surface for exact replay:
+    # unlike top-k output it always includes the sampled/teacher-forced token.
+    return_raw_token_logprobs_b64: bool = False
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
@@ -779,6 +783,7 @@ class GenerateReqInput:
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            return_raw_token_logprobs_b64=self.return_raw_token_logprobs_b64,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,

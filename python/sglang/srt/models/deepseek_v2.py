@@ -593,6 +593,13 @@ class MoEGate(nn.Module):
             return bi_router_gemm(hidden_states, self.weight)
 
         if get_exec().deterministic.enable_deterministic_inference:
+            if self.is_deepseek_v4:
+                # DSV4 hash_topk consumes FP32 router logits, and the later
+                # correction-bias router uses the same serving-value GEMM.
+                # Deterministic mode must not fall back to BF16 F.linear here.
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+
+                return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
 
         if (

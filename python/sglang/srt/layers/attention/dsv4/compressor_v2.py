@@ -156,6 +156,7 @@ class CompressorBackendMixin:
         out_loc: torch.Tensor,
         use_fp4_indexer: bool = False,
         bf16_store: bool = False,
+        debug_compressed=None,
     ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
         assert rotate == is_indexer == (head_dim == 128)
@@ -184,6 +185,8 @@ class CompressorBackendMixin:
             head_dim=head_dim,
             is_online=is_online,
         )
+        if debug_compressed is not None:
+            kv_compressed = debug_compressed(kv_compressed)
 
         # Step 2: norm + rope + store
         compress_norm_rope_store(
@@ -267,6 +270,7 @@ class CompressorBackendMixin:
                 out_loc=out_loc,
                 use_fp4_indexer=use_fp4_indexer,
                 bf16_store=bf16_store,
+                debug_compressed=getattr(compressor, "debug_compressed", None),
             )
         online_c128_mtp = getattr(self, "online_c128_mtp", None)
         if online_c128_mtp is not None:

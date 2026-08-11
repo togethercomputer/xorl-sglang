@@ -477,6 +477,76 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
+    def apply_grouped_lora(
+        self,
+        base_output: torch.Tensor,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply one logical column-parallel LoRA as group-selected slices.
+
+        DSV4 ``wo_a`` is stored as ``[groups * out_per_group, in]`` but its
+        input is ``[tokens, groups, in]``.  Each input group must consume only
+        the matching B rows; flattening the group dimension would incorrectly
+        produce every output group for every input group.
+        """
+
+        if x.ndim != 3 or base_output.ndim != 3:
+            raise ValueError(
+                "Grouped LoRA requires [tokens, groups, width] input/output, "
+                f"got x={tuple(x.shape)} base={tuple(base_output.shape)}"
+            )
+        tokens, groups, _ = x.shape
+        if base_output.shape[:2] != (tokens, groups):
+            raise ValueError("Grouped LoRA input and base output rows do not align")
+        out_per_group = base_output.shape[-1]
+        if self.B_buffer.shape[1] != groups * out_per_group:
+            raise ValueError(
+                "Grouped LoRA B layout mismatch: "
+                f"B rows={self.B_buffer.shape[1]}, groups={groups}, "
+                f"out_per_group={out_per_group}"
+            )
+
+        offsets_key = (groups, out_per_group)
+        offsets = getattr(self, "_grouped_output_offsets", None)
+        if offsets is None or offsets[0] != offsets_key:
+            device_offsets = torch.tensor(
+                [0, out_per_group],
+                dtype=torch.int32,
+                device=base_output.device,
+            )
+            cpu_offsets = torch.tensor(
+                [0, out_per_group],
+                dtype=torch.int32,
+                device="cpu",
+                pin_memory=True,
+            )
+            offsets = (offsets_key, device_offsets, cpu_offsets)
+            self._grouped_output_offsets = offsets
+
+        outputs = []
+        for group_idx in range(groups):
+            # Selecting one group from [tokens, groups, width] preserves the
+            # inter-group row stride.  SGLang's serving SGEMM ABI requires a
+            # contiguous token-major matrix, as does its in-place base output.
+            group_input = x[:, group_idx, :].contiguous()
+            group_base = base_output[:, group_idx, :].contiguous()
+            lora_a_output = self.lora_backend.run_lora_a_sgemm(
+                group_input,
+                self.A_buffer,
+            )
+            start = group_idx * out_per_group
+            end = start + out_per_group
+            outputs.append(
+                self.lora_backend.run_lora_b_sgemm(
+                    x=lora_a_output,
+                    weights=self.B_buffer[:, start:end, :].contiguous(),
+                    output_offset=offsets[1],
+                    output_offset_cpu=offsets[2],
+                    base_output=group_base,
+                )
+            )
+        return torch.stack(outputs, dim=1)
+
     def forward(self, input_: torch.Tensor):
         # duplicate the logic in ColumnParallelLinear
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
@@ -1033,10 +1103,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             from sglang.srt.layers.quantization.modelopt_quant import (
                 ModelOptNvFp4FusedMoEMethod,
             )
+            from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+                Mxfp4MarlinMoEMethod,
+            )
 
             assert isinstance(
                 base_layer.quant_method,
-                (CompressedTensorsFusedMoEMethod, ModelOptNvFp4FusedMoEMethod),
+                (
+                    CompressedTensorsFusedMoEMethod,
+                    ModelOptNvFp4FusedMoEMethod,
+                    Mxfp4MarlinMoEMethod,
+                ),
             ), (
                 f"Marlin MoE backend requires a quant method exposing "
                 f"get_marlin_quant_info, got {type(base_layer.quant_method).__name__}"
@@ -1078,9 +1155,14 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # the Python weight_indices list, no GPU sync needed.
         has_active_lora = bool(getattr(batch_info, "has_active_lora", False))
 
-        if self._lora_runner_backend.is_experimental_sgl_trtllm() or (
-            self._lora_runner_backend.is_experimental_sgl_marlin()
+        if self._lora_runner_backend.is_marlin() or (
+            self._lora_runner_backend.is_experimental_sgl_trtllm()
         ):
+            # StandardDispatcher localizes EP ids before all Marlin runners.
+            # The adapter bank is sharded to the same local expert count, so
+            # alignment must use that count (32 for official DSV4 EP8), not
+            # base_layer.num_experts (the global 256).  This also makes -1
+            # sentinels unambiguously invalid in the small-batch CPU aligner.
             num_experts = (
                 self.down_lora_a_weights.shape[1]
                 if self.down_lora_a_weights is not None
@@ -1154,8 +1236,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # Use pre-computed quant info (doesn't change so not sure why we need to pass it in every time)
-        quant_info = self._quant_info
+        quant_info = self._quant_info_after_dispatch(base_layer)
 
         # ===== TO BE REFACTORED ====
         if self._lora_runner_backend.is_experimental_sgl_trtllm():
@@ -1186,6 +1267,27 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         final_hidden_states = base_layer.dispatcher.combine(combine_input=combine_input)
 
         return final_hidden_states
+
+    def _quant_info_after_dispatch(self, base_layer):
+        """Return runner metadata after lazy EP localization is initialized."""
+
+        if not self._lora_runner_backend.is_marlin():
+            return self._quant_info
+
+        # StandardDispatcher creates local_expert_mapping lazily in dispatch().
+        # A Marlin quant-info object cached in __init__ therefore predates the
+        # map and falsely reports is_ep=False even though the dispatched ids
+        # contain -1 sentinels.  Refresh after dispatch so the kernel receives
+        # the map and global expert count together with those localized ids.
+        quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+        if getattr(base_layer.dispatcher, "moe_ep_size", 1) > 1 and (
+            quant_info.expert_map is None or quant_info.global_num_experts <= 0
+        ):
+            raise RuntimeError(
+                "Marlin MoE-LoRA dispatch localized EP ids without publishing "
+                "the expert map and global expert count."
+            )
+        return quant_info
 
     def slice_lora_a_weights(self, A: torch.Tensor):
         return A

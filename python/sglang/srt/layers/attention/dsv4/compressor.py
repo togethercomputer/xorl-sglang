@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
 
 import torch
@@ -389,6 +390,13 @@ class Compressor(BaseFusedOp):
         self.freqs_cis = freqs_cis
 
         self.ape_converted = False
+        if os.environ.get("SGLANG_DSV4_DEBUG_ATTENTION_BOUNDARIES") == "1":
+            # Opt-in parity probes. Identity modules keep the production path
+            # byte-neutral while letting tensor_dump_forward_hook expose the
+            # two serving-specific compressor boundaries that do not cross a
+            # normal nn.Module return edge.
+            self.debug_kv_score = nn.Identity()
+            self.debug_compressed = nn.Identity()
 
     def _apply_ape_hotfix(self):
         self.ape_converted = True
@@ -423,6 +431,8 @@ class Compressor(BaseFusedOp):
 
     def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        if hasattr(self, "debug_kv_score"):
+            kv_score = self.debug_kv_score(kv_score)
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
@@ -449,7 +459,7 @@ class Compressor(BaseFusedOp):
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4AttnBackend)
         kv_score_buffer = self.get_state_pool(attn_backend).kv_score_buffer.kv_score
-        return attn_backend.forward_compress(
+        output = attn_backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score,
             ape=self.ape.view(-1, self.head_dim),
@@ -461,6 +471,9 @@ class Compressor(BaseFusedOp):
             forward_batch=forward_batch,
             is_paged=True,
         )
+        if hasattr(self, "debug_compressed"):
+            output = self.debug_compressed(output)
+        return output
 
     def forward_npu(
         self,

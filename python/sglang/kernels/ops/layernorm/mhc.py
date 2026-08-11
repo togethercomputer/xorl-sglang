@@ -582,7 +582,17 @@ def prewarm_mhc_pre(
     from sglang.srt.runtime_context import get_schedule
 
     hc_mult, hidden_size = residual.shape[-2], residual.shape[-1]
-    max_num_tokens = get_schedule().chunked_prefill_size
+    schedule = get_schedule()
+    max_num_tokens = schedule.chunked_prefill_size
+    # ``-1`` means chunked prefill is disabled; it is a sentinel, not a
+    # legal tensor extent.  In that mode prewarm through the admitted prefill
+    # ceiling so every n_splits specialization remains off the serving path.
+    if max_num_tokens is None or max_num_tokens <= 0:
+        max_num_tokens = schedule.max_prefill_tokens
+    if max_num_tokens is None or max_num_tokens <= 0:
+        raise ValueError(
+            "DSV4 MHC prewarm requires a positive chunked or maximum prefill size"
+        )
     buckets = get_mhc_pre_token_count_representatives(
         max_num_tokens, hc_mult * hidden_size
     )

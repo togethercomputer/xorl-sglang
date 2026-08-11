@@ -247,9 +247,22 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         base = moe_layer.base_layer
         top_k = base.top_k
         qinfo = moe_layer._quant_info
-        E, N, _ = qinfo.w13_weight.shape
-        hidden_dim = qinfo.w2_weight.shape[1]
-        device = qinfo.w13_weight.device
+        # Quant-info payload names and physical shapes are backend-specific.
+        # In particular, MXFP4 Marlin exposes repacked ``w13_qweight`` /
+        # ``w2_qweight`` tensors whose dimensions are not the logical MLP
+        # dimensions.  The shared LoRA workspaces are logical activation
+        # buffers, so size them from the layer contract and use the quantized
+        # payload only to resolve the device.
+        N = 2 * base.intermediate_size_per_partition
+        hidden_dim = base.hidden_size
+        quant_weight = getattr(qinfo, "w13_weight", None)
+        if quant_weight is None:
+            quant_weight = getattr(qinfo, "w13_qweight", None)
+        if quant_weight is None:
+            raise AttributeError(
+                f"{type(qinfo).__name__} exposes neither w13_weight nor w13_qweight"
+            )
+        device = quant_weight.device
         dtype = compute_dtype
         num_experts = base.num_experts
 
