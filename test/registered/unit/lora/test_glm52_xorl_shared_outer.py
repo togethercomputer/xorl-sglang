@@ -555,7 +555,16 @@ def _exact_official_config():
 
 @pytest.mark.parametrize(
     ("rank", "alpha"),
-    ((1, 1), (2, 3), (3, 7), (7, 11), (16, 32), (31, 47), (64, 128)),
+    (
+        (1, 0.5),
+        (1, 1),
+        (2, 3),
+        (3, 7.5),
+        (7, 11),
+        (16, 32),
+        (31, 47),
+        (64, 128),
+    ),
 )
 def test_exact_inventory_accepts_positive_rank_and_alpha(rank, alpha):
     adapter_config = _exact_adapter_config()
@@ -599,6 +608,20 @@ def test_exact_inventory_rejects_adapter_program_variants(name, value):
     adapter_config[name] = value
 
     with pytest.raises(ValueError, match="GLM-5.2"):
+        build_glm52_xorl_shared_outer_inventory(
+            _exact_official_config(), adapter_config
+        )
+
+
+@pytest.mark.parametrize(
+    "alpha",
+    (float("nan"), float("inf"), float("-inf"), 1e100, 1e-100, 10**1000),
+)
+def test_exact_inventory_rejects_nonfinite_or_unrepresentable_alpha(alpha):
+    adapter_config = _exact_adapter_config()
+    adapter_config["lora_alpha"] = alpha
+
+    with pytest.raises(ValueError, match="FP32-representable"):
         build_glm52_xorl_shared_outer_inventory(
             _exact_official_config(), adapter_config
         )
@@ -1032,6 +1055,35 @@ def test_exact_batch_requires_one_resident_certified_positive_rank_adapter(monke
     manager.loras["generation-6"]._glm52_exact_adapter_certified = False
     with pytest.raises(RuntimeError, match="complete 1,700-factor inventory"):
         manager.prepare_lora_batch(active)
+
+
+@pytest.mark.parametrize(
+    ("alpha", "scaling"),
+    (
+        (float("nan"), float("nan")),
+        (float("inf"), float("inf")),
+        (1e100, 1e100 / 3),
+        (1e-100, 1e-100 / 3),
+    ),
+)
+def test_exact_batch_rejects_nonfinite_or_unrepresentable_scaling(
+    monkeypatch, alpha, scaling
+):
+    manager = _exact_batch_manager()
+    manager.loras["generation-6"].config.lora_alpha = alpha
+    manager.loras["generation-6"].scaling = scaling
+    monkeypatch.setattr(
+        "sglang.srt.lora.lora_manager.get_is_capture_mode", lambda: False
+    )
+
+    with pytest.raises(RuntimeError, match="FP32-representable"):
+        manager.prepare_lora_batch(
+            SimpleNamespace(
+                batch_size=1,
+                forward_mode=_ForwardMode(True),
+                lora_ids=["generation-6"],
+            )
+        )
 
 
 def test_exact_batch_allows_only_all_base_placeholders_during_graph_capture(

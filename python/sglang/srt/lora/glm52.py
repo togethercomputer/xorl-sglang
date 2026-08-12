@@ -12,6 +12,7 @@ factors have real runtime modules.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
@@ -34,6 +35,40 @@ GLM52_REQUIRED_TARGET_MODULES = frozenset(
 )
 
 _ADAPTER_PREFIX = "base_model.model."
+_FLOAT32_MAX = float(torch.finfo(torch.float32).max)
+_FLOAT32_MIN_POSITIVE = 2.0**-149
+
+
+def resolve_glm52_exact_lora_scaling(rank, alpha) -> Optional[float]:
+    """Return the admitted alpha/rank scaling for the exact GLM lane.
+
+    Runtime scaling metadata is materialized as FP32.  Keep fractional alpha
+    values, but reject values which are non-finite or become zero/infinite when
+    represented by that metadata dtype.
+    """
+
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+        return None
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)):
+        return None
+    try:
+        alpha_value = float(alpha)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(alpha_value) or alpha_value <= 0:
+        return None
+    if not (_FLOAT32_MIN_POSITIVE <= alpha_value <= _FLOAT32_MAX):
+        return None
+
+    try:
+        scaling = alpha_value / float(rank)
+    except OverflowError:
+        return None
+    if not math.isfinite(scaling) or scaling <= 0:
+        return None
+    if not (_FLOAT32_MIN_POSITIVE <= scaling <= _FLOAT32_MAX):
+        return None
+    return scaling
 
 
 @dataclass(frozen=True)
@@ -155,13 +190,10 @@ def _validate_official_geometry(config, adapter_config: dict) -> dict[str, int]:
         alpha = adapter_config.get("lora_alpha")
         dropout = adapter_config.get("lora_dropout", 0.0)
         exact_mismatches = []
-        if (
-            isinstance(alpha, bool)
-            or not isinstance(alpha, (int, float))
-            or alpha <= 0
-        ):
+        if resolve_glm52_exact_lora_scaling(rank, alpha) is None:
             exact_mismatches.append(
-                f"lora_alpha={alpha!r} (expected a positive number)"
+                f"lora_alpha={alpha!r} (expected a positive finite "
+                "FP32-representable number with FP32-representable alpha/rank)"
             )
         if (
             isinstance(dropout, bool)
@@ -185,7 +217,7 @@ def _validate_official_geometry(config, adapter_config: dict) -> dict[str, int]:
         if exact_mismatches:
             raise ValueError(
                 "The exact GLM-5.2 XORL active-LoRA contract requires the "
-                "complete rank-1/alpha-1 factor-only adapter: "
+                "complete positive-rank factor-only adapter: "
                 + ", ".join(exact_mismatches)
             )
     geometry["rank"] = rank

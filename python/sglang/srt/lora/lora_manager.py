@@ -34,7 +34,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
-from sglang.srt.lora.glm52 import is_glm52_xorl_shared_outer_adapter
+from sglang.srt.lora.glm52 import (
+    is_glm52_xorl_shared_outer_adapter,
+    resolve_glm52_exact_lora_scaling,
+)
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -432,20 +435,12 @@ class LoRAManager:
             )
         rank = adapter.config.r
         alpha = adapter.config.lora_alpha
-        expected_scaling = (
-            float(alpha) / float(rank)
-            if isinstance(rank, int)
-            and not isinstance(rank, bool)
-            and rank > 0
-            and isinstance(alpha, (int, float))
-            and not isinstance(alpha, bool)
-            and alpha > 0
-            else None
-        )
+        expected_scaling = resolve_glm52_exact_lora_scaling(rank, alpha)
         if expected_scaling is None or adapter.scaling != expected_scaling:
             raise RuntimeError(
                 "The exact GLM-5.2 active-LoRA request requires a positive integer "
-                "rank, positive alpha, and scaling=alpha/rank; "
+                "rank, finite FP32-representable alpha and scaling, and "
+                "scaling=alpha/rank; "
                 f"got rank={rank}, alpha={alpha}, scaling={adapter.scaling}."
             )
 
