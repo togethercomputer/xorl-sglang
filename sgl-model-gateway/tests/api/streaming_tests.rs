@@ -12,6 +12,25 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn test_generate_accepts_and_preserves_per_row_sampling_and_r3_flags() {
+        let value = json!({
+            "input_ids": [[9707, 25], [9707, 26]],
+            "sampling_params": [
+                {"temperature": 1.0, "max_new_tokens": 1, "sampling_seed": 11},
+                {"temperature": 1.0, "max_new_tokens": 1, "sampling_seed": 12}
+            ],
+            "return_logprob": true,
+            "return_routed_experts": true,
+            "return_expert_logits": true
+        });
+        let request: GenerateRequest = serde_json::from_value(value.clone()).unwrap();
+        let forwarded = serde_json::to_value(request).unwrap();
+        assert_eq!(forwarded["sampling_params"], value["sampling_params"]);
+        assert_eq!(forwarded["return_routed_experts"], true);
+        assert_eq!(forwarded["return_expert_logits"], true);
+    }
+
     #[tokio::test]
     async fn test_non_streaming_generate_body_is_proxied_incrementally() {
         let ctx = AppTestContext::new(vec![MockWorkerConfig {
