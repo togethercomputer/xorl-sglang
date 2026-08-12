@@ -5539,6 +5539,7 @@ class ServerArgs:
             # even when no adapter is present at server startup.
             self.lora_target_modules = set(GLM52_REQUIRED_TARGET_MODULES)
         requested_max_lora_rank = self.max_lora_rank
+        requested_max_total_tokens = self.max_total_tokens
         exact_program = {
             "moe_runner_backend": (self.moe_runner_backend, ("auto", "triton")),
             "fp8_gemm_runner_backend": (
@@ -5578,7 +5579,7 @@ class ServerArgs:
             ),
             "max_prefill_tokens": (self.max_prefill_tokens, (8192, 16384)),
             "prefill_max_requests": (self.prefill_max_requests, (None, 1)),
-            "max_total_tokens": (self.max_total_tokens, (None, 8192)),
+            "max_total_tokens": (self.max_total_tokens, (None, 8192, 32768)),
             "max_running_requests": (self.max_running_requests, (None, 16)),
             "model_impl": (self.model_impl, ("auto", "sglang")),
             "device": (self.device, (None, "cuda")),
@@ -5697,7 +5698,9 @@ class ServerArgs:
         self.chunked_prefill_size = -1
         self.max_prefill_tokens = 8192
         self.prefill_max_requests = 1
-        self.max_total_tokens = 8192
+        self.max_total_tokens = (
+            8192 if requested_max_total_tokens is None else requested_max_total_tokens
+        )
         self.max_running_requests = 16
         self.mem_fraction_static = 0.82
         self.model_impl = "sglang"
@@ -5792,7 +5795,6 @@ class ServerArgs:
             "chunked_prefill_size": -1,
             "max_prefill_tokens": 8192,
             "prefill_max_requests": 1,
-            "max_total_tokens": 8192,
             "max_running_requests": 16,
             "mem_fraction_static": 0.82,
             "model_impl": "sglang",
@@ -5818,6 +5820,11 @@ class ServerArgs:
             for name, value in expected.items()
             if getattr(self, name, None) != value
         ]
+        if self.max_total_tokens not in (8192, 32768):
+            mismatches.append(
+                f"max_total_tokens={self.max_total_tokens!r} "
+                "(expected one of (8192, 32768))"
+            )
         if (
             isinstance(self.max_lora_rank, bool)
             or not isinstance(self.max_lora_rank, int)
