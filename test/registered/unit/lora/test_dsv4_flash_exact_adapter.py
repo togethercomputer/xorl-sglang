@@ -22,7 +22,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _load_lora_utils_for_cpu_contract_test():
@@ -582,3 +582,9 @@ def test_certified_all_zero_adapter_prepares_as_literal_base_noop() -> None:
     manager.memory_pool.uid_to_buffer_id.pop(None)
     with pytest.raises(RuntimeError, match="resident base-model LoRA slot"):
         manager.prepare_lora_batch(batch)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

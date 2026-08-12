@@ -4,7 +4,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_deterministic_dsv4_router_keeps_fp32_serving_gemm(monkeypatch) -> None:
@@ -90,3 +90,11 @@ def test_hash_topk_can_disable_unarmed_pdl(monkeypatch) -> None:
     assert calls == [False]
     assert torch.equal(weights, torch.full((3, 2), 0.5))
     assert torch.equal(ids, torch.ones(3, 2, dtype=torch.int32))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
