@@ -125,7 +125,6 @@ def test_exact_active_lora_head_matches_literal_kernels_for_pruned_prefill_rows(
         scalings=[1.0, 0.0],
         use_cuda_graph=False,
     )
-    backend._glm52_exact_batch_certified = True
     head = _make_real_lora_head(weight, backend, lora_a, lora_b)
 
     assert backend.batch_info.seg_lens.tolist() == [8]
@@ -155,12 +154,15 @@ def test_exact_active_lora_head_matches_literal_kernels_for_pruned_prefill_rows(
     assert torch.count_nonzero(actual != base_only).item() > 0
 
 
-def test_decode_graph_captured_with_base_metadata_replays_active_rank_one_exactly():
+@pytest.mark.parametrize("active_batch_size", [1, 4])
+def test_decode_graph_captured_with_base_metadata_replays_active_rows_exactly(
+    active_batch_size,
+):
     """A/B launches captured as rank-zero no-ops must remain live graph nodes.
 
-    The graph owns 16 physical rows, while replay installs one logical active
-    request. Changing A and then B after capture must change only that row and
-    still match the direct v2 + literal Triton A/B program byte for byte.
+    The graph owns 16 physical rows while replay installs the requested number
+    of active rows. Changing A and then B after capture must change only those
+    rows and still match the direct v2 + literal Triton A/B program byte for byte.
     """
 
     device = torch.device("cuda")
@@ -192,7 +194,6 @@ def test_decode_graph_captured_with_base_metadata_replays_active_rank_one_exactl
         scalings=[0.0],
         use_cuda_graph=True,
     )
-    backend._glm52_exact_batch_certified = True
     head = _make_real_lora_head(weight, backend, lora_a, lora_b)
 
     # Compile both real LoRA kernels while their device-side rank is zero.
@@ -220,24 +221,23 @@ def test_decode_graph_captured_with_base_metadata_replays_active_rank_one_exactl
     torch.cuda.synchronize()
     _assert_same_bytes(capture_output, capture_base)
 
-    # This is the production replay shape: one logical request in a width-16
-    # graph bucket, with the static metadata buffers refreshed in place.
+    # Production uses four logical requests in a width-16 graph bucket. Keep
+    # the single-request case as a regression cell too.
     lora_a.copy_(active_a)
     lora_b.copy_(active_b)
     replay_batch = SimpleNamespace(
         forward_mode=ForwardMode.DECODE,
-        batch_size=1,
+        batch_size=active_batch_size,
     )
     backend.prepare_lora_batch(
         replay_batch,
-        weight_indices=[0],
+        weight_indices=[0] * active_batch_size,
         lora_ranks=[1],
         scalings=[1.0],
         use_cuda_graph=True,
     )
-    backend._glm52_exact_batch_certified = True
-    assert backend.batch_info.bs == 1
-    assert backend.sgemm_batch_info.seg_lens.tolist() == [1]
+    assert backend.batch_info.bs == active_batch_size
+    assert backend.sgemm_batch_info.seg_lens.tolist() == [active_batch_size]
 
     graph.replay()
     torch.cuda.synchronize()
@@ -253,7 +253,9 @@ def test_decode_graph_captured_with_base_metadata_replays_active_rank_one_exactl
     assert not torch.equal(
         captured_output.view(torch.uint8), capture_output.view(torch.uint8)
     )
-    _assert_same_bytes(captured_output[1:], capture_base[1:])
+    _assert_same_bytes(
+        captured_output[active_batch_size:], capture_base[active_batch_size:]
+    )
 
     # Replay-time A mutation proves the captured shrink node reads the live A
     # buffer. A byte-exact literal result rules out an accidental base-only path.

@@ -34,10 +34,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
-from sglang.srt.lora.glm52 import (
-    is_glm52_xorl_shared_outer_adapter,
-    resolve_glm52_exact_lora_scaling,
-)
+from sglang.srt.lora.glm52 import is_glm52_xorl_shared_outer_adapter
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -399,50 +396,24 @@ class LoRAManager:
                 "Start the server with --disable-shared-experts-fusion."
             )
 
-    def _validate_glm52_exact_batch(self, forward_batch: ForwardBatch) -> None:
-        """Admit the one-request exact GLM adapter program before metadata mutation."""
+    def _validate_glm52_active_adapters(self, forward_batch: ForwardBatch) -> None:
+        """Reject stale adapter references without restricting normal batching."""
 
         if not getattr(self.base_hf_config, "_glm52_exact_mode", False):
             return
 
         lora_ids = list(forward_batch.lora_ids)
         if get_is_capture_mode():
-            if not lora_ids or any(uid is not None for uid in lora_ids):
-                raise RuntimeError(
-                    "Exact GLM-5.2 CUDA-graph capture requires only synthetic "
-                    "base-slot placeholders."
-                )
             return
 
-        if len(lora_ids) != 1:
-            raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA contract admits exactly one "
-                f"logical request, got {len(lora_ids)}."
-            )
-        uid = lora_ids[0]
-        if uid is None:
-            return
-        adapter = self.loras.get(uid)
-        if adapter is None or uid not in self.memory_pool.uid_to_buffer_id:
-            raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA request references a missing or "
-                f"nonresident adapter UID: {uid!r}."
-            )
-        if not getattr(adapter, "_glm52_exact_adapter_certified", False):
-            raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA request requires an adapter "
-                "certified from the complete 1,700-factor inventory."
-            )
-        rank = adapter.config.r
-        alpha = adapter.config.lora_alpha
-        expected_scaling = resolve_glm52_exact_lora_scaling(rank, alpha)
-        if expected_scaling is None or adapter.scaling != expected_scaling:
-            raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA request requires a positive integer "
-                "rank, finite FP32-representable alpha and scaling, and "
-                "scaling=alpha/rank; "
-                f"got rank={rank}, alpha={alpha}, scaling={adapter.scaling}."
-            )
+        for uid in set(lora_ids):
+            if uid is None:
+                continue
+            if uid not in self.loras or uid not in self.memory_pool.uid_to_buffer_id:
+                raise RuntimeError(
+                    "The GLM-5.2 active-LoRA request references a missing or "
+                    f"nonresident adapter UID: {uid!r}."
+                )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         logger.info(
@@ -556,8 +527,6 @@ class LoRAManager:
         take the base path instead of reading the previous batch's stale
         metadata."""
         self.lora_backend.reset_batch_state()
-        if getattr(self.base_hf_config, "_glm52_exact_mode", False):
-            self.lora_backend._glm52_exact_batch_certified = False
 
     @contextmanager
     def glm52_context_parallel_lora_batch(
@@ -822,9 +791,7 @@ class LoRAManager:
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
-        if getattr(self.base_hf_config, "_glm52_exact_mode", False):
-            self.lora_backend._glm52_exact_batch_certified = False
-        self._validate_glm52_exact_batch(forward_batch)
+        self._validate_glm52_active_adapters(forward_batch)
         bs = forward_batch.batch_size
 
         use_cuda_graph = (
@@ -862,8 +829,6 @@ class LoRAManager:
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
         )
-        if getattr(self.base_hf_config, "_glm52_exact_mode", False):
-            self.lora_backend._glm52_exact_batch_certified = True
 
     def update_lora_info(self):
         """

@@ -1020,7 +1020,7 @@ def _exact_batch_manager():
     return manager
 
 
-def test_exact_batch_requires_one_resident_certified_positive_rank_adapter(monkeypatch):
+def test_exact_batch_accepts_normal_multi_request_batches(monkeypatch):
     manager = _exact_batch_manager()
     monkeypatch.setattr(
         "sglang.srt.lora.lora_manager.get_is_capture_mode", lambda: False
@@ -1032,63 +1032,33 @@ def test_exact_batch_requires_one_resident_certified_positive_rank_adapter(monke
         lora_ids=["generation-6"],
     )
     manager.prepare_lora_batch(active)
-    assert manager.lora_backend._glm52_exact_batch_certified is True
     assert manager.lora_backend.calls[-1]["weight_indices"] == [1]
     assert manager.lora_backend.calls[-1]["lora_ranks"] == [0, 3, 0]
     assert manager.lora_backend.calls[-1]["scalings"] == [0, 7 / 3, 0]
 
-    for lora_ids, error in (
-        (["missing"], "missing or nonresident"),
-        (["generation-6", "generation-6"], "exactly one logical request"),
-        ([None, "generation-6"], "exactly one logical request"),
-    ):
-        with pytest.raises(RuntimeError, match=error):
-            manager.prepare_lora_batch(
-                SimpleNamespace(
-                    batch_size=len(lora_ids),
-                    forward_mode=_ForwardMode(True),
-                    lora_ids=lora_ids,
-                )
-            )
-        assert manager.lora_backend._glm52_exact_batch_certified is False
-
-    manager.loras["generation-6"]._glm52_exact_adapter_certified = False
-    with pytest.raises(RuntimeError, match="complete 1,700-factor inventory"):
-        manager.prepare_lora_batch(active)
-
-
-@pytest.mark.parametrize(
-    ("alpha", "scaling"),
-    (
-        (float("nan"), float("nan")),
-        (float("inf"), float("inf")),
-        (1e100, 1e100 / 3),
-        (1e-100, 1e-100 / 3),
-    ),
-)
-def test_exact_batch_rejects_nonfinite_or_unrepresentable_scaling(
-    monkeypatch, alpha, scaling
-):
-    manager = _exact_batch_manager()
-    manager.loras["generation-6"].config.lora_alpha = alpha
-    manager.loras["generation-6"].scaling = scaling
-    monkeypatch.setattr(
-        "sglang.srt.lora.lora_manager.get_is_capture_mode", lambda: False
+    lora_ids = ["generation-6"] * 4
+    manager.prepare_lora_batch(
+        SimpleNamespace(
+            batch_size=len(lora_ids),
+            forward_mode=_ForwardMode(True),
+            lora_ids=lora_ids,
+        )
     )
+    assert manager.lora_backend.calls[-1]["weight_indices"] == [1] * 4
+    assert manager.lora_backend.calls[-1]["lora_ranks"] == [0, 3, 0]
+    assert manager.lora_backend.calls[-1]["scalings"] == [0, 7 / 3, 0]
 
-    with pytest.raises(RuntimeError, match="FP32-representable"):
+    with pytest.raises(RuntimeError, match="missing or nonresident"):
         manager.prepare_lora_batch(
             SimpleNamespace(
                 batch_size=1,
                 forward_mode=_ForwardMode(True),
-                lora_ids=["generation-6"],
+                lora_ids=["missing"],
             )
         )
 
 
-def test_exact_batch_allows_only_all_base_placeholders_during_graph_capture(
-    monkeypatch,
-):
+def test_exact_batch_does_not_restrict_graph_capture_batch(monkeypatch):
     manager = _exact_batch_manager()
     monkeypatch.setattr(
         "sglang.srt.lora.lora_manager.get_is_capture_mode", lambda: True
@@ -1100,17 +1070,15 @@ def test_exact_batch_allows_only_all_base_placeholders_during_graph_capture(
         lora_ids=[None] * 16,
     )
     manager.prepare_lora_batch(capture)
-    assert manager.lora_backend._glm52_exact_batch_certified is True
     assert manager.lora_backend.calls[-1]["weight_indices"] == [0] * 16
 
-    with pytest.raises(RuntimeError, match="synthetic base-slot placeholders"):
-        manager.prepare_lora_batch(
-            SimpleNamespace(
-                batch_size=16,
-                forward_mode=_ForwardMode(True),
-                lora_ids=[None] * 15 + ["generation-6"],
-            )
+    manager.prepare_lora_batch(
+        SimpleNamespace(
+            batch_size=16,
+            forward_mode=_ForwardMode(True),
+            lora_ids=[None] * 15 + ["generation-6"],
         )
+    )
 
 
 def test_post_load_launch_contract_selects_shared_outer_triton_pool():

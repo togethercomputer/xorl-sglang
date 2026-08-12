@@ -178,11 +178,6 @@ def _apply_xorl_exact_lora_lm_head(
         )
     if not lora_active:
         return base_logits
-    if getattr(backend, "_glm52_exact_batch_certified", False) is not True:
-        raise RuntimeError(
-            "The XORL exact active-LoRA LM-head contract requires a certified "
-            "one-request GLM-5.2 batch."
-        )
     if getattr(lm_head, "set_lora", None) is not True:
         raise RuntimeError(
             "The XORL exact active-LoRA LM-head contract requires installed "
