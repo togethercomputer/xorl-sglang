@@ -34,3 +34,11 @@ def test_first_decode_graph_replay_is_logged_before_periodic_interval(caplog):
         "Decode batch [first graph replay], #running-req: 32, "
         "cuda graph: True, #queue-req: 0"
     ]
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

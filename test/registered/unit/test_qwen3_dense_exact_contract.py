@@ -187,3 +187,11 @@ def test_other_architecture_or_target_does_not_engage_dense_qwen3_contract():
         model_arch="Qwen3ForCausalLM",
     )
     assert not non_xorl.qwen3_dense_exact_mode
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

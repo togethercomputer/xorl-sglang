@@ -958,3 +958,9 @@ def test_qwen35_sampler_rescore_fails_closed_after_logit_mutation():
             torch.tensor([0]),
             _exact_sampling_info(n=1, logit_bias=torch.zeros((1, 32))),
         )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

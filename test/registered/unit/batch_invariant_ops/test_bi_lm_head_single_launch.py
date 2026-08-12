@@ -90,3 +90,11 @@ def test_rescore_from_single_launch_matches_fused_contract():
         hidden.contiguous(), weight, token_ids, temperature=temperature
     )
     assert torch.equal(got, want), "single-launch rescore diverges from fused contract"
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

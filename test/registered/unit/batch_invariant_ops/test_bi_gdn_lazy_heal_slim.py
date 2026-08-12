@@ -70,3 +70,11 @@ def test_batched_warm_persists_every_slim_cache_row():
         assert torch.equal(
             getattr(reference_rows, name), getattr(batched_rows, name)
         ), name
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

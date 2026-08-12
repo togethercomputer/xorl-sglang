@@ -410,3 +410,11 @@ def test_lm_head_loader_replicates_a_and_loads_exact_b_shard_bytes(
     assert loaded_a.is_contiguous() and loaded_b.is_contiguous()
     _assert_same_bytes(loaded_a, exported_a)
     _assert_same_bytes(loaded_b, exported_b[start:end])
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

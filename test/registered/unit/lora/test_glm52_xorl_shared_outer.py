@@ -1327,3 +1327,11 @@ def test_memory_pool_uses_wrapped_layer_tp_for_dense_and_shared_mlp(monkeypatch)
         shared_down.A_buffer.shape[-1]
         == shared_down.base_layer.input_size_per_partition
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

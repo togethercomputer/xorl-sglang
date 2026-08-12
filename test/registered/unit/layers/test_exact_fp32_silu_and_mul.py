@@ -48,3 +48,11 @@ def test_forward_is_byte_exact_to_one_round_reference(shape):
     expected = _one_round_reference(input_tensor)
 
     assert torch.equal(actual, expected)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

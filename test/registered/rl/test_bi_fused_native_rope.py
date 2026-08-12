@@ -90,3 +90,11 @@ def test_bitwise_matches_packed_qkv_views():
         expected = _eager(tensor, positions, cache, head_size)
         actual = bi_fused_native_rope(tensor, positions, cache, head_size)
         assert torch.equal(actual, expected)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

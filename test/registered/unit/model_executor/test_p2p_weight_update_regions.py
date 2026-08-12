@@ -576,3 +576,11 @@ def test_mooncake_register_location_falls_back_for_two_arg_engine():
 
     assert wrapper.register(0x1000, 0x40, location="cuda:3") == 0
     assert wrapper.engine.calls == [(0x1000, 0x40)]
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

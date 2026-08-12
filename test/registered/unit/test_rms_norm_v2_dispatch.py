@@ -50,3 +50,11 @@ def test_no_residual_split_is_bitwise_equal_to_fused(shape, zero_centered):
     split = v2._rms_norm_v2_split(x, weight, 1e-6, None, zero_centered)
 
     assert torch.equal(fused, split)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -59,3 +59,9 @@ def test_qwen35_class_b_rejects_multimodal_mrope_positions():
                 torch.zeros((2, 8), dtype=torch.bfloat16),
                 torch.zeros((2, 8), dtype=torch.bfloat16),
             )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

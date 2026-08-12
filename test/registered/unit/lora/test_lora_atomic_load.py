@@ -224,3 +224,11 @@ def test_tp_registry_disagreement_is_a_failed_load():
     assert not result.success
     assert "loaded adapter registries differ across TP ranks" in result.error_message
     scheduler.tp_worker.rollback_lora_adapter.assert_called_once_with("candidate-id")
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

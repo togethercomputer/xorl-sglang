@@ -13,3 +13,11 @@ def test_partial_sm90_paged_kv_tile_has_one_register_entry_per_thread():
 def test_paged_kv_register_entries_use_ceiling_division():
     assert _page_entries_per_thread(128, 128) == 1
     assert _page_entries_per_thread(129, 128) == 2
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

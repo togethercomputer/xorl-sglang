@@ -341,6 +341,14 @@ def test_graph_workspace_round_trip_updates_live_slot_zero() -> None:
     torch.testing.assert_close(cache.rows_beta[0], expected[3])
 
 
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
+
+
 def test_graph_workspace_idle_dp_row_preserves_live_slot_zero() -> None:
     cache = _cache(num_slots=1)
     cache.boundary[0].fill_(3)
