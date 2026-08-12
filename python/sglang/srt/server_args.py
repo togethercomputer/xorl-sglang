@@ -5831,8 +5831,7 @@ class ServerArgs:
             or self.max_lora_rank <= 0
         ):
             mismatches.append(
-                f"max_lora_rank={self.max_lora_rank!r} "
-                "(expected a positive integer)"
+                f"max_lora_rank={self.max_lora_rank!r} " "(expected a positive integer)"
             )
         if self.node_rank not in (0, 1):
             mismatches.append(f"node_rank={self.node_rank!r} (expected 0 or 1)")
