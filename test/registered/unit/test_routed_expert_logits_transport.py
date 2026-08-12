@@ -85,3 +85,44 @@ def test_extract_expert_logits_preserves_float32_bytes():
         {"meta_info": {"expert_logits": encoded}}
     )
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_inkling_gate_captures_computed_routed_weights(monkeypatch):
+    from sglang.srt.models.inkling_common import moe as inkling_moe
+
+    gate = object.__new__(inkling_moe.InklingGate)
+    torch.nn.Module.__init__(gate)
+    gate.n_routed_experts = 3
+    gate.n_shared_experts = 0
+    gate.n_total_experts = 3
+    gate.topk = 2
+    gate.layer_id = 7
+    gate.norm_after_topk = False
+    gate.gate_activation = "softmax"
+    gate.global_scale = None
+    gate.route_scale = 1.25
+    gate.bias = None
+    gate.shared_expert_sink = False
+    gate.weight = torch.nn.Parameter(torch.zeros(3, 2), requires_grad=False)
+
+    logits = torch.tensor([[1.0, 3.0, 2.0]], dtype=torch.float32)
+    topk_indices = torch.tensor([[1, 2]], dtype=torch.int32)
+    captured = {}
+
+    class _Capturer:
+        def capture(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(inkling_moe, "linear_with_pad", lambda *_args: logits)
+    monkeypatch.setattr(
+        inkling_moe,
+        "gate_topk",
+        lambda *_args: (torch.empty_like(topk_indices), topk_indices),
+    )
+    monkeypatch.setattr(inkling_moe, "get_global_experts_capturer", lambda: _Capturer())
+
+    routed_weights, actual_ids, _, _ = gate(torch.zeros(1, 2))
+
+    assert captured["layer_id"] == 7
+    torch.testing.assert_close(captured["topk_indices"], actual_ids)
+    torch.testing.assert_close(captured["topk_weights"], routed_weights)

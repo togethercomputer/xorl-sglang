@@ -4,6 +4,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs, _exact_batch_invariant_ops
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -39,6 +41,22 @@ def _args(**overrides):
     for name, value in overrides.items():
         setattr(args, name, value)
     return args
+
+
+def _ingress_manager():
+    manager = object.__new__(TokenizerManager)
+    manager.context_len = 8192
+    manager.num_reserved_tokens = 0
+    manager.validate_total_tokens = True
+    manager.allow_auto_truncate = False
+    manager.preferred_sampling_params = {}
+    manager.is_generation = True
+    manager.server_args = SimpleNamespace(
+        glm52_exact_mode=False,
+        qwen35_gdn_exact_mode=False,
+        qwen3_dense_exact_mode=True,
+    )
+    return manager
 
 
 def test_dense_qwen3_resolves_architecture_owned_exact_program():
@@ -84,6 +102,43 @@ def test_dense_qwen3_model_construction_uses_runtime_contract(monkeypatch):
     monkeypatch.setattr(qwen2, "get_exec", lambda: runtime)
 
     assert qwen2._is_qwen3_dense_exact_runtime()
+
+
+@pytest.mark.parametrize(
+    ("sampling_params", "request_fields", "error"),
+    (
+        ({"temperature": 0.5}, {}, "temperature=0.5"),
+        ({"top_p": 0.9}, {}, "top_p=0.9"),
+        ({"top_k": 10}, {}, "top_k=10"),
+        ({"min_p": 0.1}, {}, "min_p=0.1"),
+        ({}, {"top_logprobs_num": 2}, "top_logprobs_num=2"),
+        ({}, {"token_ids_logprob": [7]}, "token_ids_logprob=set"),
+    ),
+)
+def test_dense_qwen3_ingress_rejects_sampler_fatal_options(
+    sampling_params, request_fields, error
+):
+    request = GenerateReqInput(
+        input_ids=[1],
+        sampling_params={"max_new_tokens": 1, **sampling_params},
+        return_logprob=True,
+        **request_fields,
+    )
+    request.normalize_batch_and_arguments()
+
+    with pytest.raises(ValueError, match=error):
+        _ingress_manager()._validate_one_request(request, [1])
+
+
+def test_dense_qwen3_ingress_admits_unit_temperature_plain_sampling():
+    request = GenerateReqInput(
+        input_ids=[1],
+        sampling_params={"temperature": 1.0, "max_new_tokens": 1},
+        return_logprob=True,
+    )
+    request.normalize_batch_and_arguments()
+
+    _ingress_manager()._validate_one_request(request, [1])
 
 
 @pytest.mark.parametrize(

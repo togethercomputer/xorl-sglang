@@ -127,6 +127,7 @@ from sglang.srt.server_args import (
     ServerArgs,
     is_glm52_exact_mode,
     is_qwen35_gdn_exact_mode,
+    is_qwen3_dense_exact_mode,
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.utils import (
@@ -1246,19 +1247,28 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Reject exact-lane request transforms before they can trip the
         # batch-level, scheduler-fatal sampler assertions on the GPU.
-        exact_qwen = is_qwen35_gdn_exact_mode(self.server_args)
+        exact_qwen35 = is_qwen35_gdn_exact_mode(self.server_args)
+        exact_qwen3 = is_qwen3_dense_exact_mode(self.server_args)
         exact_glm = is_glm52_exact_mode(self.server_args)
-        if (exact_qwen or exact_glm) and isinstance(obj, GenerateReqInput):
+        if (exact_qwen35 or exact_qwen3 or exact_glm) and isinstance(
+            obj, GenerateReqInput
+        ):
             violations = _get_bi_decode_strict_ingress_violations(
                 obj,
                 self.preferred_sampling_params,
-                require_unit_temperature=exact_glm,
-                sampled_logprob_only=exact_glm,
+                require_unit_temperature=exact_glm or exact_qwen3,
+                sampled_logprob_only=exact_glm or exact_qwen3,
             )
             if violations:
-                contract_name = "GLM-5.2" if exact_glm else "Qwen3.5-family"
+                contract_name = (
+                    "GLM-5.2"
+                    if exact_glm
+                    else "dense Qwen3" if exact_qwen3 else "Qwen3.5-family"
+                )
                 temperature_contract = (
-                    "unit-temperature" if exact_glm else "plain-temperature"
+                    "unit-temperature"
+                    if exact_glm or exact_qwen3
+                    else "plain-temperature"
                 )
                 raise ValueError(
                     f"This server runs the exact {contract_name} RL on-policy "
