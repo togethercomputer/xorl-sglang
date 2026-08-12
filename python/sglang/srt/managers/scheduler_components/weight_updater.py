@@ -49,6 +49,24 @@ from sglang.srt.managers.io_struct import (
 logger = logging.getLogger(__name__)
 
 
+def _radix_flush_required_for_rl() -> bool:
+    """Whether the exact-RL contract mandates a prefix-cache flush on weight sync.
+
+    With the radix cache enabled under ``rl_on_policy_target``, KV pages left
+    in the tree were computed by the pre-update weights; a prefix hit after
+    the update would splice stale-policy bytes into new-policy decision
+    logprobs (nonzero K3) with no error anywhere.  The engine owns the
+    numerical contract, so the flush cannot be left to the client's
+    ``flush_cache`` flag.
+    """
+    from sglang.srt.runtime_context import get_exec, get_memory
+
+    return (
+        get_exec().deterministic.rl_on_policy_target is not None
+        and not get_memory().disable_radix_cache
+    )
+
+
 def _get_draft_model_runner(draft_worker):
     # DFlash / FrozenKVMTP workers expose draft_model_runner directly
     runner = getattr(draft_worker, "draft_model_runner", None)
@@ -105,10 +123,26 @@ class SchedulerWeightUpdaterManager:
                 )
 
     def flush_cache_after_weight_update(self, recv_req) -> None:
-        if recv_req.flush_cache:
+        force_flush = not recv_req.flush_cache and _radix_flush_required_for_rl()
+        if force_flush:
+            logger.warning(
+                "Forcing a prefix-cache flush after this weight update: the "
+                "radix cache is enabled under rl_on_policy_target, and prefix "
+                "reuse across a policy update would replay KV computed by the "
+                "previous weights (stale-policy behavior logprobs). The "
+                "client's flush_cache=False is overridden."
+            )
+        if recv_req.flush_cache or force_flush:
             flush_cache_success = self.flush_cache(
                 empty_cache=recv_req.torch_empty_cache
             )
+            if force_flush and not flush_cache_success:
+                raise RuntimeError(
+                    "Mandatory prefix-cache flush after a weight update failed "
+                    "(requests still in flight?). Refusing to continue: serving "
+                    "from the pre-update radix tree would return stale-policy "
+                    "logprobs with no error."
+                )
             assert flush_cache_success, "Cache flush failed after updating weights"
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
