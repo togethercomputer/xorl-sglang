@@ -9,7 +9,7 @@ from sglang.srt.layers.rotary_embedding.bi_fused_native import (
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="stage-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires CUDA"
