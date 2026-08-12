@@ -12,7 +12,7 @@ from sglang.srt.state_capturer.routed_experts import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_routed_experts_cache_reconstructs_global_prefill_when_chunking_is_disabled():
@@ -129,3 +129,11 @@ def test_inkling_gate_captures_computed_routed_weights(monkeypatch):
     assert captured["layer_id"] == 7
     torch.testing.assert_close(captured["topk_indices"], actual_ids)
     torch.testing.assert_close(captured["topk_weights"], routed_weights)
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
