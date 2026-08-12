@@ -6197,6 +6197,8 @@ class ServerArgs:
             envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS,
             envs.SGLANG_OPT_MOE_QUANT_ONCE,
             envs.SGLANG_SHARED_EXPERT_TP1,
+            envs.SGLANG_DP_USE_GATHERV,
+            envs.SGLANG_DP_USE_REDUCE_SCATTER,
         )
         mismatches.extend(
             f"{setting.name} is enabled"

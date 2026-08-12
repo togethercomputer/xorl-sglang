@@ -126,6 +126,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    is_dsv4_flash_exact_mode,
     is_glm52_exact_mode,
     is_qwen3_dense_exact_mode,
     is_qwen35_gdn_exact_mode,
@@ -1279,7 +1280,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         exact_qwen35 = is_qwen35_gdn_exact_mode(self.server_args)
         exact_qwen3 = is_qwen3_dense_exact_mode(self.server_args)
         exact_glm = is_glm52_exact_mode(self.server_args)
-        if (exact_qwen35 or exact_qwen3 or exact_glm) and isinstance(
+        exact_dsv4 = is_dsv4_flash_exact_mode(self.server_args)
+        if (exact_qwen35 or exact_qwen3 or exact_glm or exact_dsv4) and isinstance(
             obj, GenerateReqInput
         ):
             violations = _get_bi_decode_strict_ingress_violations(
@@ -1294,10 +1296,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if exact_glm
                     else "dense Qwen3" if exact_qwen3 else "Qwen3.5-family"
                 )
+                if exact_dsv4:
+                    contract_name = "DSV4-Flash"
                 temperature_contract = (
                     "unit-temperature"
                     if exact_glm or exact_qwen3
-                    else "plain-temperature"
+                    else "temperature-aware" if exact_dsv4 else "plain-temperature"
                 )
                 raise ValueError(
                     f"This server runs the exact {contract_name} RL on-policy "

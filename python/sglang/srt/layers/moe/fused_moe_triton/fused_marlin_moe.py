@@ -124,6 +124,7 @@ DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS = 10  # floor(pinned row block 64 / topk 6)
 
 def is_dsv4_exact_pinned_marlin_geometry(
     *,
+    dsv4_exact_mode: bool,
     is_mxfp4_marlin: bool,
     global_experts: int,
     local_experts: int,
@@ -135,7 +136,8 @@ def is_dsv4_exact_pinned_marlin_geometry(
     """The admitted DSV4-Flash exact Marlin geometry (row block pinned to 64,
     token batches chunked so no expert spans more than one row block)."""
     return (
-        is_mxfp4_marlin
+        dsv4_exact_mode
+        and is_mxfp4_marlin
         and global_experts == 256
         and local_experts == 32
         and hidden_size == 4096
@@ -147,6 +149,7 @@ def is_dsv4_exact_pinned_marlin_geometry(
 
 def select_marlin_moe_block_size_m(
     *,
+    dsv4_exact_mode: bool = False,
     num_tokens: int,
     topk: int,
     local_experts: int,
@@ -178,6 +181,7 @@ def select_marlin_moe_block_size_m(
         if num_tokens * topk / local_experts / candidate < 0.9:
             break
     if is_dsv4_exact_pinned_marlin_geometry(
+        dsv4_exact_mode=dsv4_exact_mode,
         is_mxfp4_marlin=is_mxfp4_marlin,
         global_experts=global_experts,
         local_experts=local_experts,
@@ -233,6 +237,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    dsv4_exact_mode: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -310,6 +315,7 @@ def fused_marlin_moe(
         global_num_experts = E
     if (
         is_dsv4_exact_pinned_marlin_geometry(
+            dsv4_exact_mode=dsv4_exact_mode,
             is_mxfp4_marlin=is_mxfp4_marlin,
             global_experts=global_num_experts,
             local_experts=E,
@@ -359,12 +365,14 @@ def fused_marlin_moe(
                 gemm1_alpha=gemm1_alpha,
                 activation=activation,
                 is_gated=is_gated,
+                dsv4_exact_mode=dsv4_exact_mode,
             )
         if inplace:
             hidden_states.copy_(chunked_out)
             return hidden_states
         return chunked_out
     block_size_m = select_marlin_moe_block_size_m(
+        dsv4_exact_mode=dsv4_exact_mode,
         num_tokens=M,
         topk=topk,
         local_experts=E,

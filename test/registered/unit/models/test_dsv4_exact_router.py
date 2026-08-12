@@ -46,6 +46,7 @@ def test_dsv4_exact_mxfp4_ep_pins_repeatable_marlin_block() -> None:
     )
 
     common = dict(
+        dsv4_exact_mode=True,
         num_tokens=48,
         topk=6,
         local_experts=32,
@@ -56,6 +57,12 @@ def test_dsv4_exact_mxfp4_ep_pins_repeatable_marlin_block() -> None:
     )
     assert select_marlin_moe_block_size_m(global_experts=256, **common) == 64
     assert select_marlin_moe_block_size_m(global_experts=32, **common) == 16
+    assert (
+        select_marlin_moe_block_size_m(
+            global_experts=256, **{**common, "dsv4_exact_mode": False}
+        )
+        == 16
+    )
 
 
 def test_hash_topk_can_disable_unarmed_pdl(monkeypatch) -> None:

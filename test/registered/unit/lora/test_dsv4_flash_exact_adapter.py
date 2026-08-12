@@ -18,6 +18,8 @@ from sglang.srt.lora.dsv4 import (
     summarize_dsv4_flash_factor_roles,
     validate_dsv4_flash_exact_request_routing,
 )
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
@@ -221,6 +223,50 @@ def test_exact_request_routing_is_explicitly_rank_zero_only() -> None:
             validate_dsv4_flash_exact_request_routing(candidate)
 
 
+def _exact_ingress_manager() -> TokenizerManager:
+    manager = object.__new__(TokenizerManager)
+    manager.context_len = 8192
+    manager.num_reserved_tokens = 0
+    manager.validate_total_tokens = True
+    manager.allow_auto_truncate = False
+    manager.preferred_sampling_params = {}
+    manager.is_generation = True
+    manager.server_args = SimpleNamespace(
+        dsv4_flash_exact_mode=True,
+        glm52_exact_mode=False,
+        qwen35_gdn_exact_mode=False,
+        qwen3_dense_exact_mode=False,
+    )
+    return manager
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    (("top_k", 8), ("top_p", 0.9), ("min_p", 0.1)),
+)
+def test_exact_ingress_rejects_filtered_sampling(name, value) -> None:
+    request = GenerateReqInput(
+        input_ids=[1],
+        sampling_params={name: value, "max_new_tokens": 1},
+        return_logprob=True,
+    )
+    request.normalize_batch_and_arguments()
+
+    with pytest.raises(ValueError, match=rf"{name}={value}"):
+        _exact_ingress_manager()._validate_one_request(request, [1])
+
+
+def test_exact_ingress_allows_temperature_aware_sampling() -> None:
+    request = GenerateReqInput(
+        input_ids=[1],
+        sampling_params={"temperature": 0.7, "max_new_tokens": 1},
+        return_logprob=True,
+    )
+    request.normalize_batch_and_arguments()
+
+    _exact_ingress_manager()._validate_one_request(request, [1])
+
+
 def test_dsv4_attention_targets_do_not_alias_dsa_indexer_and_have_exact_dims() -> None:
     config = _official_config()
     normalized = _LORA_UTILS.get_normalized_target_modules(
@@ -391,6 +437,7 @@ def test_dsv4_exact_marlin_geometry_is_narrow_and_fail_closed() -> None:
     )
 
     admitted = {
+        "dsv4_exact_mode": True,
         "is_mxfp4_marlin": True,
         "global_experts": 256,
         "local_experts": 32,
@@ -401,6 +448,9 @@ def test_dsv4_exact_marlin_geometry_is_narrow_and_fail_closed() -> None:
     }
     assert DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS == 10
     assert is_dsv4_exact_pinned_marlin_geometry(**admitted)
+    assert not is_dsv4_exact_pinned_marlin_geometry(
+        **{**admitted, "dsv4_exact_mode": False}
+    )
 
     for field, value in {
         "is_mxfp4_marlin": False,
@@ -414,6 +464,22 @@ def test_dsv4_exact_marlin_geometry_is_narrow_and_fail_closed() -> None:
         candidate = dict(admitted)
         candidate[field] = value
         assert not is_dsv4_exact_pinned_marlin_geometry(**candidate)
+
+
+@pytest.mark.parametrize(
+    "setting_name", ("SGLANG_DP_USE_GATHERV", "SGLANG_DP_USE_REDUCE_SCATTER")
+)
+def test_exact_resolved_contract_rejects_alternate_dp_combine(
+    setting_name: str,
+) -> None:
+    from sglang.srt.environ import envs
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="dummy")
+    args.dsv4_flash_exact_mode = True
+    setting = getattr(envs, setting_name)
+    with setting.override(True), pytest.raises(ValueError, match=setting_name):
+        args._validate_dsv4_flash_exact_resolved_contract()
 
 
 def test_chunked_moe_lora_info_rebases_segments_and_slices_tokens() -> None:

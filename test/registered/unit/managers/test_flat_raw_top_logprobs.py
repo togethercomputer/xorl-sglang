@@ -132,11 +132,17 @@ class TestFlatRawTopLogprobsValidation(CustomTestCase):
     def test_raw_selected_token_flag_propagates_to_batch_items(self):
         req = GenerateReqInput(
             text=["a", "b"],
+            return_logprob=True,
             return_raw_token_logprobs_b64=True,
         )
         req.normalize_batch_and_arguments()
         for i in range(2):
             self.assertTrue(req[i].return_raw_token_logprobs_b64)
+
+    def test_raw_selected_token_flag_requires_return_logprob(self):
+        req = GenerateReqInput(text="hello", return_raw_token_logprobs_b64=True)
+        with self.assertRaisesRegex(ValueError, "return_logprob=true"):
+            req.normalize_batch_and_arguments()
 
 
 class TestRawSelectedTokenLogprobs(CustomTestCase):
@@ -160,7 +166,10 @@ class TestRawSelectedTokenLogprobs(CustomTestCase):
         self.assertEqual(fields["token_logprobs_raw_b64_dtype"], "float32_le")
 
     def test_response_metadata_uses_live_raw_buffers(self):
-        state = _make_state(return_raw_token_logprobs_b64=True)
+        state = _make_state(
+            return_logprob=True,
+            return_raw_token_logprobs_b64=True,
+        )
         state.input_token_logprobs_val = [None, -0.5]
         state.input_token_logprobs_idx = [None, 11]
         state.output_token_logprobs_val = [-0.25]

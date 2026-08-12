@@ -95,6 +95,7 @@ class MarlinLoraRunnerCore:
         ) and not is_mxfp4_marlin
 
         block_size_m = select_marlin_moe_block_size_m(
+            dsv4_exact_mode=runner_config.dsv4_exact_mode,
             num_tokens=M,
             topk=topk,
             local_experts=E,

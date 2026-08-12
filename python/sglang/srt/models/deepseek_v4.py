@@ -1838,8 +1838,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
         # MUST tell the MoE to skip it (mlp_reduce_scatter=True) or it
         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
+        _dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
         _use_reduce_scatterv = (
-            _use_tp_moe_gather
+            not _dsv4_exact_mode
+            and _use_tp_moe_gather
             and is_dp_gatherv_active()
             and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
@@ -1852,7 +1854,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         # all_reduce. tp_size==attn_dp_size required so the global buffer splits
         # evenly into per-rank chunks.
         _use_reduce_scatter = (
-            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            not _dsv4_exact_mode
+            and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
             and _use_tp_moe_gather
             and not _use_reduce_scatterv
             and not should_use_dp_reduce_scatterv()

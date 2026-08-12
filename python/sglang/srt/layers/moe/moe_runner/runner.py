@@ -227,6 +227,9 @@ class MoeRunner:
         ``fused_marlin_moe``. Returns ``None`` for every other model or
         geometry, leaving the stock path untouched.
         """
+        if not self.config.dsv4_exact_mode:
+            return None
+
         import torch
 
         from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
@@ -267,6 +270,7 @@ class MoeRunner:
             else local_experts
         )
         if not is_dsv4_exact_pinned_marlin_geometry(
+            dsv4_exact_mode=self.config.dsv4_exact_mode,
             is_mxfp4_marlin=is_mxfp4_marlin,
             global_experts=global_experts,
             local_experts=local_experts,
