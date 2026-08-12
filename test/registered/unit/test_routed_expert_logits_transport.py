@@ -10,6 +10,9 @@ from sglang.srt.state_capturer.routed_experts import (
     _routed_experts_device_cache_rows,
     extract_expert_logits_from_meta_info,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
 
 
 def test_routed_experts_cache_reconstructs_global_prefill_when_chunking_is_disabled():

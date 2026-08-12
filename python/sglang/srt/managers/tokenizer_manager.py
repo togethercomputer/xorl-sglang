@@ -126,8 +126,8 @@ from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
     is_glm52_exact_mode,
-    is_qwen35_gdn_exact_mode,
     is_qwen3_dense_exact_mode,
+    is_qwen35_gdn_exact_mode,
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.utils import (
