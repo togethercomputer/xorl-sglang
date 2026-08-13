@@ -3782,6 +3782,16 @@ class ServerArgs:
         "Enable returning float32 selected-router weights of each layer with responses.",
         NS("exec.features"),
     ] = False
+    routed_experts_side_channel_dir: A[
+        Optional[str],
+        "Publish routed-experts tensors asynchronously into packed files in this shared directory and return descriptors instead of base64 bodies.",
+        NS("exec.features"),
+    ] = None
+    routed_experts_side_channel_workers: A[
+        int,
+        "Number of asynchronous routed-experts side-channel publisher threads.",
+        NS("exec.features"),
+    ] = 2
     enable_return_indexer_topk: A[
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",

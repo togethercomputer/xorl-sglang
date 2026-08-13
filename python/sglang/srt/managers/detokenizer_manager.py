@@ -18,7 +18,7 @@ import logging
 import os
 import signal
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import psutil
 import pybase64
@@ -410,8 +410,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     @staticmethod
     def _b64_encode_per_request(
-        data_list: Optional[List[Optional[torch.Tensor]]],
-    ) -> Optional[List[Optional[str]]]:
+        data_list: Optional[List[Optional[Any]]],
+    ) -> Optional[List[Optional[Any]]]:
         """Encode a per-request list of tensors as base64 strings, off the
         tokenizer hot path. Returns None when the input is None; per-item None
         stays None.
@@ -420,7 +420,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             return None
         return [
             (
-                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
+                item
+                if isinstance(item, dict)
+                else pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
                 if item is not None
                 else None
             )

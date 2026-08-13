@@ -238,7 +238,8 @@ class GenerateReqInput:
     # Absolute start position for returned routings; response covers
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
     # 0 = full sequence.
-    routed_experts_start_len: int = 0
+    routed_experts_start_len: Union[List[int], int] = 0
+    return_routed_experts_file: bool = False
     return_indexer_topk: bool = False
 
     # The modalities of the image data [image, multi-images, video]
@@ -494,6 +495,12 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if isinstance(self.routed_experts_start_len, list):
+            if len(self.routed_experts_start_len) != 1:
+                raise ValueError(
+                    "a single request accepts exactly one routed_experts_start_len"
+                )
+            self.routed_experts_start_len = int(self.routed_experts_start_len[0])
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -514,9 +521,22 @@ class GenerateReqInput:
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
+        self._normalize_routed_experts_start_len(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
+
+    def _normalize_routed_experts_start_len(self, num: int) -> None:
+        value = self.routed_experts_start_len
+        if isinstance(value, list):
+            if len(value) != self.batch_size:
+                raise ValueError(
+                    "routed_experts_start_len must contain one value per batch item: "
+                    f"got {len(value)}, expected {self.batch_size}"
+                )
+            self.routed_experts_start_len = value * self.parallel_sample_num
+        else:
+            self.routed_experts_start_len = [int(value)] * num
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -808,7 +828,12 @@ class GenerateReqInput:
             ),
             return_routed_experts=self.return_routed_experts,
             return_expert_logits=self.return_expert_logits,
-            routed_experts_start_len=self.routed_experts_start_len,
+            routed_experts_start_len=(
+                self.routed_experts_start_len[i]
+                if isinstance(self.routed_experts_start_len, list)
+                else self.routed_experts_start_len
+            ),
+            return_routed_experts_file=self.return_routed_experts_file,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -899,6 +924,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     return_expert_logits: bool = False
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
+    return_routed_experts_file: bool = False
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
@@ -1370,8 +1396,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
     # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
     # straight to TokenizerManager, which encodes on demand.
-    routed_experts: Optional[List[Optional[torch.Tensor]]]
-    expert_logits: Optional[List[Optional[torch.Tensor]]] = None
+    routed_experts: Optional[List[Optional[Any]]]
+    expert_logits: Optional[List[Optional[Any]]] = None
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
 
@@ -1462,8 +1488,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
     # see BatchTokenIDOutput.routed_experts.
-    routed_experts: Optional[List[Optional[str]]]
-    expert_logits: Optional[List[Optional[str]]] = None
+    routed_experts: Optional[List[Optional[Any]]]
+    expert_logits: Optional[List[Optional[Any]]] = None
 
     indexer_topk: Optional[List[Optional[str]]]
 

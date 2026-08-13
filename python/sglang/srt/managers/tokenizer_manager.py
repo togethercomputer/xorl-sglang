@@ -1501,6 +1501,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_routed_experts=obj.return_routed_experts,
                 return_expert_logits=obj.return_expert_logits,
                 routed_experts_start_len=obj.routed_experts_start_len,
+                return_routed_experts_file=obj.return_routed_experts_file,
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,

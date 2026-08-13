@@ -42,6 +42,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.state_capturer.routed_experts_side_channel import (
+    get_routed_experts_side_channel_publisher,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -163,6 +166,33 @@ class SchedulerBatchResultProcessor:
                 req.cached_tokens,
                 req.routed_experts_start_len,
             )
+
+        publisher = (
+            get_routed_experts_side_channel_publisher(
+                self.server_args.routed_experts_side_channel_dir,
+                self.server_args.routed_experts_side_channel_workers,
+            )
+            if req.return_routed_experts_file
+            else None
+        )
+        if publisher is not None:
+            descriptor = publisher.publish(
+                request_id=req.rid,
+                routed_experts=req.routed_experts,
+                expert_logits=req.expert_logits,
+                start_row=start_len,
+            )
+            req.routed_experts = (
+                {**descriptor, "field": "routed_experts"}
+                if req.routed_experts is not None
+                else None
+            )
+            req.expert_logits = (
+                {**descriptor, "field": "routed_expert_logits"}
+                if req.expert_logits is not None
+                else None
+            )
+
 
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()

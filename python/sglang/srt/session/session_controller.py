@@ -310,6 +310,7 @@ class Session:
             return_routed_experts=req.return_routed_experts,
             return_expert_logits=req.return_expert_logits,
             routed_experts_start_len=req.routed_experts_start_len,
+            return_routed_experts_file=req.return_routed_experts_file,
             priority=req.priority,
             routing_key=req.routing_key,
             extra_key=req.extra_key,

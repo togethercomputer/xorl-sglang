@@ -811,6 +811,7 @@ class Req(ReqDllmMixin):
         return_routed_experts: bool = False,
         return_expert_logits: bool = False,
         routed_experts_start_len: int = 0,
+        return_routed_experts_file: bool = False,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -1062,6 +1063,7 @@ class Req(ReqDllmMixin):
         self.return_routed_experts = return_routed_experts
         self.return_expert_logits = return_expert_logits
         self.routed_experts_start_len = routed_experts_start_len
+        self.return_routed_experts_file = return_routed_experts_file
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )

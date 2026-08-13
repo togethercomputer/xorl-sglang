@@ -2106,6 +2106,7 @@ class MMReceiverBase(ABC):
             return_routed_experts=recv_req.return_routed_experts,
             return_expert_logits=recv_req.return_expert_logits,
             routed_experts_start_len=recv_req.routed_experts_start_len,
+            return_routed_experts_file=recv_req.return_routed_experts_file,
             eos_token_ids=self.scheduler.model_config.hf_eos_token_id,
             bootstrap_host=recv_req.bootstrap_host,
             bootstrap_port=recv_req.bootstrap_port,
