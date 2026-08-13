@@ -23,7 +23,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import psutil
 import pybase64
 import setproctitle
-import torch
 import zmq
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -422,9 +421,11 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             (
                 item
                 if isinstance(item, dict)
-                else pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
-                if item is not None
-                else None
+                else (
+                    pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
+                    if item is not None
+                    else None
+                )
             )
             for item in data_list
         ]

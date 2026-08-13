@@ -193,7 +193,6 @@ class SchedulerBatchResultProcessor:
                 else None
             )
 
-
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()
         if capturer is None:

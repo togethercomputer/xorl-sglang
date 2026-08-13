@@ -17,7 +17,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-_PUBLISHERS: dict[tuple[str, int], "RoutedExpertsSideChannelPublisher"] = {}
+_PUBLISHERS: dict[tuple[str, int], RoutedExpertsSideChannelPublisher] = {}
 _PUBLISHERS_LOCK = threading.Lock()
 
 
@@ -77,7 +77,9 @@ class RoutedExpertsSideChannelPublisher:
             "routed_experts": routed_experts,
             "routed_expert_logits": expert_logits,
         }
-        tensors = {name: tensor for name, tensor in tensors.items() if tensor is not None}
+        tensors = {
+            name: tensor for name, tensor in tensors.items() if tensor is not None
+        }
         if not tensors:
             raise ValueError("at least one routed-experts tensor is required")
 
@@ -92,7 +94,9 @@ class RoutedExpertsSideChannelPublisher:
             fields[name] = self._field(tensor, offset)
             offset += int(fields[name]["nbytes"])
 
-        safe_id = "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in str(request_id))
+        safe_id = "".join(
+            ch if ch.isalnum() or ch in "._-" else "_" for ch in str(request_id)
+        )
         stem = f"{safe_id or 'request'}.{uuid.uuid4().hex}"
         final_path = self.root / f"{stem}.bin"
         tmp_path = self.root / f".{stem}.partial"
@@ -138,8 +142,13 @@ class RoutedExpertsSideChannelPublisher:
                         encoding="utf-8",
                     )
                 except Exception:
-                    logger.exception("Failed to publish routed experts side-channel error marker")
-                logger.exception("Failed to publish routed experts side payload for request %s", request_id)
+                    logger.exception(
+                        "Failed to publish routed experts side-channel error marker"
+                    )
+                logger.exception(
+                    "Failed to publish routed experts side payload for request %s",
+                    request_id,
+                )
 
         self._executor.submit(_publish)
         return descriptor
