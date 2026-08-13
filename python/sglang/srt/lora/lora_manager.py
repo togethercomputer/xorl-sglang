@@ -748,9 +748,7 @@ class LoRAManager:
         )
         self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
 
-    def prepare_glm52_exact_dp_lora_batch(
-        self, forward_batch: ForwardBatch
-    ) -> None:
+    def prepare_glm52_exact_dp_lora_batch(self, forward_batch: ForwardBatch) -> None:
         """Build rank-major LoRA metadata for DP-gathered GLM-5.2 MLP rows."""
 
         if not getattr(self.base_hf_config, "_glm52_exact_mode", False):
@@ -821,9 +819,7 @@ class LoRAManager:
                 scalings[slot] = adapter.scaling
 
         device = self.device
-        segment_lens = torch.tensor(
-            global_num_tokens, dtype=torch.int32, device=device
-        )
+        segment_lens = torch.tensor(global_num_tokens, dtype=torch.int32, device=device)
         segment_indptr = torch.zeros(
             (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
         )

@@ -1012,9 +1012,7 @@ class TestDeterministicGlmDsa(unittest.TestCase):
         self.assertTrue(server_args.disable_cuda_graph_padding)
         self.assertIsNone(server_args.cuda_graph_bs_decode)
         self.assertIsNone(server_args.cuda_graph_max_bs_decode)
-        self.assertEqual(
-            server_args.cuda_graph_config.decode.backend, Backend.DISABLED
-        )
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
         self.assertEqual(
             server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
         )

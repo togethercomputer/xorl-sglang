@@ -6005,8 +6005,7 @@ class ServerArgs:
             )
         if self.max_loras_per_batch not in (2, 8) and glm52_dp_owned:
             incompatible.append(
-                f"max_loras_per_batch={self.max_loras_per_batch!r} "
-                "(DP16 requires 2)"
+                f"max_loras_per_batch={self.max_loras_per_batch!r} " "(DP16 requires 2)"
             )
         if requested_max_lora_rank is not None and (
             isinstance(requested_max_lora_rank, bool)

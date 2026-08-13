@@ -61,9 +61,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 SimpleNamespace(),
             )
 
-        self.assertTrue(
-            torch.equal(aligned.values, torch.tensor([0, 2, 3, 5, 6, -1]))
-        )
+        self.assertTrue(torch.equal(aligned.values, torch.tensor([0, 2, 3, 5, 6, -1])))
         self.assertTrue(
             torch.equal(
                 aligned.valid_mask,
