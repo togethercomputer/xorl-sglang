@@ -4,20 +4,24 @@
 Qwen3.6, whose HF architecture is `Qwen3_5MoeForConditionalGeneration`)
 automatically engages the model's admitted exact serving contract. Dense Qwen
 keeps the conservative eager implementation from its literal-zero receipt;
-Qwen3.6 MoE selects the conservative partial-chunk-rescan CUDA-graph program.
+Qwen3.6 MoE additionally selects the cached-row CUDA-graph program.
 
 There is nothing to configure. The stack engages as a unit:
 
 - **Exact GDN execution.** Prefill runs the trainer's exact chunked scan
   composition (batch-invariant kernels, fp32 chunk-boundary checkpoints);
   eager decode rescans the current partial chunk from the fp32 boundary state,
-  so it remains the exact oracle. MoE graph decode uses the same bounded
-  rescan composition. Cached-row, lazy-heal, fused-small-stage, and related
-  Wave-3 mechanisms remain experimental until a fresh decision-time sampler
-  capture and independent trainer replay promote their cumulative tuple.
+  so it remains the exact oracle. MoE graph decode caches the causal per-row
+  intermediates and computes only the new row, with deferred recurrent-state
+  writeback at exact chunk boundaries. Extend initializes those caches once per
+  batch through the same stock stage binaries. The batched initializer persists
+  every slim-path input, including cumulative-g rows; single-request batches
+  retain the per-request oracle initializer.
 - **Exact MoE routing** (MoE architectures): the conservative batch-invariant
-  routing and combine program remains selected here. Faster fused routing and
-  combine mechanisms require their own cumulative promotion gate.
+  routing program remains selected, and the cross-rank combine is the
+  canonical contributor fold shared with the trainer. The faster fused
+  Tier-A GEMM, fused router renorm, and head fastpath mechanisms remain held
+  behind their own cumulative promotion gate.
 - **Decision-time logprob contract**: the lm head is the batch-invariant
   fp32-logit GEMM; sampled tokens are rescored through the fused chunk-stats
   fast path and pinned-order LSE merge; requests with transforms the trainer
@@ -33,8 +37,10 @@ There is nothing to configure. The stack engages as a unit:
   Chunked prefill is likewise disabled because a continuation at an arbitrary
   prompt offset does not carry that complete exact GDN seed; each prompt is
   prefetched in one forward from prefix zero.
-  The tuple pins the static-memory fraction to `0.38`; this capacity choice
-  does not change the numerical program.
+  The tuple pins the static-memory fraction to `0.38`. Cached-row graph capture
+  retains incremental slabs for every live GDN slot, so the remaining HBM is
+  deliberately reserved for full-width prefill activations rather than added
+  to the KV pool. This capacity choice does not change the numerical program.
   Incompatible graph settings fail loudly. The separate dense
   Qwen3.5 TP1 contract runs eager with radix disabled and does not arm the
   graph-only incremental state.
@@ -55,8 +61,9 @@ non-chunk-aligned state restores, LoRA-wrapped lm heads.
 
 Internal development flags are not part of the public surface and are not
 consulted by this path. The architecture resolver selects the complete
-batch-invariant op set, conservative GDN implementation, routing and combine,
-and decision-head program from the one RL target switch.
+batch-invariant op set, cached-row GDN implementation, conservative routing
+with the canonical combine fold, and decision-head program from the one RL
+target switch.
 
 Pair with the xorl trainer's stock exact Qwen3.5-family configuration.
 Certification of the pair is a fresh capture / teacher-forced replay (100%

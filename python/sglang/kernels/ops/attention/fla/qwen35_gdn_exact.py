@@ -75,17 +75,19 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     _bi_ops._ENABLE_MM_FALLBACK_VARIANT = False
     _bi_ops._ENABLE_MM_COMPARISON_TEST = False
 
-    # The promotion receipt covers the original exact prefill scan and the
-    # conservative partial-chunk-rescan graph program. Cached-row, lazy-heal,
-    # and fused Wave-3 mechanisms remain available for qualification work, but
-    # component equality does not admit them to the architecture-owned tuple.
+    # Dense Qwen retains its directly certified eager tuple.  MoE uses the
+    # component-byte-certified cached-row graph program: true graph decode updates
+    # only the new row, while eager fallback remains the exact bounded rescan and
+    # maintains the same cached intermediates. Batched cache warm replaces the
+    # old request-serial warm loop; its slim composition must persist gcum rows
+    # as well as the other cached intermediates.
     _prefill.BI_GDN_PREFILL_ENABLED = True
-    # FAST, INCR, and HEAL import this scalar by value. Reset every bound copy
-    # so a previous experimental selection cannot leak into the exact tuple.
-    _prefill.BI_GDN_SOLVE_TRIL_DECODE = False
-    _fast.BI_GDN_SOLVE_TRIL_DECODE = False
-    _incr.BI_GDN_SOLVE_TRIL_DECODE = False
-    _heal.BI_GDN_SOLVE_TRIL_DECODE = False
+    _prefill.BI_GDN_SOLVE_TRIL_DECODE = is_moe
+    # FAST, INCR, and HEAL import this scalar by value, so the resolver must
+    # update all bound copies as part of the atomic implementation selection.
+    _fast.BI_GDN_SOLVE_TRIL_DECODE = is_moe
+    _incr.BI_GDN_SOLVE_TRIL_DECODE = is_moe
+    _heal.BI_GDN_SOLVE_TRIL_DECODE = is_moe
     _decode.BI_GDN_DECODE_ENABLED = True
     _decode.BI_GDN_BS1_STATIC = is_moe
     _decode.BI_GDN_DECODE_GRAPH = exact_graph
@@ -94,13 +96,18 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     # unlike the retired single-bucket staging path it supports every exact
     # decode graph shape through the graph-32 ceiling.
     _fast.BI_GDN_DECODE_FAST_ENABLED = is_moe
-    _fast.BI_GDN_FUSE_SMALL_ENABLED = False
-    _incr.BI_GDN_DECODE_INCR_ENABLED = False
-    _incr.BI_GDN_INCR_DEFER_ENABLED = False
-    _incr.BI_GDN_VNEW_SLIM_ENABLED = False
-    _heal.BI_GDN_LAZY_HEAL_ENABLED = False
+    _fast.BI_GDN_FUSE_SMALL_ENABLED = is_moe
+    _incr.BI_GDN_DECODE_INCR_ENABLED = exact_graph
+    _incr.BI_GDN_INCR_DEFER_ENABLED = exact_graph
+    _incr.BI_GDN_VNEW_SLIM_ENABLED = exact_graph
+    _heal.BI_GDN_LAZY_HEAL_ENABLED = exact_graph
     _gemm_configs._force_bi_gemm_config_table(is_moe)
     _norm_gated.set_gdn_norm_rows_per_block_pin(4)
+    # The fused Wave-3 GEMM/router/head mechanisms remain HELD behind their
+    # own live promotion: this re-promotion restores exactly the cached-row
+    # incremental GDN set the live trainer-to-sampler gate re-qualified on
+    # the fixed solve kernel. The promoted tuple's fused ordered combine was
+    # structurally superseded by the canonical contributor fold.
     _tiera.set_tiera_enabled(False)
     _bi_ops.set_router_renorm_fused_enabled(False)
     _bi_ops.set_bi_head_fastpath_enabled(False)
@@ -110,9 +117,10 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
         "prefill/rescan decode%s, rows-per-block pin, contract lm-head + "
         "decode rescore; rmsnorm_family=%s; moe_fold=%s; resolved tuple=%s",
         (
-            ", conservative no-overlap/no-padding partial-chunk-rescan graph "
-            "program; cached-row and Wave-3 mechanisms held behind live "
-            "trainer-to-sampler promotion"
+            ", cached-row incremental graph decode + batched cache warm + exact "
+            "rescan eager fallback, decode-scheduled solve, fused small stages; "
+            "Tier-A BI-GEMM configs, fused router renorm, and head fastpath "
+            "held behind live promotion"
             if is_moe
             else " (conservative eager tuple; MoE Wave-3 fast paths disabled)"
         ),
