@@ -72,3 +72,7 @@ def test_mandatory_flush_failure_raises_instead_of_serving_stale_kv():
             _manager(flush).flush_cache_after_weight_update(
                 _recv_req(flush_cache=False)
             )
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
