@@ -9,8 +9,9 @@ use std::{
 };
 
 use axum::{
+    body::Body,
     extract::{Json, Path, State},
-    http::StatusCode,
+    http::{header::CONTENT_TYPE, HeaderValue, StatusCode},
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -455,6 +456,38 @@ async fn generate_handler(
         )
             .into_response()
     } else {
+        // Test-only large non-streaming response delivered in multiple HTTP
+        // body frames.  The payload remains one ordinary JSON document; this
+        // lets gateway tests distinguish transparent body proxying from eager
+        // `res.bytes()` materialization.
+        if payload.get("text").and_then(|v| v.as_str()) == Some("__slow_chunked_nonstream__") {
+            let chunks = [
+                "{\"text\":\"",
+                "routed-expert-payload",
+                "\",\"meta_info\":{\"finish_reason\":{\"type\":\"stop\"}}}",
+            ];
+            let body_stream = stream::unfold(0usize, move |index| async move {
+                if index >= chunks.len() {
+                    return None;
+                }
+                if index > 0 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(150)).await;
+                }
+                Some((
+                    Ok::<_, Infallible>(bytes::Bytes::copy_from_slice(chunks[index].as_bytes())),
+                    index + 1,
+                ))
+            });
+            let mut response = Response::new(Body::from_stream(body_stream));
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            response
+                .headers_mut()
+                .insert("x-worker-id", HeaderValue::from_str(&worker_id).unwrap());
+            return response;
+        }
+
         (
             [("x-worker-id", worker_id)],
             Json(json!({

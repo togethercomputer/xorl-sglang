@@ -3742,6 +3742,11 @@ class ServerArgs:
         "Enable returning routed experts of each layer with responses.",
         NS("exec.features"),
     ] = False
+    enable_return_expert_logits: A[
+        bool,
+        "Enable returning float32 selected-router weights of each layer with responses.",
+        NS("exec.features"),
+    ] = False
     enable_return_indexer_topk: A[
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",

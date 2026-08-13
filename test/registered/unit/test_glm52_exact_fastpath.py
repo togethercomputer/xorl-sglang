@@ -19,6 +19,7 @@ from sglang.srt.layers.attention.nsa.glm52_selector_fast import (
     select_canonical_logical_topk_fused,
     select_canonical_paged_topk_fused,
 )
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -84,6 +85,21 @@ def _glm52_config():
 
 
 class TestGlm52ExactFastpath(unittest.TestCase):
+    @staticmethod
+    def _ingress_manager():
+        manager = object.__new__(TokenizerManager)
+        manager.context_len = 8192
+        manager.num_reserved_tokens = 0
+        manager.validate_total_tokens = True
+        manager.allow_auto_truncate = False
+        manager.preferred_sampling_params = {}
+        manager.is_generation = True
+        manager.server_args = SimpleNamespace(
+            glm52_exact_mode=True,
+            qwen35_gdn_exact_mode=False,
+        )
+        return manager
+
     def test_private_resolver_installs_one_tuple_once(self):
         from sglang.srt.layers import xorl_batch_invariant
 
@@ -137,6 +153,37 @@ class TestGlm52ExactFastpath(unittest.TestCase):
                     model_arch="GlmMoeDsaForCausalLM",
                     is_dsa_model=True,
                 )
+
+    def test_exact_request_ingress_rejects_sampler_fatal_options(self):
+        manager = self._ingress_manager()
+        cases = (
+            ({"temperature": 0.5}, {}, "temperature=0.5"),
+            ({"temperature": 0.0}, {}, "temperature=0.0"),
+            ({}, {"top_logprobs_num": 2}, "top_logprobs_num=2"),
+            ({}, {"token_ids_logprob": [7]}, "token_ids_logprob=set"),
+        )
+        for sampling_params, request_fields, error in cases:
+            with self.subTest(error=error):
+                request = GenerateReqInput(
+                    input_ids=[1],
+                    sampling_params=sampling_params,
+                    return_logprob=True,
+                    **request_fields,
+                )
+                request.normalize_batch_and_arguments()
+                with self.assertRaisesRegex(ValueError, error):
+                    manager._validate_one_request(request, [1])
+
+    def test_exact_request_ingress_admits_contract_request(self):
+        manager = self._ingress_manager()
+        request = GenerateReqInput(
+            input_ids=[1],
+            sampling_params={"temperature": 1.0, "max_new_tokens": 4},
+            return_logprob=True,
+        )
+        request.normalize_batch_and_arguments()
+
+        manager._validate_one_request(request, [1])
 
     def test_tier_a_tables_answer_only_when_selected(self):
         with patch.object(bi_gemm_configs, "_GLM52_TIER_A", False):

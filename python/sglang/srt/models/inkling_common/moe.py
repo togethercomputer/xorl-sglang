@@ -438,17 +438,6 @@ class InklingGate(nn.Module):
             else routed_scores
         )
         _, topk_indices = gate_topk(routed_scores_for_topk, self.topk)
-        # R3 (rollout routing replay): feed the routed-expert selection to sglang's global
-        # experts capturer so --use-rollout-routing-replay can ship it back to the trainer,
-        # which replays the exact same routing during training. Inkling's gate uses its own
-        # gate_topk (not srt/layers/moe/topk.py), so the standard capture call is re-added here.
-        # NOTE: this inlines cap.capture() rather than going through topk.py's
-        # capture_routed_experts_if_allowed, so disable_routed_experts_capture_for_draft
-        # (which only rewires TopK modules) cannot opt a InklingGate out. Moot while Inkling MTP
-        # draft blocks are forced dense; give the gate an allow_capture flag if a draft
-        # ever carries MoE.
-        if (cap := get_global_experts_capturer()) is not None:
-            cap.capture(layer_id=self.layer_id, topk_indices=topk_indices)
         if self.norm_after_topk:
             if self.gate_activation == "sigmoid" and self.global_scale is not None:
                 routed_weights, shared_gammas = renorm_topk_logits_scaled(
@@ -483,6 +472,20 @@ class InklingGate(nn.Module):
             else:
                 routed_weights = routed_weights * self.route_scale
             shared_gammas = None
+
+        # R3 (rollout routing replay): feed Inkling's selected experts and the
+        # corresponding final routed weights to the global capturer. Inkling
+        # uses its own gate_topk (not srt/layers/moe/topk.py), so the standard
+        # capture call is re-added here after routed_weights has been computed.
+        # NOTE: disable_routed_experts_capture_for_draft only rewires TopK
+        # modules. Inkling draft blocks are currently forced dense; give this
+        # gate an allow_capture flag if a draft ever carries MoE.
+        if (cap := get_global_experts_capturer()) is not None:
+            cap.capture(
+                layer_id=self.layer_id,
+                topk_indices=topk_indices,
+                topk_weights=routed_weights,
+            )
 
         return routed_weights, topk_indices, shared_gammas, None
 

@@ -229,6 +229,8 @@ class GenerateReqInput:
     ] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return float32 selected-router weights.
+    return_expert_logits: bool = False
     # Absolute start position for returned routings; response covers
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
     # 0 = full sequence.
@@ -789,6 +791,7 @@ class GenerateReqInput:
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_expert_logits=self.return_expert_logits,
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
@@ -877,6 +880,7 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    return_expert_logits: bool = False
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
@@ -1351,6 +1355,7 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
     # straight to TokenizerManager, which encodes on demand.
     routed_experts: Optional[List[Optional[torch.Tensor]]]
+    expert_logits: Optional[List[Optional[torch.Tensor]]] = None
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
 
@@ -1442,6 +1447,7 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
     # see BatchTokenIDOutput.routed_experts.
     routed_experts: Optional[List[Optional[str]]]
+    expert_logits: Optional[List[Optional[str]]] = None
 
     indexer_topk: Optional[List[Optional[str]]]
 

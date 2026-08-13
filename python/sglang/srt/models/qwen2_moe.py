@@ -35,7 +35,7 @@ from sglang.srt.distributed import (
     moe_expert_parallel_all_reduce,
     moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_ordered_all_reduce,
+    tensor_model_parallel_canonical_moe_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -128,7 +128,7 @@ _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
-def _ordered_moe_all_reduce_enabled() -> bool:
+def _canonical_moe_fold_enabled() -> bool:
     return is_qwen35_gdn_exact_mode(get_global_server_args())
 
 
@@ -136,11 +136,11 @@ def _bi_router_enabled() -> bool:
     return is_qwen35_gdn_exact_mode(get_global_server_args())
 
 
-def _require_no_ordered_all_reduce_under_deepep() -> None:
-    if not _ordered_moe_all_reduce_enabled():
+def _require_no_canonical_moe_fold_under_deepep() -> None:
+    if not _canonical_moe_fold_enabled():
         return
     raise NotImplementedError(
-        "The ordered MoE reduction contract has no DeepEP implementation: "
+        "The canonical MoE fold has no DeepEP transport implementation: "
         "use --moe-a2a-backend none, or disable the Qwen3.5-family XORL exact target."
     )
 
@@ -536,6 +536,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             config,
             self.topk.layer_id,
             selected_experts,
+            routing_weights,
         )
         return StandardTopKOutput(
             topk_weights=routing_weights,
@@ -650,7 +651,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if get_moe_a2a_backend().is_deepep():
-            _require_no_ordered_all_reduce_under_deepep()
+            _require_no_canonical_moe_fold_under_deepep()
             return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = (
@@ -693,8 +694,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             and not get_moe_a2a_backend().is_flashinfer()
         ):
-            if _ordered_moe_all_reduce_enabled():
-                final_hidden_states = tensor_model_parallel_ordered_all_reduce(
+            if _canonical_moe_fold_enabled():
+                final_hidden_states = tensor_model_parallel_canonical_moe_all_reduce(
                     final_hidden_states
                 )
             else:

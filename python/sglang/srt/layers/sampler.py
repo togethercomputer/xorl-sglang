@@ -119,8 +119,8 @@ class Sampler(nn.Module):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         return_logprob: bool,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
+        top_logprobs_nums: Optional[List[int]],
+        token_ids_logprobs: Optional[List[Optional[List[int]]]],
         positions: torch.Tensor,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
