@@ -531,10 +531,20 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     const auto fxi = freq[1];
     const auto fyr = freq[2];
     const auto fyi = freq[3];
-    data[0] = x_real * fxr - x_imag * fxi;
-    data[1] = x_real * fxi + x_imag * fxr;
-    data[2] = y_real * fyr - y_imag * fyi;
-    data[3] = y_real * fyi + y_imag * fyr;
+    if constexpr (kRopeFirst && !kHadamard && kUE8M0QueryCodec) {
+      // Match the compiled trainer expressions. Pin each FMA owner and its
+      // separately rounded addend: algebraic reassociation can cross a BF16
+      // tie before the literal UE8M0 codec observes it.
+      data[0] = __fmaf_rn(x_real, fxr, -__fmul_rn(x_imag, fxi));
+      data[1] = __fmaf_rn(x_imag, fxr, __fmul_rn(x_real, fxi));
+      data[2] = __fmaf_rn(y_real, fyr, -__fmul_rn(y_imag, fyi));
+      data[3] = __fmaf_rn(y_imag, fyr, __fmul_rn(y_real, fyi));
+    } else {
+      data[0] = x_real * fxr - x_imag * fxi;
+      data[1] = x_real * fxi + x_imag * fxr;
+      data[2] = y_real * fyr - y_imag * fyi;
+      data[3] = y_real * fyi + y_imag * fyr;
+    }
   }
 
   PDLTriggerSecondary<kUsePDL>();

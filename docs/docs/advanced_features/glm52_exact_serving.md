@@ -24,6 +24,16 @@ unqualified growth path. Incompatible geometry, topology, precision, backend,
 graph/cache setting, or sampling transform fails before returning behavior
 logprobs.
 
+The radix disable is conservative rather than structural: sparse-MLA KV is
+BF16 in a paged pool, the DSA indexer scores cold and warm prefills from the
+same FP8 index-key pages, and the fused selector breaks ties totally per row.
+Set `SGLANG_ENABLE_GLM52_EXACT_RADIX=1` to keep deterministic prefix reuse
+enabled. The opt-in path logs engagement and rejects hierarchical or host
+caches and LoRA-keyed reuse. It pins the prefill ceiling to 4,864 tokens and
+the static-memory fraction to 0.80 so the canonical-fold workspace and fused-
+MoE prefill scratch fit together. Weight updates must flush the prefix cache:
+reuse across a policy update replays stale-policy bytes.
+
 Pair it with the XORL trainer's official WORLD16/PP1/TP1/DP1/EP16/CP16,
 Ring1/Ulysses16 server-training program. A revision pair is qualified only by a
 fresh repeatable sampler capture and full 78-block teacher-forced replay with

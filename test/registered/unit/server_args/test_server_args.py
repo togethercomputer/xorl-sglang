@@ -1163,6 +1163,72 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                         is_dsa_model=True,
                     )
 
+    def _glm_exact_args(self, **overrides):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.nnodes = 2
+        server_args.tp_size = 16
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args._cuda_graph_config_locked = set()
+        for name, value in overrides.items():
+            setattr(server_args, name, value)
+        return server_args
+
+    def test_glm52_xorl_exact_radix_is_env_gated_and_fail_closed(self):
+        """The radix path stays opt-in and rejects unsupported combinations.
+
+        With SGLANG_ENABLE_GLM52_EXACT_RADIX unset, the resolver keeps the
+        default radix-disabled envelope. The opt-in path rejects cache and
+        adapter combinations outside its contract.
+        """
+        resolve = lambda args: args._resolve_glm52_exact_contract(
+            self._glm_model_config().hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_dsa_model=True,
+        )
+
+        with envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.override(False):
+            default_args = self._glm_exact_args()
+            resolve(default_args)
+            self.assertTrue(default_args.disable_radix_cache)
+            self.assertEqual(default_args.mem_fraction_static, 0.82)
+            self.assertEqual(default_args.max_prefill_tokens, 8192)
+
+        with envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.override(True):
+            radix_args = self._glm_exact_args()
+            resolve(radix_args)
+            self.assertFalse(radix_args.disable_radix_cache)
+            # Capacity-only changes reserve prefill scratch headroom.
+            self.assertEqual(radix_args.mem_fraction_static, 0.80)
+            self.assertEqual(radix_args.max_prefill_tokens, 4864)
+            with self.assertRaisesRegex(ValueError, "max_prefill_tokens"):
+                resolve(self._glm_exact_args(max_prefill_tokens=5376))
+            with self.assertRaisesRegex(ValueError, "max_prefill_tokens"):
+                resolve(self._glm_exact_args(max_prefill_tokens=8192))
+            with self.assertRaisesRegex(ValueError, "mem_fraction_static"):
+                stale_fraction = self._glm_exact_args(mem_fraction_static=0.82)
+                stale_fraction._mem_fraction_static_user_supplied = True
+                resolve(stale_fraction)
+
+            # The late validator accepts the opt-in path and still detects
+            # drift back to a disabled cache.
+            radix_args.page_size = 64
+            radix_args.enable_dp_attention = True
+            with patch.object(envs.SGLANG_ENABLE_CP_V2, "get", return_value=True):
+                radix_args._validate_glm52_exact_resolved_contract()
+                radix_args.disable_radix_cache = True
+                with self.assertRaisesRegex(ValueError, "disable_radix_cache"):
+                    radix_args._validate_glm52_exact_resolved_contract()
+
+            with self.assertRaisesRegex(ValueError, "conflicts"):
+                resolve(self._glm_exact_args(disable_radix_cache=True))
+            with self.assertRaisesRegex(ValueError, "in-device radix tree"):
+                resolve(self._glm_exact_args(enable_hierarchical_cache=True))
+            with self.assertRaisesRegex(ValueError, "in-device radix tree"):
+                resolve(self._glm_exact_args(enable_lmcache=True))
+            with self.assertRaisesRegex(ValueError, "adapter-keyed"):
+                resolve(self._glm_exact_args(enable_lora=True))
+
     def test_glm52_xorl_accepts_transformers_normalized_rope_parameters(self):
         hf_config = self._glm_model_config().hf_config
         hf_config.rope_parameters.pop("type")

@@ -945,6 +945,10 @@ class DeepseekV2MoE(nn.Module):
             config, is_nextn=is_nextn
         )
         self._canonical_v3_workspaces: dict[tuple, CanonicalMoEV3Workspace] = {}
+        # Keys minted while a CUDA graph was being captured: the captured
+        # graph replays against those tensor addresses forever, so they are
+        # exempt from the single-slot eviction below.
+        self._canonical_v3_pinned_keys: set[tuple] = set()
         self._glm52_deferred_status_book: CanonicalDeferredStatusBook | None = None
         self._glm52_canonical_transport = (
             _resolve_glm52_canonical_transport(config)
@@ -1373,6 +1377,61 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states += shared_output
         return final_hidden_states
 
+    def _get_canonical_v3_workspace(
+        self,
+        workspace_key: tuple,
+        local_partial: torch.Tensor,
+        *,
+        plan,
+        group,
+        distribution,
+        capture_mode: bool,
+    ) -> CanonicalMoEV3Workspace:
+        """Get-or-allocate the canonical fold workspace, single-slot for prefill-CP.
+
+        The former unbounded keying retained one workspace set per distinct
+        CP-padded capacity bucket (~92 MiB per sparse layer per 256-row bucket
+        at hidden 6144). Eviction changes only the Python retention policy: a
+        re-mint allocates the same shapes, strides, and kernels as first use,
+        so the serving arithmetic is unchanged.
+
+        Entries minted during CUDA graph capture are pinned: the captured
+        graph replays against their addresses, so they must never be
+        evicted (decode's REPLICATED_CANONICAL bucket). Prefill CUDA graphs
+        are disabled on this lane, so CONSUMER_SHARDED entries are
+        eager-only and safe to drop when the capacity bucket changes.
+        """
+        workspace = self._canonical_v3_workspaces.get(workspace_key)
+        if workspace is not None:
+            if capture_mode:
+                self._canonical_v3_pinned_keys.add(workspace_key)
+            return workspace
+        if not capture_mode and distribution is CanonicalDistribution.CONSUMER_SHARDED:
+            stale_keys = [
+                key
+                for key in self._canonical_v3_workspaces
+                if key[0] == distribution.value
+                and key not in self._canonical_v3_pinned_keys
+            ]
+            for key in stale_keys:
+                logger.info(
+                    "canonical-v3 workspace evicted (layer %s): %s -> %s",
+                    self.layer_id,
+                    key[1],
+                    workspace_key[1],
+                )
+                del self._canonical_v3_workspaces[key]
+        workspace = CanonicalMoEV3Workspace.allocate(
+            local_partial,
+            plan=plan,
+            group=group,
+            distribution=distribution,
+        )
+        self._canonical_v3_workspaces[workspace_key] = workspace
+        if capture_mode:
+            self._canonical_v3_pinned_keys.add(workspace_key)
+        return workspace
+
     def _canonicalize_glm52_partial(
         self,
         local_partial: torch.Tensor,
@@ -1446,17 +1505,15 @@ class DeepseekV2MoE(nn.Module):
             local_partial.dtype,
             local_partial.device,
         )
-        workspace = self._canonical_v3_workspaces.get(workspace_key)
-        if workspace is None:
-            workspace = CanonicalMoEV3Workspace.allocate(
-                local_partial,
-                plan=plan,
-                group=group,
-                distribution=distribution,
-            )
-            self._canonical_v3_workspaces[workspace_key] = workspace
-
         capture_mode = get_is_capture_mode()
+        workspace = self._get_canonical_v3_workspace(
+            workspace_key,
+            local_partial,
+            plan=plan,
+            group=group,
+            distribution=distribution,
+            capture_mode=capture_mode,
+        )
         if prefill_cp:
             canonical = canonicalize_glm52_local_partial_v3(
                 local_partial,

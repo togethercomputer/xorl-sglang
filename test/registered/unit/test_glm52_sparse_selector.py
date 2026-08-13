@@ -9,7 +9,10 @@ from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
     DSATopKBackend,
     TopkTransformMethod,
 )
-from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+from sglang.srt.layers.attention.dsa_backend import (
+    DeepseekSparseAttnBackend,
+    _gather_bf16_sparse_paged_kv,
+)
 from sglang.srt.layers.attention.nsa.glm52_selector import (
     pack_selected_kv_dynamic,
     pack_selected_kv_static,
@@ -19,6 +22,34 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+class TestBf16SparsePagedKvGather(unittest.TestCase):
+    def test_preserves_row_order_duplicates_and_bytes(self):
+        kv_cache = (
+            torch.arange(24, dtype=torch.float32)
+            .mul_(0.25)
+            .to(torch.bfloat16)
+            .reshape(2, 3, 1, 4)
+        )
+        row_indices = torch.tensor([5, 1, 5, 0], dtype=torch.int64)
+
+        actual = _gather_bf16_sparse_paged_kv(kv_cache, row_indices)
+        rows = kv_cache.reshape(-1, kv_cache.shape[-1])
+        expected = torch.stack((rows[5], rows[1], rows[5], rows[0])).unsqueeze(1)
+
+        self.assertEqual(actual.shape, (4, 1, 4))
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertTrue(
+            torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        )
+
+    def test_rejects_non_bf16_pool(self):
+        with self.assertRaises(AssertionError):
+            _gather_bf16_sparse_paged_kv(
+                torch.zeros(2, 1, 4, dtype=torch.float32),
+                torch.tensor([0], dtype=torch.int64),
+            )
 
 
 class TestGlm52SparseSelector(unittest.TestCase):

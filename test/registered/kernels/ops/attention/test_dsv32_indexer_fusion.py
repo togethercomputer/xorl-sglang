@@ -193,6 +193,54 @@ def test_q_rope_ue8m0_matches_unfused_prefill_codec(pos_dtype):
     assert torch.equal(weights_out, weights_ref)
 
 
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+def test_q_rope_ue8m0_pins_trainer_fma_order_at_bf16_tie(pos_dtype):
+    _skip_if_unavailable()
+    dev = "cuda"
+    q = torch.zeros((1, 1, HEAD_DIM), dtype=torch.bfloat16, device=dev)
+    q[0, 0, 6] = 5.21875
+    q[0, 0, 7] = 0.81640625
+    # Hold the UE8M0 row scale at 2^-4 with a non-RoPE sentinel. The imaginary
+    # result is then exactly the FP8 tie between 80 and 88 if RoPE rounds down,
+    # and 88 if it follows the trainer's one-round expression and rounds up
+    # through BF16 first.
+    q[0, 0, ROPE_DIM] = 16.0
+
+    cos_sin_cache = torch.zeros((1, ROPE_DIM), dtype=torch.float32, device=dev)
+    cos_sin_cache[0, :HALF] = 1.0
+    cos_sin_cache[0, 3] = 0.075813688337802887
+    cos_sin_cache[0, HALF + 3] = 0.99712198972702026
+    positions = torch.zeros(1, dtype=pos_dtype, device=dev)
+
+    q_fp8, fused_scale = fused_q_indexer_rope_first_quant(
+        q,
+        torch.ones((1, 1), dtype=torch.bfloat16, device=dev),
+        1.0,
+        1.0,
+        cos_sin_cache,
+        positions,
+    )
+    q_ref = q.clone()
+    k_scratch = q[:, :1].clone()
+    apply_rope_with_cos_sin_cache_inplace(
+        q_ref[..., :ROPE_DIM],
+        k_scratch[..., :ROPE_DIM],
+        cos_sin_cache,
+        positions,
+        is_neox=False,
+        rope_dim=ROPE_DIM,
+    )
+    q_ref_fp8, ref_scale = act_quant(q_ref.contiguous(), HEAD_DIM, "ue8m0")
+    torch.cuda.synchronize()
+
+    assert fused_scale.item() == 0.0625
+    assert torch.equal(fused_scale, ref_scale)
+    assert torch.equal(q_fp8.view(torch.uint8), q_ref_fp8.view(torch.uint8))
+    assert q_ref.view(torch.int16)[0, 0, 7].item() == 0x40A9
+    assert q_fp8[0, 0, 7].item() == 88.0
+    assert q_fp8.view(torch.uint8)[0, 0, 7].item() == 0x6B
+
+
 # ----------------------------------------------------------------------------
 # Strided weight (the wk_weights_proj slice) matches contiguous for the Q kernel
 # ----------------------------------------------------------------------------

@@ -13,6 +13,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.configs.model_config import ModelConfig  # noqa: E402
 from sglang.srt.distributed.canonical_moe import (  # noqa: E402
+    CanonicalDistribution,
     SamplerParallelPlan,
 )
 from sglang.srt.layers import layernorm as layernorm_module  # noqa: E402
@@ -348,6 +349,97 @@ class TestGlm52ExactOwners(CustomTestCase):
                 communicator.postprocess_layer(full, residual, forward_batch), sentinel
             )
         legacy.assert_called_once_with(full, residual, forward_batch)
+
+
+class TestCanonicalWorkspaceRetention(CustomTestCase):
+    """Single-slot canonical-fold workspace cache for prefill-CP.
+
+    Guarded bug: the workspace dict was keyed by CP-padded capacity and
+    never evicted, so every distinct 256-row request bucket retained another
+    workspace set. Eviction must be single-slot for eager CONSUMER_SHARDED
+    entries only:
+    capture-minted entries are replayed by address inside CUDA graphs and
+    must survive every eviction attempt.
+    """
+
+    @staticmethod
+    def _moe():
+        moe = object.__new__(deepseek_v2.DeepseekV2MoE)
+        torch.nn.Module.__init__(moe)
+        moe._canonical_v3_workspaces = {}
+        moe._canonical_v3_pinned_keys = set()
+        moe.layer_id = 7
+        return moe
+
+    @staticmethod
+    def _key(distribution, capacity):
+        return (distribution.value, capacity, (4,), torch.bfloat16, "cpu")
+
+    def _mint(self, moe, distribution, capacity, capture_mode):
+        with patch.object(
+            deepseek_v2.CanonicalMoEV3Workspace, "allocate", return_value=object()
+        ) as allocate:
+            workspace = moe._get_canonical_v3_workspace(
+                self._key(distribution, capacity),
+                torch.zeros(capacity, 4, dtype=torch.bfloat16),
+                plan=object(),
+                group=object(),
+                distribution=distribution,
+                capture_mode=capture_mode,
+            )
+        return workspace, allocate
+
+    def test_eager_prefill_cp_workspace_is_single_slot(self):
+        moe = self._moe()
+        sharded = CanonicalDistribution.CONSUMER_SHARDED
+        self._mint(moe, sharded, 2560, capture_mode=False)
+        self._mint(moe, sharded, 512, capture_mode=False)
+        self.assertEqual(list(moe._canonical_v3_workspaces), [self._key(sharded, 512)])
+
+    def test_repeat_bucket_hits_cache_without_reallocation(self):
+        moe = self._moe()
+        sharded = CanonicalDistribution.CONSUMER_SHARDED
+        first, _ = self._mint(moe, sharded, 2560, capture_mode=False)
+        again, allocate = self._mint(moe, sharded, 2560, capture_mode=False)
+        self.assertIs(again, first)
+        allocate.assert_not_called()
+
+    def test_eager_workspace_reused_during_capture_becomes_pinned(self):
+        moe = self._moe()
+        sharded = CanonicalDistribution.CONSUMER_SHARDED
+        original_key = self._key(sharded, 256)
+
+        first, _ = self._mint(moe, sharded, 256, capture_mode=False)
+        captured, allocate = self._mint(moe, sharded, 256, capture_mode=True)
+
+        self.assertIs(captured, first)
+        allocate.assert_not_called()
+        self.assertIn(original_key, moe._canonical_v3_pinned_keys)
+
+        self._mint(moe, sharded, 512, capture_mode=False)
+        self.assertIn(original_key, moe._canonical_v3_workspaces)
+
+    def test_capture_minted_and_replicated_entries_survive_eviction(self):
+        moe = self._moe()
+        sharded = CanonicalDistribution.CONSUMER_SHARDED
+        replicated = CanonicalDistribution.REPLICATED_CANONICAL
+        # Captured decode bucket and a captured sharded entry: pinned.
+        self._mint(moe, replicated, 16, capture_mode=True)
+        self._mint(moe, sharded, 256, capture_mode=True)
+        # Eager replicated entry: outside the eviction scope.
+        self._mint(moe, replicated, 32, capture_mode=False)
+        # Two eager sharded mints: single-slot among themselves only.
+        self._mint(moe, sharded, 2560, capture_mode=False)
+        self._mint(moe, sharded, 512, capture_mode=False)
+        self.assertEqual(
+            set(moe._canonical_v3_workspaces),
+            {
+                self._key(replicated, 16),
+                self._key(sharded, 256),
+                self._key(replicated, 32),
+                self._key(sharded, 512),
+            },
+        )
 
 
 if __name__ == "__main__":

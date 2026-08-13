@@ -3,7 +3,7 @@
 `--rl-on-policy-target xorl` on a Qwen3.5-family architecture (including
 Qwen3.6, whose HF architecture is `Qwen3_5MoeForConditionalGeneration`)
 automatically engages the model's admitted exact serving contract. Dense Qwen
-keeps the conservative eager implementation from its literal-zero receipt;
+keeps the validated conservative eager implementation;
 Qwen3.6 MoE additionally selects the cached-row CUDA-graph program.
 
 There is nothing to configure. The stack engages as a unit:

@@ -795,6 +795,10 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt in to deterministic radix prefix reuse inside the exact GLM-5.2
+    # XORL contract. The default stays radix-disabled, and resolution rejects
+    # cache tiers and adapter-keyed reuse that are outside this path.
+    SGLANG_ENABLE_GLM52_EXACT_RADIX = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

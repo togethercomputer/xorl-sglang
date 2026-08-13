@@ -5888,6 +5888,12 @@ class ServerArgs:
             self.lora_target_modules = set(GLM52_REQUIRED_TARGET_MODULES)
         requested_max_lora_rank = self.max_lora_rank
         requested_max_total_tokens = self.max_total_tokens
+        # Radix reuse admits varied extend lengths, so its envelope bounds the
+        # per-request canonical-fold workspace together with fused-MoE scratch.
+        # This capacity-only choice does not change the numerical program.
+        glm52_max_prefill_tokens = (
+            4864 if envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get() else 8192
+        )
         exact_program = {
             "moe_runner_backend": (self.moe_runner_backend, ("auto", "triton")),
             "fp8_gemm_runner_backend": (
@@ -5925,7 +5931,10 @@ class ServerArgs:
                 self.chunked_prefill_size,
                 (None, -1, 8192),
             ),
-            "max_prefill_tokens": (self.max_prefill_tokens, (8192, 16384)),
+            "max_prefill_tokens": (
+                self.max_prefill_tokens,
+                (glm52_max_prefill_tokens, 16384),
+            ),
             "prefill_max_requests": (self.prefill_max_requests, (None, 1)),
             "max_total_tokens": (self.max_total_tokens, (None, 8192, 32768)),
             "max_running_requests": (self.max_running_requests, (None, 16)),
@@ -5996,9 +6005,15 @@ class ServerArgs:
             )
         if self.disable_cuda_graph_padding:
             incompatible.append("disable_cuda_graph_padding=True")
+        # Radix reuse reserves two extra percentage points of HBM for the
+        # canonical-fold workspace and fused-MoE prefill temporaries. Pool
+        # sizing changes, but the numerical program does not.
+        glm52_mem_fraction_static = (
+            0.80 if envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get() else 0.82
+        )
         if (
             getattr(self, "_mem_fraction_static_user_supplied", False)
-            and self.mem_fraction_static != 0.82
+            and self.mem_fraction_static != glm52_mem_fraction_static
         ):
             incompatible.append(f"mem_fraction_static={self.mem_fraction_static!r}")
         if isinstance(self.cuda_graph_config, CudaGraphConfig):
@@ -6044,13 +6059,13 @@ class ServerArgs:
         self.sampling_backend = "pytorch"
         self.sampling_defaults = "openai"
         self.chunked_prefill_size = -1
-        self.max_prefill_tokens = 8192
+        self.max_prefill_tokens = glm52_max_prefill_tokens
         self.prefill_max_requests = 1
         self.max_total_tokens = (
             8192 if requested_max_total_tokens is None else requested_max_total_tokens
         )
         self.max_running_requests = 16
-        self.mem_fraction_static = 0.82
+        self.mem_fraction_static = glm52_mem_fraction_static
         self.model_impl = "sglang"
         self.device = "cuda"
         self.max_lora_rank = (
@@ -6078,7 +6093,46 @@ class ServerArgs:
         self.disable_custom_all_reduce = True
         self.disable_overlap_schedule = True
         self.disable_piecewise_cuda_graph = True
-        self.disable_radix_cache = True
+        # Radix remains opt-in. The admitted path uses the in-device radix tree
+        # with BF16 sparse-MLA KV and fails closed on other cache tiers and
+        # adapter-keyed reuse.
+        if envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get():
+            if self.disable_radix_cache:
+                raise ValueError(
+                    "SGLANG_ENABLE_GLM52_EXACT_RADIX conflicts with "
+                    "--disable-radix-cache; drop one of the two."
+                )
+            incompatible_cache = [
+                name
+                for name, value in (
+                    ("enable_hierarchical_cache", self.enable_hierarchical_cache),
+                    ("enable_lmcache", self.enable_lmcache),
+                    ("enable_flexkv", self.enable_flexkv),
+                    ("hicache_storage_backend", self.hicache_storage_backend),
+                )
+                if value
+            ]
+            if incompatible_cache:
+                raise ValueError(
+                    "The GLM-5.2 exact radix path admits only the "
+                    "in-device radix tree; incompatible cache settings: "
+                    f"{', '.join(incompatible_cache)}."
+                )
+            if self.enable_lora or self.lora_paths:
+                raise ValueError(
+                    "The GLM-5.2 exact radix path does not admit adapter-keyed "
+                    "prefix reuse; launch without LoRA or unset "
+                    "SGLANG_ENABLE_GLM52_EXACT_RADIX."
+                )
+            logger.warning(
+                "GLM-5.2 exact radix prefix reuse is ENABLED "
+                "(SGLANG_ENABLE_GLM52_EXACT_RADIX=1). Weight updates must "
+                "flush the prefix cache. mem_fraction_static is pinned to "
+                "0.80 for prefill scratch headroom; the numerical program is "
+                "unchanged."
+            )
+        else:
+            self.disable_radix_cache = True
         self.cuda_graph_bs_decode = [16]
         self.cuda_graph_max_bs_decode = 16
         if isinstance(self.cuda_graph_config, CudaGraphConfig):
@@ -6255,16 +6309,22 @@ class ServerArgs:
             "disable_custom_all_reduce": True,
             "disable_overlap_schedule": True,
             "disable_piecewise_cuda_graph": True,
-            "disable_radix_cache": True,
+            # The opt-in radix path is the only admitted deviation from the
+            # default radix-disabled envelope.
+            "disable_radix_cache": (not envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get()),
             "disable_cuda_graph": False,
             "disable_cuda_graph_padding": False,
             "sampling_backend": "pytorch",
             "sampling_defaults": "openai",
             "chunked_prefill_size": -1,
-            "max_prefill_tokens": 8192,
+            "max_prefill_tokens": (
+                4864 if envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get() else 8192
+            ),
             "prefill_max_requests": 1,
             "max_running_requests": 16,
-            "mem_fraction_static": 0.82,
+            "mem_fraction_static": (
+                0.80 if envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get() else 0.82
+            ),
             "model_impl": "sglang",
             "device": "cuda",
             "is_embedding": False,
@@ -6532,13 +6592,10 @@ class ServerArgs:
                 self._cuda_graph_config_locked.add((Phase.DECODE, "bs"))
                 self._cuda_graph_config_locked.add((Phase.DECODE, "max_bs"))
                 self._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
-            # The production Wordle literal-zero receipt used the conservative
-            # no-overlap/no-padding scheduler contract.  A live GRPO gate on
-            # the newer overlap + padded-graph program measured nonzero K3
-            # even after the Wave-3 GDN mechanisms were disabled.  Preserve
-            # graph-32 for full local batches, but run ragged/draining batches
-            # eagerly rather than padding them into a graph shape that has not
-            # passed the trainer-versus-sampler denominator.
+            # Exact RL uses the conservative no-overlap/no-padding scheduler
+            # contract. Preserve graph-32 for full local batches, but run
+            # ragged or draining batches eagerly because padded graph shapes
+            # are outside the admitted trainer-serving parity contract.
             self.disable_overlap_schedule = True
             self.disable_cuda_graph_padding = True
             self.max_queued_requests = 512
