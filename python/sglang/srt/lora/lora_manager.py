@@ -692,9 +692,7 @@ class LoRAManager:
             return
 
         device = self.device
-        segment_lens = torch.tensor(
-            global_num_tokens, dtype=torch.int32, device=device
-        )
+        segment_lens = torch.tensor(global_num_tokens, dtype=torch.int32, device=device)
         segment_indptr = torch.zeros(
             (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
         )
