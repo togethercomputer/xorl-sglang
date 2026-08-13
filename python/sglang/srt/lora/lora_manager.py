@@ -496,6 +496,19 @@ class LoRAManager:
                     f"nonresident adapter UID: {uid!r}."
                 )
 
+    def _validate_glm52_exact_uid(self, uid: str) -> None:
+        adapter = self.loras.get(uid)
+        if adapter is None or uid not in self.memory_pool.uid_to_buffer_id:
+            raise RuntimeError(
+                "The exact GLM-5.2 active-LoRA request references a missing "
+                f"or nonresident adapter UID: {uid!r}."
+            )
+        if not getattr(adapter, "_glm52_exact_adapter_certified", False):
+            raise RuntimeError(
+                "The exact GLM-5.2 active-LoRA request requires a certified "
+                "complete shared-outer adapter."
+            )
+
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         logger.info(
             f"LoRA adapter unloading starts: {lora_ref}. "
@@ -693,6 +706,124 @@ class LoRAManager:
 
         device = self.device
         segment_lens = torch.tensor(global_num_tokens, dtype=torch.int32, device=device)
+        segment_indptr = torch.zeros(
+            (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
+        )
+        segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
+        total_tokens = sum(global_num_tokens)
+        global_batch_info = LoRABatchInfo(
+            use_cuda_graph=False,
+            bs=len(global_num_tokens),
+            num_segments=len(global_num_tokens),
+            seg_indptr=segment_indptr,
+            weight_indices=torch.tensor(
+                weight_indices, dtype=torch.int32, device=device
+            ),
+            lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=device),
+            scalings=torch.tensor(scalings, dtype=torch.float32, device=device),
+            max_len=max(global_num_tokens, default=0),
+            seg_lens=segment_lens,
+            permutation=None,
+            expected_tokens=total_tokens,
+            has_active_lora=True,
+            req_seg_indptr=segment_indptr,
+            req_weight_indices=torch.tensor(
+                weight_indices, dtype=torch.int32, device=device
+            ),
+        )
+
+        physical_batch = copy(forward_batch)
+        physical_batch.batch_size = len(global_num_tokens)
+        physical_batch.lora_ids = global_uids
+        physical_batch.forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.is_extend_in_batch
+            else ForwardMode.DECODE
+        )
+        physical_batch.extend_num_tokens = total_tokens
+        physical_batch.extend_seq_lens_cpu = global_num_tokens
+        physical_batch.extend_seq_lens = segment_lens
+        global_batch_info = self.lora_backend._add_moe_lora_info(
+            physical_batch, global_batch_info
+        )
+        self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
+
+    def prepare_glm52_exact_dp_lora_batch(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Build rank-major LoRA metadata for DP-gathered GLM-5.2 MLP rows."""
+
+        if not getattr(self.base_hf_config, "_glm52_exact_mode", False):
+            return
+        if self.dp_size <= 1:
+            return
+        if self.dp_size != 16 or self.attn_cp_size != 1 or self.tp_size != 16:
+            raise RuntimeError(
+                "The exact GLM-5.2 DP-owned LoRA lane requires TP16/DP16/CP1."
+            )
+        if get_is_capture_mode():
+            raise RuntimeError(
+                "Gather-aware GLM-5.2 active LoRA admits eager execution only."
+            )
+
+        local_lora_ids = list(forward_batch.lora_ids or [])
+        if len(local_lora_ids) > 1:
+            raise RuntimeError(
+                "The exact GLM-5.2 DP-owned lane admits at most one logical "
+                f"request per DP rank, got {len(local_lora_ids)}."
+            )
+        local_uid = local_lora_ids[0] if local_lora_ids else None
+        global_uids = get_parallel().tp_group.all_gather_object(local_uid)
+        global_num_tokens = list(forward_batch.global_num_tokens_cpu or [])
+        if len(global_uids) != len(global_num_tokens):
+            raise RuntimeError(
+                "GLM-5.2 gathered LoRA ownership does not match the DP row "
+                f"layout: owners={len(global_uids)}, row_segments={len(global_num_tokens)}."
+            )
+
+        active_uids = {uid for uid in global_uids if uid is not None}
+        if len(active_uids) > 1:
+            raise RuntimeError(
+                "The first exact GLM-5.2 DP-owned lane admits one active "
+                f"adapter globally, got {sorted(active_uids)}."
+            )
+        missing = sorted(
+            uid
+            for uid in active_uids
+            if uid not in self.loras or uid not in self.lora_refs
+        )
+        if missing:
+            raise RuntimeError(
+                "GLM-5.2 gathered batch references adapters missing from this "
+                f"EP rank: {missing}."
+            )
+
+        self.fetch_new_loras(active_uids | {None})
+        if None not in self.memory_pool.uid_to_buffer_id:
+            raise RuntimeError(
+                "GLM-5.2 gather-aware LoRA requires a resident base-model slot."
+            )
+        for uid in active_uids:
+            self._validate_glm52_exact_uid(uid)
+        if not active_uids:
+            self.lora_backend.context_parallel_mlp_batch_info = None
+            return
+
+        weight_indices = []
+        lora_ranks = [0] * self.max_loras_per_batch
+        scalings = [0.0] * self.max_loras_per_batch
+        for uid in global_uids:
+            slot = self.memory_pool.get_buffer_id(uid)
+            weight_indices.append(slot)
+            if uid is not None:
+                adapter = self.loras[uid]
+                lora_ranks[slot] = adapter.config.r
+                scalings[slot] = adapter.scaling
+
+        device = self.device
+        segment_lens = torch.tensor(
+            global_num_tokens, dtype=torch.int32, device=device
+        )
         segment_indptr = torch.zeros(
             (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
         )

@@ -118,6 +118,85 @@ def _make_cp_lora_manager(batch_size, lengths=None):
     )
 
 
+def test_dp16_lora_metadata_follows_global_request_owner(monkeypatch) -> None:
+    import sglang.srt.lora.lora_manager as lora_manager_module
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+
+    class _MemoryPool:
+        uid_to_buffer_id = {}
+
+        @staticmethod
+        def get_buffer_id(uid):
+            return _MemoryPool.uid_to_buffer_id[uid]
+
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(r=16),
+        scaling=2.0,
+        _glm52_exact_adapter_certified=True,
+    )
+    backend = object.__new__(BaseLoRABackend)
+    backend._is_moe_lora = True
+    backend.batch_info = None
+    backend.context_parallel_mlp_batch_info = None
+    backend.sgemm_batch_info = None
+
+    manager = object.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_glm52_exact_mode=True)
+    manager.tp_size = 16
+    manager.dp_size = 16
+    manager.attn_cp_size = 1
+    manager.max_loras_per_batch = 2
+    manager.device = torch.device("cpu")
+    manager.lora_backend = backend
+    manager.memory_pool = _MemoryPool()
+    manager.loras = {"adapter": adapter}
+    manager.lora_refs = {"adapter": object()}
+
+    def _fetch(uids):
+        for uid in sorted(uids, key=lambda value: (value is not None, value or "")):
+            _MemoryPool.uid_to_buffer_id.setdefault(
+                uid, len(_MemoryPool.uid_to_buffer_id)
+            )
+
+    manager.fetch_new_loras = _fetch
+    owner_rank = 11
+    global_uids = [None] * 16
+    global_uids[owner_rank] = "adapter"
+
+    class _Group:
+        @staticmethod
+        def all_gather_object(local_uid):
+            assert local_uid is None
+            return global_uids
+
+    monkeypatch.setattr(
+        lora_manager_module,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_group=_Group()),
+    )
+    token_counts = list(range(1, 17))
+    forward_batch = SimpleNamespace(
+        lora_ids=[],
+        global_num_tokens_cpu=token_counts,
+        is_extend_in_batch=True,
+        forward_mode=ForwardMode.IDLE,
+    )
+
+    manager.prepare_glm52_exact_dp_lora_batch(forward_batch)
+
+    info = backend.context_parallel_mlp_batch_info
+    assert info.expected_tokens == sum(token_counts)
+    assert info.weight_indices.tolist() == [
+        _MemoryPool.uid_to_buffer_id["adapter" if rank == owner_rank else None]
+        for rank in range(16)
+    ]
+    assert info.moe_lora_info.token_lora_mapping.tolist() == [
+        _MemoryPool.uid_to_buffer_id["adapter" if rank == owner_rank else None]
+        for rank, count in enumerate(token_counts)
+        for _ in range(count)
+    ]
+
+
 def _cp_forward_batch(batch_size, lengths=None):
     lengths = lengths or [4096] * batch_size
     max_logical_rank_tokens = (sum(lengths) + 15) // 16

@@ -5893,6 +5893,7 @@ class ServerArgs:
             self.lora_target_modules = set(GLM52_REQUIRED_TARGET_MODULES)
         requested_max_lora_rank = self.max_lora_rank
         requested_max_total_tokens = self.max_total_tokens
+        glm52_dp_owned = self.dp_size == 16
         # Radix reuse admits varied extend lengths, so its envelope bounds the
         # per-request canonical-fold workspace together with fused-MoE scratch.
         # This capacity-only choice does not change the numerical program.
@@ -5975,10 +5976,13 @@ class ServerArgs:
             "tp_size": (self.tp_size, (16,)),
             "ep_size": (self.ep_size, (1, 16)),
             "pp_size": (self.pp_size, (1,)),
-            "dp_size": (self.dp_size, (1,)),
+            "dp_size": (self.dp_size, (1, 16)),
             "dcp_size": (self.dcp_size, (1,)),
             "enable_cp_decode_attn_tp": (self.enable_cp_decode_attn_tp, (False,)),
-            "enable_dp_lm_head": (self.enable_dp_lm_head, (False,)),
+            "enable_dp_lm_head": (
+                self.enable_dp_lm_head,
+                (False, True) if glm52_dp_owned else (False,),
+            ),
             "moe_dp_size": (self.moe_dp_size, (1,)),
             "attn_cp_size": (self.attn_cp_size, (1, 16)),
             "dsa_prefill_cp_mode": (
@@ -5991,6 +5995,19 @@ class ServerArgs:
             for name, (value, allowed) in exact_program.items()
             if value not in allowed
         ]
+        if glm52_dp_owned and self.attn_cp_size != 1:
+            incompatible.append(
+                f"attn_cp_size={self.attn_cp_size!r} (DP16 requires CP1)"
+            )
+        if self.max_loaded_loras not in (None, 2) and glm52_dp_owned:
+            incompatible.append(
+                f"max_loaded_loras={self.max_loaded_loras!r} (DP16 requires 2)"
+            )
+        if self.max_loras_per_batch not in (2, 8) and glm52_dp_owned:
+            incompatible.append(
+                f"max_loras_per_batch={self.max_loras_per_batch!r} "
+                "(DP16 requires 2)"
+            )
         if requested_max_lora_rank is not None and (
             isinstance(requested_max_lora_rank, bool)
             or not isinstance(requested_max_lora_rank, int)
@@ -6000,15 +6017,19 @@ class ServerArgs:
                 f"max_lora_rank={requested_max_lora_rank!r} "
                 "(expected a positive integer)"
             )
-        if self.disable_cuda_graph:
+        if self.disable_cuda_graph and not glm52_dp_owned:
             incompatible.append("disable_cuda_graph=True")
-        if self.cuda_graph_bs_decode not in (None, [16]):
+        if self.cuda_graph_bs_decode not in (
+            (None,) if glm52_dp_owned else (None, [16])
+        ):
             incompatible.append(f"cuda_graph_bs_decode={self.cuda_graph_bs_decode!r}")
-        if self.cuda_graph_max_bs_decode not in (None, 16):
+        if self.cuda_graph_max_bs_decode not in (
+            (None,) if glm52_dp_owned else (None, 16)
+        ):
             incompatible.append(
                 f"cuda_graph_max_bs_decode={self.cuda_graph_max_bs_decode!r}"
             )
-        if self.disable_cuda_graph_padding:
+        if self.disable_cuda_graph_padding and not glm52_dp_owned:
             incompatible.append("disable_cuda_graph_padding=True")
         # Radix reuse reserves two extra percentage points of HBM for the
         # canonical-fold workspace and fused-MoE prefill temporaries. Pool
@@ -6026,19 +6047,19 @@ class ServerArgs:
             graph_program = {
                 (Phase.DECODE, "backend"): (
                     self.cuda_graph_config.decode.backend,
-                    (Backend.FULL,),
-                ),
-                (Phase.DECODE, "bs"): (
-                    self.cuda_graph_config.decode.bs,
-                    ([16],),
-                ),
-                (Phase.DECODE, "max_bs"): (
-                    self.cuda_graph_config.decode.max_bs,
-                    (16,),
+                    (Backend.DISABLED,) if glm52_dp_owned else (Backend.FULL,),
                 ),
                 (Phase.PREFILL, "backend"): (
                     self.cuda_graph_config.prefill.backend,
                     (Backend.DISABLED,),
+                ),
+                (Phase.DECODE, "bs"): (
+                    self.cuda_graph_config.decode.bs,
+                    (None,) if glm52_dp_owned else ([16],),
+                ),
+                (Phase.DECODE, "max_bs"): (
+                    self.cuda_graph_config.decode.max_bs,
+                    (None,) if glm52_dp_owned else (16,),
                 ),
             }
             incompatible.extend(
@@ -6081,17 +6102,23 @@ class ServerArgs:
         self.enable_lora_overlap_loading = False
         self.lora_use_virtual_experts = False
         self.lora_strict_loading = True
+        if glm52_dp_owned:
+            # DP-gathered rows can contain base and active-adapter ownership
+            # simultaneously on every EP rank.
+            self.max_loras_per_batch = 2
+            self.max_loaded_loras = 2
         self.dcp_size = 1
         self.enable_cp_decode_attn_tp = False
+        self.enable_dp_lm_head = glm52_dp_owned
         self.moe_runner_backend = "triton"
         self.fp8_gemm_runner_backend = "triton"
         self.moe_dense_tp_size = 1
         self.ep_size = 16
-        self.attn_cp_size = 16
-        self.enable_prefill_cp = True
+        self.attn_cp_size = 1 if glm52_dp_owned else 16
+        self.enable_prefill_cp = not glm52_dp_owned
         self.enable_prefill_context_parallel = False
-        self.cp_strategy = "interleave"
-        self.enable_dsa_prefill_context_parallel = True
+        self.cp_strategy = None if glm52_dp_owned else "interleave"
+        self.enable_dsa_prefill_context_parallel = not glm52_dp_owned
         self.dsa_prefill_cp_mode = "round-robin-split"
         self.enable_deterministic_inference = True
         self.disable_shared_experts_fusion = True
@@ -6102,6 +6129,11 @@ class ServerArgs:
         # with BF16 sparse-MLA KV and fails closed on other cache tiers and
         # adapter-keyed reuse.
         if envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get():
+            if glm52_dp_owned:
+                raise ValueError(
+                    "The first GLM-5.2 DP-owned exact lane requires radix cache "
+                    "disabled."
+                )
             if self.disable_radix_cache:
                 raise ValueError(
                     "SGLANG_ENABLE_GLM52_EXACT_RADIX conflicts with "
@@ -6138,16 +6170,21 @@ class ServerArgs:
             )
         else:
             self.disable_radix_cache = True
-        self.cuda_graph_bs_decode = [16]
-        self.cuda_graph_max_bs_decode = 16
+        self.cuda_graph_bs_decode = None if glm52_dp_owned else [16]
+        self.cuda_graph_max_bs_decode = None if glm52_dp_owned else 16
+        self.disable_cuda_graph = glm52_dp_owned
+        self.disable_cuda_graph_padding = glm52_dp_owned
         if isinstance(self.cuda_graph_config, CudaGraphConfig):
-            self.cuda_graph_config.decode.backend = Backend.FULL
-            self.cuda_graph_config.decode.bs = [16]
-            self.cuda_graph_config.decode.max_bs = 16
+            self.cuda_graph_config.decode.backend = (
+                Backend.DISABLED if glm52_dp_owned else Backend.FULL
+            )
+            self.cuda_graph_config.decode.bs = None if glm52_dp_owned else [16]
+            self.cuda_graph_config.decode.max_bs = None if glm52_dp_owned else 16
             self.cuda_graph_config.prefill.backend = Backend.DISABLED
             self._cuda_graph_config_locked.add((Phase.DECODE, "backend"))
-            self._cuda_graph_config_locked.add((Phase.DECODE, "bs"))
-            self._cuda_graph_config_locked.add((Phase.DECODE, "max_bs"))
+            if not glm52_dp_owned:
+                self._cuda_graph_config_locked.add((Phase.DECODE, "bs"))
+                self._cuda_graph_config_locked.add((Phase.DECODE, "max_bs"))
             self._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
 
     def _validate_dsv4_flash_exact_resolved_contract(self) -> None:
@@ -6279,6 +6316,11 @@ class ServerArgs:
         if not self.glm52_exact_mode:
             return
 
+        glm52_dp_owned = self.dp_size == 16
+        if self.dp_size not in (1, 16):
+            raise ValueError(
+                "The exact GLM-5.2 XORL contract admits DP1/CP16 or DP16/CP1."
+            )
         expected = {
             "dtype": "bfloat16",
             "quantization": "fp8",
@@ -6296,19 +6338,19 @@ class ServerArgs:
             "tp_size": 16,
             "ep_size": 16,
             "pp_size": 1,
-            "dp_size": 1,
+            "dp_size": 16 if glm52_dp_owned else 1,
             "moe_dp_size": 1,
-            "attn_cp_size": 16,
+            "attn_cp_size": 1 if glm52_dp_owned else 16,
             "moe_dense_tp_size": 1,
             "moe_a2a_backend": "none",
             "ep_num_redundant_experts": 0,
             "ep_dispatch_algorithm": None,
             "init_expert_location": "trivial",
             "enable_eplb": False,
-            "enable_prefill_cp": True,
+            "enable_prefill_cp": not glm52_dp_owned,
             "enable_prefill_context_parallel": False,
-            "enable_dsa_prefill_context_parallel": True,
-            "cp_strategy": "interleave",
+            "enable_dsa_prefill_context_parallel": not glm52_dp_owned,
+            "cp_strategy": None if glm52_dp_owned else "interleave",
             "dsa_prefill_cp_mode": "round-robin-split",
             "enable_dp_attention": True,
             "enable_hisparse": False,
@@ -6319,9 +6361,13 @@ class ServerArgs:
             "disable_piecewise_cuda_graph": True,
             # The opt-in radix path is the only admitted deviation from the
             # default radix-disabled envelope.
-            "disable_radix_cache": (not envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get()),
-            "disable_cuda_graph": False,
-            "disable_cuda_graph_padding": False,
+            "disable_radix_cache": (
+                True
+                if glm52_dp_owned
+                else not envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get()
+            ),
+            "disable_cuda_graph": glm52_dp_owned,
+            "disable_cuda_graph_padding": glm52_dp_owned,
             "sampling_backend": "pytorch",
             "sampling_defaults": "openai",
             "chunked_prefill_size": -1,
@@ -6349,8 +6395,15 @@ class ServerArgs:
             "lora_strict_loading": True,
             "dcp_size": 1,
             "enable_cp_decode_attn_tp": False,
-            "enable_dp_lm_head": False,
+            "enable_dp_lm_head": glm52_dp_owned,
         }
+        if glm52_dp_owned:
+            expected.update(
+                {
+                    "max_loras_per_batch": 2,
+                    "max_loaded_loras": 2,
+                }
+            )
         mismatches = [
             f"{name}={getattr(self, name, None)!r} (expected {value!r})"
             for name, value in expected.items()
@@ -6375,9 +6428,18 @@ class ServerArgs:
             mismatches.append("cuda_graph_config is not resolved")
         else:
             graph_expected = {
-                "decode.backend": (self.cuda_graph_config.decode.backend, Backend.FULL),
-                "decode.bs": (self.cuda_graph_config.decode.bs, [16]),
-                "decode.max_bs": (self.cuda_graph_config.decode.max_bs, 16),
+                "decode.backend": (
+                    self.cuda_graph_config.decode.backend,
+                    Backend.DISABLED if glm52_dp_owned else Backend.FULL,
+                ),
+                "decode.bs": (
+                    self.cuda_graph_config.decode.bs,
+                    None if glm52_dp_owned else [16],
+                ),
+                "decode.max_bs": (
+                    self.cuda_graph_config.decode.max_bs,
+                    None if glm52_dp_owned else 16,
+                ),
                 "prefill.backend": (
                     self.cuda_graph_config.prefill.backend,
                     Backend.DISABLED,
@@ -6394,7 +6456,7 @@ class ServerArgs:
             or self.enable_multi_layer_eagle
         ):
             mismatches.append("speculative or draft decoding is enabled")
-        if not envs.SGLANG_ENABLE_CP_V2.get():
+        if not glm52_dp_owned and not envs.SGLANG_ENABLE_CP_V2.get():
             mismatches.append("SGLANG_ENABLE_CP_V2 is not enabled")
         if envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get():
             mismatches.append("SGLANG_DISABLE_DSA_INDEXER_FUSION is enabled")
@@ -6406,6 +6468,11 @@ class ServerArgs:
             envs.SGLANG_OPT_MOE_QUANT_ONCE,
             envs.SGLANG_SHARED_EXPERT_TP1,
         )
+        if glm52_dp_owned:
+            exact_disabled_envs += (
+                envs.SGLANG_DP_USE_GATHERV,
+                envs.SGLANG_DP_USE_REDUCE_SCATTER,
+            )
         mismatches.extend(
             f"{setting.name} is enabled"
             for setting in exact_disabled_envs

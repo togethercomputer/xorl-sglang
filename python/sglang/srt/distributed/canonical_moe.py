@@ -47,6 +47,7 @@ class SamplerParallelPlan:
     pp_size: int = 1
     ep_size: int = 8
     attention_cp_size: int = 8
+    attention_dp_size: int = 1
     production: bool = False
     version: str = GLM52_CANONICAL_MOE_VERSION
 
@@ -103,12 +104,19 @@ class SamplerParallelPlan:
                 )
             if (
                 self.ep_size != self.contributor_count
-                or self.attention_cp_size != self.contributor_count
+                or self.attention_cp_size * self.attention_dp_size
+                != self.contributor_count
                 or self.launcher_tp_size != self.contributor_count
+                or (self.attention_cp_size, self.attention_dp_size)
+                not in {
+                    (self.contributor_count, 1),
+                    (1, self.contributor_count),
+                }
             ):
                 raise ValueError(
-                    "Production GLM-5.2 sampler requires launcher TP, attention CP, "
-                    "and EP to equal the contributor count"
+                    "Production GLM-5.2 sampler requires launcher TP and EP to "
+                    "equal the contributor count, with ownership entirely in "
+                    "attention CP or attention DP"
                 )
 
     @classmethod
@@ -119,6 +127,7 @@ class SamplerParallelPlan:
         pp_size: int = 1,
         pp_rank: int = 0,
         physical_ranks: tuple[int, ...] | None = None,
+        attention_dp_size: int = 1,
     ) -> SamplerParallelPlan:
         ranks = (
             tuple(
@@ -139,7 +148,8 @@ class SamplerParallelPlan:
             pp_rank=pp_rank,
             pp_size=pp_size,
             ep_size=contributors,
-            attention_cp_size=contributors,
+            attention_cp_size=contributors // attention_dp_size,
+            attention_dp_size=attention_dp_size,
             production=True,
         )
 
@@ -170,6 +180,7 @@ class SamplerParallelPlan:
         pp_size: int,
         ep_size: int,
         attention_cp_size: int,
+        attention_dp_size: int = 1,
     ) -> None:
         actual = (
             dist.get_world_size(),
@@ -178,6 +189,7 @@ class SamplerParallelPlan:
             pp_size,
             ep_size,
             attention_cp_size,
+            attention_dp_size,
             dist.get_world_size(group),
         )
         expected = (
@@ -187,6 +199,7 @@ class SamplerParallelPlan:
             self.pp_size,
             self.ep_size,
             self.attention_cp_size,
+            self.attention_dp_size,
             self.contributor_count,
         )
         if self.production and actual != expected:
@@ -202,6 +215,11 @@ class SamplerParallelPlan:
                 )
 
     def validate_cuda_graph_policy(self, *, disable_cuda_graph: bool) -> None:
+        if self.production and self.attention_dp_size > 1 and not disable_cuda_graph:
+            raise RuntimeError(
+                "GLM-5.2 canonical attention-DP requires --disable-cuda-graph "
+                "until DP-owned replay is certified"
+            )
         if self.production and self.pp_size > 1 and not disable_cuda_graph:
             raise RuntimeError(
                 "GLM-5.2 canonical PP2 requires --disable-cuda-graph until "
@@ -222,6 +240,7 @@ class SamplerParallelPlan:
             "pp_size": self.pp_size,
             "ep_size": self.ep_size,
             "attention_cp_size": self.attention_cp_size,
+            "attention_dp_size": self.attention_dp_size,
             "production": self.production,
             "version": self.version,
         }
@@ -371,6 +390,7 @@ class CanonicalMoEWorkspace:
             pp_size=plan.pp_size,
             ep_size=plan.ep_size,
             attention_cp_size=plan.attention_cp_size,
+            attention_dp_size=plan.attention_dp_size,
         )
         return cls(
             plan_hash=plan.identity,
@@ -462,6 +482,7 @@ class CanonicalMoEV3Workspace:
             pp_size=plan.pp_size,
             ep_size=plan.ep_size,
             attention_cp_size=plan.attention_cp_size,
+            attention_dp_size=plan.attention_dp_size,
         )
         contributors = plan.contributor_count
         capacity = local_partial.shape[0]

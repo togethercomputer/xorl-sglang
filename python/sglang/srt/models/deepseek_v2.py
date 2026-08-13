@@ -2798,6 +2798,19 @@ class DeepseekV2DecoderLayer(nn.Module):
             return "fp8"
         return ""
 
+    def _glm52_mlp_lora_context(self, num_tokens: int):
+        """Route all GLM MLP LoRA sites with metadata for gathered DP/CP rows."""
+
+        if not getattr(self, "glm52_xorl_bi_contract", False):
+            return nullcontext()
+        if isinstance(self.mlp, DeepseekV2MoE):
+            backend = getattr(self.mlp.experts, "lora_backend", None)
+        else:
+            backend = getattr(self.mlp.gate_up_proj, "lora_backend", None)
+        if backend is None:
+            return nullcontext()
+        return backend.use_gathered_mlp_batch_info(num_tokens)
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         mlp_layer_types = getattr(self.config, "mlp_layer_types", None)
         if self.glm52_xorl_bi_contract and mlp_layer_types is not None and not is_nextn:
@@ -2902,7 +2915,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            with _mlp_ctx:
+            with _mlp_ctx, self._glm52_mlp_lora_context(hidden_states.shape[0]):
                 if moe_positions is None:
                     hidden_states = self.mlp(
                         hidden_states,
@@ -3022,10 +3035,17 @@ class DeepseekV2Model(nn.Module):
             )
         self.glm52_parallel_plan: SamplerParallelPlan | None = None
         if self.glm52_xorl_bi_contract:
-            if not self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
+            parallel = get_parallel()
+            dp_owned = parallel.attn_dp_size == parallel.tp_size
+            cp_owned = (
+                self.dsa_enable_prefill_cp
+                and not self.mla_enable_prefill_cp
+                and parallel.attn_cp_size == parallel.tp_size
+            )
+            if not (cp_owned or dp_owned):
                 raise RuntimeError(
-                    "The exact GLM-5.2 canonical contract requires DSA context "
-                    "parallelism"
+                    "The exact GLM-5.2 canonical contract requires ownership "
+                    "entirely in DSA context parallelism or attention DP"
                 )
             server_args = get_server_args()
             forbidden_features = {
@@ -3070,6 +3090,7 @@ class DeepseekV2Model(nn.Module):
                 pp_size=get_parallel().pp_size,
                 pp_rank=self.pp_group.rank_in_group,
                 physical_ranks=physical_ranks,
+                attention_dp_size=get_parallel().attn_dp_size,
             )
             self.glm52_parallel_plan.validate_cuda_graph_policy(
                 disable_cuda_graph=server_args.disable_cuda_graph
@@ -3081,6 +3102,7 @@ class DeepseekV2Model(nn.Module):
                 pp_size=get_parallel().pp_size,
                 ep_size=get_parallel().moe_ep_size,
                 attention_cp_size=get_parallel().attn_cp_size,
+                attention_dp_size=get_parallel().attn_dp_size,
             )
 
         if self.pp_group.is_first_rank:

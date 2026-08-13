@@ -35,6 +35,8 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
+    dp_gather_replicate,
+    get_dp_global_num_tokens,
     get_local_dp_buffer,
 )
 from sglang.srt.layers.glm52_positions import (
@@ -107,6 +109,40 @@ def align_glm52_moe_positions(
     """Apply the rank-major CP gather and padding used by FULL MoE rows."""
 
     prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
+    if not prefill_cp and get_parallel().attn_dp_size > 1:
+        cached = getattr(forward_batch, "_glm52_dp_moe_positions", None)
+        if cached is not None:
+            if cached.values.numel() != full_hidden_states.shape[0]:
+                raise RuntimeError(
+                    "Cached GLM-5.2 DP positions do not match the gathered MLP rows"
+                )
+            return cached
+        local_positions = positions.reshape(-1).to(torch.int64)
+        global_num_tokens = get_dp_global_num_tokens()
+        if global_num_tokens is None:
+            raise RuntimeError(
+                "GLM-5.2 DP-owned position alignment requires the DP row layout"
+            )
+        local_capacity = int(global_num_tokens[get_parallel().attn_dp_rank])
+        local_real_tokens = int(
+            getattr(forward_batch, "_original_num_tokens", local_positions.numel())
+        )
+        if not 0 <= local_real_tokens <= min(local_positions.numel(), local_capacity):
+            raise RuntimeError(
+                "GLM-5.2 rank-local position ownership exceeds the DP gather capacity"
+            )
+        # Shift real positions by one so the zero-filled DP gather produces
+        # -1 sentinels after shifting back, including idle/padded rows.
+        padded_positions = local_positions.new_zeros((local_capacity,))
+        padded_positions[:local_real_tokens].copy_(
+            local_positions[:local_real_tokens] + 1
+        )
+        full_positions = local_positions.new_empty((full_hidden_states.shape[0],))
+        dp_gather_replicate(full_positions, padded_positions, forward_batch)
+        full_positions.sub_(1)
+        aligned = CanonicalMoEPositions(full_positions, full_positions >= 0)
+        forward_batch._glm52_dp_moe_positions = aligned
+        return aligned
     return _align_glm52_moe_positions(
         positions,
         full_hidden_states,

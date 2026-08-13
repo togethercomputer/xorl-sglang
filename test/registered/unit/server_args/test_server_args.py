@@ -983,6 +983,59 @@ class TestDeterministicGlmDsa(unittest.TestCase):
         ):
             server_args._validate_glm52_exact_resolved_contract()
 
+    def test_glm52_xorl_resolves_dp16_cp1_as_eager_dp_owned_lane(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.nnodes = 2
+        server_args.tp_size = 16
+        server_args.dp_size = 16
+        server_args.attn_cp_size = 1
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args._cuda_graph_config_locked = set()
+
+        server_args._resolve_glm52_exact_contract(
+            self._glm_model_config().hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_dsa_model=True,
+        )
+
+        self.assertEqual(server_args.ep_size, 16)
+        self.assertEqual(server_args.dp_size, 16)
+        self.assertEqual(server_args.attn_cp_size, 1)
+        self.assertFalse(server_args.enable_prefill_cp)
+        self.assertFalse(server_args.enable_dsa_prefill_context_parallel)
+        self.assertIsNone(server_args.cp_strategy)
+        self.assertTrue(server_args.enable_dp_lm_head)
+        self.assertEqual(server_args.max_loras_per_batch, 2)
+        self.assertEqual(server_args.max_loaded_loras, 2)
+        self.assertTrue(server_args.disable_cuda_graph)
+        self.assertTrue(server_args.disable_cuda_graph_padding)
+        self.assertIsNone(server_args.cuda_graph_bs_decode)
+        self.assertIsNone(server_args.cuda_graph_max_bs_decode)
+        self.assertEqual(
+            server_args.cuda_graph_config.decode.backend, Backend.DISABLED
+        )
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+        self.assertTrue(server_args.disable_radix_cache)
+
+        server_args.page_size = 64
+        server_args.enable_dp_attention = True
+        with patch.object(
+            envs.SGLANG_DISABLE_DSA_INDEXER_FUSION, "get", return_value=False
+        ):
+            server_args._validate_glm52_exact_resolved_contract()
+
+        server_args.attn_cp_size = 16
+        with (
+            patch.object(
+                envs.SGLANG_DISABLE_DSA_INDEXER_FUSION, "get", return_value=False
+            ),
+            self.assertRaisesRegex(ValueError, "drifted.*attn_cp_size"),
+        ):
+            server_args._validate_glm52_exact_resolved_contract()
+
     def test_glm52_xorl_preserves_arbitrary_positive_max_lora_rank(self):
         for rank in (1, 3, 7, 16, 31, 64):
             with self.subTest(rank=rank):

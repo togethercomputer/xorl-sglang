@@ -34,6 +34,43 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestGlm52CanonicalMoE(unittest.TestCase):
+    def test_dp_owned_positions_follow_rank_major_gather(self):
+        from sglang.srt.layers.communicator_dsa_cp import (
+            align_glm52_moe_positions as align_runtime_positions,
+        )
+
+        expected_shifted = torch.tensor([1, 3, 4, 6, 7, 0], dtype=torch.int64)
+
+        def fake_dp_gather(output, local, _forward_batch):
+            self.assertTrue(torch.equal(local, torch.tensor([3, 4])))
+            output.copy_(expected_shifted)
+
+        with patch.multiple(
+            "sglang.srt.layers.communicator_dsa_cp",
+            dsa_use_prefill_cp=lambda *_args: False,
+            mla_use_prefill_cp=lambda *_args: False,
+            get_parallel=lambda: SimpleNamespace(
+                attn_dp_size=3, attn_dp_rank=1, attn_cp_size=1
+            ),
+            get_dp_global_num_tokens=lambda: [1, 2, 3],
+            dp_gather_replicate=fake_dp_gather,
+        ):
+            aligned = align_runtime_positions(
+                torch.tensor([2, 3]),
+                torch.empty((6, 4)),
+                SimpleNamespace(),
+            )
+
+        self.assertTrue(
+            torch.equal(aligned.values, torch.tensor([0, 2, 3, 5, 6, -1]))
+        )
+        self.assertTrue(
+            torch.equal(
+                aligned.valid_mask,
+                torch.tensor([True, True, True, True, True, False]),
+            )
+        )
+
     def test_cp16_dp1_does_not_request_mlp_tp_gather(self):
         from sglang.srt.utils.common import require_mlp_sync, require_mlp_tp_gather
 
@@ -1153,6 +1190,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         self.assertEqual(production_16.launcher_tp_size, 16)
         self.assertEqual(production_16.ep_size, 16)
         self.assertEqual(production_16.attention_cp_size, 16)
+        self.assertEqual(production_16.attention_dp_size, 1)
         with (
             patch("torch.distributed.get_world_size", return_value=16),
             patch(
@@ -1167,6 +1205,37 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 pp_size=1,
                 ep_size=16,
                 attention_cp_size=16,
+            )
+
+        production_dp16 = SamplerParallelPlan.glm52(
+            contributors=16, attention_dp_size=16
+        )
+        self.assertEqual(production_dp16.attention_cp_size, 1)
+        self.assertEqual(production_dp16.attention_dp_size, 16)
+        with self.assertRaisesRegex(RuntimeError, "attention-DP requires"):
+            production_dp16.validate_cuda_graph_policy(disable_cuda_graph=False)
+        production_dp16.validate_cuda_graph_policy(disable_cuda_graph=True)
+        with (
+            patch("torch.distributed.get_world_size", return_value=16),
+            patch(
+                "torch.distributed.get_process_group_ranks",
+                return_value=list(range(16)),
+            ),
+        ):
+            production_dp16.validate_runtime(
+                group=object(),
+                launcher_tp_size=16,
+                effective_dense_tp=1,
+                pp_size=1,
+                ep_size=16,
+                attention_cp_size=1,
+                attention_dp_size=16,
+            )
+        with self.assertRaisesRegex(ValueError, "ownership entirely"):
+            replace(
+                production_dp16,
+                attention_cp_size=4,
+                attention_dp_size=4,
             )
 
         with (
