@@ -3,11 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _exec_config(
@@ -113,9 +114,7 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
         compile_mock.assert_called_once()
         self.assertIs(compiled_rope._apply_rotary_emb_wrapped, compiled_apply)
         with (
-            _exec_patch(
-                rl_on_policy_target="xorl", qwen35_gdn_exact_mode=True
-            ),
+            _exec_patch(rl_on_policy_target="xorl", qwen35_gdn_exact_mode=True),
             patch(
                 "sglang.srt.layers.rotary_embedding.base.torch.compile"
             ) as compile_mock,

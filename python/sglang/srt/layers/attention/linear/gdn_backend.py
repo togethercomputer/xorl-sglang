@@ -38,10 +38,18 @@ MAX_FUSED_QKV_SPLIT_DIM = 8192
 if is_cuda():
     from sglang.kernels.ops.attention.fla import bi_gdn_decode as _bi_decode_mod
     from sglang.kernels.ops.attention.fla import bi_gdn_decode_fast as _bi_fast_mod
+    from sglang.kernels.ops.attention.fla import bi_gdn_decode_incr as _bi_incr_mod
+    from sglang.kernels.ops.attention.fla import bi_gdn_incr_lazy_heal as _bi_heal_mod
     from sglang.kernels.ops.attention.fla import bi_gdn_prefill as _bi_prefill_mod
     from sglang.kernels.ops.attention.fla.bi_gdn_decode import BIGDNDecodeCache
     from sglang.kernels.ops.attention.fla.bi_gdn_decode_fast import (
         BIGDNFastDecodeRunner,
+    )
+    from sglang.kernels.ops.attention.fla.bi_gdn_decode_incr import (
+        BIGDNIncrDecodeRunner,
+    )
+    from sglang.kernels.ops.attention.fla.bi_gdn_incr_lazy_heal import (
+        warm_slots_batched,
     )
     from sglang.kernels.ops.attention.fla.bi_gdn_prefill import (
         bi_chunk_gated_delta_rule_prefill,
@@ -82,8 +90,28 @@ def _bi_gdn_decode_fast_enabled() -> bool:
     return is_cuda() and _bi_fast_mod.BI_GDN_DECODE_FAST_ENABLED
 
 
+def _bi_gdn_decode_incr_enabled() -> bool:
+    return is_cuda() and _bi_incr_mod.BI_GDN_DECODE_INCR_ENABLED
+
+
+def _bi_gdn_incr_defer_enabled() -> bool:
+    return is_cuda() and _bi_incr_mod.BI_GDN_INCR_DEFER_ENABLED
+
+
+def _bi_gdn_lazy_heal_enabled() -> bool:
+    return is_cuda() and _bi_heal_mod.BI_GDN_LAZY_HEAL_ENABLED
+
+
 def _bi_gdn_prefill_enabled() -> bool:
     return is_cuda() and _bi_prefill_mod.BI_GDN_PREFILL_ENABLED
+
+
+def _make_bi_gdn_decode_runner():
+    if not _bi_gdn_decode_fast_enabled():
+        return None
+    if _bi_gdn_decode_incr_enabled():
+        return BIGDNIncrDecodeRunner()
+    return BIGDNFastDecodeRunner()
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -362,9 +390,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
         )
         if not is_cpu() and not is_npu():
-            assert self.conv_states_shape[-1] < FLA_CHUNK_SIZE, (
-                f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
-            )
+            assert (
+                self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+            ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
 
         decode_backend = get_linear_attn_decode_backend()
         prefill_backend = get_linear_attn_prefill_backend()
@@ -387,13 +415,52 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     "The exact Qwen GDN graph contract requires the "
                     "slot-direct rescan runner."
                 )
+            if _bi_gdn_decode_incr_enabled() and not _bi_gdn_decode_fast_enabled():
+                raise RuntimeError(
+                    "The cached-row GDN decode runner requires the slot-direct "
+                    "rescan runner for eager fallback and cache maintenance."
+                )
+            if _bi_gdn_incr_defer_enabled() and not _bi_gdn_decode_incr_enabled():
+                raise RuntimeError(
+                    "Cached-row GDN writeback deferral requires the cached-row "
+                    "incremental runner."
+                )
+            if _bi_gdn_lazy_heal_enabled() and not _bi_gdn_decode_incr_enabled():
+                raise RuntimeError(
+                    "Batched GDN cache warm requires the cached-row incremental runner."
+                )
+            if (
+                _bi_gdn_incr_defer_enabled()
+                and not model_runner.server_args.disable_radix_cache
+            ):
+                raise RuntimeError(
+                    "Cached-row GDN writeback deferral is admitted only by the "
+                    "no-radix exact contract; radix insertion would require an "
+                    "explicit finish flush."
+                )
             rank0_log(
-                "GDN decode contract ENGAGED: slot-direct exact partial-chunk rescan"
+                "GDN decode contract ENGAGED: "
+                + (
+                    "cached-row incremental graph decode with batched cache warm "
+                    "and exact rescan eager fallback"
+                    if _bi_gdn_decode_incr_enabled()
+                    else "slot-direct exact partial-chunk rescan"
+                )
             )
         self._bi_decode_caches = {}
-        self._bi_fast_runner = (
-            BIGDNFastDecodeRunner() if _bi_gdn_decode_fast_enabled() else None
-        )
+        self._bi_fast_runner = _make_bi_gdn_decode_runner()
+        if self._bi_fast_runner is not None:
+            if isinstance(self._bi_fast_runner, BIGDNIncrDecodeRunner):
+                server_args = model_runner.server_args
+                if server_args.enable_mamba_extra_buffer():
+                    interval = int(server_args.mamba_track_interval)
+                    if interval % FLA_CHUNK_SIZE != 0:
+                        raise RuntimeError(
+                            "Cached-row GDN writeback deferral requires "
+                            f"mamba_track_interval % {FLA_CHUNK_SIZE} == 0; "
+                            f"got {interval}."
+                        )
+                    self._bi_fast_runner.track_interval = interval
         self._bi_decode_step_metadata = None
         self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
@@ -458,6 +525,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         hv = layer.num_v_heads
         g_rows = g.reshape(-1, hv)
         beta_rows = beta.reshape(-1, hv)
+        warm_pairs = []
         for i, slot in enumerate(slots):
             lo, hi = starts[i], starts[i + 1]
             cache.seed_from_extend(
@@ -469,6 +537,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 prefix_len=int(prefix_lens[i]),
                 ssm_states=ssm_states,
             )
+            if isinstance(self._bi_fast_runner, BIGDNIncrDecodeRunner):
+                suffix = (int(prefix_lens[i]) + (hi - lo)) % FLA_CHUNK_SIZE
+                warm_pairs.append((slot, suffix))
+        if isinstance(self._bi_fast_runner, BIGDNIncrDecodeRunner):
+            # Export the already-prefilled partial suffix once. Decode graph
+            # replays can then update only the new row; eager fallbacks retain
+            # the exact rescan and maintain these caches for the next graph.
+            if _bi_gdn_lazy_heal_enabled():
+                warm_slots_batched(self._bi_fast_runner, cache, warm_pairs)
+            else:
+                for slot, suffix in warm_pairs:
+                    self._bi_fast_runner.warm_slot(cache, slot, suffix)
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)

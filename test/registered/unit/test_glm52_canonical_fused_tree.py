@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+
 from sglang.srt.distributed.canonical_moe import (
     GLM52_CANONICAL_MOE_V3B_VERSION,
     CanonicalTransport,
@@ -11,7 +12,7 @@ from sglang.srt.distributed.canonical_moe import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _partials(contributors: int, *, seed: int, shape=(5, 33)) -> torch.Tensor:

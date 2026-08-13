@@ -42,7 +42,6 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
-
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
@@ -52,7 +51,6 @@ import setproctitle
 import torch
 import torch.distributed
 from torch.distributed import barrier
-
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -319,7 +317,6 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
 
 if is_mps():
     CudaStreamContext = nullcontext

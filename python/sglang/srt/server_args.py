@@ -445,6 +445,10 @@ def is_qwen35_gdn_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "qwen35_gdn_exact_mode", False))
 
 
+def is_qwen3_dense_exact_mode(server_args: ServerArgs) -> bool:
+    return bool(getattr(server_args, "qwen3_dense_exact_mode", False))
+
+
 def is_qwen35_rope_class_b(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "qwen35_rope_class_b", False))
 
@@ -463,12 +467,211 @@ def _validate_exact_model_geometry(
     mismatches = []
     for name, expected_value in expected.items():
         actual_value = getattr(config, name, None)
+        if name == "rope_theta" and actual_value is None:
+            rope_parameters = getattr(config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                actual_value = rope_parameters.get("rope_theta")
         if actual_value != expected_value:
             mismatches.append(f"{name}={actual_value!r} (expected {expected_value!r})")
     if mismatches:
         raise ValueError(
             f"The exact {contract_name} XORL contract only admits the qualified "
             f"model geometry; mismatched fields: {', '.join(mismatches)}"
+        )
+
+
+def _validate_exact_qwen3_dense_capabilities(hf_config) -> None:
+    config = _text_model_config(hf_config)
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "use_sliding_window": False,
+        "attention_dropout": 0.0,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+        unsupported_keys = set(rope_scaling) - {"rope_type", "type", "rope_theta"}
+        if rope_type not in (None, "default") or unsupported_keys:
+            mismatches.append(
+                f"rope_scaling={rope_scaling!r} (only default RoPE is supported)"
+            )
+    elif rope_scaling:
+        mismatches.append(
+            f"rope_scaling={rope_scaling!r} (only default RoPE is supported)"
+        )
+
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get("rope_theta")
+    if (
+        not isinstance(rope_theta, (int, float))
+        or isinstance(rope_theta, bool)
+        or rope_theta <= 0
+    ):
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if (
+        not isinstance(rms_norm_eps, (int, float))
+        or isinstance(rms_norm_eps, bool)
+        or rms_norm_eps <= 0
+    ):
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    if mismatches:
+        raise ValueError(
+            "The exact dense Qwen3 XORL contract does not support this "
+            f"architecture configuration: {', '.join(mismatches)}"
+        )
+
+
+def _validate_exact_qwen35_dense_capabilities(hf_config) -> None:
+    config = _text_model_config(hf_config)
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+        "linear_num_value_heads",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 256,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+    if getattr(config, "use_sliding_window", False):
+        mismatches.append("use_sliding_window=True (requires False)")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if (
+        not isinstance(rms_norm_eps, (int, float))
+        or isinstance(rms_norm_eps, bool)
+        or rms_norm_eps <= 0
+    ):
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
+
+    rope_parameters = getattr(config, "rope_parameters", None)
+    rope_theta = getattr(config, "rope_theta", None)
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+    if isinstance(rope_parameters, dict):
+        if rope_theta is None:
+            rope_theta = rope_parameters.get("rope_theta")
+        if partial_rotary_factor is None:
+            partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
+    if (
+        not isinstance(rope_theta, (int, float))
+        or isinstance(rope_theta, bool)
+        or rope_theta <= 0
+    ):
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+    if partial_rotary_factor != 0.25:
+        mismatches.append(
+            f"partial_rotary_factor={partial_rotary_factor!r} (requires 0.25)"
+        )
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    linear_num_value_heads = getattr(config, "linear_num_value_heads", None)
+    if (
+        isinstance(linear_num_value_heads, int)
+        and linear_num_value_heads > 0
+        and linear_num_value_heads % 16 != 0
+    ):
+        mismatches.append(
+            f"linear_num_value_heads={linear_num_value_heads!r} "
+            "(requires a multiple of 16)"
+        )
+
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    layer_types = getattr(config, "layer_types", None)
+    if (
+        isinstance(num_hidden_layers, int)
+        and num_hidden_layers > 0
+        and layer_types is not None
+    ):
+        expected_layer_types = tuple(
+            "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
+            for layer_idx in range(num_hidden_layers)
+        )
+        if tuple(layer_types) != expected_layer_types:
+            mismatches.append("layer_types does not match full_attention_interval=4")
+
+    if mismatches:
+        raise ValueError(
+            "The exact dense Qwen3.5 XORL contract does not support this "
+            f"architecture configuration: {', '.join(mismatches)}"
         )
 
 
@@ -571,6 +774,10 @@ def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | Non
         )
 
         return QWEN35_REQUIRED_BI_OPS
+    if is_qwen3_dense_exact_mode(server_args):
+        # Dense Qwen3 owns its norm, activation, lm-head, and probability
+        # reductions. Only trunk matrix products use the generic BI interpose.
+        return ("addmm", "bmm", "mm")
     return None
 
 
@@ -3423,6 +3630,9 @@ class ServerArgs:
     qwen35_rmsnorm_family: A[Literal["v1", "v2"], NS("exec.deterministic")] = (
         dataclasses.field(init=False, default="v1", repr=False)
     )
+    qwen3_dense_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
+    )
 
     # -------------------------------------------------------------------------
     # KV canary
@@ -5292,9 +5502,7 @@ class ServerArgs:
                 f"rope_parameters={rope_parameters!r}"
             )
         if getattr(config, "cli_factor", 1) != 1:
-            raise ValueError(
-                "The exact GLM-5.2 XORL contract requires cli_factor=1"
-            )
+            raise ValueError("The exact GLM-5.2 XORL contract requires cli_factor=1")
         if getattr(config, "num_hash_layers", 0) not in (None, 0):
             raise ValueError(
                 "The exact GLM-5.2 XORL contract requires num_hash_layers=0"
@@ -5330,6 +5538,8 @@ class ServerArgs:
             # Dynamic POST loading needs the fixed complete memory-pool layout
             # even when no adapter is present at server startup.
             self.lora_target_modules = set(GLM52_REQUIRED_TARGET_MODULES)
+        requested_max_lora_rank = self.max_lora_rank
+        requested_max_total_tokens = self.max_total_tokens
         exact_program = {
             "moe_runner_backend": (self.moe_runner_backend, ("auto", "triton")),
             "fp8_gemm_runner_backend": (
@@ -5369,7 +5579,7 @@ class ServerArgs:
             ),
             "max_prefill_tokens": (self.max_prefill_tokens, (8192, 16384)),
             "prefill_max_requests": (self.prefill_max_requests, (None, 1)),
-            "max_total_tokens": (self.max_total_tokens, (None, 8192)),
+            "max_total_tokens": (self.max_total_tokens, (None, 8192, 32768)),
             "max_running_requests": (self.max_running_requests, (None, 16)),
             "model_impl": (self.model_impl, ("auto", "sglang")),
             "device": (self.device, (None, "cuda")),
@@ -5389,7 +5599,6 @@ class ServerArgs:
                 (None,),
             ),
             "msprobe_dump_config": (self.msprobe_dump_config, (None,)),
-            "max_lora_rank": (self.max_lora_rank, (None, 1)),
             "lora_backend": (self.lora_backend, ("csgmv", "triton")),
             "experts_shared_outer_loras": (
                 self.experts_shared_outer_loras,
@@ -5420,6 +5629,15 @@ class ServerArgs:
             for name, (value, allowed) in exact_program.items()
             if value not in allowed
         ]
+        if requested_max_lora_rank is not None and (
+            isinstance(requested_max_lora_rank, bool)
+            or not isinstance(requested_max_lora_rank, int)
+            or requested_max_lora_rank <= 0
+        ):
+            incompatible.append(
+                f"max_lora_rank={requested_max_lora_rank!r} "
+                "(expected a positive integer)"
+            )
         if self.disable_cuda_graph:
             incompatible.append("disable_cuda_graph=True")
         if self.cuda_graph_bs_decode not in (None, [16]):
@@ -5480,12 +5698,16 @@ class ServerArgs:
         self.chunked_prefill_size = -1
         self.max_prefill_tokens = 8192
         self.prefill_max_requests = 1
-        self.max_total_tokens = 8192
+        self.max_total_tokens = (
+            8192 if requested_max_total_tokens is None else requested_max_total_tokens
+        )
         self.max_running_requests = 16
         self.mem_fraction_static = 0.82
         self.model_impl = "sglang"
         self.device = "cuda"
-        self.max_lora_rank = 1
+        self.max_lora_rank = (
+            1 if requested_max_lora_rank is None else requested_max_lora_rank
+        )
         self.lora_backend = "triton"
         self.experts_shared_outer_loras = True
         self.enable_lora_overlap_loading = False
@@ -5573,7 +5795,6 @@ class ServerArgs:
             "chunked_prefill_size": -1,
             "max_prefill_tokens": 8192,
             "prefill_max_requests": 1,
-            "max_total_tokens": 8192,
             "max_running_requests": 16,
             "mem_fraction_static": 0.82,
             "model_impl": "sglang",
@@ -5585,7 +5806,6 @@ class ServerArgs:
             "enable_single_batch_overlap": False,
             "debug_tensor_dump_output_folder": None,
             "msprobe_dump_config": None,
-            "max_lora_rank": 1,
             "lora_backend": "triton",
             "experts_shared_outer_loras": True,
             "enable_lora_overlap_loading": False,
@@ -5600,6 +5820,19 @@ class ServerArgs:
             for name, value in expected.items()
             if getattr(self, name, None) != value
         ]
+        if self.max_total_tokens not in (8192, 32768):
+            mismatches.append(
+                f"max_total_tokens={self.max_total_tokens!r} "
+                "(expected one of (8192, 32768))"
+            )
+        if (
+            isinstance(self.max_lora_rank, bool)
+            or not isinstance(self.max_lora_rank, int)
+            or self.max_lora_rank <= 0
+        ):
+            mismatches.append(
+                f"max_lora_rank={self.max_lora_rank!r} " "(expected a positive integer)"
+            )
         if self.node_rank not in (0, 1):
             mismatches.append(f"node_rank={self.node_rank!r} (expected 0 or 1)")
         if not isinstance(self.cuda_graph_config, CudaGraphConfig):
@@ -5652,30 +5885,28 @@ class ServerArgs:
         if not self.qwen35_gdn_exact_mode:
             return
         config = _text_model_config(hf_config)
-        expected = {
-            "hidden_size": 2048 if self.qwen35_gdn_exact_is_moe else 1024,
-            "num_hidden_layers": 40 if self.qwen35_gdn_exact_is_moe else 24,
-            "num_attention_heads": 16 if self.qwen35_gdn_exact_is_moe else 8,
-            "num_key_value_heads": 2,
-            "vocab_size": 248320,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 32 if self.qwen35_gdn_exact_is_moe else 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "full_attention_interval": 4,
-        }
         if self.qwen35_gdn_exact_is_moe:
-            expected.update(num_experts=256, num_experts_per_tok=8)
-        _validate_exact_model_geometry(
-            config,
-            contract_name=(
-                "Qwen3.6-35B-A3B"
-                if self.qwen35_gdn_exact_is_moe
-                else "Qwen3.5-0.8B"
-            ),
-            expected=expected,
-        )
+            _validate_exact_model_geometry(
+                config,
+                contract_name="Qwen3.6-35B-A3B",
+                expected={
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "vocab_size": 248320,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 32,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 4,
+                    "full_attention_interval": 4,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                },
+            )
+        else:
+            _validate_exact_qwen35_dense_capabilities(config)
         if (
             self.speculative_algorithm is not None
             or self.speculative_draft_model_path is not None
@@ -5802,9 +6033,13 @@ class ServerArgs:
             # radix tree persists the matching GDN checkpoint metadata.
             self.disable_radix_cache = True
             exact_decode_graph_bs = list(range(1, 33))
-            if self.cuda_graph_bs_decode is not None and self.cuda_graph_bs_decode not in (
-                [32],
-                exact_decode_graph_bs,
+            if (
+                self.cuda_graph_bs_decode is not None
+                and self.cuda_graph_bs_decode
+                not in (
+                    [32],
+                    exact_decode_graph_bs,
+                )
             ):
                 raise ValueError(
                     "The exact Qwen3.6 MoE XORL contract requires decode CUDA "
@@ -5852,13 +6087,22 @@ class ServerArgs:
                 "_mem_fraction_static_user_supplied",
                 self.mem_fraction_static is not None,
             )
-            if mem_fraction_explicit and self.mem_fraction_static != 0.40:
+            # Cached-row graph capture retains the per-slot incremental slabs.
+            # At 0.40, a full 256-request batch of varied Wordle prompts left
+            # less than one GiB available for the fused-MoE prefill temporary.
+            # Reserve two additional percentage points for activation headroom;
+            # this changes pool capacity only, not the numerical program.
+            qwen35_moe_mem_fraction_static = 0.38
+            if (
+                mem_fraction_explicit
+                and self.mem_fraction_static != qwen35_moe_mem_fraction_static
+            ):
                 raise ValueError(
                     "The exact Qwen3.6 MoE XORL contract requires "
-                    "--mem-fraction-static 0.40; got "
+                    "--mem-fraction-static 0.38; got "
                     f"{self.mem_fraction_static}"
                 )
-            self.mem_fraction_static = 0.40
+            self.mem_fraction_static = qwen35_moe_mem_fraction_static
             if self.max_running_requests is None:
                 self.max_running_requests = 256
             elif self.max_running_requests != 256:
@@ -5893,6 +6137,65 @@ class ServerArgs:
             self.disable_cuda_graph = True
             self.disable_radix_cache = True
 
+    def _resolve_qwen3_dense_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+    ) -> None:
+        self.qwen3_dense_exact_mode = (
+            self.rl_on_policy_target == XORL_RL_TARGET
+            and model_arch == "Qwen3ForCausalLM"
+        )
+        hf_config._qwen3_dense_exact_mode = self.qwen3_dense_exact_mode
+        if not self.qwen3_dense_exact_mode:
+            return
+
+        _validate_exact_qwen3_dense_capabilities(hf_config)
+        if self.dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError("The exact dense Qwen3 XORL contract requires BF16 dtype")
+        if self.quantization is not None:
+            raise ValueError(
+                "The exact dense Qwen3 XORL contract requires unquantized weights"
+            )
+        if self.attention_backend not in (None, "fa4"):
+            raise ValueError(
+                "The exact dense Qwen3 XORL contract requires the FA4 backend"
+            )
+        topology = (self.tp_size, self.dp_size, self.ep_size, self.pp_size)
+        if topology != (1, 1, 1, 1):
+            raise ValueError(
+                "The exact dense Qwen3 XORL contract is admitted at "
+                f"TP1/DP1/EP1/PP1; got TP{self.tp_size}/DP{self.dp_size}/"
+                f"EP{self.ep_size}/PP{self.pp_size}"
+            )
+        if (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "The exact dense Qwen3 XORL contract does not support speculative "
+                "or draft decoding"
+            )
+
+        self.dtype = "bfloat16"
+        self.attention_backend = "fa4"
+        self.enable_fp32_lm_head = False
+        self.enable_fp32_router = False
+        self.enable_deterministic_inference = True
+        self.sampling_backend = "pytorch"
+        self.sampling_defaults = "openai"
+        self.disable_custom_all_reduce = True
+        # The generic server warmup issues a greedy request.  The exact XORL
+        # sampler deliberately admits only multinomial sampling, so graph
+        # capture is the applicable warmup for this program.
+        self.skip_server_warmup = True
+        logger.info(
+            "Dense Qwen3 exact numerics: Class-B RoPE, RMSNorm families-v2, "
+            "shape-aware exact SwiGLU, and the families-v2 BF16 lm-head"
+        )
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
@@ -5915,6 +6218,7 @@ class ServerArgs:
             is_dsa_model=is_deepseek_dsa(hf_config),
         )
         self._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=model_arch)
+        self._resolve_qwen3_dense_exact_contract(hf_config, model_arch=model_arch)
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
@@ -8733,8 +9037,7 @@ class ServerArgs:
                     )
 
             if (
-                attention_backend
-                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
                 and not is_glm_dsa_backend
             ):
                 # Currently, only certain backends support radix cache. Support for other backends is in progress

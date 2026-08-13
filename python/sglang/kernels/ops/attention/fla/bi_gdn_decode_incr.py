@@ -255,6 +255,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+
 from sglang.kernels.ops.attention.fla.bi_gdn_decode_fast import (
     BIGDNFastDecodeRunner,
     bi_gdn_fast_append_kernel,
@@ -1822,7 +1823,7 @@ class BIGDNIncrDecodeRunner(BIGDNFastDecodeRunner):
         if self._capture_mode_fn is None:
             # lazy import: the fla layer must not import model_executor at
             # module scope (import cycle).
-            from sglang.srt.model_executor.cuda_graph_runner import (
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
                 get_is_capture_mode,
             )
 
@@ -2343,7 +2344,6 @@ class BIGDNIncrDecodeRunner(BIGDNFastDecodeRunner):
                 src,
                 dst,
                 1e-6,
-                NB=triton.cdiv(l2_rows, 2048),
                 T=l2_rows,
                 D=k,
                 BD=self._next_pow2(k),

@@ -9,6 +9,7 @@ from enum import Enum
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.distributed.canonical_moe_kernels import (
     fused_balanced_adjacent_bf16_tree,
 )

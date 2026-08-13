@@ -62,6 +62,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -185,7 +186,6 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
-
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -477,13 +477,11 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
-
 # route_class is per-router, so included routers need it set too.
 v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
-
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
@@ -649,7 +647,9 @@ async def validate_json_request(raw_request: Request):
 
 def _health_generate_sampling_params(server_args) -> Dict[str, Union[int, float]]:
     """Return a health request that is valid for the selected sampler contract."""
-    if getattr(server_args, "glm52_exact_mode", False):
+    if getattr(server_args, "glm52_exact_mode", False) or getattr(
+        server_args, "qwen3_dense_exact_mode", False
+    ):
         random_seed = getattr(server_args, "random_seed", None)
         return {
             "max_new_tokens": 1,
@@ -1379,9 +1379,7 @@ async def prepare_weights_update(
     obj: Annotated[PrepareWeightsUpdateReqInput, Body()], request: Request
 ):
     """Arm a two-phase distributed-weight receiver before broadcast."""
-    result = await _global_state.tokenizer_manager.prepare_weights_update(
-        obj, request
-    )
+    result = await _global_state.tokenizer_manager.prepare_weights_update(obj, request)
     content = {"success": result.success, "message": result.message}
     if obj.transport == "p2p":
         content["tensor_map"] = result.tensor_map

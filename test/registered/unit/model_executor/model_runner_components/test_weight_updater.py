@@ -3,6 +3,9 @@ from unittest.mock import Mock
 import torch
 
 from sglang.srt.model_executor.model_runner_components import weight_updater
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def test_nccl_weight_update_group_is_initialized_eagerly(monkeypatch):
@@ -78,3 +81,11 @@ def test_non_nccl_weight_update_group_does_not_force_a_cuda_device(monkeypatch):
         backend="gloo",
     )[0]
     assert captured["device_id"] is None
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

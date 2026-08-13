@@ -248,12 +248,12 @@ class LoRAManager:
         Args:
             lora_ref (LoRARef): The LoRARef object containing the LoRA name, path, and ID.
         """
-        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
-            "LoRARef must have both lora_name and lora_path set for loading."
-        )
-        assert lora_ref.lora_id not in self.loras, (
-            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
-        )
+        assert (
+            lora_ref.lora_name is not None and lora_ref.lora_path is not None
+        ), "LoRARef must have both lora_name and lora_path set for loading."
+        assert (
+            lora_ref.lora_id not in self.loras
+        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
             # load configs
@@ -396,45 +396,24 @@ class LoRAManager:
                 "Start the server with --disable-shared-experts-fusion."
             )
 
-    def _validate_glm52_exact_batch(self, forward_batch: ForwardBatch) -> None:
-        """Admit the one-request exact GLM adapter program before metadata mutation."""
+    def _validate_glm52_active_adapters(self, forward_batch: ForwardBatch) -> None:
+        """Reject stale adapter references without restricting normal batching."""
 
         if not getattr(self.base_hf_config, "_glm52_exact_mode", False):
             return
 
         lora_ids = list(forward_batch.lora_ids)
         if get_is_capture_mode():
-            if not lora_ids or any(uid is not None for uid in lora_ids):
-                raise RuntimeError(
-                    "Exact GLM-5.2 CUDA-graph capture requires only synthetic "
-                    "base-slot placeholders."
-                )
             return
 
-        if len(lora_ids) != 1:
-            raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA contract admits exactly one "
-                f"logical request, got {len(lora_ids)}."
-            )
-        uid = lora_ids[0]
-        if uid is None:
-            return
-        adapter = self.loras.get(uid)
-        if adapter is None or uid not in self.memory_pool.uid_to_buffer_id:
-            raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA request references a missing or "
-                f"nonresident adapter UID: {uid!r}."
-            )
-        if not getattr(adapter, "_glm52_exact_adapter_certified", False):
-            raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA request requires an adapter "
-                "certified from the complete 1,700-factor inventory."
-            )
-        if adapter.config.r != 1 or adapter.scaling != 1:
-            raise RuntimeError(
-                "The exact GLM-5.2 active-LoRA request requires rank 1 and "
-                f"unit scaling, got rank={adapter.config.r}, scaling={adapter.scaling}."
-            )
+        for uid in set(lora_ids):
+            if uid is None:
+                continue
+            if uid not in self.loras or uid not in self.memory_pool.uid_to_buffer_id:
+                raise RuntimeError(
+                    "The GLM-5.2 active-LoRA request references a missing or "
+                    f"nonresident adapter UID: {uid!r}."
+                )
 
     def unload_lora_adapter(self, lora_ref: LoRARef) -> LoRAUpdateOutput:
         logger.info(
@@ -456,9 +435,9 @@ class LoRAManager:
 
         adapter = self.configs.get(lora_ref.lora_id)
         lora_ref = self.lora_refs.get(lora_ref.lora_id)
-        assert adapter is not None and lora_ref is not None, (
-            f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
-        )
+        assert (
+            adapter is not None and lora_ref is not None
+        ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
 
         try:
             pending_events = getattr(self, "pending_lora_load_events", {})
@@ -498,9 +477,9 @@ class LoRAManager:
         for lora_id in lora_ids:
             if lora_id is not None:
                 lora_ref = self.lora_refs.get(lora_id)
-                assert lora_ref is not None, (
-                    f"LoRA ID {lora_id} not found in lora_refs."
-                )
+                assert (
+                    lora_ref is not None
+                ), f"LoRA ID {lora_id} not found in lora_refs."
                 pinned_loras_in_batch += int(lora_ref.pinned)
 
         assert pinned_loras_in_batch <= self.num_pinned_loras, (
@@ -548,8 +527,6 @@ class LoRAManager:
         take the base path instead of reading the previous batch's stale
         metadata."""
         self.lora_backend.reset_batch_state()
-        if getattr(self.base_hf_config, "_glm52_exact_mode", False):
-            self.lora_backend._glm52_exact_batch_certified = False
 
     @contextmanager
     def glm52_context_parallel_lora_batch(
@@ -814,9 +791,7 @@ class LoRAManager:
 
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
-        if getattr(self.base_hf_config, "_glm52_exact_mode", False):
-            self.lora_backend._glm52_exact_batch_certified = False
-        self._validate_glm52_exact_batch(forward_batch)
+        self._validate_glm52_active_adapters(forward_batch)
         bs = forward_batch.batch_size
 
         use_cuda_graph = (
@@ -854,8 +829,6 @@ class LoRAManager:
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
         )
-        if getattr(self.base_hf_config, "_glm52_exact_mode", False):
-            self.lora_backend._glm52_exact_batch_certified = True
 
     def update_lora_info(self):
         """
@@ -957,9 +930,7 @@ class LoRAManager:
 
         assert lora_paths or (
             max_lora_rank is not None and target_modules is not None
-        ), (
-            "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
-        )
+        ), "When no initial --lora-paths is provided, you need to specify both --max-lora-rank and --lora-target-modules for LoRA initialization."
 
         self.init_lora_adapters(lora_paths)
         self.init_lora_shapes(
@@ -1217,12 +1188,12 @@ class LoRAManager:
         """
         Load a single LoRA adapter from tensors and config dict.
         """
-        assert lora_ref.lora_name is not None and lora_ref.lora_path is not None, (
-            "LoRARef must have both lora_name and lora_path set for loading."
-        )
-        assert lora_ref.lora_id not in self.loras, (
-            f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
-        )
+        assert (
+            lora_ref.lora_name is not None and lora_ref.lora_path is not None
+        ), "LoRARef must have both lora_name and lora_path set for loading."
+        assert (
+            lora_ref.lora_id not in self.loras
+        ), f"LoRA adapter with ID {lora_ref.lora_id} is already loaded. This should have been verified before request is sent to the backend."
 
         try:
             new_adapter = LoRAConfig.from_dict(

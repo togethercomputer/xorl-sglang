@@ -7,13 +7,14 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
+
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
-from sglang.srt.model_loader.utils import set_default_torch_dtype
-from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.model_executor.p2p_weight_update_receiver import (
     P2PWeightUpdateReceiver,
 )
+from sglang.srt.model_loader.loader import DefaultModelLoader, get_model_loader
+from sglang.srt.model_loader.utils import set_default_torch_dtype
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -27,7 +28,6 @@ from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
 )
-
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

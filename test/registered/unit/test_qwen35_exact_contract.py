@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
 from sglang.kernels.ops.attention.fla import qwen35_gdn_exact as exact
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -13,6 +14,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     default_cuda_graph_config,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _server_args(**overrides):
@@ -23,14 +27,25 @@ def _server_args(**overrides):
     return args
 
 
-def _qwen_config(*, moe: bool):
+def _qwen_config(*, moe: bool, **overrides):
     layers = 40 if moe else 24
-    text_config = SimpleNamespace(
+    values = dict(
         hidden_size=2048 if moe else 1024,
+        intermediate_size=3584,
         num_hidden_layers=layers,
         num_attention_heads=16 if moe else 8,
         num_key_value_heads=2,
         vocab_size=248320,
+        max_position_embeddings=262144,
+        head_dim=256,
+        hidden_act="silu",
+        attention_bias=False,
+        attention_dropout=0.0,
+        use_sliding_window=False,
+        rms_norm_eps=1e-6,
+        rope_theta=10000000.0,
+        partial_rotary_factor=0.25,
+        attn_output_gate=True,
         linear_num_key_heads=16,
         linear_num_value_heads=32 if moe else 16,
         linear_key_head_dim=128,
@@ -38,6 +53,8 @@ def _qwen_config(*, moe: bool):
         linear_conv_kernel_dim=4,
         full_attention_interval=4,
     )
+    values.update(overrides)
+    text_config = SimpleNamespace(**values)
     if moe:
         text_config.num_experts = 256
         text_config.num_experts_per_tok = 8
@@ -95,7 +112,7 @@ def test_qwen35_moe_plain_config_resolves_certified_topology():
     assert args.max_queued_requests == 512
     assert args.chunked_prefill_size == -1
     assert args.max_prefill_tokens == 32768
-    assert args.mem_fraction_static == 0.40
+    assert args.mem_fraction_static == 0.38
     assert not args.disable_cuda_graph
     assert args.disable_radix_cache
 
@@ -168,7 +185,7 @@ def test_non_qwen_keeps_conservative_norm_and_rope_defaults():
         ("speculative_algorithm", "EAGLE", "speculative"),
         ("disable_cuda_graph", True, "CUDA graph bucket"),
         ("max_running_requests", 16, "max-running-requests 256"),
-        ("mem_fraction_static", 0.5, "mem-fraction-static 0.40"),
+        ("mem_fraction_static", 0.40, "mem-fraction-static 0.38"),
         ("max_mamba_cache_size", 512, "max-mamba-cache-size 1280"),
     ],
 )
@@ -243,31 +260,95 @@ def test_qwen35_moe_rejects_explicit_non_graph32_program():
         )
 
 
-@pytest.mark.parametrize("moe", (False, True))
-def test_qwen35_rejects_architecture_alias_with_unqualified_geometry(moe):
-    hf_config = _qwen_config(moe=moe)
+def test_qwen35_moe_rejects_architecture_alias_with_unqualified_geometry():
+    hf_config = _qwen_config(moe=True)
     hf_config.text_config.hidden_size += 1
-    args = _server_args(tp_size=8 if moe else 1)
-    architecture = (
-        "Qwen3_5MoeForConditionalGeneration"
-        if moe
-        else "Qwen3_5ForConditionalGeneration"
-    )
+    args = _server_args(tp_size=8)
     with pytest.raises(ValueError, match="qualified model geometry.*hidden_size"):
-        args._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=architecture)
+        args._resolve_qwen35_gdn_exact_contract(
+            hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
+        )
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        dict(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=24,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            linear_num_value_heads=16,
+        ),
+        dict(
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            linear_num_value_heads=32,
+        ),
+        dict(
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            linear_num_value_heads=32,
+        ),
+        dict(
+            hidden_size=5120,
+            intermediate_size=17408,
+            num_hidden_layers=64,
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            linear_num_value_heads=48,
+        ),
+    ],
+)
+def test_qwen35_dense_admits_family_geometries(geometry):
+    hf_config = _qwen_config(moe=False, **geometry)
+    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=1)
+
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config, model_arch="Qwen3_5ForConditionalGeneration"
+    )
+
+    assert args.qwen35_gdn_exact_mode
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("head_dim", 128),
+        ("attention_bias", True),
+        ("linear_num_key_heads", 8),
+        ("linear_num_value_heads", 24),
+        ("linear_conv_kernel_dim", 3),
+        ("full_attention_interval", 8),
+    ],
+)
+def test_qwen35_dense_rejects_unsupported_capabilities(name, value):
+    hf_config = _qwen_config(moe=False, **{name: value})
+    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=1)
+
+    with pytest.raises(ValueError, match=rf"does not support.*{name}"):
+        args._resolve_qwen35_gdn_exact_contract(
+            hf_config, model_arch="Qwen3_5ForConditionalGeneration"
+        )
 
 
 def test_qwen35_private_resolver_installs_one_tuple_once():
-    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
-    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
-    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
-    import sglang.srt.distributed.communication_op as communication
     import sglang.kernels.ops.attention.fla.bi_gdn_decode as decode
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_fast as fast
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_incr as incremental
     import sglang.kernels.ops.attention.fla.bi_gdn_incr_lazy_heal as heal
     import sglang.kernels.ops.attention.fla.bi_gdn_prefill as prefill
     import sglang.kernels.ops.attention.fla.layernorm_gated as norm
+    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
+    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
+    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
     import sglang.srt.layers.xorl_batch_invariant as xorl_family
 
     active_flags = [
@@ -279,17 +360,22 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
     ]
     held_flags = [
         (prefill, "BI_GDN_SOLVE_TRIL_DECODE"),
+        (fast, "BI_GDN_SOLVE_TRIL_DECODE"),
         (fast, "BI_GDN_FUSE_SMALL_ENABLED"),
+        (incremental, "BI_GDN_SOLVE_TRIL_DECODE"),
         (incremental, "BI_GDN_DECODE_INCR_ENABLED"),
         (incremental, "BI_GDN_INCR_DEFER_ENABLED"),
         (incremental, "BI_GDN_VNEW_SLIM_ENABLED"),
+        (heal, "BI_GDN_SOLVE_TRIL_DECODE"),
         (heal, "BI_GDN_LAZY_HEAL_ENABLED"),
     ]
     with ExitStack() as stack:
         stack.enter_context(patch.object(exact, "_applied", False))
         stack.enter_context(patch.object(bi_ops, "ENABLE_JIT_DEEPGEMM", True))
-        for module, name in active_flags + held_flags:
+        for module, name in active_flags:
             stack.enter_context(patch.object(module, name, False))
+        for module, name in held_flags:
+            stack.enter_context(patch.object(module, name, True))
         force_table = stack.enter_context(
             patch.object(gemm_configs, "_force_bi_gemm_config_table")
         )
@@ -302,9 +388,6 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         )
         set_head = stack.enter_context(
             patch.object(bi_ops, "set_bi_head_fastpath_enabled")
-        )
-        set_combine = stack.enter_context(
-            patch.object(communication, "set_ordered_combine_fused_enabled")
         )
         startup = stack.enter_context(patch.object(exact.logger, "info"))
         force_family = stack.enter_context(
@@ -325,7 +408,6 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         set_tiera.assert_called_once_with(False)
         set_router.assert_called_once_with(False)
         set_head.assert_called_once_with(False)
-        set_combine.assert_called_once_with(False)
         startup.assert_called_once()
         startup_args = startup.call_args.args
         assert startup_args[2] == "v2"
@@ -333,6 +415,7 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         rendered = startup_args[0] % startup_args[1:]
         assert "decode, conservative" in rendered
         assert "rmsnorm_family=v2" in rendered
+        assert "moe_fold=canonical_moe_fold_v1" in rendered
         force_family.assert_not_called()
 
 
@@ -342,15 +425,14 @@ def test_qwen35_public_module_has_no_partial_selection_api():
 
 
 def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
-    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
-    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
-    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
-    import sglang.srt.distributed.communication_op as communication
     import sglang.kernels.ops.attention.fla.bi_gdn_decode as decode
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_fast as fast
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_incr as incremental
     import sglang.kernels.ops.attention.fla.bi_gdn_incr_lazy_heal as heal
     import sglang.kernels.ops.attention.fla.bi_gdn_prefill as prefill
+    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
+    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
+    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
 
     with (
         patch.object(exact, "_applied", False),
@@ -368,7 +450,6 @@ def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
         patch.object(tiera, "set_tiera_enabled") as tier_a,
         patch.object(bi_ops, "set_router_renorm_fused_enabled") as router,
         patch.object(bi_ops, "set_bi_head_fastpath_enabled") as head,
-        patch.object(communication, "set_ordered_combine_fused_enabled") as combine,
     ):
         exact._apply_qwen35_gdn_exact(
             SimpleNamespace(
@@ -389,7 +470,6 @@ def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
         tier_a.assert_called_once_with(False)
         router.assert_called_once_with(False)
         head.assert_called_once_with(False)
-        combine.assert_called_once_with(False)
 
 
 def test_model_runner_resolves_qwen_exact_bi_ops_before_construction():
@@ -412,11 +492,33 @@ def test_gdn_backend_reads_architecture_resolver_flags_at_call_time():
         patch.object(backend, "is_cuda", return_value=True),
         patch.object(backend._bi_decode_mod, "BI_GDN_DECODE_ENABLED", True),
         patch.object(backend._bi_fast_mod, "BI_GDN_DECODE_FAST_ENABLED", True),
+        patch.object(backend._bi_incr_mod, "BI_GDN_DECODE_INCR_ENABLED", True),
+        patch.object(backend._bi_incr_mod, "BI_GDN_INCR_DEFER_ENABLED", True),
+        patch.object(backend._bi_heal_mod, "BI_GDN_LAZY_HEAL_ENABLED", True),
         patch.object(backend._bi_prefill_mod, "BI_GDN_PREFILL_ENABLED", True),
     ):
         assert backend._bi_gdn_decode_enabled()
         assert backend._bi_gdn_decode_fast_enabled()
+        assert backend._bi_gdn_decode_incr_enabled()
+        assert backend._bi_gdn_incr_defer_enabled()
+        assert backend._bi_gdn_lazy_heal_enabled()
         assert backend._bi_gdn_prefill_enabled()
+
+
+def test_gdn_backend_selects_cached_row_runner_atomically():
+    import sglang.srt.layers.attention.linear.gdn_backend as backend
+
+    sentinel = object()
+    with (
+        patch.object(backend, "is_cuda", return_value=True),
+        patch.object(backend._bi_fast_mod, "BI_GDN_DECODE_FAST_ENABLED", True),
+        patch.object(backend._bi_incr_mod, "BI_GDN_DECODE_INCR_ENABLED", True),
+        patch.object(backend, "BIGDNIncrDecodeRunner", return_value=sentinel) as incr,
+        patch.object(backend, "BIGDNFastDecodeRunner") as rescan,
+    ):
+        assert backend._make_bi_gdn_decode_runner() is sentinel
+        incr.assert_called_once_with()
+        rescan.assert_not_called()
 
 
 def test_qwen35_gemma_norm_routes_the_certified_family_split():
@@ -804,8 +906,8 @@ def test_qwen35_sampler_contract_rescore_uses_temperature_and_fast_head():
 
 
 def test_qwen35_sampler_forward_overwrites_stock_logprob_with_contract_value():
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     import sglang.srt.layers.sampler as sampler_module
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
     sampler = sampler_module.Sampler.__new__(sampler_module.Sampler)
     torch.nn.Module.__init__(sampler)
@@ -856,3 +958,9 @@ def test_qwen35_sampler_rescore_fails_closed_after_logit_mutation():
             torch.tensor([0]),
             _exact_sampling_info(n=1, logit_bias=torch.zeros((1, 32))),
         )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

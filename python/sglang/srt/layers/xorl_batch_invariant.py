@@ -2,6 +2,7 @@ import logging
 from typing import Any, Callable, List, Literal
 
 import torch
+
 from sglang.srt.batch_invariant_ops import (
     RMS_NORM_FAMILY_NO_RESIDUAL,
     RMS_NORM_FAMILY_RESIDUAL_TREE,
@@ -144,7 +145,7 @@ def _apply_xorl_exact_lora_lm_head(
     lm_head: Any,
     base_logits: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the literal rank-one Triton LoRA head to exact FP32 base logits.
+    """Apply the literal Triton LoRA head to exact FP32 base logits.
 
     ``ParallelLMHeadWithLoRA.apply_lora`` is the serving implementation: its A
     kernel accumulates in FP32 and stores BF16, then its B kernel rounds the
@@ -177,11 +178,6 @@ def _apply_xorl_exact_lora_lm_head(
         )
     if not lora_active:
         return base_logits
-    if getattr(backend, "_glm52_exact_batch_certified", False) is not True:
-        raise RuntimeError(
-            "The XORL exact active-LoRA LM-head contract requires a certified "
-            "one-request GLM-5.2 batch."
-        )
     if getattr(lm_head, "set_lora", None) is not True:
         raise RuntimeError(
             "The XORL exact active-LoRA LM-head contract requires installed "
@@ -205,18 +201,20 @@ def _apply_xorl_exact_lora_lm_head(
             "The XORL exact active-LoRA LM-head contract requires BF16 A/B "
             f"buffers, got {a_buffer.dtype} and {b_buffer.dtype}."
         )
-    expected_a_tail = (1, hidden_states.shape[-1])
-    expected_b_tail = (lm_head.weight.shape[0], 1)
+    physical_rank = a_buffer.shape[-2] if a_buffer.ndim == 3 else -1
+    expected_a_tail = (physical_rank, hidden_states.shape[-1])
+    expected_b_tail = (lm_head.weight.shape[0], physical_rank)
     if (
         a_buffer.ndim != 3
         or tuple(a_buffer.shape[-2:]) != expected_a_tail
         or b_buffer.ndim != 3
         or tuple(b_buffer.shape[-2:]) != expected_b_tail
         or a_buffer.shape[0] != b_buffer.shape[0]
+        or physical_rank <= 0
     ):
         raise RuntimeError(
-            "The XORL exact active-LoRA LM-head contract requires rank-one "
-            "physical buffers [slots,1,hidden] and [slots,local_vocab,1], got "
+            "The XORL exact active-LoRA LM-head contract requires admitted "
+            "physical buffers [slots,rank,hidden] and [slots,local_vocab,rank], got "
             f"A={tuple(a_buffer.shape)} and B={tuple(b_buffer.shape)}."
         )
     if not a_buffer.is_contiguous() or not b_buffer.is_contiguous():
@@ -351,8 +349,8 @@ def xorl_bi_sample_and_score(
         raise RuntimeError(
             "The XORL batch-invariant sampler rejects SGLANG_RETURN_ORIGINAL_LOGPROB."
         )
-    if any(x > 0 for x in top_logprobs_nums) or any(
-        token_ids is not None for token_ids in token_ids_logprobs
+    if any(x > 0 for x in (top_logprobs_nums or ())) or any(
+        token_ids is not None for token_ids in (token_ids_logprobs or ())
     ):
         raise RuntimeError(
             "The XORL batch-invariant sampler only returns the sampled token logprob."

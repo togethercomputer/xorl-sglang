@@ -35,6 +35,7 @@
 import torch
 import triton
 import triton.language as tl
+
 from sglang.kernels.ops.attention.fla.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd,
 )
@@ -982,9 +983,11 @@ def chunk_gated_delta_rule_fwd_h(
         N, NT, chunk_offsets = (
             len(cu_seqlens) - 1,
             len(chunk_indices),
-            prepare_chunk_offsets(cu_seqlens, BT)
-            if chunk_offsets is None
-            else chunk_offsets,
+            (
+                prepare_chunk_offsets(cu_seqlens, BT)
+                if chunk_offsets is None
+                else chunk_offsets
+            ),
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 

@@ -57,16 +57,16 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     if rmsnorm_family not in ("v1", "v2"):
         raise RuntimeError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
 
-    from sglang.srt.batch_invariant_ops import batch_invariant_ops as _bi_ops
-    from sglang.srt.batch_invariant_ops import bi_gemm_configs as _gemm_configs
-    from sglang.srt.batch_invariant_ops import bi_gemm_tiera as _tiera
-    from sglang.srt.distributed import communication_op as _comm
     from sglang.kernels.ops.attention.fla import bi_gdn_decode as _decode
     from sglang.kernels.ops.attention.fla import bi_gdn_decode_fast as _fast
     from sglang.kernels.ops.attention.fla import bi_gdn_decode_incr as _incr
     from sglang.kernels.ops.attention.fla import bi_gdn_incr_lazy_heal as _heal
     from sglang.kernels.ops.attention.fla import bi_gdn_prefill as _prefill
     from sglang.kernels.ops.attention.fla import layernorm_gated as _norm_gated
+    from sglang.srt.batch_invariant_ops import batch_invariant_ops as _bi_ops
+    from sglang.srt.batch_invariant_ops import bi_gemm_configs as _gemm_configs
+    from sglang.srt.batch_invariant_ops import bi_gemm_tiera as _tiera
+    from sglang.srt.distributed import communication_op as _comm
 
     if not _bi_ops.ENABLE_JIT_DEEPGEMM:
         raise RuntimeError(
@@ -76,16 +76,17 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     _bi_ops._ENABLE_MM_FALLBACK_VARIANT = False
     _bi_ops._ENABLE_MM_COMPARISON_TEST = False
 
-    # The production literal-zero receipt was taken with the original exact
-    # prefill scan, partial-chunk-rescan graph decode, and conservative
-    # no-overlap/no-padding serving schedule.  Live Qwen3.6 GRPO gates measured
-    # nonzero K3 for both the promoted Wave-3 tuple and the conservative GDN
-    # tuple when the newer overlap + padded-graph schedule remained selected.
-    # Keep every unpromoted mechanism out of the architecture-owned tuple until
-    # a fresh live gate promotes it; component equality is not a substitute for
-    # the trainer-versus-sampler denominator.
+    # The promotion receipt covers the original exact prefill scan and the
+    # conservative partial-chunk-rescan graph program. Cached-row, lazy-heal,
+    # and fused Wave-3 mechanisms remain available for qualification work, but
+    # component equality does not admit them to the architecture-owned tuple.
     _prefill.BI_GDN_PREFILL_ENABLED = True
+    # FAST, INCR, and HEAL import this scalar by value. Reset every bound copy
+    # so a previous experimental selection cannot leak into the exact tuple.
     _prefill.BI_GDN_SOLVE_TRIL_DECODE = False
+    _fast.BI_GDN_SOLVE_TRIL_DECODE = False
+    _incr.BI_GDN_SOLVE_TRIL_DECODE = False
+    _heal.BI_GDN_SOLVE_TRIL_DECODE = False
     _decode.BI_GDN_DECODE_ENABLED = True
     _decode.BI_GDN_BS1_STATIC = is_moe
     _decode.BI_GDN_DECODE_GRAPH = exact_graph
@@ -112,7 +113,8 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
         "decode rescore; rmsnorm_family=%s; resolved tuple=%s",
         (
             ", conservative no-overlap/no-padding partial-chunk-rescan graph "
-            "program; Wave-3 fast mechanisms held behind live zero-K3 promotion"
+            "program; cached-row and Wave-3 mechanisms held behind live "
+            "trainer-to-sampler promotion"
             if is_moe
             else " (conservative eager tuple; MoE Wave-3 fast paths disabled)"
         ),

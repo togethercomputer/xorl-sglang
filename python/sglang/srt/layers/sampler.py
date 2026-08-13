@@ -6,10 +6,10 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     is_bi_head_fastpath_enabled,
 )
-from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -22,7 +22,11 @@ from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import is_glm52_exact_mode, is_qwen35_gdn_exact_mode
+from sglang.srt.server_args import (
+    is_glm52_exact_mode,
+    is_qwen3_dense_exact_mode,
+    is_qwen35_gdn_exact_mode,
+)
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -79,14 +83,13 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
+        self._qwen3_dense_exact_mode = is_qwen3_dense_exact_mode(get_server_args())
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
-        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(
-            get_server_args()
-        )
+        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(get_server_args())
         self.return_original_logprob = (
             False
             if self.use_qwen35_bi_decode_rescore
@@ -134,7 +137,7 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
-        if self._glm52_exact_mode:
+        if self._glm52_exact_mode or getattr(self, "_qwen3_dense_exact_mode", False):
             return xorl_bi_sample_and_score(
                 logits_output,
                 sampling_info,
@@ -146,6 +149,7 @@ class Sampler(nn.Module):
                 sync_token_ids=self._sync_token_ids_across_tp,
                 enable_deterministic=self.enable_deterministic,
                 return_original_logprob=SGLANG_RETURN_ORIGINAL_LOGPROB,
+                family="v2",
             )
 
         logits = logits_output.next_token_logits

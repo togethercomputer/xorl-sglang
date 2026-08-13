@@ -2,7 +2,11 @@ import unittest
 from types import SimpleNamespace
 
 import torch
+
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestForwardBatchLogicalRows(unittest.TestCase):
@@ -21,6 +25,7 @@ class TestForwardBatchLogicalRows(unittest.TestCase):
             positions=torch.arange(4095, 4095 + padded_rows),
         )
         batch._original_batch_size = logical_rows
+        batch._original_num_tokens = logical_rows
         logits_output = SimpleNamespace(
             next_token_logits=torch.arange(padded_rows * 2).reshape(padded_rows, 2),
             hidden_states=torch.arange(padded_rows * 3).reshape(padded_rows, 3),

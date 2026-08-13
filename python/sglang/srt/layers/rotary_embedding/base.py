@@ -59,6 +59,7 @@ def _pin_qwen35_class_b_compile_budget() -> None:
     if hasattr(config, "fail_on_recompile_limit_hit"):
         config.fail_on_recompile_limit_hit = True
 
+
 if _is_cuda:
     from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
 

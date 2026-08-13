@@ -4477,9 +4477,7 @@ def reserve_rope_cache_for_long_sequences(
     # built whole during model construction. Mark every layer fail-closed
     # before the reserve walk so a short cache raises at startup instead of
     # silently switching to the incremental recipe.
-    glm52_exact_prebuilt_only = bool(
-        getattr(server_args, "glm52_exact_mode", False)
-    )
+    glm52_exact_prebuilt_only = bool(getattr(server_args, "glm52_exact_mode", False))
 
     if glm52_exact_prebuilt_only:
         # Exact mode disables speculative decoding and admits precisely the

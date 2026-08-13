@@ -3,6 +3,7 @@ import unittest
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDistribution,
     CanonicalMoEWorkspace,
@@ -12,6 +13,10 @@ from sglang.srt.distributed.canonical_moe import (
     canonicalize_glm52_local_partial,
     canonicalize_glm52_local_partial_v3,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
+
+register_cuda_ci(est_time=180, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestGlm52CanonicalMoENcclGraph(unittest.TestCase):
@@ -194,4 +199,7 @@ class TestGlm52CanonicalMoENcclGraph(unittest.TestCase):
 
 
 if __name__ == "__main__":
+    multigpu_pytest_main(__name__, __file__, num_gpus=(8,))
+    # The launcher exits from workers; this fallback only runs in the parent
+    # after the real eight-rank test and keeps unittest-based CI discovery valid.
     unittest.main()

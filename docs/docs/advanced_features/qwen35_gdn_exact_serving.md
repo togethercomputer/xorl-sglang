@@ -2,29 +2,25 @@
 
 `--rl-on-policy-target xorl` on a Qwen3.5-family architecture (including
 Qwen3.6, whose HF architecture is `Qwen3_5MoeForConditionalGeneration`)
-automatically engages the model's admitted exact serving contract. Both
-checkpoints use the conservative implementation family from the literal-zero
-production receipt; the MoE checkpoint additionally uses its qualified CUDA
-graph program.
+automatically engages the model's admitted exact serving contract. Dense Qwen
+keeps the conservative eager implementation from its literal-zero receipt;
+Qwen3.6 MoE selects the conservative partial-chunk-rescan CUDA-graph program.
 
 There is nothing to configure. The stack engages as a unit:
 
 - **Exact GDN execution.** Prefill runs the trainer's exact chunked scan
   composition (batch-invariant kernels, fp32 chunk-boundary checkpoints);
-  decode rescans the current partial chunk from the fp32 boundary state, so
-  decode equals teacher-forced prefill bitwise. MoE decode uses slot-direct
-  graph transport around those exact arithmetic stages; it does not change
-  the numerical program. The later Wave-3 incremental/writeback,
-  decode-scheduled solve, fused-renorm, fused-combine, Tier-A, and head-fastpath
-  mechanisms are not selected: component tests were insufficient to promote
-  them after a live GRPO gate found nonzero K3 with the composed stack.
-- **Exact MoE routing** (MoE architectures): the batch-invariant router GEMM
-  and fixed-order top-k renorm pin expert selection identically to the
-  trainer; the cross-rank MoE combine runs the ordered reduction the paired
-  trainer mirrors structurally.
+  eager decode rescans the current partial chunk from the fp32 boundary state,
+  so it remains the exact oracle. MoE graph decode uses the same bounded
+  rescan composition. Cached-row, lazy-heal, fused-small-stage, and related
+  Wave-3 mechanisms remain experimental until a fresh decision-time sampler
+  capture and independent trainer replay promote their cumulative tuple.
+- **Exact MoE routing** (MoE architectures): the conservative batch-invariant
+  routing and combine program remains selected here. Faster fused routing and
+  combine mechanisms require their own cumulative promotion gate.
 - **Decision-time logprob contract**: the lm head is the batch-invariant
-  fp32-logit GEMM; sampled tokens are rescored through the contract's
-  chunk-stats + pinned-order LSE merge; requests with transforms the trainer
+  fp32-logit GEMM; sampled tokens are rescored through the fused chunk-stats
+  fast path and pinned-order LSE merge; requests with transforms the trainer
   cannot replay (top-k/top-p/min-p, penalties, grammar, logit bias, custom
   processors) are rejected at HTTP ingress.
 - **Qwen3.6 MoE CUDA graphs** stay on at the proven production
@@ -37,6 +33,8 @@ There is nothing to configure. The stack engages as a unit:
   Chunked prefill is likewise disabled because a continuation at an arbitrary
   prompt offset does not carry that complete exact GDN seed; each prompt is
   prefetched in one forward from prefix zero.
+  The tuple pins the static-memory fraction to `0.38`; this capacity choice
+  does not change the numerical program.
   Incompatible graph settings fail loudly. The separate dense
   Qwen3.5 TP1 contract runs eager with radix disabled and does not arm the
   graph-only incremental state.
@@ -56,10 +54,9 @@ grouped-top-k or bias-corrected routing, DeepEP, radix/session resume or other
 non-chunk-aligned state restores, LoRA-wrapped lm heads.
 
 Internal development flags are not part of the public surface and are not
-consulted by this path. The architecture resolver selects the appropriate
-batch-invariant op set and GDN implementation from the one RL target switch,
-and selects the conservative ordered combine and graph-rescan program for the
-qualified MoE geometry.
+consulted by this path. The architecture resolver selects the complete
+batch-invariant op set, conservative GDN implementation, routing and combine,
+and decision-head program from the one RL target switch.
 
 Pair with the xorl trainer's stock exact Qwen3.5-family configuration.
 Certification of the pair is a fresh capture / teacher-forced replay (100%

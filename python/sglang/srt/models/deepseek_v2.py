@@ -91,8 +91,8 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_dsa_cp import (
     CanonicalMoEPositions,
-    DSAMLPOutputLayout,
     DSACPLayerCommunicator,
+    DSAMLPOutputLayout,
     align_glm52_moe_positions,
     maybe_prefetch_next_full_attention_kv,
 )

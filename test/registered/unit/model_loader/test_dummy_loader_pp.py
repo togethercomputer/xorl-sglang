@@ -1,9 +1,10 @@
 import torch
+
 from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.model_loader.loader import DummyModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def test_dummy_loader_skips_pipeline_placeholders(monkeypatch):
@@ -49,3 +50,11 @@ def test_dummy_loader_skips_pipeline_placeholders(monkeypatch):
 
     assert loaded is model
     assert processed == [real_layer]
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -6,6 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
+from sglang.kernels.ops.attention.dsa.transform_index import (
+    transform_index_page_table_decode_ref,
+    transform_index_page_table_prefill_ref,
+)
 from sglang.srt.distributed.canonical_moe import (
     GLM52_CANONICAL_MOE_VERSION,
     CanonicalDistribution,
@@ -17,10 +22,6 @@ from sglang.srt.distributed.canonical_moe import (
     canonicalize_glm52_local_partial,
     canonicalize_glm52_local_partial_v3,
 )
-from sglang.kernels.ops.attention.dsa.transform_index import (
-    transform_index_page_table_decode_ref,
-    transform_index_page_table_prefill_ref,
-)
 from sglang.srt.layers.glm52_positions import align_glm52_moe_positions
 from sglang.srt.models.glm52_index_share import (
     CanonicalLogicalIndices,
@@ -29,7 +30,7 @@ from sglang.srt.models.glm52_index_share import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestGlm52CanonicalMoE(unittest.TestCase):

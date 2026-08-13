@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.batch_invariant_ops import bi_families_v2
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     disable_batch_invariant_mode,
@@ -43,7 +44,7 @@ from sglang.srt.server_args import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _module_stub(name, **attributes):
@@ -659,14 +660,14 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Triton LoRA backend"):
                 xorl_bi_lm_head(hidden, lora_head, use_fp32_lm_head=False)
 
-            rank_two_head = _TestParallelLMHeadWithLoRA(
+            zero_rank_head = _TestParallelLMHeadWithLoRA(
                 weight=weight,
-                a_buffer=torch.zeros((2, 2, 16), dtype=torch.bfloat16),
-                b_buffer=torch.zeros((2, 32, 2), dtype=torch.bfloat16),
+                a_buffer=torch.zeros((2, 0, 16), dtype=torch.bfloat16),
+                b_buffer=torch.zeros((2, 32, 0), dtype=torch.bfloat16),
                 callback=lambda *_args: None,
             )
-            with self.assertRaisesRegex(RuntimeError, "rank-one physical buffers"):
-                xorl_bi_lm_head(hidden, rank_two_head, use_fp32_lm_head=False)
+            with self.assertRaisesRegex(RuntimeError, "physical buffers"):
+                xorl_bi_lm_head(hidden, zero_rank_head, use_fp32_lm_head=False)
 
         with self.assertRaisesRegex(RuntimeError, "embedding bias"):
             xorl_bi_lm_head(
@@ -771,6 +772,28 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                         events[2][2], torch.ones(n, dtype=torch.int32)
                     )
                     self.assertIs(output.next_token_logprobs, selected_logprobs)
+
+    def test_sampler_accepts_absent_optional_logprob_lists(self):
+        output = SimpleNamespace(
+            next_token_logits=torch.zeros((1, 32), dtype=torch.float32),
+            next_token_logprobs=None,
+        )
+        expected = torch.tensor([3], dtype=torch.int32)
+
+        actual = xorl_bi_sample_and_score(
+            output,
+            self._sampling_info(1),
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            positions=torch.tensor([0]),
+            sample_from_logprobs=lambda *_args: expected,
+            sync_token_ids=lambda *_args: None,
+            enable_deterministic=True,
+            return_original_logprob=False,
+        )
+
+        self.assertIs(actual, expected)
 
     def test_extend_response_consumes_sampled_id_logprob_pair(self):
         scheduler = _scheduler_response_processor()
