@@ -51,7 +51,7 @@ from sglang.srt.lora.utils import (
     get_target_module_name,
 )
 from sglang.srt.managers.io_struct import LoRAUpdateOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs
@@ -454,6 +454,12 @@ class LoRAManager:
         if uid is None:
             self.lora_backend._dsv4_flash_exact_batch_certified = True
             return
+        self._validate_dsv4_flash_exact_uid(uid)
+        self.lora_backend._dsv4_flash_exact_batch_certified = True
+
+    def _validate_dsv4_flash_exact_uid(self, uid: str) -> None:
+        """Validate one active adapter independently of its scheduler owner."""
+
         adapter = self.loras.get(uid)
         if adapter is None or uid not in self.memory_pool.uid_to_buffer_id:
             raise RuntimeError(
@@ -470,7 +476,6 @@ class LoRAManager:
                 "The exact DSV4-Flash active-LoRA request requires rank 1 and "
                 f"unit scaling, got rank={adapter.config.r}, scaling={adapter.scaling}."
             )
-        self.lora_backend._dsv4_flash_exact_batch_certified = True
 
     def _validate_glm52_active_adapters(self, forward_batch: ForwardBatch) -> None:
         """Reject stale adapter references without restricting normal batching."""
@@ -605,6 +610,132 @@ class LoRAManager:
         self.lora_backend.reset_batch_state()
         if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
             self.lora_backend._dsv4_flash_exact_batch_certified = False
+
+    def prepare_dsv4_flash_exact_dp_lora_batch(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Build rank-major LoRA metadata for the DP-gathered DSV4 MLP rows."""
+
+        if not getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
+            return
+        if get_is_capture_mode():
+            raise RuntimeError(
+                "Gather-aware DSV4-Flash active LoRA admits eager execution only."
+            )
+
+        local_lora_ids = list(forward_batch.lora_ids or [])
+        if len(local_lora_ids) > 1:
+            raise RuntimeError(
+                "The exact DSV4-Flash lane admits at most one logical request "
+                f"per DP rank, got {len(local_lora_ids)}."
+            )
+        local_uid = local_lora_ids[0] if local_lora_ids else None
+
+        tp_group = get_parallel().tp_group
+        global_uids = tp_group.all_gather_object(local_uid)
+        global_num_tokens = list(forward_batch.global_num_tokens_cpu or [])
+        if len(global_uids) != len(global_num_tokens):
+            raise RuntimeError(
+                "DSV4-Flash gathered LoRA ownership does not match the DP row "
+                f"layout: owners={len(global_uids)}, row_segments={len(global_num_tokens)}."
+            )
+
+        active_uids = {uid for uid in global_uids if uid is not None}
+        active_adapter_limit = self.max_loras_per_batch - 1
+        if len(active_uids) > active_adapter_limit:
+            raise RuntimeError(
+                "DSV4-Flash gathered batch exceeds the one-base-plus-adapter "
+                f"resident layout: active={sorted(active_uids)}, "
+                f"adapter_limit={active_adapter_limit}."
+            )
+        missing = sorted(
+            uid
+            for uid in active_uids
+            if uid not in self.loras or uid not in self.lora_refs
+        )
+        if missing:
+            raise RuntimeError(
+                "DSV4-Flash gathered batch references adapters missing from this "
+                f"EP rank: {missing}."
+            )
+
+        # Every EP rank must own the adapter factors for every gathered row,
+        # including the base rows. This also makes an active-LoRA request safe
+        # as the first request after startup.
+        self.fetch_new_loras(active_uids | {None})
+        if None not in self.memory_pool.uid_to_buffer_id:
+            raise RuntimeError(
+                "DSV4-Flash gather-aware LoRA requires a resident base-model slot."
+            )
+        for uid in active_uids:
+            self._validate_dsv4_flash_exact_uid(uid)
+
+        weight_indices = []
+        lora_ranks = [0] * self.max_loras_per_batch
+        scalings = [0.0] * self.max_loras_per_batch
+        for uid in global_uids:
+            effective_uid = uid
+            if uid is not None and getattr(
+                self.loras[uid], "_dsv4_flash_exact_all_zero", False
+            ):
+                effective_uid = None
+            slot = self.memory_pool.get_buffer_id(effective_uid)
+            weight_indices.append(slot)
+            if effective_uid is not None:
+                adapter = self.loras[effective_uid]
+                lora_ranks[slot] = adapter.config.r
+                scalings[slot] = adapter.scaling
+
+        has_active_lora = any(rank > 0 for rank in lora_ranks)
+        if not has_active_lora:
+            self.lora_backend.context_parallel_mlp_batch_info = None
+            return
+
+        device = self.device
+        segment_lens = torch.tensor(
+            global_num_tokens, dtype=torch.int32, device=device
+        )
+        segment_indptr = torch.zeros(
+            (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
+        )
+        segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
+        total_tokens = sum(global_num_tokens)
+        global_batch_info = LoRABatchInfo(
+            use_cuda_graph=False,
+            bs=len(global_num_tokens),
+            num_segments=len(global_num_tokens),
+            seg_indptr=segment_indptr,
+            weight_indices=torch.tensor(
+                weight_indices, dtype=torch.int32, device=device
+            ),
+            lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=device),
+            scalings=torch.tensor(scalings, dtype=torch.float32, device=device),
+            max_len=max(global_num_tokens, default=0),
+            seg_lens=segment_lens,
+            permutation=None,
+            expected_tokens=total_tokens,
+            has_active_lora=True,
+            req_seg_indptr=segment_indptr,
+            req_weight_indices=torch.tensor(
+                weight_indices, dtype=torch.int32, device=device
+            ),
+        )
+
+        physical_batch = copy(forward_batch)
+        physical_batch.batch_size = len(global_num_tokens)
+        physical_batch.lora_ids = global_uids
+        physical_batch.forward_mode = (
+            ForwardMode.EXTEND
+            if forward_batch.is_extend_in_batch
+            else ForwardMode.DECODE
+        )
+        physical_batch.extend_num_tokens = total_tokens
+        physical_batch.extend_seq_lens_cpu = global_num_tokens
+        physical_batch.extend_seq_lens = segment_lens
+        global_batch_info = self.lora_backend._add_moe_lora_info(
+            physical_batch, global_batch_info
+        )
+        self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
 
     @contextmanager
     def glm52_context_parallel_lora_batch(

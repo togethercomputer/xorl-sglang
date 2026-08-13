@@ -20,7 +20,6 @@ DSV4_FLASH_LOGICAL_FACTOR_COUNT = 948
 DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT = 345
 DSV4_FLASH_ROUTED_BANK_COUNT = 43
 DSV4_FLASH_LORA_FORMAT = "dsv4_expert_banks"
-DSV4_FLASH_EXACT_ROUTED_DP_RANK = 0
 DSV4_FLASH_REQUIRED_TARGET_MODULES = frozenset(
     {
         "down_proj",
@@ -82,19 +81,6 @@ DSV4_FLASH_COMPRESS_RATIOS = (
 )
 
 _ADAPTER_PREFIX = "base_model.model."
-
-
-def validate_dsv4_flash_exact_request_routing(
-    routed_dp_rank: Optional[int],
-) -> None:
-    """Require the one qualified MAX_LEN row placement for the first lane."""
-
-    if routed_dp_rank != DSV4_FLASH_EXACT_ROUTED_DP_RANK:
-        raise ValueError(
-            "The exact DSV4-Flash lane requires routed_dp_rank=0 so MAX_LEN "
-            "DP-attention row placement is invariant; unpinned or other-rank "
-            f"requests are not qualified (got {routed_dp_rank!r})."
-        )
 
 
 @dataclass(frozen=True)

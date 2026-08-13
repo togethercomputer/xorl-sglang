@@ -1,4 +1,5 @@
-from typing import Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple, Union
 
 import torch
 import triton
@@ -30,9 +31,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # reset_batch_state() on DP-attention idle forwards. None means "no
         # batch prepared" — the LoRA layers read it to skip LoRA application.
         self.batch_info: Optional[LoRABatchInfo] = None
-        # CP-v2 gathers rank-local rows before sparse MLPs. The manager
-        # installs matching rank-major physical metadata here for the gathered
-        # row count; attention and dense fully-DP MLPs keep batch_info.
+        # DP attention and CP-v2 can gather rank-local rows before sparse MLPs.
+        # The manager installs matching rank-major physical metadata here for
+        # the gathered row count; local attention keeps batch_info.
         self.context_parallel_mlp_batch_info: Optional[LoRABatchInfo] = None
         self.init_lm_head_config()
         self._is_moe_lora = False
@@ -75,6 +76,30 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             f"{getattr(gathered_batch_info, 'expected_tokens', None)}, "
             f"activation_rows={num_tokens}."
         )
+
+    @contextmanager
+    def use_gathered_mlp_batch_info(self, num_tokens: int) -> Iterator[None]:
+        """Temporarily route dense and MoE LoRA kernels with gathered rows."""
+
+        gathered = self.context_parallel_mlp_batch_info
+        if gathered is None:
+            yield
+            return
+        if gathered.expected_tokens != num_tokens:
+            raise RuntimeError(
+                "Gathered MLP LoRA metadata does not match the activation rows: "
+                f"metadata_rows={gathered.expected_tokens}, activation_rows={num_tokens}."
+            )
+
+        local_batch_info = self.batch_info
+        local_sgemm_batch_info = getattr(self, "sgemm_batch_info", None)
+        self.batch_info = gathered
+        self.sgemm_batch_info = None
+        try:
+            yield
+        finally:
+            self.batch_info = local_batch_info
+            self.sgemm_batch_info = local_sgemm_batch_info
 
     def run_lora_a_embedding(
         self,

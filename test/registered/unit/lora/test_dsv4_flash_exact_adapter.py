@@ -16,7 +16,6 @@ from sglang.srt.lora.dsv4 import (
     build_dsv4_flash_exact_inventory,
     maybe_create_dsv4_flash_validator,
     summarize_dsv4_flash_factor_roles,
-    validate_dsv4_flash_exact_request_routing,
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -216,13 +215,6 @@ def test_non_exact_non_dsv4_adapter_is_ignored() -> None:
     assert maybe_create_dsv4_flash_validator(config, _adapter_config()) is None
 
 
-def test_exact_request_routing_is_explicitly_rank_zero_only() -> None:
-    validate_dsv4_flash_exact_request_routing(0)
-    for candidate in (None, 1, 7):
-        with pytest.raises(ValueError, match="routed_dp_rank=0"):
-            validate_dsv4_flash_exact_request_routing(candidate)
-
-
 def _exact_ingress_manager() -> TokenizerManager:
     manager = object.__new__(TokenizerManager)
     manager.context_len = 8192
@@ -238,6 +230,124 @@ def _exact_ingress_manager() -> TokenizerManager:
         qwen3_dense_exact_mode=False,
     )
     return manager
+
+
+def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None:
+    import sglang.srt.lora.lora_manager as lora_manager_module
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+    from sglang.srt.lora.lora_manager import LoRAManager
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    class _MemoryPool:
+        uid_to_buffer_id = {}
+
+        @staticmethod
+        def get_buffer_id(uid):
+            return _MemoryPool.uid_to_buffer_id[uid]
+
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(r=1),
+        scaling=1,
+        _dsv4_flash_exact_adapter_certified=True,
+        _dsv4_flash_exact_all_zero=False,
+    )
+    backend = object.__new__(BaseLoRABackend)
+    backend._is_moe_lora = True
+    backend.batch_info = None
+    backend.context_parallel_mlp_batch_info = None
+    backend.sgemm_batch_info = None
+
+    manager = object.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    manager.max_loras_per_batch = 2
+    manager.device = torch.device("cpu")
+    manager.lora_backend = backend
+    manager.memory_pool = _MemoryPool()
+    manager.loras = {"adapter": adapter}
+    manager.lora_refs = {"adapter": object()}
+    fetched = []
+
+    def _fetch(uids):
+        fetched.append(set(uids))
+        for uid in sorted(uids, key=lambda value: (value is not None, value or "")):
+            _MemoryPool.uid_to_buffer_id.setdefault(
+                uid, len(_MemoryPool.uid_to_buffer_id)
+            )
+
+    manager.fetch_new_loras = _fetch
+
+    token_count_cases = (([1] * 8, False), (list(range(1, 9)), True))
+    for token_counts, is_extend in token_count_cases:
+        for local_rank in range(8):
+            for owner_rank in range(8):
+                global_uids = [None] * 8
+                global_uids[owner_rank] = "adapter"
+                # The owner may have admitted the adapter locally before the
+                # gathered preparation, while idle ranks can still be empty.
+                # The global mapping must use each rank's physical slot IDs.
+                _MemoryPool.uid_to_buffer_id.clear()
+                if local_rank == owner_rank:
+                    _MemoryPool.uid_to_buffer_id["adapter"] = 0
+
+                class _Group:
+                    @staticmethod
+                    def all_gather_object(local_uid):
+                        assert local_uid == global_uids[local_rank]
+                        return global_uids
+
+                monkeypatch.setattr(
+                    lora_manager_module,
+                    "get_parallel",
+                    lambda: SimpleNamespace(tp_group=_Group()),
+                )
+                forward_batch = SimpleNamespace(
+                    lora_ids=(["adapter"] if local_rank == owner_rank else []),
+                    global_num_tokens_cpu=token_counts,
+                    is_extend_in_batch=is_extend,
+                    forward_mode=ForwardMode.IDLE,
+                )
+
+                manager.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
+
+                info = backend.context_parallel_mlp_batch_info
+                assert info.expected_tokens == sum(token_counts)
+                assert info.weight_indices.tolist() == [
+                    _MemoryPool.uid_to_buffer_id[
+                        "adapter" if rank == owner_rank else None
+                    ]
+                    for rank in range(8)
+                ]
+                assert info.moe_lora_info.token_lora_mapping.tolist() == [
+                    _MemoryPool.uid_to_buffer_id[
+                        "adapter" if rank == owner_rank else None
+                    ]
+                    for rank, count in enumerate(token_counts)
+                    for _ in range(count)
+                ]
+
+    assert fetched == [{None, "adapter"}] * 128
+
+
+def test_gathered_mlp_lora_metadata_is_scoped_and_restored() -> None:
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+
+    backend = object.__new__(BaseLoRABackend)
+    local = SimpleNamespace(expected_tokens=1)
+    gathered = SimpleNamespace(expected_tokens=8)
+    local_sgemm = object()
+    backend.batch_info = local
+    backend.context_parallel_mlp_batch_info = gathered
+    backend.sgemm_batch_info = local_sgemm
+
+    with backend.use_gathered_mlp_batch_info(8):
+        assert backend.batch_info is gathered
+        assert backend.sgemm_batch_info is None
+
+    assert backend.batch_info is local
+    assert backend.sgemm_batch_info is local_sgemm
+    with pytest.raises(RuntimeError, match="metadata_rows=8, activation_rows=7"):
+        with backend.use_gathered_mlp_batch_info(7):
+            pass
 
 
 @pytest.mark.parametrize(
@@ -479,6 +589,20 @@ def test_exact_resolved_contract_rejects_alternate_dp_combine(
     args.dsv4_flash_exact_mode = True
     setting = getattr(envs, setting_name)
     with setting.override(True), pytest.raises(ValueError, match=setting_name):
+        args._validate_dsv4_flash_exact_resolved_contract()
+
+
+def test_exact_resolved_contract_requires_base_and_active_lora_slots() -> None:
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="dummy")
+    args.dsv4_flash_exact_mode = True
+    args.max_loras_per_batch = 1
+    args.max_loaded_loras = 1
+    with pytest.raises(
+        ValueError,
+        match="max_loras_per_batch=1.*expected 2.*max_loaded_loras=1.*expected 2",
+    ):
         args._validate_dsv4_flash_exact_resolved_contract()
 
 

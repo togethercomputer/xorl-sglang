@@ -1908,7 +1908,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        lora_backend = getattr(getattr(self.mlp, "experts", None), "lora_backend", None)
+        lora_context = (
+            lora_backend.use_gathered_mlp_batch_info(hidden_states.shape[0])
+            if lora_backend is not None
+            else nullcontext()
+        )
+        with (
+            get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
+            lora_context,
+        ):
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,

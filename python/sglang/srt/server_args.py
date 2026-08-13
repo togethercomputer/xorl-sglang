@@ -5730,6 +5730,11 @@ class ServerArgs:
         self.model_impl = "sglang"
         self.device = "cuda"
         self.max_lora_rank = 1
+        # The DP-gathered MLP contains base rows from idle ranks alongside
+        # active-adapter rows from the request owner. Keep both physical
+        # programs resident; a single slot would evict the base mapping.
+        self.max_loras_per_batch = 2
+        self.max_loaded_loras = 2
         self.lora_backend = "triton"
         self.experts_shared_outer_loras = False
         self.enable_lora_overlap_loading = False
@@ -6198,6 +6203,9 @@ class ServerArgs:
             "enable_two_batch_overlap": False,
             "enable_single_batch_overlap": False,
             "max_lora_rank": 1,
+            # One base-model slot plus one certified active adapter.
+            "max_loras_per_batch": 2,
+            "max_loaded_loras": 2,
             "lora_backend": "triton",
             "experts_shared_outer_loras": False,
             "enable_lora_overlap_loading": False,
