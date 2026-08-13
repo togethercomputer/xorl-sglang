@@ -632,8 +632,6 @@ async fn test_unsupported_endpoints() {
         custom_labels: None,
         return_bytes: false,
         return_entropy: false,
-        return_routed_experts: false,
-        return_expert_logits: false,
         rid: None,
     };
 

@@ -2,10 +2,6 @@
 members = ["bindings/python"]
 exclude = ["bindings/golang", "examples"]
 
-[patch.crates-io]
-openai-protocol = { git = "https://github.com/togethercomputer/together-smg.git", rev = "a224f09f981af9125f330914920adb5e56b0be86" }
-smg-grpc-client = { git = "https://github.com/togethercomputer/together-smg.git", rev = "a224f09f981af9125f330914920adb5e56b0be86" }
-
 [package]
 name = "sgl-model-gateway"
 version = "0.3.2"

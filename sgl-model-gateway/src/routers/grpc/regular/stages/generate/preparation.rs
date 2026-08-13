@@ -57,10 +57,7 @@ impl GeneratePreparationStage {
         };
 
         // Create stop sequence decoder for generate requests
-        let params = request
-            .sampling_params
-            .as_ref()
-            .and_then(|params| params.representative());
+        let params = request.sampling_params.as_ref();
         let stop_decoder = utils::create_stop_decoder(
             &tokenizer,
             params.and_then(|p| p.stop.as_ref()),
