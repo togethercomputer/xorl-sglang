@@ -1424,9 +1424,10 @@ class ModelRunner:
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
 
-        if self.lora_manager is not None:
-            self.lora_manager.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
-            self.lora_manager.prepare_glm52_exact_dp_lora_batch(forward_batch)
+        lora_manager = getattr(self, "lora_manager", None)
+        if lora_manager is not None:
+            lora_manager.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
+            lora_manager.prepare_glm52_exact_dp_lora_batch(forward_batch)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those
