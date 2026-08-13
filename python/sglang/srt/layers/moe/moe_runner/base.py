@@ -56,6 +56,10 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
+    # Admit DSV4's qualified block-64/ten-token Marlin launch program. This
+    # must be explicit so official-geometry models outside the exact lane keep
+    # the stock Marlin launch heuristic.
+    dsv4_exact_mode: bool = False
     # Whether gate/up weights are stored interleaved (vs split). Only the
     # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,
     # otherwise chunk gate/up then apply alpha/limit).

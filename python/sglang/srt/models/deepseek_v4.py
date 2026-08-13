@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from typing import (
@@ -447,6 +448,12 @@ class MqaAttentionBase(nn.Module):
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
+        if getattr(config, "_dsv4_flash_exact_mode", False) and fuse:
+            raise ValueError(
+                "DSV4-Flash exact active-LoRA mode requires unfused wq_a/wkv "
+                "until the fused QKV-A factor boundary is byte-qualified; set "
+                "SGLANG_OPT_FUSE_WQA_WKV=0."
+            )
         fp8: bool = _FP8_WO_A_GEMM if wo_a_fp8 is None else wo_a_fp8
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
@@ -529,6 +536,15 @@ class MqaAttentionBase(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
+
+        if os.getenv("SGLANG_DSV4_DEBUG_ATTENTION_BOUNDARIES", "0") == "1":
+            self.debug_q_raw = nn.Identity()
+            self.debug_q = nn.Identity()
+            self.debug_kv_raw = nn.Identity()
+            self.debug_attn_core = nn.Identity()
+            self.debug_attn_inverse = nn.Identity()
+            self.debug_wo_a = nn.Identity()
+            self.debug_wo_b = nn.Identity()
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
@@ -738,10 +754,14 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if hasattr(self, "debug_q_raw"):
+            q = self.debug_q_raw(q)
         if q_out is None:
             q_out = torch.empty_like(q)
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        if hasattr(self, "debug_q"):
+            q_out = self.debug_q(q_out)
         return q_out
 
     def _compute_kv_to_cache(
@@ -770,6 +790,8 @@ class MQALayer(MqaAttentionBase):
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
+        if hasattr(self, "debug_kv_raw"):
+            kv = self.debug_kv_raw(kv)
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
@@ -1295,6 +1317,8 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+        if hasattr(self, "debug_attn_core"):
+            o = self.debug_attn_core(o)
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True
@@ -1314,8 +1338,11 @@ class MQALayer(MqaAttentionBase):
                 positions=positions,
                 inverse=True,
             )
+        if hasattr(self, "debug_attn_inverse"):
+            o = self.debug_attn_inverse(o)
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
+        o_input = o
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
@@ -1351,7 +1378,20 @@ class MQALayer(MqaAttentionBase):
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
+        if getattr(self.wo_a, "lora_active", False):
+            apply_grouped_lora = getattr(self.wo_a, "apply_grouped_lora", None)
+            if not callable(apply_grouped_lora):
+                raise RuntimeError(
+                    "DSV4 grouped wo_a has an active adapter but no grouped LoRA value path"
+                )
+            o = apply_grouped_lora(o, o_input)
+
+        if hasattr(self, "debug_wo_a"):
+            o = self.debug_wo_a(o)
+
         o, _ = self.wo_b(o.flatten(1))
+        if hasattr(self, "debug_wo_b"):
+            o = self.debug_wo_b(o)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
@@ -1798,8 +1838,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
         # MUST tell the MoE to skip it (mlp_reduce_scatter=True) or it
         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
+        _dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
         _use_reduce_scatterv = (
-            _use_tp_moe_gather
+            not _dsv4_exact_mode
+            and _use_tp_moe_gather
             and is_dp_gatherv_active()
             and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
@@ -1812,7 +1854,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         # all_reduce. tp_size==attn_dp_size required so the global buffer splits
         # evenly into per-rank chunks.
         _use_reduce_scatter = (
-            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            not _dsv4_exact_mode
+            and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
             and _use_tp_moe_gather
             and not _use_reduce_scatterv
             and not should_use_dp_reduce_scatterv()
@@ -2470,6 +2513,17 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    supported_lora_modules = (
+        "wq_a",
+        "self_attn.wq_b",
+        "wkv",
+        "wo_a",
+        "wo_b",
+        "gate_up_proj",
+        "down_proj",
+        "lm_head",
+    )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -2554,6 +2608,15 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
+        if (
+            getattr(self.config, "_dsv4_flash_exact_mode", False)
+            and not get_exec().moe.disable_shared_experts_fusion
+        ):
+            raise ValueError(
+                "DSV4-Flash exact active-LoRA mode requires "
+                "disable_shared_experts_fusion=true so every shared-expert "
+                "adapter target has a physical runtime module."
+            )
         if get_exec().moe.disable_shared_experts_fusion:
             return
 
@@ -2612,7 +2675,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model.forward(
+            hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         if not self.pp_group.is_last_rank:

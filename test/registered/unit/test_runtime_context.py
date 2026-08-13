@@ -962,6 +962,23 @@ class TestForwardFlags(_IsolatedServerArgs):
         ):
             self.assertFalse(should_use_dp_reduce_scatterv())
 
+    def test_dsv4_exact_mode_refuses_destination_dependent_reduce_scatterv(self):
+        from sglang.srt.layers.moe.utils import should_use_dp_reduce_scatterv
+
+        reset_context()
+        with (
+            patch(
+                "sglang.srt.layers.moe.utils.get_server_args",
+                return_value=SimpleNamespace(dsv4_flash_exact_mode=True),
+            ),
+            patch(
+                "sglang.srt.layers.moe.utils.is_dp_attention_enabled",
+                return_value=True,
+            ),
+            get_parallel().override(tp_size=8, attn_dp_size=8, moe_ep_size=8),
+        ):
+            self.assertFalse(should_use_dp_reduce_scatterv())
+
 
 class TestPublishLifecycle(_IsolatedServerArgs):
     """Publish installs the resolved server_args and seeds the capture tier."""

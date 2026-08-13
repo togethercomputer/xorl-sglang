@@ -205,6 +205,7 @@ def fused_experts_none_to_marlin(
         gemm1_alpha=runner_config.gemm1_alpha,
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
+        dsv4_exact_mode=runner_config.dsv4_exact_mode,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(

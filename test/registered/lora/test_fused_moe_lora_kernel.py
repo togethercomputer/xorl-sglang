@@ -5,6 +5,7 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.moe import fused_moe_lora_kernel
 from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
 
 # ==============================================================================
@@ -17,6 +18,31 @@ from sglang.test.ci.ci_register import register_cuda_ci
 # ==============================================================================
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-large")
+
+
+def test_get_ptr_records_sources_on_cache_hits(monkeypatch):
+    """Indirect LoRA operands must remain live for every asynchronous launch."""
+
+    stream = object()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: stream)
+
+    class FakeWeight:
+        def __init__(self, ptr):
+            self.ptr = ptr
+            self.recorded = []
+
+        def data_ptr(self):
+            return self.ptr
+
+        def record_stream(self, value):
+            self.recorded.append(value)
+
+    weights = [FakeWeight(11), FakeWeight(22)]
+    cached = object()
+    monkeypatch.setitem(fused_moe_lora_kernel._LORA_PTR_DICT, (11, 22), cached)
+
+    assert fused_moe_lora_kernel._get_ptr(weights, torch.device("cuda")) is cached
+    assert [weight.recorded for weight in weights] == [[stream], [stream]]
 
 
 def round_up(x, base):

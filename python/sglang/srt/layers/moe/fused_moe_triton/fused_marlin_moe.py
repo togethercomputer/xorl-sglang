@@ -119,6 +119,81 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS = 10  # floor(pinned row block 64 / topk 6)
+
+
+def is_dsv4_exact_pinned_marlin_geometry(
+    *,
+    dsv4_exact_mode: bool,
+    is_mxfp4_marlin: bool,
+    global_experts: int,
+    local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    clamp_limit: Optional[float],
+) -> bool:
+    """The admitted DSV4-Flash exact Marlin geometry (row block pinned to 64,
+    token batches chunked so no expert spans more than one row block)."""
+    return (
+        dsv4_exact_mode
+        and is_mxfp4_marlin
+        and global_experts == 256
+        and local_experts == 32
+        and hidden_size == 4096
+        and intermediate_size == 2048
+        and topk == 6
+        and clamp_limit == 10.0
+    )
+
+
+def select_marlin_moe_block_size_m(
+    *,
+    dsv4_exact_mode: bool = False,
+    num_tokens: int,
+    topk: int,
+    local_experts: int,
+    global_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    is_mxfp4_marlin: bool,
+    clamp_limit: Optional[float],
+) -> int:
+    """Select Marlin's row block, pinning the admitted DSV4 exact geometry.
+
+    The generic density heuristic selects blocks 8-32 at admitted DSV4 widths.
+    On SM90, repeated hot routes can then assign one expert to multiple Marlin
+    row blocks, whose partial completion order is not byte-stable.  A
+    shape-matched M=48 discriminator proves blocks 8/16/32 diverge while 48/64
+    are stable and produce the same bytes.  Pin 64 to keep one block per expert
+    through the retained four- and 64-decision lane; unrelated Marlin models
+    retain their established choice.  Pinning the block is NOT sufficient on
+    its own: a hot expert with more than 64 routed rows spans several blocks
+    again (measured 31% repeat-flip rate at a real 74-token layer-40 routing),
+    so the exact geometry additionally chunks token batches to
+    ``DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS`` so every expert stays within one
+    row block per launch.
+    """
+
+    block_size_m = 8
+    for candidate in (8, 16, 32, 48, 64):
+        block_size_m = candidate
+        if num_tokens * topk / local_experts / candidate < 0.9:
+            break
+    if is_dsv4_exact_pinned_marlin_geometry(
+        dsv4_exact_mode=dsv4_exact_mode,
+        is_mxfp4_marlin=is_mxfp4_marlin,
+        global_experts=global_experts,
+        local_experts=local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        topk=topk,
+        clamp_limit=clamp_limit,
+    ):
+        return 64
+    return block_size_m
+
+
 def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
@@ -162,6 +237,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    dsv4_exact_mode: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -235,14 +311,77 @@ def fused_marlin_moe(
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
-
     if global_num_experts == -1:
         global_num_experts = E
+    if (
+        is_dsv4_exact_pinned_marlin_geometry(
+            dsv4_exact_mode=dsv4_exact_mode,
+            is_mxfp4_marlin=is_mxfp4_marlin,
+            global_experts=global_num_experts,
+            local_experts=E,
+            hidden_size=K,
+            intermediate_size=N,
+            topk=topk,
+            clamp_limit=clamp_limit,
+        )
+        and M > DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS
+    ):
+        # Chunk so no expert can exceed one 64-row Marlin block per launch:
+        # multi-block experts reduce across blocks in completion order, which
+        # is not byte-stable. Chunked launches are the DSV4 exact byte
+        # program; the trainer reaches this same primitive and chunks
+        # identically. Row outputs are per-token, so concatenation is exact.
+        chunk = DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS
+        chunked_out = torch.empty_like(hidden_states)
+        for chunk_start in range(0, M, chunk):
+            chunk_stop = min(chunk_start + chunk, M)
+            chunked_out[chunk_start:chunk_stop] = fused_marlin_moe(
+                hidden_states[chunk_start:chunk_stop],
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating_output[chunk_start:chunk_stop],
+                topk_weights[chunk_start:chunk_stop],
+                topk_ids[chunk_start:chunk_stop],
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                g_idx1=g_idx1,
+                g_idx2=g_idx2,
+                sort_indices1=sort_indices1,
+                sort_indices2=sort_indices2,
+                w1_zeros=w1_zeros,
+                w2_zeros=w2_zeros,
+                w1_global_scale=w1_global_scale,
+                w2_global_scale=w2_global_scale,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                workspace=workspace,
+                num_bits=num_bits,
+                is_k_full=is_k_full,
+                inplace=False,
+                routed_scaling_factor=routed_scaling_factor,
+                clamp_limit=clamp_limit,
+                gemm1_alpha=gemm1_alpha,
+                activation=activation,
+                is_gated=is_gated,
+                dsv4_exact_mode=dsv4_exact_mode,
+            )
+        if inplace:
+            hidden_states.copy_(chunked_out)
+            return hidden_states
+        return chunked_out
+    block_size_m = select_marlin_moe_block_size_m(
+        dsv4_exact_mode=dsv4_exact_mode,
+        num_tokens=M,
+        topk=topk,
+        local_experts=E,
+        global_experts=global_num_experts,
+        hidden_size=K,
+        intermediate_size=N,
+        is_mxfp4_marlin=is_mxfp4_marlin,
+        clamp_limit=clamp_limit,
+    )
     if (
         M == 1
         and topk <= 32

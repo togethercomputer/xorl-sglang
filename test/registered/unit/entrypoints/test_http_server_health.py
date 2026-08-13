@@ -63,6 +63,20 @@ class TestHealthGenerateSamplingParams(unittest.TestCase):
         self.assertEqual(normalized.min_p, 0.0)
         self.assertEqual(normalized.sampling_seed, 300008)
 
+    def test_other_exact_health_requests_use_strict_multinomial_contract(self):
+        for exact_mode in ("qwen35_gdn_exact_mode", "dsv4_flash_exact_mode"):
+            with self.subTest(exact_mode=exact_mode):
+                params = _health_generate_sampling_params(
+                    SimpleNamespace(**{exact_mode: True}, random_seed=17)
+                )
+                normalized = SamplingParams(**params)
+
+                self.assertEqual(normalized.temperature, 1.0)
+                self.assertEqual(normalized.top_p, 1.0)
+                self.assertEqual(normalized.top_k, TOP_K_ALL)
+                self.assertEqual(normalized.min_p, 0.0)
+                self.assertEqual(normalized.sampling_seed, 17)
+
 
 class TestHealthGenerateEndpoint(unittest.IsolatedAsyncioTestCase):
     async def test_glm52_exact_endpoint_submits_the_contract_request(self):

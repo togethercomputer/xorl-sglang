@@ -24,7 +24,7 @@ without needing a per-backend LoRA runner subclass.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 import torch
@@ -110,7 +110,14 @@ def _naive_moe_lora_align_block_size(
             end = seg_indptr_list[seg_idx + 1]
             for m in range(start, end):
                 for k in range(top_k):
-                    pairs.append((topk_ids_list[m][k], m * top_k + k))
+                    expert_id = topk_ids_list[m][k]
+                    # StandardDispatcher localizes EP routes before the LoRA
+                    # runner and marks non-local routes with -1.  The GPU
+                    # aligner already treats those as invalid; the small-batch
+                    # CPU aligner must do the same instead of materializing a
+                    # bogus expert -1 block for decode.
+                    if 0 <= expert_id < num_experts:
+                        pairs.append((expert_id, m * top_k + k))
 
         if not pairs:
             continue
@@ -473,6 +480,26 @@ def _add_lora_down_delta(
             fully_sharded=lora_info.fully_sharded,
             offset=offset,
         )
+
+
+def slice_moe_lora_info(
+    lora_info: LoRAInfo | None, start: int, stop: int
+) -> LoRAInfo | None:
+    """Per-token slice of a LoRAInfo for the DSV4 exact chunked Marlin launches.
+
+    ``token_lora_mapping`` is per token and slices directly; ``seg_indptr``
+    shifts into chunk coordinates with out-of-chunk requests clamped to
+    zero-length segments (``req_to_lora`` alignment is preserved). Adapter
+    weight tables are per adapter and carried through unchanged.
+    """
+    if lora_info is None:
+        return None
+    length = stop - start
+    return replace(
+        lora_info,
+        seg_indptr=(lora_info.seg_indptr - start).clamp(0, length),
+        token_lora_mapping=lora_info.token_lora_mapping[start:stop],
+    )
 
 
 def build_lora_hooks(

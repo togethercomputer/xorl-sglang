@@ -55,6 +55,7 @@ from sglang.srt.distributed import (
     divide,
     get_pp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_canonical_moe_all_reduce,
 )
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDeferredStatusBook,
@@ -261,6 +262,11 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
 )
 
 logger = logging.getLogger(__name__)
+
+# One-shot per-process marker so the DSV4 exact-combine gate's engagement (or
+# non-engagement) is visible in the serving log; both states are contract
+# evidence (a silent gate was the root cause of an inert byte-program change).
+_dsv4_exact_combine_engagement_logged = False
 
 
 def _is_glm52_architecture(config) -> bool:
@@ -593,6 +599,13 @@ class MoEGate(nn.Module):
             return bi_router_gemm(hidden_states, self.weight)
 
         if get_exec().deterministic.enable_deterministic_inference:
+            if self.is_deepseek_v4:
+                # DSV4 hash_topk consumes FP32 router logits, and the later
+                # correction-bias router uses the same serving-value GEMM.
+                # Deterministic mode must not fall back to BF16 F.linear here.
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+
+                return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -683,6 +696,9 @@ class DeepseekV2MoE(nn.Module):
             top_k_for_moe = config.num_experts_per_tok + self.num_fused_shared_experts
 
         self.config = config
+        self._dsv4_exact_ordered_combine = bool(
+            getattr(config, "_dsv4_flash_exact_mode", False)
+        )
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
@@ -1173,12 +1189,36 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _post_experts_all_reduce(self, final_hidden_states):
+        """Post-experts TP sum; the DSV4 exact lane pins the canonical fold.
+
+        The stock NCCL all_reduce has a topology-dependent reduction order.
+        The XoRL exact contract requires the canonical adjacent-pair BF16
+        fold over TP-rank-ordered partials (the same primitive as the
+        Qwen/GLM exact lanes) so the trainer's EP combine (raw exchange +
+        canonical_moe_fold_v1) can reproduce the serving bytes.
+        """
+        global _dsv4_exact_combine_engagement_logged
+        if not _dsv4_exact_combine_engagement_logged:
+            _dsv4_exact_combine_engagement_logged = True
+            logger.info(
+                "DSV4 post-experts combine gate: %s",
+                (
+                    "canonical fold ENGAGED"
+                    if self._dsv4_exact_ordered_combine
+                    else "OFF (stock all_reduce)"
+                ),
+            )
+        if self._dsv4_exact_ordered_combine:
+            return tensor_model_parallel_canonical_moe_all_reduce(final_hidden_states)
+        return tensor_model_parallel_all_reduce(final_hidden_states)
 
     def forward_normal(
         self,
@@ -1326,7 +1366,7 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
@@ -1499,7 +1539,7 @@ class DeepseekV2MoE(nn.Module):
             True,  # is_vnni
         )
         if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(

@@ -338,6 +338,7 @@ class FusedMoE(torch.nn.Module):
             hidden_size = round_up(hidden_size, 256)
         self.hidden_size = hidden_size
 
+        server_args = get_server_args()
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
@@ -358,10 +359,10 @@ class FusedMoE(torch.nn.Module):
             is_gated=is_gated,
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
+            dsv4_exact_mode=bool(getattr(server_args, "dsv4_flash_exact_mode", False)),
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
-        server_args = get_server_args()
         kt_config = create_kt_config_from_server_args(server_args, layer_id)
         if kt_config is not None:
             if quant_config is not None:

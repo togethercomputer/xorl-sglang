@@ -26,8 +26,10 @@ def _jit_mask_topk_module():
 
 
 @cache_once
-def _jit_hash_topk_module():
-    args = make_cpp_args("act_sqrt_softplus", is_arch_support_pdl())
+def _jit_hash_topk_module(use_pdl: Optional[bool] = None):
+    if use_pdl is None:
+        use_pdl = is_arch_support_pdl()
+    args = make_cpp_args("act_sqrt_softplus", use_pdl)
     return load_jit(
         make_name("hash_topk"),
         *args,
@@ -116,6 +118,7 @@ def hash_topk(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: float = 1.0,
     scoring_func: str = "sqrtsoftplus",
+    use_pdl: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     assert scoring_func == "sqrtsoftplus"
     if is_hip_runtime():
@@ -139,7 +142,7 @@ def hash_topk(
         topk_weights = torch.empty(
             (num_tokens, topk_fused), dtype=torch.float32, device=router_logits.device
         )
-        module = _jit_hash_topk_module()
+        module = _jit_hash_topk_module(use_pdl)
         module.hash_topk(
             router_logits,
             input_ids,

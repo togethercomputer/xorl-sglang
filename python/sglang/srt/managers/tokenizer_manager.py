@@ -50,6 +50,7 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encode_receiver import create_mm_receiver
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.lora.dsv4 import validate_dsv4_flash_exact_request_routing
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
@@ -125,6 +126,7 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    is_dsv4_flash_exact_mode,
     is_glm52_exact_mode,
     is_qwen3_dense_exact_mode,
     is_qwen35_gdn_exact_mode,
@@ -417,6 +419,32 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
     fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
+
+
+def _build_raw_token_logprobs_b64_fields(
+    input_values: List[Optional[float]],
+    output_values: List[Optional[float]],
+) -> Dict[str, Any]:
+    """Encode selected-token logprobs without a JSON float round trip.
+
+    Positions with no defined logprob (normally the first prompt token) are
+    represented by the canonical NumPy float32 NaN.  Length fields preserve
+    the position mapping and make the wire format independently auditable.
+    """
+
+    def _encode(values: List[Optional[float]]) -> str:
+        arr = np.asarray(
+            [np.nan if value is None else value for value in values], dtype="<f4"
+        )
+        return pybase64.b64encode(arr.tobytes()).decode("utf-8")
+
+    return {
+        "input_token_logprobs_raw_b64": _encode(input_values),
+        "input_token_logprobs_raw_length": len(input_values),
+        "output_token_logprobs_raw_b64": _encode(output_values),
+        "output_token_logprobs_raw_length": len(output_values),
+        "token_logprobs_raw_b64_dtype": "float32_le",
+    }
 
 
 class InputFormat(Enum):
@@ -807,6 +835,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Normalize the request
         obj.normalize_batch_and_arguments()
         self._set_default_priority(obj)
+        if isinstance(obj, GenerateReqInput) and self.server_args.dsv4_flash_exact_mode:
+            validate_dsv4_flash_exact_request_routing(obj.routed_dp_rank)
         if (
             isinstance(obj, GenerateReqInput)
             and obj.max_thinking_tokens is not None
@@ -1250,7 +1280,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         exact_qwen35 = is_qwen35_gdn_exact_mode(self.server_args)
         exact_qwen3 = is_qwen3_dense_exact_mode(self.server_args)
         exact_glm = is_glm52_exact_mode(self.server_args)
-        if (exact_qwen35 or exact_qwen3 or exact_glm) and isinstance(
+        exact_dsv4 = is_dsv4_flash_exact_mode(self.server_args)
+        if (exact_qwen35 or exact_qwen3 or exact_glm or exact_dsv4) and isinstance(
             obj, GenerateReqInput
         ):
             violations = _get_bi_decode_strict_ingress_violations(
@@ -1265,10 +1296,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if exact_glm
                     else "dense Qwen3" if exact_qwen3 else "Qwen3.5-family"
                 )
+                if exact_dsv4:
+                    contract_name = "DSV4-Flash"
                 temperature_contract = (
                     "unit-temperature"
                     if exact_glm or exact_qwen3
-                    else "plain-temperature"
+                    else "temperature-aware" if exact_dsv4 else "plain-temperature"
                 )
                 raise ValueError(
                     f"This server runs the exact {contract_name} RL on-policy "
@@ -2604,6 +2637,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info["input_token_logprobs"] = state.input_token_logprobs
         meta_info["output_token_logprobs"] = state.output_token_logprobs
         meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs)
+        if state.obj.return_raw_token_logprobs_b64:
+            meta_info.update(
+                _build_raw_token_logprobs_b64_fields(
+                    state.input_token_logprobs_val,
+                    state.output_token_logprobs_val,
+                )
+            )
 
         # 2. Handle top logprobs
         if top_logprobs_num > 0:

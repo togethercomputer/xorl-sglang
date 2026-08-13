@@ -586,6 +586,10 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Use exact-size DP-MoE gather/reduce_scatterv for SUM_LEN forwards.
+    # Kept as an EnvField so exact contracts can reject this byte-changing
+    # combine path during startup resolution.
+    SGLANG_DP_USE_GATHERV = EnvBool(False)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
     # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
     # halves the gathered hidden-state bytes over NCCL; the combine

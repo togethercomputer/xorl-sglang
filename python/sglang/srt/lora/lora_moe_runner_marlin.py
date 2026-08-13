@@ -30,6 +30,8 @@ if _is_cuda:
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
         get_scalar_type,
+        select_marlin_moe_block_size_m,
+        swiglu_limit_func,
     )
     from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
         moe_align_block_size,
@@ -80,10 +82,33 @@ class MarlinLoraRunnerCore:
         N = quant_info.w2_qweight.shape[1] * 16
         topk = topk_ids.shape[1]
         num_bits = quant_info.weight_bits
+        is_mxfp4_marlin = (
+            num_bits == 4
+            and quant_info.w13_qzeros is None
+            and quant_info.w2_qzeros is None
+            and quant_info.w13_scales.dtype == torch.float8_e8m0fnu
+            and quant_info.w2_scales.dtype == torch.float8_e8m0fnu
+        )
+        use_atomic_add = (
+            hidden_states.dtype == torch.float16
+            or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
+        ) and not is_mxfp4_marlin
 
-        for block_size_m in [8, 16, 32, 48, 64]:
-            if M * topk / E / block_size_m < 0.9:
-                break
+        block_size_m = select_marlin_moe_block_size_m(
+            dsv4_exact_mode=runner_config.dsv4_exact_mode,
+            num_tokens=M,
+            topk=topk,
+            local_experts=E,
+            global_experts=(
+                quant_info.global_num_experts
+                if quant_info.global_num_experts != -1
+                else E
+            ),
+            hidden_size=K,
+            intermediate_size=N,
+            is_mxfp4_marlin=is_mxfp4_marlin,
+            clamp_limit=runner_config.swiglu_limit,
+        )
 
         # Under EP the dispatcher already localized topk_ids (-1 = non-local); align
         # over the global expert count like fused_marlin_moe, not the local E.
@@ -113,10 +138,23 @@ class MarlinLoraRunnerCore:
             quant_info.w2_global_scale,
         )
 
-        # Stage 1: Gate/Up (Marlin)
-        intermediate_cache1 = torch.empty(
-            (M * topk, 2 * N), device=hidden_states.device, dtype=hidden_states.dtype
+        # Match fused_marlin_moe's cache ownership exactly.  Under EP, Marlin
+        # skips every -1 (non-local) route, so those rows must start at zero;
+        # exposing uninitialized rows to the LoRA hook/activation is both
+        # nondeterministic and unsafe.  The shared zero allocation also keeps
+        # gate/up and down cache layout identical to the base implementation.
+        intermediate_cache2 = torch.empty(
+            (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype
         )
+        intermediate_cache13 = torch.zeros(
+            (M * topk * max(2 * N, K),),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+        intermediate_cache1 = intermediate_cache13[: M * topk * 2 * N].view(
+            M * topk, 2 * N
+        )
+        intermediate_cache3 = intermediate_cache13[: M * topk * K].view(M * topk, K)
         intermediate_cache1 = moe_wna16_marlin_gemm(
             hidden_states,
             intermediate_cache1,
@@ -141,31 +179,29 @@ class MarlinLoraRunnerCore:
             size_n=2 * N,
             size_k=K,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
-
         # Hook: after gate_up
         if hooks.after_gate_up:
             intermediate_cache1_3d = intermediate_cache1.view(M, topk, 2 * N)
             hooks.after_gate_up(
                 hidden_states, intermediate_cache1_3d, topk_weights, topk_ids
             )
-
         # Stage 2: Activation
-        intermediate_cache2 = torch.empty(
-            (M * topk, N), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
-
+        gate_up = intermediate_cache1.view(-1, 2 * N)
+        if runner_config.swiglu_limit is not None:
+            # Match fused_marlin_moe exactly: DSV4 clamps only the positive
+            # gate bound and clamps both bounds of the up half before SiLU.
+            swiglu_limit_func(
+                intermediate_cache2,
+                gate_up,
+                runner_config.swiglu_limit,
+            )
+        else:
+            silu_and_mul(gate_up, intermediate_cache2)
         # Stage 3: Down (Marlin)
-        intermediate_cache3 = torch.empty(
-            (M * topk, K), device=hidden_states.device, dtype=hidden_states.dtype
-        )
-        if quant_info.expert_map is not None:
-            intermediate_cache3.zero_()
-
         intermediate_cache3 = moe_wna16_marlin_gemm(
             intermediate_cache2,
             intermediate_cache3,
@@ -190,7 +226,7 @@ class MarlinLoraRunnerCore:
             size_n=K,
             size_k=N,
             is_k_full=quant_info.is_k_full,
-            use_atomic_add=True,
+            use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
         )
@@ -201,10 +237,18 @@ class MarlinLoraRunnerCore:
             hooks.after_down(
                 intermediate_cache2, intermediate_cache3, topk_weights, topk_ids
             )
-
         # Stage 4: Reduction. Never alias hidden_states even under inplace: the sink
         # forward still reads it (stock fused_experts_none_to_marlin does the same).
         output = torch.empty_like(hidden_states)
+        if is_mxfp4_marlin:
+            # Match fused_marlin_moe: the down GEMM and down-LoRA hook already
+            # apply top-k weights (including DSV4's routed scale), then use the
+            # same fixed-order vectorized top-k sum. Applying routed_scaling_factor
+            # again here was both numerically wrong and byte-divergent at zero LoRA.
+            from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
+
+            moe_topk_sum(intermediate_cache3, output)
+            return StandardCombineInput(hidden_states=output)
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
         # NOTE: fusion opportunity here

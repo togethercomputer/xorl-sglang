@@ -2041,6 +2041,14 @@ def _deterministic_attention_backend(view: Any) -> dict:
         return {}
     from sglang.srt.server_args import DETERMINISTIC_ATTENTION_BACKEND_CHOICES
 
+    if view.attention_backend == "dsv4" and bool(
+        getattr(view, "dsv4_flash_exact_mode", False)
+    ):
+        # The DSV4-Flash exact lane is deliberately single-request, eager, and
+        # pins the model-specific attention backend.  Admit only that resolved
+        # contract; generic deterministic DSV4 remains unsupported.
+        return {}
+
     if view.attention_backend == "dsa":
         try:
             model_arch = view.get_model_config().hf_config.architectures[0]
