@@ -1,5 +1,6 @@
 """Byte contract for exact DeepSeek-V4 CP KV-cache formation."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -134,3 +135,7 @@ def test_exact_cp_raw_gather_produces_cp1_identical_cache_bytes():
     torch.cuda.synchronize()
     assert cp1_cache.count_nonzero().item() > 0
     assert torch.equal(cp_cache, cp1_cache)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
