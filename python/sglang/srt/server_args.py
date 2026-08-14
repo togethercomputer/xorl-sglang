@@ -767,6 +767,37 @@ def _validate_glm52_exact_quantization_config(hf_config) -> None:
         )
 
 
+def _validate_dsv4_flash_exact_quantization_config(hf_config) -> None:
+    """Validate the FP8 formats consumed by the exact DSV4 arithmetic path."""
+
+    config = _text_model_config(hf_config)
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        raise ValueError(
+            "The DSV4 exact arithmetic path requires a dynamic block-FP8 "
+            "quantization config."
+        )
+    expected = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    }
+    mismatches = [
+        f"quantization_config.{name}={quantization_config.get(name)!r} "
+        f"(expected {value!r})"
+        for name, value in expected.items()
+        if quantization_config.get(name) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "The DSV4 exact arithmetic path requires dynamic E4M3 weights, "
+            "UE8M0 scales, and 128x128 blocks; mismatched fields: "
+            + ", ".join(mismatches)
+        )
+
+
 def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | None:
     if is_glm52_exact_mode(server_args):
         from sglang.srt.layers.xorl_batch_invariant import XORL_GLM52_REQUIRED_BI_OPS
@@ -5444,6 +5475,8 @@ class ServerArgs:
         config._dsv4_flash_exact_mode = self.dsv4_flash_exact_mode
         if not self.dsv4_flash_exact_mode:
             return
+
+        _validate_dsv4_flash_exact_quantization_config(config)
 
         # Geometry, ownership, adapter inventory, and graph-buffer constraints
         # are checked by the runtime mechanisms that consume them. ServerArgs

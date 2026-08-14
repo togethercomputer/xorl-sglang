@@ -35,7 +35,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
-from sglang.srt.lora.dsv4 import is_dsv4_flash_exact_adapter
+from sglang.srt.lora.dsv4 import (
+    dsv4_exact_speculative_request_error,
+    is_dsv4_flash_exact_adapter,
+)
 from sglang.srt.lora.glm52 import is_glm52_xorl_shared_outer_adapter
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
@@ -535,6 +538,13 @@ class LoRAManager:
         self.lora_backend._dsv4_flash_exact_batch_certified = False
         if not getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
             return
+        speculative_request_error = dsv4_exact_speculative_request_error(
+            exact_mode=True,
+            speculative_enabled=forward_batch.forward_mode.is_target_verify(),
+        )
+        if speculative_request_error is not None:
+            raise RuntimeError(speculative_request_error)
+        lora_ids = list(forward_batch.lora_ids)
         # ``ForwardMode.is_cuda_graph()`` means that a mode *can* be captured;
         # eager decode uses the same ``DECODE`` enum.  Reject only an actual
         # capture or a batch backed by initialized decode-graph metadata.
@@ -557,7 +567,6 @@ class LoRAManager:
                 "Gather-aware DSV4-Flash decode graphs currently require one "
                 "local one-token request per DP rank."
             )
-        lora_ids = list(forward_batch.lora_ids)
         if len(lora_ids) != 1:
             raise RuntimeError(
                 "The exact DSV4-Flash active-LoRA contract admits exactly one "

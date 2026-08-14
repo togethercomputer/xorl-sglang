@@ -102,6 +102,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+from sglang.srt.lora.dsv4 import dsv4_exact_speculative_request_error
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
@@ -2321,6 +2322,20 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _reject_dsv4_exact_speculative_request(self, req: Req) -> bool:
+        """Reject the unsupported request before cache allocation or forwarding."""
+
+        error_msg = dsv4_exact_speculative_request_error(
+            exact_mode=self.server_args.dsv4_flash_exact_mode,
+            speculative_enabled=not self.spec_algorithm.is_none(),
+        )
+        if error_msg is None:
+            return False
+        logger.warning("Rejecting request %s: %s", req.rid, error_msg)
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
+        return True
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2460,6 +2475,9 @@ class Scheduler(
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
+            return
+
+        if self._reject_dsv4_exact_speculative_request(req):
             return
 
         self._maybe_namespace_elastic_radix_cache(req)

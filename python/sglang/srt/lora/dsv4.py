@@ -83,6 +83,22 @@ DSV4_FLASH_COMPRESS_RATIOS = (
 _ADAPTER_PREFIX = "base_model.model."
 
 
+def dsv4_exact_speculative_request_error(
+    *,
+    exact_mode: bool,
+    speculative_enabled: bool,
+) -> Optional[str]:
+    """Return the request-level error for the unsupported exact scorer boundary."""
+
+    if not exact_mode or not speculative_enabled:
+        return None
+    return (
+        "DSV4 exact target verification is unsupported because the generic "
+        "speculative scorer does not implement the exact decision program. "
+        "Send this request to a non-speculative server."
+    )
+
+
 @dataclass(frozen=True)
 class Dsv4FlashLoRAFactorSpec:
     """One trainer-logical factor and its physical SGLang destination."""

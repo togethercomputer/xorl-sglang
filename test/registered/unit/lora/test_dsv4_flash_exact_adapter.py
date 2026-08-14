@@ -79,6 +79,13 @@ def _official_config(*, exact: bool = True) -> SimpleNamespace:
         scoring_func="sqrtsoftplus",
         topk_method="noaux_tc",
         swiglu_limit=10.0,
+        quantization_config={
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "scale_fmt": "ue8m0",
+            "weight_block_size": [128, 128],
+        },
         _dsv4_flash_exact_mode=exact,
     )
 
@@ -509,6 +516,46 @@ def test_exact_radix_namespace_isolates_dp_owner_and_lora_generation() -> None:
 
     assert generation_a == "adapter-generation-a|dsv4_exact_dp_owner=0"
     assert len({generation_a, generation_b, owner_b}) == 3
+
+
+@pytest.mark.parametrize(
+    ("speculative", "lora_id", "rejected"),
+    [(True, "policy", True), (True, None, True), (False, None, False)],
+)
+def test_exact_speculative_request_boundary(
+    monkeypatch, speculative, lora_id, rejected
+) -> None:
+    import sglang.srt.managers.scheduler as scheduler_module
+    from sglang.srt.managers.scheduler import Scheduler
+
+    scheduler = object.__new__(Scheduler)
+    scheduler.server_args = SimpleNamespace(dsv4_flash_exact_mode=True)
+    scheduler.spec_algorithm = SimpleNamespace(is_none=lambda: not speculative)
+    streamed = []
+    scheduler.output_streamer = SimpleNamespace(
+        stream_output=lambda reqs, return_logprob: streamed.append(
+            (reqs, return_logprob)
+        )
+    )
+    aborted = []
+    monkeypatch.setattr(
+        scheduler_module,
+        "prepare_abort",
+        lambda req, message, status_code: aborted.append(
+            (req, message, status_code)
+        ),
+    )
+    request = SimpleNamespace(
+        rid="exact-speculative",
+        lora_id=lora_id,
+        return_logprob=True,
+    )
+
+    assert scheduler._reject_dsv4_exact_speculative_request(request) is rejected
+    assert bool(aborted) is rejected
+    assert bool(streamed) is rejected
+    if rejected:
+        assert "generic speculative scorer" in aborted[0][1]
 
 
 def test_dynamic_lora_reload_mints_a_new_radix_generation() -> None:
@@ -977,6 +1024,56 @@ def test_exact_batch_checks_decode_graph_metadata_shape_not_topology() -> None:
     manager.max_bs_in_cuda_graph = 2
     with pytest.raises(RuntimeError, match="one local one-token request"):
         manager._validate_dsv4_flash_exact_batch(invalid_batch)
+
+
+@pytest.mark.parametrize("lora_ids", [["policy"], [None]])
+def test_exact_target_verify_rejects_before_model_forward(lora_ids) -> None:
+    from sglang.srt.lora.lora_manager import LoRAManager
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    manager = LoRAManager.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    manager.lora_backend = SimpleNamespace(_dsv4_flash_exact_batch_certified=False)
+
+    batch = SimpleNamespace(
+        batch_size=1,
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        lora_ids=lora_ids,
+    )
+    with pytest.raises(RuntimeError, match="generic speculative scorer"):
+        manager._validate_dsv4_flash_exact_batch(batch)
+
+
+def test_exact_fp8_format_accepts_mechanism_and_rejects_alternates() -> None:
+    from sglang.srt.server_args import (
+        _validate_dsv4_flash_exact_quantization_config,
+    )
+
+    expected = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    }
+    _validate_dsv4_flash_exact_quantization_config(
+        SimpleNamespace(quantization_config=dict(expected))
+    )
+
+    alternates = {
+        "quant_method": "compressed-tensors",
+        "activation_scheme": "static",
+        "fmt": "e5m2",
+        "scale_fmt": "fp32",
+        "weight_block_size": [64, 128],
+    }
+    for field, value in alternates.items():
+        config = dict(expected)
+        config[field] = value
+        with pytest.raises(ValueError, match=rf"quantization_config\.{field}"):
+            _validate_dsv4_flash_exact_quantization_config(
+                SimpleNamespace(quantization_config=config)
+            )
 
 
 def test_certified_all_zero_adapter_prepares_as_literal_base_noop() -> None:
