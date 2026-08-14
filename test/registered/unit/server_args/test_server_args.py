@@ -1034,6 +1034,45 @@ class TestDeterministicGlmDsa(unittest.TestCase):
         ):
             server_args._validate_glm52_exact_resolved_contract()
 
+    def test_glm52_xorl_derives_every_mixed_dp_cp_factorization(self):
+        for dp_size, cp_size in ((2, 8), (4, 4), (8, 2)):
+            with self.subTest(dp_size=dp_size, cp_size=cp_size):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.rl_on_policy_target = "xorl"
+                server_args.nnodes = 2
+                server_args.tp_size = 16
+                server_args.dp_size = dp_size
+                server_args.cuda_graph_config = CudaGraphConfig()
+                server_args._cuda_graph_config_locked = set()
+
+                server_args._resolve_glm52_exact_contract(
+                    self._glm_model_config().hf_config,
+                    model_arch="GlmMoeDsaForCausalLM",
+                    is_dsa_model=True,
+                )
+
+                self.assertEqual(server_args.dp_size, dp_size)
+                self.assertEqual(server_args.attn_cp_size, cp_size)
+                self.assertEqual(server_args.ep_size, 16)
+                self.assertTrue(server_args.enable_prefill_cp)
+                self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
+                self.assertEqual(server_args.cp_strategy, "interleave")
+                self.assertTrue(server_args.enable_dp_lm_head)
+                self.assertEqual(server_args.max_loras_per_batch, 2)
+                self.assertEqual(server_args.max_loaded_loras, 2)
+
+                server_args.page_size = 64
+                server_args.enable_dp_attention = True
+                with (
+                    patch.object(envs.SGLANG_ENABLE_CP_V2, "get", return_value=True),
+                    patch.object(
+                        envs.SGLANG_DISABLE_DSA_INDEXER_FUSION,
+                        "get",
+                        return_value=False,
+                    ),
+                ):
+                    server_args._validate_glm52_exact_resolved_contract()
+
     def test_glm52_xorl_preserves_arbitrary_positive_max_lora_rank(self):
         for rank in (1, 3, 7, 16, 31, 64):
             with self.subTest(rank=rank):
@@ -1115,9 +1154,7 @@ class TestDeterministicGlmDsa(unittest.TestCase):
             "tp_size": 8,
             "ep_size": 8,
             "pp_size": 2,
-            "dp_size": 2,
             "moe_dp_size": 2,
-            "attn_cp_size": 8,
             "dsa_prefill_cp_mode": "in-seq-split",
             "enable_hisparse": True,
             "page_size": 32,

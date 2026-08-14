@@ -1494,7 +1494,7 @@ class DeepseekV2MoE(nn.Module):
         )
         distribution = (
             CanonicalDistribution.CONSUMER_SHARDED
-            if prefill_cp
+            if prefill_cp and plan.attention_dp_size == 1
             else CanonicalDistribution.REPLICATED_CANONICAL
         )
         group = get_parallel().tp_group.device_group
@@ -3035,18 +3035,6 @@ class DeepseekV2Model(nn.Module):
             )
         self.glm52_parallel_plan: SamplerParallelPlan | None = None
         if self.glm52_xorl_bi_contract:
-            parallel = get_parallel()
-            dp_owned = parallel.attn_dp_size == parallel.tp_size
-            cp_owned = (
-                self.dsa_enable_prefill_cp
-                and not self.mla_enable_prefill_cp
-                and parallel.attn_cp_size == parallel.tp_size
-            )
-            if not (cp_owned or dp_owned):
-                raise RuntimeError(
-                    "The exact GLM-5.2 canonical contract requires ownership "
-                    "entirely in DSA context parallelism or attention DP"
-                )
             server_args = get_server_args()
             forbidden_features = {
                 "two-batch overlap": server_args.enable_two_batch_overlap,

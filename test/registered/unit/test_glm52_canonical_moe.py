@@ -34,26 +34,119 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestGlm52CanonicalMoE(unittest.TestCase):
+    def test_logical_row_ownership_covers_every_dp_cp_factorization(self):
+        from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
+
+        for dp_size, cp_size in ((1, 16), (2, 8), (4, 4), (8, 2), (16, 1)):
+            with self.subTest(dp_size=dp_size, cp_size=cp_size):
+                ordinals = []
+                for dp_rank in range(dp_size):
+                    for cp_rank in range(cp_size):
+                        ownership = LogicalRowOwnership(
+                            dp_size, cp_size, dp_rank, cp_rank, 16
+                        )
+                        ordinals.append(ownership.source_ordinal)
+                        self.assertEqual(
+                            ownership.context_source_ordinals,
+                            tuple(range(dp_rank * cp_size, (dp_rank + 1) * cp_size)),
+                        )
+                self.assertEqual(ordinals, list(range(16)))
+
+    def test_logical_row_ownership_maps_prefill_and_decode_sources(self):
+        from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
+
+        ownership = LogicalRowOwnership(4, 4, 2, 3, 16)
+        self.assertEqual(
+            ownership.local_source_slice(
+                [8, 12, 16, 20], local_rows=4, context_sharded=True
+            ),
+            slice(32, 36),
+        )
+        self.assertEqual(
+            ownership.local_source_slice(
+                [2, 3, 4, 5], local_rows=4, context_sharded=False
+            ),
+            slice(5, 9),
+        )
+        self.assertEqual(
+            ownership.select_dp_representatives(
+                ["a"] * 4 + ["b"] * 4 + ["c"] * 4 + [None] * 4
+            ),
+            ["a", "b", "c", None],
+        )
+        with self.assertRaisesRegex(ValueError, "CP replicas disagree"):
+            ownership.select_dp_representatives(
+                ["a"] * 4 + ["b"] * 3 + ["x"] + ["c"] * 4 + [None] * 4
+            )
+
+    def test_dp_owned_row_gather_uses_one_cp_representative_per_request(self):
+        from sglang.srt.layers.communicator_dsa_cp import _gather_dp_owned_rows
+        from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
+
+        local = torch.arange(8, dtype=torch.bfloat16).reshape(4, 2)
+        remote = local + 100
+        for cp_rank in (0, 3):
+            ownership = LogicalRowOwnership(2, 8, 1, cp_rank, 16)
+            output = torch.empty((7, 2), dtype=torch.bfloat16)
+
+            def fake_all_reduce(actual, *, group):
+                self.assertIs(group, tp_group)
+                self.assertTrue(torch.equal(actual[:3], torch.zeros_like(actual[:3])))
+                expected_local = local if cp_rank == 0 else torch.zeros_like(local)
+                self.assertTrue(torch.equal(actual[3:], expected_local))
+                actual[:3].copy_(remote[:3])
+                actual[3:].copy_(local)
+
+            tp_group = object()
+            with (
+                patch(
+                    "sglang.srt.layers.communicator_dsa_cp.get_dp_global_num_tokens",
+                    return_value=[3, 4],
+                ),
+                patch(
+                    "sglang.srt.layers.communicator_dsa_cp.get_parallel",
+                    return_value=SimpleNamespace(
+                        tp_group=SimpleNamespace(device_group=tp_group)
+                    ),
+                ),
+                patch(
+                    "sglang.srt.layers.communicator_dsa_cp.dist.all_reduce",
+                    side_effect=fake_all_reduce,
+                ),
+            ):
+                gathered = _gather_dp_owned_rows(
+                    local, output=output, ownership=ownership
+                )
+            self.assertTrue(torch.equal(gathered[:3], remote[:3]))
+            self.assertTrue(torch.equal(gathered[3:], local))
+
     def test_dp_owned_positions_follow_rank_major_gather(self):
         from sglang.srt.layers.communicator_dsa_cp import (
             align_glm52_moe_positions as align_runtime_positions,
         )
 
-        expected_shifted = torch.tensor([1, 3, 4, 6, 7, 0], dtype=torch.int64)
-
-        def fake_dp_gather(output, local, _forward_batch):
-            self.assertTrue(torch.equal(local, torch.tensor([3, 4])))
-            output.copy_(expected_shifted)
+        def fake_dp_gather(local, *, output, ownership):
+            self.assertEqual(ownership.dp_rank, 1)
+            if output.dtype is torch.int64:
+                self.assertTrue(torch.equal(local, torch.tensor([2, 3])))
+                output.copy_(torch.tensor([0, 2, 3, 5, 6, -1]))
+            else:
+                output.copy_(torch.tensor([1, 1, 1, 1, 1, 0], dtype=output.dtype))
+            return output
 
         with patch.multiple(
             "sglang.srt.layers.communicator_dsa_cp",
             dsa_use_prefill_cp=lambda *_args: False,
             mla_use_prefill_cp=lambda *_args: False,
             get_parallel=lambda: SimpleNamespace(
-                attn_dp_size=3, attn_dp_rank=1, attn_cp_size=1
+                attn_dp_size=3,
+                attn_dp_rank=1,
+                attn_cp_size=1,
+                attn_cp_rank=0,
+                tp_size=3,
             ),
             get_dp_global_num_tokens=lambda: [1, 2, 3],
-            dp_gather_replicate=fake_dp_gather,
+            _gather_dp_owned_rows=fake_dp_gather,
         ):
             aligned = align_runtime_positions(
                 torch.tensor([2, 3]),
@@ -68,6 +161,60 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 torch.tensor([True, True, True, True, True, False]),
             )
         )
+
+    def test_mixed_dp_cp_positions_compose_context_and_owner_gathers(self):
+        from sglang.srt.layers.communicator_dsa_cp import (
+            align_glm52_moe_positions as align_runtime_positions,
+        )
+
+        cp_positions = torch.tensor([8, 9, -1, 11])
+        cp_valid = torch.tensor([1, 1, 0, 1], dtype=torch.int32)
+        expected_positions = torch.tensor(
+            [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, -1, 11, 12, 13, 14, 15]
+        )
+        expected_valid = expected_positions >= 0
+
+        def fake_cp_gather(output, local):
+            self.assertEqual(local.numel(), 1)
+            output.copy_(cp_positions if output.dtype is torch.int64 else cp_valid)
+
+        def fake_dp_gather(local, *, output, ownership):
+            self.assertEqual((ownership.dp_rank, ownership.cp_rank), (2, 1))
+            self.assertTrue(
+                torch.equal(
+                    local, cp_positions if output.dtype is torch.int64 else cp_valid
+                )
+            )
+            output.copy_(
+                expected_positions
+                if output.dtype is torch.int64
+                else expected_valid.to(output.dtype)
+            )
+            return output
+
+        with patch.multiple(
+            "sglang.srt.layers.communicator_dsa_cp",
+            dsa_use_prefill_cp=lambda *_args: True,
+            mla_use_prefill_cp=lambda *_args: False,
+            get_parallel=lambda: SimpleNamespace(
+                attn_dp_size=4,
+                attn_dp_rank=2,
+                attn_cp_size=4,
+                attn_cp_rank=1,
+                tp_size=16,
+            ),
+            get_dp_global_num_tokens=lambda: [4, 4, 4, 4],
+            attn_cp_all_gather_into_tensor=fake_cp_gather,
+            _gather_dp_owned_rows=fake_dp_gather,
+        ):
+            aligned = align_runtime_positions(
+                torch.tensor([9]),
+                torch.empty((16, 4)),
+                SimpleNamespace(),
+            )
+
+        self.assertTrue(torch.equal(aligned.values, expected_positions))
+        self.assertTrue(torch.equal(aligned.valid_mask, expected_valid))
 
     def test_cp16_dp1_does_not_request_mlp_tp_gather(self):
         from sglang.srt.utils.common import require_mlp_sync, require_mlp_tp_gather
@@ -1210,8 +1357,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         )
         self.assertEqual(production_dp16.attention_cp_size, 1)
         self.assertEqual(production_dp16.attention_dp_size, 16)
-        with self.assertRaisesRegex(RuntimeError, "attention-DP requires"):
-            production_dp16.validate_cuda_graph_policy(disable_cuda_graph=False)
+        production_dp16.validate_cuda_graph_policy(disable_cuda_graph=False)
         production_dp16.validate_cuda_graph_policy(disable_cuda_graph=True)
         with (
             patch("torch.distributed.get_world_size", return_value=16),
@@ -1229,12 +1375,18 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 attention_cp_size=1,
                 attention_dp_size=16,
             )
-        with self.assertRaisesRegex(ValueError, "ownership entirely"):
-            replace(
-                production_dp16,
-                attention_cp_size=4,
-                attention_dp_size=4,
+        for dp_size, cp_size in ((1, 16), (2, 8), (4, 4), (8, 2), (16, 1)):
+            mixed = SamplerParallelPlan.glm52(
+                contributors=16, attention_dp_size=dp_size
             )
+            self.assertEqual(mixed.attention_cp_size, cp_size)
+            self.assertEqual(mixed.attention_dp_size, dp_size)
+        mixed = replace(
+            production_dp16,
+            attention_cp_size=4,
+            attention_dp_size=4,
+        )
+        self.assertEqual(mixed.attention_cp_size * mixed.attention_dp_size, 16)
 
         with (
             patch("torch.distributed.get_world_size", return_value=8),

@@ -5903,7 +5903,12 @@ class ServerArgs:
             self.lora_target_modules = set(GLM52_REQUIRED_TARGET_MODULES)
         requested_max_lora_rank = self.max_lora_rank
         requested_max_total_tokens = self.max_total_tokens
-        glm52_dp_owned = self.dp_size == 16
+        if self.dp_size <= 0 or self.tp_size % self.dp_size:
+            raise ValueError(
+                "Exact GLM-5.2 requires dp_size to be a positive divisor of tp_size"
+            )
+        glm52_dp_owned = self.dp_size > 1
+        glm52_cp_size = self.tp_size // self.dp_size
         # Radix reuse admits varied extend lengths, so its envelope bounds the
         # per-request canonical-fold workspace together with fused-MoE scratch.
         # This capacity-only choice does not change the numerical program.
@@ -5986,7 +5991,6 @@ class ServerArgs:
             "tp_size": (self.tp_size, (16,)),
             "ep_size": (self.ep_size, (1, 16)),
             "pp_size": (self.pp_size, (1,)),
-            "dp_size": (self.dp_size, (1, 16)),
             "dcp_size": (self.dcp_size, (1,)),
             "enable_cp_decode_attn_tp": (self.enable_cp_decode_attn_tp, (False,)),
             "enable_dp_lm_head": (
@@ -5994,7 +5998,6 @@ class ServerArgs:
                 (False, True) if glm52_dp_owned else (False,),
             ),
             "moe_dp_size": (self.moe_dp_size, (1,)),
-            "attn_cp_size": (self.attn_cp_size, (1, 16)),
             "dsa_prefill_cp_mode": (
                 self.dsa_prefill_cp_mode,
                 ("round-robin-split",),
@@ -6005,17 +6008,14 @@ class ServerArgs:
             for name, (value, allowed) in exact_program.items()
             if value not in allowed
         ]
-        if glm52_dp_owned and self.attn_cp_size != 1:
-            incompatible.append(
-                f"attn_cp_size={self.attn_cp_size!r} (DP16 requires CP1)"
-            )
         if self.max_loaded_loras not in (None, 2) and glm52_dp_owned:
             incompatible.append(
-                f"max_loaded_loras={self.max_loaded_loras!r} (DP16 requires 2)"
+                f"max_loaded_loras={self.max_loaded_loras!r} (DP-owned rows require 2)"
             )
         if self.max_loras_per_batch not in (2, 8) and glm52_dp_owned:
             incompatible.append(
-                f"max_loras_per_batch={self.max_loras_per_batch!r} " "(DP16 requires 2)"
+                f"max_loras_per_batch={self.max_loras_per_batch!r} "
+                "(DP-owned rows require 2)"
             )
         if requested_max_lora_rank is not None and (
             isinstance(requested_max_lora_rank, bool)
@@ -6123,11 +6123,11 @@ class ServerArgs:
         self.fp8_gemm_runner_backend = "triton"
         self.moe_dense_tp_size = 1
         self.ep_size = 16
-        self.attn_cp_size = 1 if glm52_dp_owned else 16
-        self.enable_prefill_cp = not glm52_dp_owned
+        self.attn_cp_size = glm52_cp_size
+        self.enable_prefill_cp = glm52_cp_size > 1
         self.enable_prefill_context_parallel = False
-        self.cp_strategy = None if glm52_dp_owned else "interleave"
-        self.enable_dsa_prefill_context_parallel = not glm52_dp_owned
+        self.cp_strategy = "interleave" if glm52_cp_size > 1 else None
+        self.enable_dsa_prefill_context_parallel = glm52_cp_size > 1
         self.dsa_prefill_cp_mode = "round-robin-split"
         self.enable_deterministic_inference = True
         self.disable_shared_experts_fusion = True
@@ -6325,11 +6325,12 @@ class ServerArgs:
         if not self.glm52_exact_mode:
             return
 
-        glm52_dp_owned = self.dp_size == 16
-        if self.dp_size not in (1, 16):
+        if self.dp_size <= 0 or self.tp_size % self.dp_size:
             raise ValueError(
-                "The exact GLM-5.2 XORL contract admits DP1/CP16 or DP16/CP1."
+                "Exact GLM-5.2 requires dp_size to be a positive divisor of tp_size"
             )
+        glm52_dp_owned = self.dp_size > 1
+        glm52_cp_size = self.tp_size // self.dp_size
         expected = {
             "dtype": "bfloat16",
             "quantization": "fp8",
@@ -6347,19 +6348,19 @@ class ServerArgs:
             "tp_size": 16,
             "ep_size": 16,
             "pp_size": 1,
-            "dp_size": 16 if glm52_dp_owned else 1,
+            "dp_size": self.dp_size,
             "moe_dp_size": 1,
-            "attn_cp_size": 1 if glm52_dp_owned else 16,
+            "attn_cp_size": glm52_cp_size,
             "moe_dense_tp_size": 1,
             "moe_a2a_backend": "none",
             "ep_num_redundant_experts": 0,
             "ep_dispatch_algorithm": None,
             "init_expert_location": "trivial",
             "enable_eplb": False,
-            "enable_prefill_cp": not glm52_dp_owned,
+            "enable_prefill_cp": glm52_cp_size > 1,
             "enable_prefill_context_parallel": False,
-            "enable_dsa_prefill_context_parallel": not glm52_dp_owned,
-            "cp_strategy": None if glm52_dp_owned else "interleave",
+            "enable_dsa_prefill_context_parallel": glm52_cp_size > 1,
+            "cp_strategy": "interleave" if glm52_cp_size > 1 else None,
             "dsa_prefill_cp_mode": "round-robin-split",
             "enable_dp_attention": True,
             "enable_hisparse": False,
@@ -6465,7 +6466,7 @@ class ServerArgs:
             or self.enable_multi_layer_eagle
         ):
             mismatches.append("speculative or draft decoding is enabled")
-        if not glm52_dp_owned and not envs.SGLANG_ENABLE_CP_V2.get():
+        if glm52_cp_size > 1 and not envs.SGLANG_ENABLE_CP_V2.get():
             mismatches.append("SGLANG_ENABLE_CP_V2 is not enabled")
         if envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get():
             mismatches.append("SGLANG_DISABLE_DSA_INDEXER_FUSION is enabled")

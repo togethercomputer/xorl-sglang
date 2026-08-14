@@ -107,16 +107,11 @@ class SamplerParallelPlan:
                 or self.attention_cp_size * self.attention_dp_size
                 != self.contributor_count
                 or self.launcher_tp_size != self.contributor_count
-                or (self.attention_cp_size, self.attention_dp_size)
-                not in {
-                    (self.contributor_count, 1),
-                    (1, self.contributor_count),
-                }
             ):
                 raise ValueError(
                     "Production GLM-5.2 sampler requires launcher TP and EP to "
-                    "equal the contributor count, with ownership entirely in "
-                    "attention CP or attention DP"
+                    "equal the contributor count, with attention DP and CP "
+                    "exactly covering the logical row owners"
                 )
 
     @classmethod
@@ -129,6 +124,10 @@ class SamplerParallelPlan:
         physical_ranks: tuple[int, ...] | None = None,
         attention_dp_size: int = 1,
     ) -> SamplerParallelPlan:
+        if attention_dp_size <= 0 or contributors % attention_dp_size:
+            raise ValueError(
+                "GLM-5.2 attention DP must be a positive divisor of the contributor count"
+            )
         ranks = (
             tuple(
                 range(
@@ -215,11 +214,6 @@ class SamplerParallelPlan:
                 )
 
     def validate_cuda_graph_policy(self, *, disable_cuda_graph: bool) -> None:
-        if self.production and self.attention_dp_size > 1 and not disable_cuda_graph:
-            raise RuntimeError(
-                "GLM-5.2 canonical attention-DP requires --disable-cuda-graph "
-                "until DP-owned replay is certified"
-            )
         if self.production and self.pp_size > 1 and not disable_cuda_graph:
             raise RuntimeError(
                 "GLM-5.2 canonical PP2 requires --disable-cuda-graph until "

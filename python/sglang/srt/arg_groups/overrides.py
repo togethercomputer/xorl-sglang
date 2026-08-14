@@ -619,39 +619,6 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                         "zigzag DSA CP requires moe_dense_tp_size=1, "
                         "moe_a2a_backend=deepep, ep_size=tp_size, batch_size=1."
                     )
-                else:
-                    assert (
-                        server_args.dp_size == 1
-                    ), "interleave DSA CP does not support DP attention."
-                architectures = getattr(hf_config, "architectures", ()) or ()
-                glm52_geometry = {
-                    "hidden_size": 6144,
-                    "num_hidden_layers": 78,
-                    "num_attention_heads": 64,
-                    "num_key_value_heads": 64,
-                    "n_routed_experts": 256,
-                }
-                glm52_world16 = (
-                    bool(architectures)
-                    and architectures[0] == "GlmMoeDsaForCausalLM"
-                    and server_args.tp_size == 16
-                    and server_args.dp_size == 1
-                    and server_args.nnodes == 2
-                    and server_args.cp_strategy == "interleave"
-                    and all(
-                        getattr(hf_config, field, None) == expected
-                        for field, expected in glm52_geometry.items()
-                    )
-                )
-                assert (
-                    server_args.tp_size <= 8
-                    or getattr(server_args, "glm52_exact_mode", False)
-                    or glm52_world16
-                ), (
-                    "Context parallel supports a single machine (tp_size <= 8), "
-                    "the exact GLM-5.2 contract, or the certified two-node "
-                    "TP16 GLM-5.2 lane."
-                )
                 # Note(kpham-sgl): Keep attn_tp_size == 1 under DSA CP.
                 # DSACPLayerCommunicator does not all-reduce attention-TP
                 # partial o_proj outputs before replicated dense FFNs.

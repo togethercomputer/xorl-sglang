@@ -18,6 +18,7 @@ from functools import partial
 from typing import Callable, Optional
 
 import torch
+import torch.distributed as dist
 
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -35,15 +36,13 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
-    dp_gather_replicate,
+    get_global_dp_buffer,
     get_dp_global_num_tokens,
     get_local_dp_buffer,
 )
+from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
 from sglang.srt.layers.glm52_positions import (
     CanonicalMoEPositions,
-)
-from sglang.srt.layers.glm52_positions import (
-    align_glm52_moe_positions as _align_glm52_moe_positions,
 )
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -80,13 +79,92 @@ def maybe_prefetch_next_full_attention_kv(
 def dsa_cp_gather_hidden_states(hidden_states: torch.Tensor):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
-    assert attn_dp_size == 1 and attn_tp_size == 1
+    del attn_dp_size
+    assert attn_tp_size == 1
     hidden_states, local_hidden_states = (
         get_local_dp_buffer(get_parallel().attn_cp_group),
         hidden_states,
     )
     attn_cp_all_gather_into_tensor(hidden_states, local_hidden_states)
     return hidden_states
+
+
+def _glm52_row_ownership(context=None) -> LogicalRowOwnership:
+    parallel = get_parallel() if context is None else context
+    dp_rank = getattr(parallel, "attn_dp_rank", None)
+    if dp_rank is None:
+        if parallel.attn_dp_size == 1:
+            dp_rank = 0
+        else:
+            dp_rank = parallel.tp_rank // (
+                parallel.attn_cp_size * parallel.attn_tp_size
+            )
+    contributor_count = getattr(
+        parallel,
+        "tp_size",
+        parallel.attn_dp_size * parallel.attn_cp_size,
+    )
+    return LogicalRowOwnership(
+        dp_size=parallel.attn_dp_size,
+        cp_size=parallel.attn_cp_size,
+        dp_rank=dp_rank,
+        cp_rank=parallel.attn_cp_rank,
+        contributor_count=contributor_count,
+    )
+
+
+def _gather_dp_owned_rows(
+    dp_local_rows: torch.Tensor,
+    *,
+    output: torch.Tensor,
+    ownership: LogicalRowOwnership,
+) -> torch.Tensor:
+    """Replicate DP-owned row blocks without duplicating their CP replicas."""
+
+    segment_lengths = list(get_dp_global_num_tokens() or [])
+    block = ownership.dp_block_slice(segment_lengths)
+    if dp_local_rows.shape[0] != block.stop - block.start:
+        raise RuntimeError(
+            "GLM-5.2 DP-owned rows do not match the prepared global layout: "
+            f"local={dp_local_rows.shape[0]}, expected={block.stop - block.start}"
+        )
+    if (
+        output.shape[0] != sum(segment_lengths)
+        or output.shape[1:] != dp_local_rows.shape[1:]
+    ):
+        raise RuntimeError(
+            "GLM-5.2 global row buffer does not match the DP ownership layout"
+        )
+    output.zero_()
+    if ownership.cp_rank == 0:
+        output[block].copy_(dp_local_rows)
+    dist.all_reduce(output, group=get_parallel().tp_group.device_group)
+    return output
+
+
+def gather_glm52_mlp_rows(
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    *,
+    context=None,
+) -> torch.Tensor:
+    """Compose CP source gathering with DP logical-owner replication."""
+
+    ownership = _glm52_row_ownership(context)
+    context_sharded = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(
+        forward_batch
+    )
+    dp_local_rows = (
+        dsa_cp_gather_hidden_states(hidden_states) if context_sharded else hidden_states
+    )
+    if ownership.dp_size == 1:
+        return dp_local_rows
+    global_rows = get_global_dp_buffer(get_parallel().tp_group)
+    return _gather_dp_owned_rows(
+        dp_local_rows,
+        output=global_rows,
+        ownership=ownership,
+    )
 
 
 def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
@@ -106,50 +184,68 @@ def align_glm52_moe_positions(
     full_hidden_states: torch.Tensor,
     forward_batch: ForwardBatch,
 ) -> CanonicalMoEPositions:
-    """Apply the rank-major CP gather and padding used by FULL MoE rows."""
+    """Align positions to the same DP-major/CP-minor FULL row layout."""
 
+    cached = getattr(forward_batch, "_glm52_owned_moe_positions", None)
+    if cached is not None:
+        if cached.values.numel() != full_hidden_states.shape[0]:
+            raise RuntimeError(
+                "Cached GLM-5.2 positions do not match the gathered MLP rows"
+            )
+        return cached
+
+    ownership = _glm52_row_ownership()
+    segment_lengths = list(get_dp_global_num_tokens() or [])
+    if not segment_lengths and ownership.dp_size == 1:
+        segment_lengths = [full_hidden_states.shape[0]]
+    block = ownership.dp_block_slice(segment_lengths)
+    block_rows = block.stop - block.start
     prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
-    if not prefill_cp and get_parallel().attn_dp_size > 1:
-        cached = getattr(forward_batch, "_glm52_dp_moe_positions", None)
-        if cached is not None:
-            if cached.values.numel() != full_hidden_states.shape[0]:
-                raise RuntimeError(
-                    "Cached GLM-5.2 DP positions do not match the gathered MLP rows"
-                )
-            return cached
-        local_positions = positions.reshape(-1).to(torch.int64)
-        global_num_tokens = get_dp_global_num_tokens()
-        if global_num_tokens is None:
-            raise RuntimeError(
-                "GLM-5.2 DP-owned position alignment requires the DP row layout"
-            )
-        local_capacity = int(global_num_tokens[get_parallel().attn_dp_rank])
-        local_real_tokens = int(
-            getattr(forward_batch, "_original_num_tokens", local_positions.numel())
+    local_positions = positions.reshape(-1).to(torch.int64)
+    if prefill_cp:
+        if block_rows % ownership.cp_size:
+            raise RuntimeError("GLM-5.2 DP row capacity must divide across CP owners")
+        local_capacity = block_rows // ownership.cp_size
+        if local_positions.numel() > local_capacity:
+            raise RuntimeError("GLM-5.2 local positions exceed the CP source capacity")
+        padded_positions = local_positions.new_full((local_capacity,), -1)
+        padded_positions[: local_positions.numel()].copy_(local_positions)
+        padded_valid = torch.zeros(
+            (local_capacity,), dtype=torch.int32, device=local_positions.device
         )
-        if not 0 <= local_real_tokens <= min(local_positions.numel(), local_capacity):
-            raise RuntimeError(
-                "GLM-5.2 rank-local position ownership exceeds the DP gather capacity"
-            )
-        # Shift real positions by one so the zero-filled DP gather produces
-        # -1 sentinels after shifting back, including idle/padded rows.
-        padded_positions = local_positions.new_zeros((local_capacity,))
-        padded_positions[:local_real_tokens].copy_(
-            local_positions[:local_real_tokens] + 1
+        padded_valid[: local_positions.numel()].copy_(
+            (local_positions >= 0).to(torch.int32)
         )
-        full_positions = local_positions.new_empty((full_hidden_states.shape[0],))
-        dp_gather_replicate(full_positions, padded_positions, forward_batch)
-        full_positions.sub_(1)
-        aligned = CanonicalMoEPositions(full_positions, full_positions >= 0)
-        forward_batch._glm52_dp_moe_positions = aligned
-        return aligned
-    return _align_glm52_moe_positions(
-        positions,
-        full_hidden_states,
-        prefill_cp=prefill_cp,
-        cp_size=get_parallel().attn_cp_size if prefill_cp else 1,
-        all_gather=attn_cp_all_gather_into_tensor if prefill_cp else None,
-    )
+        dp_positions = local_positions.new_empty((block_rows,))
+        dp_valid = padded_valid.new_empty((block_rows,))
+        attn_cp_all_gather_into_tensor(dp_positions, padded_positions)
+        attn_cp_all_gather_into_tensor(dp_valid, padded_valid)
+    else:
+        if local_positions.numel() > block_rows:
+            raise RuntimeError("GLM-5.2 local positions exceed the DP source capacity")
+        dp_positions = local_positions.new_full((block_rows,), -1)
+        dp_positions[: local_positions.numel()].copy_(local_positions)
+        dp_valid = torch.zeros(
+            (block_rows,), dtype=torch.int32, device=local_positions.device
+        )
+        dp_valid[: local_positions.numel()].copy_(
+            (local_positions >= 0).to(torch.int32)
+        )
+
+    if ownership.dp_size > 1:
+        full_positions = local_positions.new_empty((sum(segment_lengths),))
+        full_valid = dp_valid.new_empty((sum(segment_lengths),))
+        _gather_dp_owned_rows(dp_positions, output=full_positions, ownership=ownership)
+        _gather_dp_owned_rows(dp_valid, output=full_valid, ownership=ownership)
+    else:
+        full_positions, full_valid = dp_positions, dp_valid
+    if full_positions.numel() != full_hidden_states.shape[0]:
+        raise RuntimeError(
+            "GLM-5.2 positions and gathered MLP rows have different capacities"
+        )
+    aligned = CanonicalMoEPositions(full_positions, full_valid.to(torch.bool))
+    forward_batch._glm52_owned_moe_positions = aligned
+    return aligned
 
 
 class DSAMLPOutputLayout(str, Enum):
@@ -183,7 +279,10 @@ class DSACPLayerCommunicator(LayerCommunicator):
 
     def _post_init_communicate(self):
         # SCATTERED in attn tp is different from SCATTERED in global tp when dp_size > 1
-        if self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED:
+        if (
+            self.layer_scatter_modes.mlp_mode != ScatterMode.SCATTERED
+            and self.mlp_output_layout is not DSAMLPOutputLayout.COMPLETE
+        ):
             assert (
                 self._context.attn_dp_size == 1
             ), f"dp_size should be 1 when moe_runner_backend is none"
@@ -259,31 +358,34 @@ class DSACPLayerCommunicator(LayerCommunicator):
         prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(
             forward_batch
         )
-        if not prefill_cp:
-            if hidden_states.shape != residual.shape:
-                raise RuntimeError(
-                    "Complete DSA decode output must match the replicated "
-                    "residual layout"
-                )
-            return hidden_states, residual
         if hidden_states.shape == residual.shape:
             return hidden_states, residual
-        cp_size = self._context.attn_cp_size
-        cp_rank = self._context.attn_cp_rank
-        if cp_size <= 1 or not 0 <= cp_rank < cp_size:
-            raise RuntimeError(
-                f"Invalid canonical DSA CP coordinates rank={cp_rank}, size={cp_size}"
-            )
         local_rows = residual.shape[0]
+        ownership = _glm52_row_ownership(self._context)
+        segment_lengths = list(get_dp_global_num_tokens() or [])
+        if not segment_lengths and ownership.dp_size == 1:
+            segment_lengths = [
+                local_rows * ownership.cp_size if prefill_cp else local_rows
+            ]
+        try:
+            source = ownership.local_source_slice(
+                segment_lengths,
+                local_rows=local_rows,
+                context_sharded=prefill_cp,
+            )
+        except ValueError as error:
+            raise RuntimeError(
+                "Replicated complete DSA MLP rows do not match the logical source layout"
+            ) from error
         if (
-            hidden_states.shape[0] != local_rows * cp_size
+            hidden_states.shape[0] != sum(segment_lengths)
             or hidden_states.shape[1:] != residual.shape[1:]
         ):
             raise RuntimeError(
                 "Replicated complete DSA MLP rows do not match the rank-local "
-                "CP residual capacity"
+                "CP residual capacity in the DP/CP layout"
             )
-        return hidden_states.narrow(0, cp_rank * local_rows, local_rows), residual
+        return hidden_states[source], residual
 
 
 class DSACPCommunicateSimpleFn(CommunicateSimpleFn):
@@ -345,8 +447,16 @@ class DSACPCommunicateWithAllReduceAndLayerNormFn(
             hidden_states, residual = layernorm(hidden_states, residual)
         # for prefill: attn tp scattered -> full
         # for decode: attn tp full -> full
-        if dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch):
-            hidden_states = dsa_cp_gather_hidden_states(hidden_states)
+        if (
+            dsa_use_prefill_cp(forward_batch)
+            or mla_use_prefill_cp(forward_batch)
+            or get_parallel().attn_dp_size > 1
+        ):
+            hidden_states = gather_glm52_mlp_rows(
+                hidden_states,
+                forward_batch,
+                context=context,
+            )
         return hidden_states, residual
 
 

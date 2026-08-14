@@ -118,7 +118,10 @@ def _make_cp_lora_manager(batch_size, lengths=None):
     )
 
 
-def test_dp16_lora_metadata_follows_global_request_owner(monkeypatch) -> None:
+@pytest.mark.parametrize(("dp_size", "cp_size"), [(2, 8), (4, 4), (8, 2), (16, 1)])
+def test_mixed_dp_cp_lora_metadata_follows_logical_request_owner(
+    monkeypatch, dp_size, cp_size
+) -> None:
     import sglang.srt.lora.lora_manager as lora_manager_module
     from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 
@@ -143,8 +146,9 @@ def test_dp16_lora_metadata_follows_global_request_owner(monkeypatch) -> None:
     manager = object.__new__(LoRAManager)
     manager.base_hf_config = SimpleNamespace(_glm52_exact_mode=True)
     manager.tp_size = 16
-    manager.dp_size = 16
-    manager.attn_cp_size = 1
+    manager.dp_size = dp_size
+    manager.ep_size = 16
+    manager.attn_cp_size = cp_size
     manager.max_loras_per_batch = 2
     manager.device = torch.device("cpu")
     manager.lora_backend = backend
@@ -159,22 +163,27 @@ def test_dp16_lora_metadata_follows_global_request_owner(monkeypatch) -> None:
             )
 
     manager.fetch_new_loras = _fetch
-    owner_rank = 11
-    global_uids = [None] * 16
-    global_uids[owner_rank] = "adapter"
+    owner_rank = dp_size - 1
+    logical_uids = [None] * dp_size
+    logical_uids[owner_rank] = "adapter"
+    physical_uids = [uid for uid in logical_uids for _ in range(cp_size)]
 
     class _Group:
         @staticmethod
         def all_gather_object(local_uid):
             assert local_uid is None
-            return global_uids
+            return physical_uids
 
     monkeypatch.setattr(
         lora_manager_module,
         "get_parallel",
-        lambda: SimpleNamespace(tp_group=_Group()),
+        lambda: SimpleNamespace(
+            tp_group=_Group(),
+            attn_dp_rank=0,
+            attn_cp_rank=0,
+        ),
     )
-    token_counts = list(range(1, 17))
+    token_counts = list(range(1, dp_size + 1))
     forward_batch = SimpleNamespace(
         lora_ids=[],
         global_num_tokens_cpu=token_counts,
@@ -188,7 +197,7 @@ def test_dp16_lora_metadata_follows_global_request_owner(monkeypatch) -> None:
     assert info.expected_tokens == sum(token_counts)
     assert info.weight_indices.tolist() == [
         _MemoryPool.uid_to_buffer_id["adapter" if rank == owner_rank else None]
-        for rank in range(16)
+        for rank in range(dp_size)
     ]
     assert info.moe_lora_info.token_lora_mapping.tolist() == [
         _MemoryPool.uid_to_buffer_id["adapter" if rank == owner_rank else None]
@@ -280,6 +289,36 @@ def test_cp_lora_batch_installs_single_request_local_segment():
     assert backend.batch_info is full_batch_info
 
 
+def test_mixed_dp_cp_lora_context_uses_prepared_global_mlp_metadata():
+    manager, backend, full_batch_info, *_ = _make_cp_lora_manager(
+        batch_size=1, lengths=[4096]
+    )
+    manager.dp_size = 2
+    manager.attn_cp_size = 8
+    forward_batch = _cp_forward_batch(batch_size=1, lengths=[4096])
+    forward_batch.attn_cp_metadata.per_rank_actual_token = [512] * 8
+    forward_batch.global_num_tokens_cpu = [4096, 2048]
+    prepared_global = SimpleNamespace(expected_tokens=6144)
+    backend.context_parallel_mlp_batch_info = prepared_global
+    strategy = SimpleNamespace(name="interleave", cp_size=8, cp_rank=3)
+
+    with (
+        patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy),
+        patch(
+            "sglang.srt.lora.lora_manager.get_parallel",
+            return_value=SimpleNamespace(attn_dp_rank=0, attn_cp_rank=3),
+        ),
+    ):
+        with manager.glm52_context_parallel_lora_batch(
+            forward_batch, local_num_tokens=512
+        ):
+            assert backend.batch_info.expected_tokens == 512
+            assert backend.context_parallel_mlp_batch_info is prepared_global
+
+    assert backend.batch_info is full_batch_info
+    assert backend.context_parallel_mlp_batch_info is None
+
+
 @pytest.mark.parametrize(
     ("cp_rank", "expected_lens", "expected_weights"),
     [
@@ -348,13 +387,13 @@ def test_cp_lora_batch_rejects_physical_metadata_mismatch():
                 pass
 
 
-def test_cp_lora_batch_rejects_uncertified_world_geometry():
+def test_cp_lora_batch_rejects_incomplete_contributor_coverage():
     manager, _, *_ = _make_cp_lora_manager(batch_size=1)
     manager.tp_size = 8
     forward_batch = _cp_forward_batch(batch_size=1)
     strategy = SimpleNamespace(name="interleave", cp_size=16, cp_rank=0)
     with patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy):
-        with pytest.raises(RuntimeError, match="only certified for the WORLD16"):
+        with pytest.raises(ValueError, match="exactly cover"):
             with manager.glm52_context_parallel_lora_batch(
                 forward_batch, local_num_tokens=256
             ):
@@ -381,7 +420,7 @@ def test_cp_lora_batch_rejects_row_reordering_modes(patch_target, patch_value):
     with (
         patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy),
         patch(patch_target, patch_value),
-        pytest.raises(RuntimeError, match="only certified for the WORLD16"),
+        pytest.raises(RuntimeError, match="missing required execution mechanisms"),
     ):
         with manager.glm52_context_parallel_lora_batch(
             forward_batch, local_num_tokens=256

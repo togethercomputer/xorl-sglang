@@ -27,6 +27,7 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -749,15 +750,23 @@ class LoRAManager:
         self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
 
     def prepare_glm52_exact_dp_lora_batch(self, forward_batch: ForwardBatch) -> None:
-        """Build rank-major LoRA metadata for DP-gathered GLM-5.2 MLP rows."""
+        """Build logical-owner LoRA metadata for DP/CP-gathered GLM rows."""
 
         if not getattr(self.base_hf_config, "_glm52_exact_mode", False):
             return
         if self.dp_size <= 1:
             return
-        if self.dp_size != 16 or self.attn_cp_size != 1 or self.tp_size != 16:
+        parallel = get_parallel()
+        ownership = LogicalRowOwnership(
+            dp_size=self.dp_size,
+            cp_size=self.attn_cp_size,
+            dp_rank=parallel.attn_dp_rank,
+            cp_rank=parallel.attn_cp_rank,
+            contributor_count=self.tp_size,
+        )
+        if self.ep_size != self.tp_size:
             raise RuntimeError(
-                "The exact GLM-5.2 DP-owned LoRA lane requires TP16/DP16/CP1."
+                "Gather-aware GLM-5.2 LoRA requires EP to cover every canonical contributor."
             )
         if get_is_capture_mode():
             raise RuntimeError(
@@ -771,11 +780,15 @@ class LoRAManager:
                 f"request per DP rank, got {len(local_lora_ids)}."
             )
         local_uid = local_lora_ids[0] if local_lora_ids else None
-        global_uids = get_parallel().tp_group.all_gather_object(local_uid)
+        physical_uids = parallel.tp_group.all_gather_object(local_uid)
+        try:
+            global_uids = ownership.select_dp_representatives(physical_uids)
+        except ValueError as error:
+            raise RuntimeError(str(error)) from error
         global_num_tokens = list(forward_batch.global_num_tokens_cpu or [])
         if len(global_uids) != len(global_num_tokens):
             raise RuntimeError(
-                "GLM-5.2 gathered LoRA ownership does not match the DP row "
+                "GLM-5.2 gathered LoRA ownership does not match the logical DP row "
                 f"layout: owners={len(global_uids)}, row_segments={len(global_num_tokens)}."
             )
 
@@ -875,9 +888,8 @@ class LoRAManager:
 
         Sparse MLPs gather those local rows in raw rank-major order before
         reducing/scattering them again. Build both rank-local body metadata and
-        rank-major physical MLP metadata, then restore the full object before
-        returning to logits processing. This initial path is deliberately
-        limited to the qualified WORLD16 topology.
+        DP-major/CP-minor physical MLP metadata, then restore the full object
+        before returning to logits processing.
 
         This context is only for CP-v2 extend. WORLD16 decode does not shard
         rows through CP-v2: its CUDA graph uses the backend's fixed decode
@@ -889,8 +901,6 @@ class LoRAManager:
             return
 
         backend = self.lora_backend
-        architectures = getattr(self.base_hf_config, "architectures", None) or []
-        architecture = architectures[0] if architectures else None
         strategy = None
         moe_a2a_backend = None
         if backend.name == "triton":
@@ -899,44 +909,38 @@ class LoRAManager:
 
             strategy = get_cp_strategy()
             moe_a2a_backend = get_moe_a2a_backend().value
-        geometry = {
-            "architecture": architecture,
-            "tp_size": self.tp_size,
-            "dp_size": self.dp_size,
-            "ep_size": self.ep_size,
-            "pp_size": self.pp_size,
-            "attn_cp_size": self.attn_cp_size,
-            "cp_strategy": self.cp_strategy,
-            "live_cp_strategy": getattr(strategy, "name", None),
-            "live_cp_size": getattr(strategy, "cp_size", None),
-            "experts_shared_outer_loras": self._experts_shared_outer_override,
-            "enable_dp_attention": self.enable_dp_attention,
-            "backend": backend.name,
+        if self.dp_size > 1:
+            parallel = get_parallel()
+            dp_rank = parallel.attn_dp_rank
+            cp_rank = parallel.attn_cp_rank
+        else:
+            dp_rank = 0
+            cp_rank = getattr(strategy, "cp_rank", 0)
+        ownership = LogicalRowOwnership(
+            dp_size=self.dp_size,
+            cp_size=self.attn_cp_size,
+            dp_rank=dp_rank,
+            cp_rank=cp_rank,
+            contributor_count=self.tp_size,
+        )
+        mechanism = {
+            "ep_covers_contributors": self.ep_size == self.tp_size,
+            "context_parallel": self.attn_cp_size > 1,
+            "configured_cp_strategy": self.cp_strategy == "interleave",
+            "live_cp_strategy": getattr(strategy, "name", None) == "interleave",
+            "live_cp_size": getattr(strategy, "cp_size", None) == self.attn_cp_size,
+            "shared_outer_lora": self._experts_shared_outer_override is True,
+            "dp_attention": self.enable_dp_attention,
+            "triton_backend": backend.name == "triton",
             "moe_lora": backend.is_moe_lora,
-            "moe_a2a_backend": moe_a2a_backend,
-            "experimental_lora_opti": bool(_SGLANG_EXPERIMENTAL_LORA_OPTI),
+            "no_moe_row_reordering": moe_a2a_backend == "none",
+            "no_experimental_lora_reordering": not bool(_SGLANG_EXPERIMENTAL_LORA_OPTI),
         }
-        certified_geometry = {
-            "architecture": "GlmMoeDsaForCausalLM",
-            "tp_size": 16,
-            "dp_size": 1,
-            "ep_size": 16,
-            "pp_size": 1,
-            "attn_cp_size": 16,
-            "cp_strategy": "interleave",
-            "live_cp_strategy": "interleave",
-            "live_cp_size": 16,
-            "experts_shared_outer_loras": True,
-            "enable_dp_attention": True,
-            "backend": "triton",
-            "moe_lora": True,
-            "moe_a2a_backend": "none",
-            "experimental_lora_opti": False,
-        }
-        if geometry != certified_geometry:
+        incompatible = [name for name, satisfied in mechanism.items() if not satisfied]
+        if incompatible:
             raise RuntimeError(
-                "GLM-5.2 CP-v2 LoRA is only certified for the WORLD16 "
-                f"shared-outer Triton geometry; got {geometry}."
+                "GLM-5.2 CP-v2 LoRA is missing required execution mechanisms: "
+                + ", ".join(incompatible)
             )
         if backend.batch_info is None:
             raise RuntimeError(
@@ -966,10 +970,7 @@ class LoRAManager:
                 "GLM-5.2 CP-v2 extend received decode-style SGEMM routing; "
                 "decode CUDA graphs must not enter the CP-v2 extend context."
             )
-        if backend.context_parallel_mlp_batch_info is not None:
-            raise RuntimeError(
-                "GLM-5.2 CP-v2 LoRA entered with stale gathered MLP metadata."
-            )
+        prepared_global_mlp_info = backend.context_parallel_mlp_batch_info
         if (
             full_batch_info.bs != forward_batch.batch_size
             or full_batch_info.num_segments != forward_batch.batch_size
@@ -989,8 +990,8 @@ class LoRAManager:
             )
 
         try:
-            cp_size = int(strategy.cp_size)
-            cp_rank = int(strategy.cp_rank)
+            cp_size = ownership.cp_size
+            cp_rank = ownership.cp_rank
             if not 0 <= cp_rank < cp_size:
                 raise RuntimeError(
                     f"GLM-5.2 CP-v2 LoRA received invalid CP rank {cp_rank}."
@@ -1105,16 +1106,32 @@ class LoRAManager:
                 rank_request_indices, rank_lens_cpu = physical_segments(rank)
                 gathered_request_indices.extend(rank_request_indices)
                 gathered_lens_cpu.extend(rank_lens_cpu)
-            gathered_batch_info = build_batch_info(
+            cp_gathered_batch_info = build_batch_info(
                 gathered_request_indices, gathered_lens_cpu
             )
             expected_gathered_tokens = sum(physical_rank_tokens)
-            if gathered_batch_info.expected_tokens != expected_gathered_tokens:
+            if cp_gathered_batch_info.expected_tokens != expected_gathered_tokens:
                 raise RuntimeError(
                     "GLM-5.2 CP-v2 LoRA gathered metadata has the wrong row count: "
-                    f"metadata_rows={gathered_batch_info.expected_tokens}, "
+                    f"metadata_rows={cp_gathered_batch_info.expected_tokens}, "
                     f"collective_rows={expected_gathered_tokens}."
                 )
+
+            gathered_batch_info = cp_gathered_batch_info
+            if ownership.dp_size > 1:
+                if prepared_global_mlp_info is None:
+                    if full_batch_info.has_active_lora:
+                        raise RuntimeError(
+                            "Mixed DP/CP GLM-5.2 LoRA requires prepared global MLP metadata"
+                        )
+                else:
+                    global_rows = sum(forward_batch.global_num_tokens_cpu or [])
+                    if prepared_global_mlp_info.expected_tokens != global_rows:
+                        raise RuntimeError(
+                            "Prepared mixed DP/CP LoRA metadata does not match the global row layout: "
+                            f"metadata_rows={prepared_global_mlp_info.expected_tokens}, rows={global_rows}"
+                        )
+                    gathered_batch_info = prepared_global_mlp_info
 
             backend.batch_info = local_batch_info
             backend.context_parallel_mlp_batch_info = gathered_batch_info
