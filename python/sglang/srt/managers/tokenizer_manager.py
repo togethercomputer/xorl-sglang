@@ -122,7 +122,7 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
-from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.sampling.sampling_params import SamplingParams, _SAMPLING_EPS
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
@@ -195,7 +195,10 @@ def _get_bi_decode_strict_ingress_violations(
         normalized_temperature = float(temperature)
     except (TypeError, ValueError):
         normalized_temperature = float("nan")
-    if not math.isfinite(normalized_temperature) or normalized_temperature <= 0.0:
+    if (
+        not math.isfinite(normalized_temperature)
+        or normalized_temperature < _SAMPLING_EPS
+    ):
         violations.append(f"temperature={temperature!r}")
 
     for name in ("json_schema", "regex", "ebnf", "structural_tag", "logit_bias"):
@@ -1300,7 +1303,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     contract_name = "DSV4-Flash"
                 raise ValueError(
                     f"This server runs the exact {contract_name} RL on-policy "
-                    "decode contract; requests must use positive finite temperature "
+                    "decode contract; requests must use finite multinomial temperature "
+                    f">= {_SAMPLING_EPS} "
                     "sampling without top-k/top-p/min-p, penalties, grammar, "
                     "logit bias, custom processors, or MTP (incompatible "
                     "fields: " + ", ".join(violations) + ")"

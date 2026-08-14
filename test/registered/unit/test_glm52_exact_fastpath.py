@@ -158,6 +158,7 @@ class TestGlm52ExactFastpath(unittest.TestCase):
         manager = self._ingress_manager()
         cases = (
             ({"temperature": 0.0}, {}, "temperature=0.0"),
+            ({"temperature": 1e-7}, {}, "temperature=1e-07"),
             ({}, {"top_logprobs_num": 2}, "top_logprobs_num=2"),
             ({}, {"token_ids_logprob": [7]}, "token_ids_logprob=set"),
         )

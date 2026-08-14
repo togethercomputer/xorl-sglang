@@ -2279,6 +2279,35 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(dumped_choice["token_ids"], [21, 22])
         self.assertEqual(dumped_choice["meta_info"], ret[0]["meta_info"])
 
+    def test_non_streaming_chat_response_always_returns_sampling_temperature(self):
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+        )
+        ret = [
+            {
+                "text": "Answer",
+                "output_ids": [21],
+                "meta_info": {
+                    "id": "chatcmpl-temperature",
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "cached_tokens": 0,
+                    "finish_reason": {"type": "stop", "matched": None},
+                    "weight_version": "default",
+                    "sampling_temperature": 0.7,
+                },
+            }
+        ]
+
+        response = self.chat._build_chat_response(req, ret, created=123)
+
+        self.assertEqual(
+            response.metadata,
+            {"weight_version": "default", "sampling_temperature": 0.7},
+        )
+        self.assertIsNone(response.choices[0].meta_info)
+
     def test_streaming_cached_tokens_details_emits_sglext(self):
         """Test that streaming chat responses emit cached token details in sglext."""
 
