@@ -1654,12 +1654,15 @@ class DeepseekV2MoE(nn.Module):
                 workspace=workspace,
             )
         else:
+            # Idle DP ranks keep a local IDLE mode while participating in another
+            # rank's globally synchronized prefill MLP.
             mixed_replicated_prefill = (
                 not capture_mode
-                and prefill_cp
                 and plan.attention_dp_size > 1
                 and plan.attention_cp_size > 1
                 and distribution is CanonicalDistribution.REPLICATED_CANONICAL
+                and forward_batch is not None
+                and forward_batch.is_extend_in_batch
             )
             if mixed_replicated_prefill:
                 pool = self._glm52_mixed_prefill_scratch_pool

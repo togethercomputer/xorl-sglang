@@ -348,7 +348,7 @@ class TestGlm52ExactOwners(CustomTestCase):
         scratch_pool = MagicMock()
         scratch_pool.lease.return_value = nullcontext(workspace)
         moe._glm52_mixed_prefill_scratch_pool = scratch_pool
-        forward_batch = object()
+        forward_batch = SimpleNamespace(is_extend_in_batch=True)
         with (
             patch.object(deepseek_v2, "dsa_use_prefill_cp", return_value=True),
             patch.object(deepseek_v2, "mla_use_prefill_cp", return_value=False),
@@ -390,6 +390,86 @@ class TestGlm52ExactOwners(CustomTestCase):
             distribution=CanonicalDistribution.REPLICATED_CANONICAL,
         )
         prefill_v3.assert_called_once()
+        output.raise_for_status.assert_called_once()
+
+    def test_mixed_dp_cp_idle_prefill_participant_uses_model_shared_scratch(self):
+        """A routed prefill must not leave idle DPs with per-layer scratch."""
+        moe = object.__new__(deepseek_v2.DeepseekV2MoE)
+        torch.nn.Module.__init__(moe)
+        moe.tp_size = 16
+        moe.moe_ep_size = 16
+        moe.glm52_parallel_plan = SamplerParallelPlan.glm52(
+            contributors=16,
+            attention_dp_size=4,
+        )
+        moe.gate = SimpleNamespace(
+            e_score_correction_bias=torch.zeros(16, dtype=torch.float32),
+            dsa_enable_prefill_cp=True,
+            mla_enable_prefill_cp=False,
+        )
+        moe._glm52_canonical_transport = "auto"
+        moe._glm52_deferred_status_book = None
+        moe.layer_id = 7
+
+        local_partial = torch.arange(64, dtype=torch.bfloat16).reshape(16, 4)
+        positions = torch.arange(16, dtype=torch.int64)
+        output = SimpleNamespace(
+            values=local_partial + 1,
+            contract_status=torch.zeros((), dtype=torch.int32),
+            raise_for_status=MagicMock(),
+        )
+        group = object()
+        workspace = object()
+        scratch_pool = MagicMock()
+        scratch_pool.lease.return_value = nullcontext(workspace)
+        moe._glm52_mixed_prefill_scratch_pool = scratch_pool
+        forward_batch = SimpleNamespace(is_extend_in_batch=True)
+        with (
+            patch.object(deepseek_v2, "dsa_use_prefill_cp", return_value=False),
+            patch.object(deepseek_v2, "mla_use_prefill_cp", return_value=False),
+            patch.object(
+                deepseek_v2,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_group=SimpleNamespace(device_group=group)
+                ),
+            ),
+            patch.object(deepseek_v2, "get_is_capture_mode", return_value=False),
+            patch.object(
+                moe,
+                "_get_canonical_v3_workspace",
+                side_effect=AssertionError(
+                    "idle prefill participant must use shared scratch"
+                ),
+            ) as get_workspace,
+            patch.object(
+                deepseek_v2,
+                "canonicalize_glm52_local_partial_v3",
+            ) as prefill_v3,
+            patch.object(
+                deepseek_v2,
+                "canonicalize_glm52_local_partial_v3b",
+                return_value=output,
+            ) as decode_v3b,
+        ):
+            actual = moe._canonicalize_glm52_partial(
+                local_partial,
+                positions,
+                forward_batch=forward_batch,
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=False,
+            )
+
+        self.assertIs(actual, output.values)
+        get_workspace.assert_not_called()
+        scratch_pool.lease.assert_called_once_with(
+            local_partial,
+            plan=moe.glm52_parallel_plan,
+            group=group,
+            distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+        )
+        prefill_v3.assert_not_called()
+        decode_v3b.assert_called_once()
         output.raise_for_status.assert_called_once()
 
     def test_mixed_dp_cp_graph_capture_keeps_pinned_layer_workspace(self):
