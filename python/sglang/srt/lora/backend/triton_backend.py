@@ -237,6 +237,30 @@ class TritonLoRABackend(BaseLoRABackend):
         self.prefill_cuda_graph_max_bs = num_slots
         self.prefill_cuda_graph_max_tokens = max_num_tokens
 
+    def init_context_parallel_cuda_graph_batch_info(self, num_rows: int):
+        """Allocate pointer-stable metadata for gathered one-token rows."""
+
+        mlpb = self.max_loras_per_batch
+        with torch.device(self.device):
+            seg_lens = torch.ones(num_rows, dtype=torch.int32)
+            seg_indptr = torch.arange(num_rows + 1, dtype=torch.int32)
+            weight_indices = torch.zeros(num_rows, dtype=torch.int32)
+            self.context_parallel_cuda_graph_batch_info = LoRABatchInfo(
+                bs=num_rows,
+                use_cuda_graph=True,
+                num_segments=num_rows,
+                seg_lens=seg_lens,
+                seg_indptr=seg_indptr,
+                max_len=1,
+                weight_indices=weight_indices,
+                lora_ranks=torch.zeros(mlpb, dtype=torch.int32),
+                scalings=torch.zeros(mlpb, dtype=torch.float),
+                permutation=None,
+                expected_tokens=num_rows,
+                req_seg_indptr=seg_indptr,
+                req_weight_indices=weight_indices,
+            )
+
     def compute_sgemm_routing(self, use_cuda_graph: bool):
         """Sort tokens by adapter and build merged segments for sgemm LoRA."""
         bi = self.batch_info

@@ -43,6 +43,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # Request/token caps for serving a batch from the static metadata.
         self.prefill_cuda_graph_max_bs: int | None = None
         self.prefill_cuda_graph_max_tokens: int | None = None
+        # Pointer-stable metadata for MLP rows gathered across DP/CP ranks.
+        self.context_parallel_cuda_graph_batch_info: LoRABatchInfo | None = None
 
     def reset_batch_state(self):
         """Idle-forward counterpart of prepare_lora_batch(): clears all
@@ -242,6 +244,13 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         sized for the largest captured token bucket. Called before capture."""
         raise NotImplementedError(
             f"LoRA backend {type(self).__name__} does not support the prefill CUDA graph."
+        )
+
+    def init_context_parallel_cuda_graph_batch_info(self, num_rows: int):
+        """Allocate fixed metadata for DP/CP-gathered decode-graph rows."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support gathered "
+            "decode CUDA graph metadata."
         )
 
     @property

@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -328,6 +329,333 @@ def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None
     assert fetched == [{None, "adapter"}] * 128
 
 
+@pytest.mark.parametrize("dp_size", [1, 4, 16])
+def test_exact_decode_graph_reuses_fixed_dp_row_metadata(
+    monkeypatch, dp_size: int
+) -> None:
+    import sglang.srt.lora.lora_manager as lora_manager_module
+    from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+    from sglang.srt.lora.lora_manager import LoRAManager
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    class _MemoryPool:
+        uid_to_buffer_id = {None: 0, "adapter": 1}
+
+        @staticmethod
+        def get_buffer_id(uid):
+            return _MemoryPool.uid_to_buffer_id[uid]
+
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(r=1),
+        scaling=1,
+        _dsv4_flash_exact_adapter_certified=True,
+        _dsv4_flash_exact_all_zero=False,
+    )
+    backend = object.__new__(TritonLoRABackend)
+    backend.device = torch.device("cpu")
+    backend.max_loras_per_batch = 2
+    backend._is_moe_lora = True
+    backend.context_parallel_mlp_batch_info = None
+    backend.init_context_parallel_cuda_graph_batch_info(num_rows=dp_size)
+    backend.moe_cg_buffers = {
+        "adapter_enabled": torch.zeros(2, dtype=torch.int32),
+        "token_lora_mapping": torch.full((dp_size,), -1, dtype=torch.int32),
+    }
+
+    manager = object.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    manager.max_loras_per_batch = 2
+    manager.max_bs_in_cuda_graph = 1
+    manager.dp_size = dp_size
+    manager.device = torch.device("cpu")
+    manager.lora_backend = backend
+    manager.memory_pool = _MemoryPool()
+    manager.loras = {"adapter": adapter}
+    manager.lora_refs = {"adapter": object()}
+    manager.fetch_new_loras = lambda _: None
+
+    first_owner = dp_size // 2
+    second_owner = dp_size - 1
+    owners = [None] * dp_size
+    owners[first_owner] = "adapter"
+
+    class _Group:
+        @staticmethod
+        def all_gather_object(local_uid):
+            assert local_uid == owners[0]
+            return list(owners)
+
+    monkeypatch.setattr(
+        lora_manager_module,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_group=_Group()),
+    )
+    batch = SimpleNamespace(
+        batch_size=1,
+        lora_ids=([owners[0]] if owners[0] is not None else []),
+        global_num_tokens_cpu=[1] * dp_size,
+        is_extend_in_batch=False,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    fixed = backend.context_parallel_cuda_graph_batch_info
+    fixed_tensor_ids = {
+        name: id(getattr(fixed, name))
+        for name in (
+            "seg_lens",
+            "seg_indptr",
+            "weight_indices",
+            "lora_ranks",
+            "scalings",
+        )
+    }
+    manager.prepare_dsv4_flash_exact_dp_lora_batch(batch)
+
+    assert backend.context_parallel_mlp_batch_info is fixed
+    assert fixed.use_cuda_graph is True
+    expected = [0] * dp_size
+    expected[first_owner] = 1
+    assert fixed.expected_tokens == fixed.bs == dp_size
+    assert fixed.seg_lens.tolist() == [1] * dp_size
+    assert fixed.seg_indptr.tolist() == list(range(dp_size + 1))
+    assert fixed.weight_indices.tolist() == expected
+    assert fixed.moe_lora_info.token_lora_mapping.tolist() == expected
+
+    owners[first_owner] = None
+    owners[second_owner] = "adapter"
+    batch.lora_ids = [owners[0]] if owners[0] is not None else []
+    manager.prepare_dsv4_flash_exact_dp_lora_batch(batch)
+    expected = [0] * dp_size
+    expected[second_owner] = 1
+    assert backend.context_parallel_mlp_batch_info is fixed
+    assert fixed.weight_indices.tolist() == expected
+    assert {
+        name: id(getattr(fixed, name)) for name in fixed_tensor_ids
+    } == fixed_tensor_ids
+
+
+@pytest.mark.parametrize("dp_size", [1, 4, 16])
+def test_exact_decode_graph_moe_buffers_cover_physical_dp_rows(
+    monkeypatch, dp_size: int
+) -> None:
+    import sglang.srt.lora.layers as lora_layers
+    from sglang.srt.lora.lora_manager import init_lora_cuda_graph_moe_buffers
+
+    class _FakeMoELoRA:
+        pass
+
+    fake_layer = _FakeMoELoRA()
+    model = SimpleNamespace(modules=lambda: [object(), fake_layer])
+    calls = []
+    manager = SimpleNamespace(
+        init_cuda_graph_moe_buffers=lambda *args: calls.append(args)
+    )
+    server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=1)),
+        dsv4_flash_exact_mode=True,
+        dp_size=dp_size,
+        max_loras_per_batch=2,
+    )
+    monkeypatch.setattr(lora_layers, "FusedMoEWithLoRA", _FakeMoELoRA)
+
+    init_lora_cuda_graph_moe_buffers(
+        server_args=server_args,
+        model=model,
+        lora_manager=manager,
+        dtype=torch.bfloat16,
+    )
+
+    assert calls == [(dp_size, 2, torch.bfloat16, fake_layer)]
+
+
+def test_exact_radix_page_boundary_preserves_c4_overlap_addresses() -> None:
+    from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
+
+    pool = object.__new__(CompressStatePool)
+    pool.swa_page_size = 256
+    pool.ring_size = 8
+    swa_locs = torch.tensor([255, 256, 257, 511, 512, -1])
+
+    assert pool.translate_from_swa_loc_to_state_loc(swa_locs).tolist() == [
+        7,
+        8,
+        9,
+        15,
+        16,
+        -1,
+    ]
+    # A page-256 radix match is simultaneously a C4 and offline-C128 boundary,
+    # so no request-scoped partial C128 row crosses into continuation decode.
+    assert 256 % 4 == 0
+    assert 256 % 128 == 0
+
+
+def test_exact_radix_namespace_isolates_dp_owner_and_lora_generation() -> None:
+    from sglang.srt.managers.scheduler import Scheduler
+
+    def cache_key(owner: int, lora_generation: str) -> str:
+        scheduler = object.__new__(Scheduler)
+        scheduler.server_args = SimpleNamespace(dsv4_flash_exact_mode=True)
+        scheduler.disable_radix_cache = False
+        scheduler.tree_cache = SimpleNamespace(is_tree_cache=lambda: True)
+        scheduler.ps = SimpleNamespace(attn_dp_rank=owner)
+        req = SimpleNamespace(extra_key=lora_generation)
+        scheduler._maybe_namespace_dsv4_exact_radix_cache(req)
+        return req.extra_key
+
+    generation_a = cache_key(0, "adapter-generation-a")
+    generation_b = cache_key(0, "adapter-generation-b")
+    owner_b = cache_key(1, "adapter-generation-a")
+
+    assert generation_a == "adapter-generation-a|dsv4_exact_dp_owner=0"
+    assert len({generation_a, generation_b, owner_b}) == 3
+
+
+def test_dynamic_lora_reload_mints_a_new_radix_generation() -> None:
+    from sglang.srt.managers.io_struct import (
+        LoadLoRAAdapterReqInput,
+        LoRAUpdateOutput,
+    )
+
+    async def run_two_loads():
+        class _Registry:
+            num_registered_loras = 0
+
+            async def register(self, _):
+                self.num_registered_loras += 1
+
+        manager = object.__new__(TokenizerManager)
+        manager.server_args = SimpleNamespace(
+            enable_lora=True,
+            dp_size=1,
+            enable_dp_attention=False,
+            max_loaded_loras=None,
+        )
+        manager.auto_create_handle_loop = lambda: None
+        manager.lora_update_lock = asyncio.Lock()
+        manager.lora_registry = _Registry()
+        manager.lora_ref_cache = {}
+        observed_ids = []
+
+        async def update(req):
+            observed_ids.append(req.lora_id)
+            return [
+                LoRAUpdateOutput(
+                    success=True,
+                    loaded_adapters={req.lora_name: req.lora_path},
+                )
+            ]
+
+        manager.update_lora_adapter_communicator = update
+        for _ in range(2):
+            result = await manager.load_lora_adapter(
+                LoadLoRAAdapterReqInput(
+                    lora_name="policy",
+                    lora_path="policy-adapter",
+                )
+            )
+            assert result.success
+        return observed_ids, manager.lora_ref_cache["policy"].lora_id
+
+    observed_ids, latest_id = asyncio.run(run_two_loads())
+    assert observed_ids[0] != observed_ids[1]
+    assert latest_id == observed_ids[1]
+
+
+def test_exact_resolution_preserves_topology_capacity_lora_and_cache_options() -> None:
+    from sglang.srt.model_executor.cuda_graph_config import (
+        Backend,
+        CudaGraphConfig,
+        Phase,
+    )
+    from sglang.srt.server_args import ServerArgs
+
+    config = _official_config()
+    config.hidden_size = 8192
+    config.n_routed_experts = 128
+    args = ServerArgs(model_path="dummy", enable_lora=True)
+    args.rl_on_policy_target = "xorl"
+    args.nnodes = 2
+    args.tp_size = 4
+    args.dp_size = 2
+    args.ep_size = 4
+    args.pp_size = 2
+    args.moe_dp_size = 2
+    args.attn_cp_size = 2
+    args.dcp_size = 2
+    args.enable_dp_attention = True
+    args.enable_prefill_cp = True
+    args.enable_prefill_context_parallel = True
+    args.enable_dsa_prefill_context_parallel = True
+    args.chunked_prefill_size = 4096
+    args.max_prefill_tokens = 12288
+    args.prefill_max_requests = 3
+    args.max_total_tokens = 24576
+    args.max_running_requests = 37
+    args.mem_fraction_static = 0.7
+    args.max_lora_rank = 8
+    args.max_loras_per_batch = 7
+    args.max_loaded_loras = 7
+    args.lora_backend = "csgmv"
+    args.lora_target_modules = {"q_proj"}
+    args.enable_two_batch_overlap = True
+    args.disable_overlap_schedule = False
+    args.disable_radix_cache = False
+    args.disable_cuda_graph = False
+    args.disable_cuda_graph_padding = False
+    args.disable_piecewise_cuda_graph = False
+    args.cuda_graph_bs_decode = [1]
+    args.cuda_graph_max_bs_decode = 1
+    args.cuda_graph_config = CudaGraphConfig()
+    args.cuda_graph_config.decode.backend = Backend.FULL
+    args.cuda_graph_config.decode.bs = [1]
+    args.cuda_graph_config.decode.max_bs = 1
+    args._cuda_graph_config_locked = {
+        (Phase.DECODE, "backend"),
+        (Phase.DECODE, "bs"),
+        (Phase.DECODE, "max_bs"),
+    }
+
+    args._resolve_dsv4_flash_exact_contract(
+        config, model_arch="DeepseekV4ForCausalLM"
+    )
+
+    assert (
+        args.nnodes,
+        args.tp_size,
+        args.dp_size,
+        args.ep_size,
+        args.pp_size,
+        args.moe_dp_size,
+        args.attn_cp_size,
+        args.dcp_size,
+    ) == (2, 4, 2, 4, 2, 2, 2, 2)
+    assert args.enable_dp_attention is True
+    assert args.enable_prefill_cp is True
+    assert args.enable_prefill_context_parallel is True
+    assert args.enable_dsa_prefill_context_parallel is True
+    assert args.chunked_prefill_size == 4096
+    assert args.max_prefill_tokens == 12288
+    assert args.prefill_max_requests == 3
+    assert args.max_total_tokens == 24576
+    assert args.max_running_requests == 37
+    assert args.mem_fraction_static == 0.7
+    assert args.max_lora_rank == 8
+    assert args.max_loras_per_batch == 7
+    assert args.max_loaded_loras == 7
+    assert args.lora_backend == "csgmv"
+    assert args.lora_target_modules == {"q_proj"}
+    assert args.enable_two_batch_overlap is True
+    assert args.disable_overlap_schedule is False
+    assert args.disable_radix_cache is False
+    assert args.disable_cuda_graph is False
+    assert args.disable_cuda_graph_padding is False
+    assert args.disable_piecewise_cuda_graph is False
+    assert args.cuda_graph_bs_decode == [1]
+    assert args.cuda_graph_max_bs_decode == 1
+    assert args.cuda_graph_config.decode.backend == Backend.FULL
+
+
 def test_gathered_mlp_lora_metadata_is_scoped_and_restored() -> None:
     from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 
@@ -592,20 +920,6 @@ def test_exact_resolved_contract_rejects_alternate_dp_combine(
         args._validate_dsv4_flash_exact_resolved_contract()
 
 
-def test_exact_resolved_contract_requires_base_and_active_lora_slots() -> None:
-    from sglang.srt.server_args import ServerArgs
-
-    args = ServerArgs(model_path="dummy")
-    args.dsv4_flash_exact_mode = True
-    args.max_loras_per_batch = 1
-    args.max_loaded_loras = 1
-    with pytest.raises(
-        ValueError,
-        match="max_loras_per_batch=1.*expected 2.*max_loaded_loras=1.*expected 2",
-    ):
-        args._validate_dsv4_flash_exact_resolved_contract()
-
-
 def test_chunked_moe_lora_info_rebases_segments_and_slices_tokens() -> None:
     from sglang.srt.lora.lora_moe_runners import LoRAInfo, slice_moe_lora_info
 
@@ -634,7 +948,7 @@ def test_chunked_moe_lora_info_rebases_segments_and_slices_tokens() -> None:
     assert slice_moe_lora_info(None, 0, 1) is None
 
 
-def test_exact_batch_admits_eager_decode_but_rejects_real_decode_graph() -> None:
+def test_exact_batch_checks_decode_graph_metadata_shape_not_topology() -> None:
     from sglang.srt.lora.lora_manager import LoRAManager
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -651,8 +965,18 @@ def test_exact_batch_admits_eager_decode_but_rejects_real_decode_graph() -> None
     assert manager.lora_backend._dsv4_flash_exact_batch_certified is True
 
     manager.max_bs_in_cuda_graph = 1
-    with pytest.raises(RuntimeError, match="eager execution only"):
-        manager._validate_dsv4_flash_exact_batch(batch)
+    manager.dp_size = 4
+    manager._validate_dsv4_flash_exact_batch(batch)
+    assert manager.lora_backend._dsv4_flash_exact_batch_certified is True
+
+    invalid_batch = SimpleNamespace(
+        batch_size=2,
+        forward_mode=ForwardMode.DECODE,
+        lora_ids=[None, None],
+    )
+    manager.max_bs_in_cuda_graph = 2
+    with pytest.raises(RuntimeError, match="one local one-token request"):
+        manager._validate_dsv4_flash_exact_batch(invalid_batch)
 
 
 def test_certified_all_zero_adapter_prepares_as_literal_base_noop() -> None:

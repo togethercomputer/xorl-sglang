@@ -2294,6 +2294,22 @@ class Scheduler(
                 namespace,
             )
 
+    def _maybe_namespace_dsv4_exact_radix_cache(self, req: Req) -> None:
+        """Keep exact DSV4 prefixes on the attention-DP rank that made them."""
+
+        if (
+            not self.server_args.dsv4_flash_exact_mode
+            or self.disable_radix_cache
+            or not self.tree_cache.is_tree_cache()
+        ):
+            return
+
+        namespace = f"dsv4_exact_dp_owner={self.ps.attn_dp_rank}"
+        if req.extra_key:
+            req.extra_key = f"{req.extra_key}|{namespace}"
+        else:
+            req.extra_key = namespace
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -2447,6 +2463,7 @@ class Scheduler(
             return
 
         self._maybe_namespace_elastic_radix_cache(req)
+        self._maybe_namespace_dsv4_exact_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = (

@@ -241,6 +241,15 @@ class LoRAManager:
             max_bs_in_cuda_graph=max_bs_in_cuda_graph,
             num_tokens_per_req=num_tokens_per_req,
         )
+        if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
+            if max_bs_in_cuda_graph != 1 or num_tokens_per_req != 1:
+                raise RuntimeError(
+                    "Gather-aware DSV4-Flash decode graphs currently require "
+                    "one local one-token request per DP rank."
+                )
+            self.lora_backend.init_context_parallel_cuda_graph_batch_info(
+                num_rows=self.dp_size
+            )
 
         # ===== TO BE REFACTORED ====
         # Pre-create the experimental LoRA two-stream side stream now (gated) so the
@@ -534,9 +543,19 @@ class LoRAManager:
             and forward_batch.batch_size <= self.max_bs_in_cuda_graph
             and forward_batch.forward_mode.is_cuda_graph()
         )
-        if get_is_capture_mode() or uses_decode_cuda_graph:
+        if get_is_capture_mode() and not uses_decode_cuda_graph:
             raise RuntimeError(
-                "The exact DSV4-Flash active-LoRA contract admits eager execution only."
+                "Gather-aware DSV4-Flash active LoRA requires initialized "
+                "fixed metadata during CUDA graph capture."
+            )
+        if uses_decode_cuda_graph and (
+            not forward_batch.forward_mode.is_decode()
+            or self.max_bs_in_cuda_graph != 1
+            or forward_batch.batch_size != 1
+        ):
+            raise RuntimeError(
+                "Gather-aware DSV4-Flash decode graphs currently require one "
+                "local one-token request per DP rank."
             )
         lora_ids = list(forward_batch.lora_ids)
         if len(lora_ids) != 1:
@@ -725,11 +744,6 @@ class LoRAManager:
 
         if not getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
             return
-        if get_is_capture_mode():
-            raise RuntimeError(
-                "Gather-aware DSV4-Flash active LoRA admits eager execution only."
-            )
-
         local_lora_ids = list(forward_batch.lora_ids or [])
         if len(local_lora_ids) > 1:
             raise RuntimeError(
@@ -794,37 +808,80 @@ class LoRAManager:
                 scalings[slot] = adapter.scaling
 
         has_active_lora = any(rank > 0 for rank in lora_ranks)
-        if not has_active_lora:
+        uses_decode_cuda_graph = (
+            hasattr(self, "max_bs_in_cuda_graph")
+            and forward_batch.batch_size <= self.max_bs_in_cuda_graph
+            and forward_batch.forward_mode.is_cuda_graph()
+        )
+        if not has_active_lora and not uses_decode_cuda_graph:
             self.lora_backend.context_parallel_mlp_batch_info = None
             return
 
         device = self.device
-        segment_lens = torch.tensor(global_num_tokens, dtype=torch.int32, device=device)
-        segment_indptr = torch.zeros(
-            (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
-        )
-        segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
         total_tokens = sum(global_num_tokens)
-        global_batch_info = LoRABatchInfo(
-            use_cuda_graph=False,
-            bs=len(global_num_tokens),
-            num_segments=len(global_num_tokens),
-            seg_indptr=segment_indptr,
-            weight_indices=torch.tensor(
-                weight_indices, dtype=torch.int32, device=device
-            ),
-            lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=device),
-            scalings=torch.tensor(scalings, dtype=torch.float32, device=device),
-            max_len=max(global_num_tokens, default=0),
-            seg_lens=segment_lens,
-            permutation=None,
-            expected_tokens=total_tokens,
-            has_active_lora=True,
-            req_seg_indptr=segment_indptr,
-            req_weight_indices=torch.tensor(
-                weight_indices, dtype=torch.int32, device=device
-            ),
-        )
+        if uses_decode_cuda_graph:
+            if global_num_tokens != [1] * self.dp_size or total_tokens != self.dp_size:
+                raise RuntimeError(
+                    "Gather-aware DSV4-Flash decode graph metadata requires one "
+                    "physical row per DP rank, got "
+                    f"dp_size={self.dp_size}, row_segments={global_num_tokens}."
+                )
+            global_batch_info = (
+                self.lora_backend.context_parallel_cuda_graph_batch_info
+            )
+            if global_batch_info is None:
+                raise RuntimeError(
+                    "Gathered DSV4-Flash decode graph metadata was not initialized."
+                )
+            if (
+                global_batch_info.bs != total_tokens
+                or global_batch_info.expected_tokens != total_tokens
+                or global_batch_info.weight_indices.numel() != len(weight_indices)
+            ):
+                raise RuntimeError(
+                    "Gathered DSV4-Flash decode graph metadata has the wrong "
+                    "physical row capacity: "
+                    f"metadata_rows={global_batch_info.bs}, "
+                    f"physical_rows={total_tokens}, owners={len(weight_indices)}."
+                )
+            global_batch_info.weight_indices.copy_(
+                torch.tensor(weight_indices, dtype=torch.int32, device=device)
+            )
+            global_batch_info.lora_ranks.copy_(
+                torch.tensor(lora_ranks, dtype=torch.int32, device=device)
+            )
+            global_batch_info.scalings.copy_(
+                torch.tensor(scalings, dtype=torch.float32, device=device)
+            )
+            global_batch_info.has_active_lora = has_active_lora
+        else:
+            segment_lens = torch.tensor(
+                global_num_tokens, dtype=torch.int32, device=device
+            )
+            segment_indptr = torch.zeros(
+                (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
+            )
+            segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
+            global_batch_info = LoRABatchInfo(
+                use_cuda_graph=False,
+                bs=len(global_num_tokens),
+                num_segments=len(global_num_tokens),
+                seg_indptr=segment_indptr,
+                weight_indices=torch.tensor(
+                    weight_indices, dtype=torch.int32, device=device
+                ),
+                lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=device),
+                scalings=torch.tensor(scalings, dtype=torch.float32, device=device),
+                max_len=max(global_num_tokens, default=0),
+                seg_lens=segment_lens,
+                permutation=None,
+                expected_tokens=total_tokens,
+                has_active_lora=True,
+                req_seg_indptr=segment_indptr,
+                req_weight_indices=torch.tensor(
+                    weight_indices, dtype=torch.int32, device=device
+                ),
+            )
 
         physical_batch = copy(forward_batch)
         physical_batch.batch_size = len(global_num_tokens)
@@ -836,7 +893,7 @@ class LoRAManager:
         )
         physical_batch.extend_num_tokens = total_tokens
         physical_batch.extend_seq_lens_cpu = global_num_tokens
-        physical_batch.extend_seq_lens = segment_lens
+        physical_batch.extend_seq_lens = global_batch_info.seg_lens
         global_batch_info = self.lora_backend._add_moe_lora_info(
             physical_batch, global_batch_info
         )
@@ -1290,6 +1347,14 @@ class LoRAManager:
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
         )
+        if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
+            self.lora_backend.batch_info.expected_tokens = (
+                sum(forward_batch.extend_seq_lens_cpu)
+                if forward_batch.forward_mode.is_extend()
+                else bs
+            )
+            if use_cuda_graph:
+                self.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
         if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
             self.lora_backend._dsv4_flash_exact_batch_certified = True
 
@@ -1862,6 +1927,10 @@ def init_lora_cuda_graph_moe_buffers(
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
     max_bs = server_args.cuda_graph_config.decode.max_bs
+    if server_args.dsv4_flash_exact_mode:
+        # Sparse MLPs consume the rank-major DP gather, not the local attention
+        # rows. Allocate every MoE workspace for all physical DP rows.
+        max_bs *= server_args.dp_size
     max_loras = server_args.max_loras_per_batch
     for module in model.modules():
         if isinstance(module, FusedMoEWithLoRA):
