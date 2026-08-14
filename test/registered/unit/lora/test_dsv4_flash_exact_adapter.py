@@ -768,7 +768,11 @@ def test_exact_resolution_composes_physical_pp_and_preserves_runtime_options() -
 
 
 @pytest.mark.parametrize("dp_size", (1, 2, 4, 8))
-def test_exact_resolution_supports_every_dsv4_dp_cp_factorization(dp_size) -> None:
+def test_exact_resolution_supports_every_dsv4_dp_cp_factorization(
+    dp_size, monkeypatch
+) -> None:
+    from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+    from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
     args = ServerArgs(model_path="dummy")
@@ -781,11 +785,45 @@ def test_exact_resolution_supports_every_dsv4_dp_cp_factorization(dp_size) -> No
     args._resolve_dsv4_flash_exact_contract(
         _official_config(), model_arch="DeepseekV4ForCausalLM"
     )
+    monkeypatch.setattr(envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, "set", lambda _: None)
+    validate_deepseek_v4_cp(args)
 
     assert args.attn_cp_size == 8 // dp_size
     assert args.enable_prefill_cp is (dp_size < 8)
     assert args.enable_dsa_prefill_context_parallel is (dp_size < 8)
+    if dp_size < 8:
+        assert args.dsa_prefill_cp_mode == "round-robin-split"
+        assert args.enable_dp_attention is True
     assert args.exact_physical_pp_capable
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    (
+        ("cp_strategy", "zigzag", "only supports interleave"),
+        ("moe_a2a_backend", "alltoall", "supports moe_a2a_backend"),
+    ),
+)
+def test_exact_dsv4_cp_keeps_invalid_runtime_options_rejected(
+    name, value, message, monkeypatch
+) -> None:
+    from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+    from sglang.srt.environ import envs
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="dummy")
+    args.rl_on_policy_target = "xorl"
+    args.tp_size = 8
+    args.ep_size = 8
+    args.dp_size = 2
+    args._resolve_dsv4_flash_exact_contract(
+        _official_config(), model_arch="DeepseekV4ForCausalLM"
+    )
+    setattr(args, name, value)
+    monkeypatch.setattr(envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL, "set", lambda _: None)
+
+    with pytest.raises(ValueError, match=message):
+        validate_deepseek_v4_cp(args)
 
 
 def test_exact_resolution_admits_torch_compile_as_execution_policy() -> None:
