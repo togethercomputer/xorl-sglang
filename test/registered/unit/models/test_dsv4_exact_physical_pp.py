@@ -14,6 +14,8 @@ from sglang.srt.layers.cp.utils import (
     cp_split_before_forward,
     prepare_cp_forward,
 )
+from sglang.srt.layers.dsv4_ownership import reconstruct_dsv4_dp_rows
+from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.runner_utils.buffers import (
@@ -371,6 +373,92 @@ def test_cp_v2_ragged_prefill_aligns_fused_q_rows_and_keeps_full_pp_metadata():
     assert proxy_hidden.shape[0] == 4
     assert torch.equal(proxy_ids, input_ids)
     assert torch.equal(proxy_positions, positions)
+
+
+def test_cp_v2_keeps_dp_max_padding_in_exact_owner_block():
+    """A four-row DP batch padded to six must reconstruct all six owner rows."""
+
+    input_ids = torch.arange(6, dtype=torch.int64)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=torch.arange(6, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([4]),
+        extend_seq_lens_cpu=[4],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=[6, 6],
+        out_cache_loc=torch.arange(6, dtype=torch.int64),
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    parallel = SimpleNamespace(
+        attn_cp_rank=0,
+        attn_cp_size=4,
+        attn_cp_group=object(),
+    )
+
+    def all_gather(output, _local):
+        output.copy_(
+            torch.tensor(
+                [
+                    0,
+                    4,
+                    0,
+                    0,
+                    1,
+                    5,
+                    0,
+                    0,
+                    2,
+                    0,
+                    0,
+                    0,
+                    3,
+                    0,
+                    0,
+                    0,
+                ],
+                dtype=input_ids.dtype,
+            )
+        )
+
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=parallel),
+        patch("sglang.srt.layers.cp.interleave.get_parallel", return_value=parallel),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+        patch("sglang.srt.layers.dp_attention.set_local_dp_buffer_len"),
+        patch(
+            "sglang.srt.layers.cp.interleave.attn_cp_all_gather_into_tensor",
+            side_effect=all_gather,
+        ),
+        patch(
+            "sglang.srt.layers.cp.interleave.is_allocation_symmetric",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.cp.interleave.use_symmetric_memory",
+            return_value=torch.no_grad(),
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        local_rows = strategy.shard_hidden_states(input_ids, forward_batch)
+        reconstructed = reconstruct_dsv4_dp_rows(
+            local_rows,
+            forward_batch,
+            LogicalRowOwnership(2, 4, 0, 0, 8),
+            [6, 6],
+            context_sharded=True,
+            strategy=strategy,
+        )
+
+    assert forward_batch.attn_cp_metadata.total_seq_lens == 6
+    assert forward_batch.attn_cp_metadata.per_rank_logical_token == [2, 2, 1, 1]
+    assert forward_batch.out_cache_loc.shape[0] == 6
+    assert torch.equal(reconstructed, input_ids)
 
 
 def test_cp_v2_ragged_prefill_shards_radix_locations_for_fused_kv_store():

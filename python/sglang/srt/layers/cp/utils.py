@@ -162,11 +162,10 @@ def prepare_cp_forward(forward_batch) -> None:
 
     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
-    num_tokens = (
-        sum(extend_lens_cpu)
-        if extend_lens_cpu is not None
-        else len(forward_batch.input_ids)
-    )
+    # MLP synchronization may already have appended DP padding to the model
+    # inputs.  Keep those rows in the CP layout: both CP strategies treat the
+    # difference from the real per-request extend lengths as suffix padding.
+    num_tokens = len(forward_batch.input_ids)
     if forward_batch.attn_cp_metadata is None:
         forward_batch.attn_cp_metadata = strategy.build_metadata(
             num_tokens=num_tokens,

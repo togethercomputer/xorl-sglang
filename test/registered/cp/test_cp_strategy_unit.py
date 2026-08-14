@@ -102,6 +102,42 @@ class TestCPStrategyUnit(CustomTestCase):
         ):
             self.assertIsNotNone(get_cp_strategy())
 
+    def test_prepare_cp_forward_keeps_existing_dp_padding(self):
+        for strategy in (ZigzagCPStrategy(cp_size=4), InterleaveCPStrategy(cp_size=4)):
+            with self.subTest(strategy=strategy.name):
+                forward_batch = SimpleNamespace(
+                    input_ids=torch.arange(6),
+                    positions=torch.arange(6),
+                    forward_mode=_ExtendMode(),
+                    seq_lens_cpu=[4],
+                    extend_seq_lens_cpu=[4],
+                    attn_cp_metadata=None,
+                    global_num_tokens_cpu=[6, 6],
+                    out_cache_loc=torch.arange(6),
+                )
+                with (
+                    patch(
+                        "sglang.srt.layers.cp.utils.is_cp_v2_active",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.utils.get_cp_strategy",
+                        return_value=strategy,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                        return_value=4,
+                    ),
+                    patch("sglang.srt.layers.dp_attention.set_local_dp_buffer_len"),
+                    get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
+                ):
+                    prepare_cp_forward(forward_batch)
+
+                metadata = forward_batch.attn_cp_metadata
+                self.assertEqual(metadata.total_seq_lens, 6)
+                self.assertEqual(sum(metadata.per_rank_logical_token), 6)
+                self.assertEqual(forward_batch.out_cache_loc.shape[0], 6)
+
     def test_shard_model_inputs_setup_failure_preserves_shared_batch(self):
         complete_hidden_states = torch.arange(16).view(4, 4)
         complete_position_ids = torch.arange(4)
