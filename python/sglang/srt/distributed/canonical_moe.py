@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 
@@ -444,6 +447,8 @@ class CanonicalMoEV3Workspace:
     zero: torch.Tensor
     logical_to_group: torch.Tensor
     status: torch.Tensor
+    ordered_sources: torch.Tensor | None = None
+    folded: torch.Tensor | None = None
 
     @classmethod
     def allocate(
@@ -538,6 +543,174 @@ class CanonicalMoEV3Workspace:
             raise RuntimeError("Canonical MoE v3 workspace distribution changed")
         if local_partial.shape != (self.capacity, *self.payload_shape):
             raise RuntimeError("Canonical MoE v3 workspace shape changed")
+        if (self.ordered_sources is None) != (self.folded is None):
+            raise RuntimeError(
+                "Canonical MoE v3 reusable reorder and fold buffers must be paired"
+            )
+        if self.ordered_sources is not None:
+            if self.ordered_sources.shape != self.collective.shape:
+                raise RuntimeError("Canonical MoE v3 reordered-source shape changed")
+            if self.folded.shape != self.result.shape:
+                raise RuntimeError("Canonical MoE v3 folded-result shape changed")
+
+
+class _CanonicalMoEV3ScratchSlot:
+    """One reusable replicated-prefill scratch allocation."""
+
+    def __init__(self, workspace: CanonicalMoEV3Workspace, *, key: tuple) -> None:
+        if workspace.distribution is not CanonicalDistribution.REPLICATED_CANONICAL:
+            raise ValueError(
+                "The mixed-prefill scratch slot requires replicated output"
+            )
+        if workspace.ordered_sources is None or workspace.folded is None:
+            raise ValueError("The mixed-prefill scratch slot requires reorder buffers")
+        self.key = key
+        self.plan_hash = workspace.plan_hash
+        self.max_capacity = workspace.capacity
+        self.payload_shape = workspace.payload_shape
+        self.contributors = workspace.collective.shape[0]
+        self.masked_input = workspace.masked_input
+        self.collective = workspace.collective
+        self.ordered_sources = workspace.ordered_sources
+        self.folded = workspace.folded
+        self.zero = workspace.zero
+        self.logical_to_group = workspace.logical_to_group
+        self.status = workspace.status
+        self.ready_event = None
+
+    def workspace_for(self, local_partial: torch.Tensor) -> CanonicalMoEV3Workspace:
+        capacity = local_partial.shape[0]
+        if capacity > self.max_capacity:
+            raise ValueError("Requested capacity exceeds the reusable scratch slot")
+        payload_shape = self.payload_shape
+        collective_rows = self.contributors * capacity
+        collective = self.collective.view(-1, *payload_shape)[:collective_rows].view(
+            self.contributors, capacity, *payload_shape
+        )
+        ordered_sources = self.ordered_sources.view(-1, *payload_shape)[
+            :collective_rows
+        ].view(self.contributors, capacity, *payload_shape)
+        return CanonicalMoEV3Workspace(
+            plan_hash=self.plan_hash,
+            distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+            capacity=capacity,
+            local_capacity=capacity,
+            payload_shape=payload_shape,
+            masked_input=self.masked_input[:capacity],
+            collective=collective,
+            received=None,
+            result=torch.empty_like(local_partial),
+            zero=self.zero,
+            logical_to_group=self.logical_to_group,
+            status=self.status,
+            ordered_sources=ordered_sources,
+            folded=self.folded[:capacity],
+        )
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        for tensor in (
+            self.masked_input,
+            self.collective,
+            self.ordered_sources,
+            self.folded,
+            self.zero,
+            self.logical_to_group,
+            self.status,
+        ):
+            tensor.record_stream(stream)
+
+
+class CanonicalMoEV3ScratchPool:
+    """Bounded scratch shared by eager mixed-DP/CP GLM prefill layers.
+
+    The gathered and logically reordered contributor planes do not escape a
+    layer. A model-level lease therefore reuses one allocation while returning
+    a fresh result tensor from every call. The event joins a previous lease to
+    a new caller's stream without synchronizing the host or device.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._slot: _CanonicalMoEV3ScratchSlot | None = None
+
+    def _uses_cuda_event(self, local_partial: torch.Tensor) -> bool:
+        return local_partial.is_cuda
+
+    def _current_stream(self, device: torch.device) -> torch.cuda.Stream:
+        return torch.cuda.current_stream(device=device)
+
+    def _new_event(self) -> torch.cuda.Event:
+        return torch.cuda.Event(enable_timing=False)
+
+    @staticmethod
+    def _slot_key(
+        local_partial: torch.Tensor,
+        *,
+        plan: SamplerParallelPlan,
+        group: dist.ProcessGroup,
+    ) -> tuple:
+        return (
+            plan.identity,
+            id(group),
+            tuple(local_partial.shape[1:]),
+            local_partial.dtype,
+            local_partial.device,
+        )
+
+    @contextmanager
+    def lease(
+        self,
+        local_partial: torch.Tensor,
+        *,
+        plan: SamplerParallelPlan,
+        group: dist.ProcessGroup,
+        distribution: CanonicalDistribution,
+    ) -> Iterator[CanonicalMoEV3Workspace]:
+        if distribution is not CanonicalDistribution.REPLICATED_CANONICAL:
+            raise ValueError("Mixed-prefill scratch only admits replicated output")
+        if plan.attention_dp_size <= 1 or plan.attention_cp_size <= 1:
+            raise ValueError("Mixed-prefill scratch requires both attention DP and CP")
+
+        self._lock.acquire()
+        slot = None
+        stream = None
+        try:
+            if self._uses_cuda_event(local_partial):
+                stream = self._current_stream(local_partial.device)
+            key = self._slot_key(local_partial, plan=plan, group=group)
+            slot = self._slot
+            if slot is not None and stream is not None and slot.ready_event is not None:
+                stream.wait_event(slot.ready_event)
+            if (
+                slot is None
+                or slot.key != key
+                or local_partial.shape[0] > slot.max_capacity
+            ):
+                self._slot = None
+                slot = None
+                workspace = CanonicalMoEV3Workspace.allocate(
+                    local_partial,
+                    plan=plan,
+                    group=group,
+                    distribution=distribution,
+                )
+                workspace.ordered_sources = torch.empty_like(workspace.collective)
+                workspace.folded = torch.empty_like(workspace.result)
+                slot = _CanonicalMoEV3ScratchSlot(workspace, key=key)
+                self._slot = slot
+            else:
+                workspace = slot.workspace_for(local_partial)
+            if local_partial.is_cuda:
+                slot.record_stream(stream)
+            yield workspace
+        finally:
+            try:
+                if slot is not None and self._slot is slot and stream is not None:
+                    if slot.ready_event is None:
+                        slot.ready_event = self._new_event()
+                    slot.ready_event.record(stream)
+            finally:
+                self._lock.release()
 
 
 def canonical_moe_leaf_fp32_v1(
@@ -866,10 +1039,21 @@ def canonicalize_glm52_local_partial_v3(
             workspace.masked_input,
             group=group,
         )
-        logical_sources = workspace.collective.index_select(
-            0, workspace.logical_to_group
+        if workspace.ordered_sources is None:
+            logical_sources = workspace.collective.index_select(
+                0, workspace.logical_to_group
+            )
+        else:
+            logical_sources = torch.index_select(
+                workspace.collective,
+                dim=0,
+                index=workspace.logical_to_group,
+                out=workspace.ordered_sources,
+            )
+        folded = canonical_moe_fold_fp32_v2(
+            logical_sources,
+            output=workspace.folded,
         )
-        folded = canonical_moe_fold_fp32_v2(logical_sources)
         torch.where(
             slots.valid_mask.view(-1, *mask_tail),
             folded,
@@ -970,6 +1154,7 @@ __all__ = [
     "CanonicalMoEOutput",
     "CanonicalRowSlots",
     "CanonicalMoEWorkspace",
+    "CanonicalMoEV3ScratchPool",
     "CanonicalMoEV3Workspace",
     "SamplerParallelPlan",
     "canonical_moe_leaf_fp32_v1",

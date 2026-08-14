@@ -1,6 +1,9 @@
 """CPU/mock tests for GLM-5.2 exact architecture and MoE owners."""
 
+import threading
 import unittest
+from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -14,7 +17,11 @@ maybe_stub_sgl_kernel()
 from sglang.srt.configs.model_config import ModelConfig  # noqa: E402
 from sglang.srt.distributed.canonical_moe import (  # noqa: E402
     CanonicalDistribution,
+    CanonicalMoEV3ScratchPool,
+    CanonicalMoEV3Workspace,
+    CanonicalRowSlots,
     SamplerParallelPlan,
+    canonicalize_glm52_local_partial_v3,
 )
 from sglang.srt.layers import layernorm as layernorm_module  # noqa: E402
 from sglang.srt.layers.communicator import (  # noqa: E402
@@ -311,7 +318,7 @@ class TestGlm52ExactOwners(CustomTestCase):
                 mlp_reduce_scatter=False,
             )
 
-    def test_mixed_dp_cp_prefill_uses_transient_replicated_workspace(self):
+    def test_mixed_dp_cp_prefill_uses_model_shared_replicated_scratch(self):
         moe = object.__new__(deepseek_v2.DeepseekV2MoE)
         torch.nn.Module.__init__(moe)
         moe.tp_size = 16
@@ -338,6 +345,9 @@ class TestGlm52ExactOwners(CustomTestCase):
         )
         group = object()
         workspace = object()
+        scratch_pool = MagicMock()
+        scratch_pool.lease.return_value = nullcontext(workspace)
+        moe._glm52_mixed_prefill_scratch_pool = scratch_pool
         forward_batch = object()
         with (
             patch.object(deepseek_v2, "dsa_use_prefill_cp", return_value=True),
@@ -353,7 +363,9 @@ class TestGlm52ExactOwners(CustomTestCase):
             patch.object(
                 moe,
                 "_get_canonical_v3_workspace",
-                return_value=workspace,
+                side_effect=AssertionError(
+                    "mixed eager prefill must use shared scratch"
+                ),
             ) as get_workspace,
             patch.object(
                 deepseek_v2,
@@ -370,23 +382,89 @@ class TestGlm52ExactOwners(CustomTestCase):
             )
 
         self.assertIs(actual, output.values)
-        get_workspace.assert_called_once_with(
-            (
-                CanonicalDistribution.REPLICATED_CANONICAL.value,
-                16,
-                (4,),
-                torch.bfloat16,
-                local_partial.device,
-            ),
+        get_workspace.assert_not_called()
+        scratch_pool.lease.assert_called_once_with(
             local_partial,
             plan=moe.glm52_parallel_plan,
             group=group,
             distribution=CanonicalDistribution.REPLICATED_CANONICAL,
-            capture_mode=False,
-            cache_eager=False,
         )
         prefill_v3.assert_called_once()
         output.raise_for_status.assert_called_once()
+
+    def test_mixed_dp_cp_graph_capture_keeps_pinned_layer_workspace(self):
+        moe = object.__new__(deepseek_v2.DeepseekV2MoE)
+        torch.nn.Module.__init__(moe)
+        moe.tp_size = 16
+        moe.moe_ep_size = 16
+        moe.glm52_parallel_plan = SamplerParallelPlan.glm52(
+            contributors=16,
+            attention_dp_size=4,
+        )
+        moe.gate = SimpleNamespace(
+            e_score_correction_bias=torch.zeros(16, dtype=torch.float32),
+            dsa_enable_prefill_cp=True,
+            mla_enable_prefill_cp=False,
+        )
+        moe._glm52_canonical_transport = "auto"
+        moe._glm52_deferred_status_book = None
+        moe._glm52_mixed_prefill_scratch_pool = MagicMock()
+        moe.layer_id = 7
+
+        local_partial = torch.zeros((16, 4), dtype=torch.bfloat16)
+        positions = torch.arange(16, dtype=torch.int64)
+        output = SimpleNamespace(
+            values=local_partial,
+            contract_status=torch.zeros((), dtype=torch.int32),
+            raise_for_status=MagicMock(),
+        )
+        workspace = object()
+        group = object()
+        with (
+            patch.object(deepseek_v2, "dsa_use_prefill_cp", return_value=True),
+            patch.object(deepseek_v2, "mla_use_prefill_cp", return_value=False),
+            patch.object(
+                deepseek_v2,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_group=SimpleNamespace(device_group=group)
+                ),
+            ),
+            patch.object(deepseek_v2, "get_is_capture_mode", return_value=True),
+            patch.object(
+                moe,
+                "_get_canonical_v3_workspace",
+                return_value=workspace,
+            ) as get_workspace,
+            patch.object(
+                deepseek_v2,
+                "canonicalize_glm52_local_partial_v3",
+                return_value=output,
+            ),
+        ):
+            first = moe._canonicalize_glm52_partial(
+                local_partial,
+                positions,
+                forward_batch=object(),
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=False,
+            )
+            second = moe._canonicalize_glm52_partial(
+                local_partial,
+                positions,
+                forward_batch=object(),
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=False,
+            )
+
+        self.assertIs(first, output.values)
+        self.assertIs(second, output.values)
+        self.assertEqual(get_workspace.call_count, 2)
+        self.assertTrue(
+            all(call.kwargs["capture_mode"] for call in get_workspace.call_args_list)
+        )
+        moe._glm52_mixed_prefill_scratch_pool.lease.assert_not_called()
+        output.raise_for_status.assert_not_called()
 
     def test_complete_cp_owner_selects_rows_without_legacy_sum_and_fails_closed(self):
         communicator = object.__new__(DSACPLayerCommunicator)
@@ -556,6 +634,320 @@ class TestCanonicalWorkspaceRetention(CustomTestCase):
         first_allocate.assert_called_once()
         second_allocate.assert_called_once()
         self.assertEqual(moe._canonical_v3_workspaces, {})
+
+
+class TestMixedPrefillScratchPool(CustomTestCase):
+    """Regression coverage for the 4096-token mixed-DP/CP prefill OOM.
+
+    The failed production request kept contributor-sized scratch planes active
+    across sparse layers. The shared slot must keep those planes O(1) across
+    the complete 75-layer GLM sparse stack without retaining outputs.
+    """
+
+    @staticmethod
+    def _plan():
+        return SamplerParallelPlan.glm52(contributors=4, attention_dp_size=2)
+
+    @staticmethod
+    def _runtime(plan):
+        return patch.multiple(
+            "torch.distributed",
+            get_world_size=MagicMock(return_value=plan.global_world_size),
+            get_process_group_ranks=MagicMock(return_value=list(plan.physical_ranks)),
+        )
+
+    @staticmethod
+    def _scratch_signature(workspace):
+        names = (
+            "masked_input",
+            "collective",
+            "ordered_sources",
+            "folded",
+            "zero",
+            "logical_to_group",
+            "status",
+        )
+        return tuple(
+            getattr(workspace, name).untyped_storage().data_ptr() for name in names
+        )
+
+    def test_one_slot_serves_all_75_layers_without_retaining_results(self):
+        plan = self._plan()
+        pool = CanonicalMoEV3ScratchPool()
+        local = torch.zeros((8, 4), dtype=torch.bfloat16)
+        group = object()
+        scratch_signatures = []
+        results = []
+
+        with self._runtime(plan):
+            for _layer_id in range(75):
+                with pool.lease(
+                    local,
+                    plan=plan,
+                    group=group,
+                    distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+                ) as workspace:
+                    scratch_signatures.append(self._scratch_signature(workspace))
+                    results.append(workspace.result)
+
+        self.assertEqual(len(set(scratch_signatures)), 1)
+        self.assertEqual(
+            len({result.untyped_storage().data_ptr() for result in results}),
+            75,
+        )
+        scratch_ptrs = set(scratch_signatures[0])
+        self.assertTrue(
+            all(
+                result.untyped_storage().data_ptr() not in scratch_ptrs
+                for result in results
+            )
+        )
+
+    def test_model_binds_one_pool_to_every_local_sparse_layer(self):
+        mlps = [SimpleNamespace() for _ in range(75)]
+        mixed = self._plan()
+        pool = deepseek_v2.DeepseekV2Model._bind_glm52_mixed_prefill_scratch_pool(
+            mixed,
+            mlps,
+        )
+
+        self.assertIsInstance(pool, CanonicalMoEV3ScratchPool)
+        self.assertEqual(
+            {id(mlp._glm52_mixed_prefill_scratch_pool) for mlp in mlps},
+            {id(pool)},
+        )
+
+        for attention_dp_size in (1, 4):
+            nonmixed = SamplerParallelPlan.glm52(
+                contributors=4,
+                attention_dp_size=attention_dp_size,
+            )
+            with self.subTest(attention_dp_size=attention_dp_size):
+                self.assertIsNone(
+                    deepseek_v2.DeepseekV2Model._bind_glm52_mixed_prefill_scratch_pool(
+                        nonmixed,
+                        mlps,
+                    )
+                )
+                self.assertTrue(
+                    all(mlp._glm52_mixed_prefill_scratch_pool is None for mlp in mlps)
+                )
+
+    def test_pool_serializes_callers_and_reuses_scratch_after_exception(self):
+        plan = self._plan()
+        pool = CanonicalMoEV3ScratchPool()
+        local = torch.zeros((8, 4), dtype=torch.bfloat16)
+        group = object()
+        first_entered = threading.Event()
+        second_started = threading.Event()
+        release_first = threading.Event()
+        second_entered = threading.Event()
+        errors = []
+        pointers = []
+
+        def first_caller():
+            try:
+                with pool.lease(
+                    local,
+                    plan=plan,
+                    group=group,
+                    distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+                ) as workspace:
+                    pointers.append(self._scratch_signature(workspace))
+                    first_entered.set()
+                    second_started.wait(timeout=2)
+                    if second_entered.is_set():
+                        raise AssertionError(
+                            "second caller entered a leased scratch slot"
+                        )
+                    release_first.wait(timeout=2)
+                    raise RuntimeError("injected canonicalization failure")
+            except RuntimeError as error:
+                if str(error) != "injected canonicalization failure":
+                    errors.append(error)
+            except BaseException as error:  # pragma: no cover - thread handoff
+                errors.append(error)
+
+        def second_caller():
+            try:
+                first_entered.wait(timeout=2)
+                second_started.set()
+                with pool.lease(
+                    local,
+                    plan=plan,
+                    group=group,
+                    distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+                ) as workspace:
+                    pointers.append(self._scratch_signature(workspace))
+                    second_entered.set()
+            except BaseException as error:  # pragma: no cover - thread handoff
+                errors.append(error)
+
+        with self._runtime(plan):
+            first_thread = threading.Thread(target=first_caller)
+            second_thread = threading.Thread(target=second_caller)
+            first_thread.start()
+            second_thread.start()
+            self.assertTrue(first_entered.wait(timeout=2))
+            self.assertTrue(second_started.wait(timeout=2))
+            self.assertFalse(second_entered.is_set())
+            release_first.set()
+            first_thread.join(timeout=2)
+            second_thread.join(timeout=2)
+
+        self.assertFalse(first_thread.is_alive())
+        self.assertFalse(second_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertTrue(second_entered.is_set())
+        self.assertEqual(pointers[0], pointers[1])
+
+    def test_event_handoff_is_recorded_even_when_canonicalization_raises(self):
+        log = []
+
+        class FakeStream:
+            def __init__(self, name):
+                self.name = name
+
+            def wait_event(self, event):
+                log.append(("wait", self.name, event.name))
+
+        class FakeEvent:
+            name = "ready"
+
+            def record(self, stream):
+                log.append(("record", stream.name, self.name))
+
+        streams = iter((FakeStream("first"), FakeStream("second")))
+        event = FakeEvent()
+
+        class EventPool(CanonicalMoEV3ScratchPool):
+            def _uses_cuda_event(self, _local_partial):
+                return True
+
+            def _current_stream(self, _device):
+                return next(streams)
+
+            def _new_event(self):
+                return event
+
+        plan = self._plan()
+        pool = EventPool()
+        local = torch.zeros((8, 4), dtype=torch.bfloat16)
+        group = object()
+        with self._runtime(plan):
+            with self.assertRaisesRegex(RuntimeError, "injected"):
+                with pool.lease(
+                    local,
+                    plan=plan,
+                    group=group,
+                    distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+                ):
+                    raise RuntimeError("injected")
+            with pool.lease(
+                local,
+                plan=plan,
+                group=group,
+                distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+            ):
+                pass
+
+        self.assertEqual(
+            log,
+            [
+                ("record", "first", "ready"),
+                ("wait", "second", "ready"),
+                ("record", "second", "ready"),
+            ],
+        )
+
+    def test_pooled_transport_is_byte_identical_and_result_does_not_alias(self):
+        base_plan = self._plan()
+        plan = replace(base_plan, physical_to_logical=(2, 0, 3, 1))
+        group = object()
+        slots = CanonicalRowSlots.from_positions(torch.arange(6), capacity=8)
+        partials = torch.empty((4, 8, 4), dtype=torch.bfloat16)
+        partials[0].fill_(4096)
+        partials[1].fill_(1)
+        partials[2].fill_(-4096)
+        partials[3].copy_(torch.arange(32).reshape(8, 4))
+        gathered_partials = partials.clone()
+        gathered_partials[:, ~slots.valid_mask] = 0
+
+        def fake_all_gather(output, _local, *, group):
+            output.view_as(gathered_partials).copy_(gathered_partials)
+
+        pool = CanonicalMoEV3ScratchPool()
+        with (
+            self._runtime(plan),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=fake_all_gather,
+            ),
+        ):
+            transient_workspace = CanonicalMoEV3Workspace.allocate(
+                partials[0],
+                plan=plan,
+                group=group,
+                distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+            )
+            transient = canonicalize_glm52_local_partial_v3(
+                partials[0],
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=3,
+                distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+                workspace=transient_workspace,
+            )
+            with pool.lease(
+                partials[0],
+                plan=plan,
+                group=group,
+                distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+            ) as pooled_workspace:
+                pooled = canonicalize_glm52_local_partial_v3(
+                    partials[0],
+                    slots,
+                    plan=plan,
+                    group=group,
+                    layer_id=3,
+                    distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+                    workspace=pooled_workspace,
+                )
+                first_values = pooled.values
+                first_bytes = first_values.view(torch.int16).clone()
+                scratch_ptrs = set(self._scratch_signature(pooled_workspace))
+
+            gathered_partials.neg_()
+            with pool.lease(
+                partials[0],
+                plan=plan,
+                group=group,
+                distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+            ) as reused_workspace:
+                reused = canonicalize_glm52_local_partial_v3(
+                    partials[0],
+                    slots,
+                    plan=plan,
+                    group=group,
+                    layer_id=4,
+                    distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+                    workspace=reused_workspace,
+                )
+
+        self.assertTrue(
+            torch.equal(
+                transient.values.view(torch.int16),
+                first_values.view(torch.int16),
+            )
+        )
+        self.assertTrue(torch.equal(first_values.view(torch.int16), first_bytes))
+        self.assertNotEqual(
+            first_values.untyped_storage().data_ptr(),
+            reused.values.untyped_storage().data_ptr(),
+        )
+        self.assertNotIn(first_values.untyped_storage().data_ptr(), scratch_ptrs)
 
 
 if __name__ == "__main__":

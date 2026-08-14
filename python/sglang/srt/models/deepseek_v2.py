@@ -60,6 +60,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDeferredStatusBook,
     CanonicalDistribution,
+    CanonicalMoEV3ScratchPool,
     CanonicalMoEV3Workspace,
     CanonicalMoEWorkspace,
     CanonicalRowSlots,
@@ -386,8 +387,7 @@ class DeepseekV2MLP(nn.Module):
             self.down_proj.weight = self.down_proj.weight_packed
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = (
@@ -675,7 +675,6 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -972,6 +971,7 @@ class DeepseekV2MoE(nn.Module):
         )
         self._canonical_dense_workspaces: dict[tuple, CanonicalMoEWorkspace] = {}
         self._canonical_v3_workspaces: dict[tuple, CanonicalMoEV3Workspace] = {}
+        self._glm52_mixed_prefill_scratch_pool: CanonicalMoEV3ScratchPool | None = None
         # Keys minted while a CUDA graph was being captured: the captured
         # graph replays against those tensor addresses forever, so they are
         # exempt from the single-slot eviction below.
@@ -1354,7 +1354,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
@@ -1471,8 +1470,8 @@ class DeepseekV2MoE(nn.Module):
         Mixed DP x CP prefill is also REPLICATED_CANONICAL, but its collective
         workspace is contributor-count times the prompt payload. Keeping one
         such eager workspace in every sparse layer makes residency grow with
-        model depth. Callers therefore leave those eager workspaces uncached;
-        the returned result tensor keeps only its own storage alive.
+        model depth. The mixed-prefill path instead leases one model-shared
+        slot; this fallback remains available to uncached callers.
         """
         if capture_mode or cache_eager:
             workspace = self._canonical_v3_workspaces.get(workspace_key)
@@ -1512,6 +1511,51 @@ class DeepseekV2MoE(nn.Module):
         if capture_mode:
             self._canonical_v3_pinned_keys.add(workspace_key)
         return workspace
+
+    def _run_glm52_v3_transport(
+        self,
+        selected_transport: str,
+        local_partial: torch.Tensor,
+        slots: CanonicalRowSlots,
+        *,
+        plan: SamplerParallelPlan,
+        group: dist.ProcessGroup,
+        distribution: CanonicalDistribution,
+        capture_mode: bool,
+        workspace: CanonicalMoEV3Workspace,
+    ):
+        if selected_transport == "canonical_v3":
+            return canonicalize_glm52_local_partial_v3(
+                local_partial,
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=self.layer_id,
+                distribution=distribution,
+                graph_capture=capture_mode,
+                workspace=workspace,
+            )
+        if selected_transport == "canonical_v3b":
+            return canonicalize_glm52_local_partial_v3b(
+                local_partial,
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=self.layer_id,
+                graph_capture=capture_mode,
+                workspace=workspace,
+            )
+        raise RuntimeError(f"Unsupported GLM-5.2 v3 transport {selected_transport!r}")
+
+    def _finish_glm52_canonical(self, canonical, *, capture_mode: bool) -> torch.Tensor:
+        if not capture_mode:
+            if self._glm52_deferred_status_book is None:
+                canonical.raise_for_status()
+            else:
+                self._glm52_deferred_status_book.record(
+                    self.layer_id, canonical.contract_status
+                )
+        return canonical.values
 
     def _canonicalize_glm52_partial(
         self,
@@ -1610,6 +1654,38 @@ class DeepseekV2MoE(nn.Module):
                 workspace=workspace,
             )
         else:
+            mixed_replicated_prefill = (
+                not capture_mode
+                and prefill_cp
+                and plan.attention_dp_size > 1
+                and plan.attention_cp_size > 1
+                and distribution is CanonicalDistribution.REPLICATED_CANONICAL
+            )
+            if mixed_replicated_prefill:
+                pool = self._glm52_mixed_prefill_scratch_pool
+                if pool is None:
+                    raise RuntimeError(
+                        "Mixed-DP/CP GLM prefill has no model-shared scratch pool"
+                    )
+                with pool.lease(
+                    local_partial,
+                    plan=plan,
+                    group=group,
+                    distribution=distribution,
+                ) as workspace:
+                    canonical = self._run_glm52_v3_transport(
+                        selected_transport,
+                        local_partial,
+                        slots,
+                        plan=plan,
+                        group=group,
+                        distribution=distribution,
+                        capture_mode=capture_mode,
+                        workspace=workspace,
+                    )
+                    return self._finish_glm52_canonical(
+                        canonical, capture_mode=capture_mode
+                    )
             workspace = self._get_canonical_v3_workspace(
                 workspace_key,
                 local_partial,
@@ -1622,35 +1698,17 @@ class DeepseekV2MoE(nn.Module):
                     and distribution is CanonicalDistribution.REPLICATED_CANONICAL
                 ),
             )
-        if selected_transport == "canonical_v3":
-            canonical = canonicalize_glm52_local_partial_v3(
+            canonical = self._run_glm52_v3_transport(
+                selected_transport,
                 local_partial,
                 slots,
                 plan=plan,
                 group=group,
-                layer_id=self.layer_id,
                 distribution=distribution,
-                graph_capture=capture_mode,
+                capture_mode=capture_mode,
                 workspace=workspace,
             )
-        elif selected_transport == "canonical_v3b":
-            canonical = canonicalize_glm52_local_partial_v3b(
-                local_partial,
-                slots,
-                plan=plan,
-                group=group,
-                layer_id=self.layer_id,
-                graph_capture=capture_mode,
-                workspace=workspace,
-            )
-        if not capture_mode:
-            if self._glm52_deferred_status_book is None:
-                canonical.raise_for_status()
-            else:
-                self._glm52_deferred_status_book.record(
-                    self.layer_id, canonical.contract_status
-                )
-        return canonical.values
+        return self._finish_glm52_canonical(canonical, capture_mode=capture_mode)
 
     def forward_cpu(
         self,
@@ -1815,7 +1873,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -1833,7 +1890,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
 
                 if (
@@ -1871,7 +1927,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -2185,7 +2240,6 @@ class DeepseekV2AttentionMLA(
     DeepseekMLARocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2730,7 +2784,6 @@ class DeepseekV2AttentionMLA(
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -3114,6 +3167,20 @@ class DeepseekV2DecoderLayer(nn.Module):
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
+    @staticmethod
+    def _bind_glm52_mixed_prefill_scratch_pool(
+        plan: SamplerParallelPlan,
+        canonical_mlps: list[DeepseekV2MoE],
+    ) -> CanonicalMoEV3ScratchPool | None:
+        pool = (
+            CanonicalMoEV3ScratchPool()
+            if plan.attention_dp_size > 1 and plan.attention_cp_size > 1
+            else None
+        )
+        for mlp in canonical_mlps:
+            mlp._glm52_mixed_prefill_scratch_pool = pool
+        return pool
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -3264,6 +3331,7 @@ class DeepseekV2Model(nn.Module):
         )
 
         self.glm52_deferred_status_book: CanonicalDeferredStatusBook | None = None
+        self.glm52_mixed_prefill_scratch_pool: CanonicalMoEV3ScratchPool | None = None
         if self.glm52_xorl_bi_contract:
             if self.glm52_parallel_plan is None:
                 raise RuntimeError(
@@ -3281,6 +3349,12 @@ class DeepseekV2Model(nn.Module):
                     if mlp._glm52_canonical_contract:
                         canonical_mlps.append(mlp)
             if canonical_mlps:
+                self.glm52_mixed_prefill_scratch_pool = (
+                    self._bind_glm52_mixed_prefill_scratch_pool(
+                        self.glm52_parallel_plan,
+                        canonical_mlps,
+                    )
+                )
                 self.glm52_deferred_status_book = CanonicalDeferredStatusBook(
                     config.num_hidden_layers
                 )
@@ -3708,7 +3782,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-
         # Multi-modal: input_ids may be None (use input_embeds).
         # Non-first PP ranks: both are None (activations via pp_proxy_tensors).
         if input_ids is not None:
