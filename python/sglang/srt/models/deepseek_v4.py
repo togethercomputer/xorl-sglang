@@ -586,10 +586,13 @@ class MqaAttentionBase(nn.Module):
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
 
+        self.dsv4_flash_exact_mode = bool(
+            getattr(config, "_dsv4_flash_exact_mode", False)
+        )
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
-        if getattr(config, "_dsv4_flash_exact_mode", False) and fuse:
+        if self.dsv4_flash_exact_mode and fuse:
             raise ValueError(
                 "DSV4-Flash exact active-LoRA mode requires unfused wq_a/wkv "
                 "until the fused QKV-A factor boundary is byte-qualified; set "
@@ -927,24 +930,63 @@ class MQALayer(MqaAttentionBase):
                 layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
             )
             return
+        kv = self._compute_raw_kv(x, qkv_a=qkv_a)
+        self._store_raw_kv_to_cache(kv, positions, forward_batch, attn_backend)
+
+    def _compute_raw_kv(
+        self,
+        x: torch.Tensor,
+        qkv_a: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return WKV projection rows before KV norm, RoPE, or FP8 storage."""
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
         if hasattr(self, "debug_kv_raw"):
             kv = self.debug_kv_raw(kv)
+        return kv.contiguous()
+
+    def _store_raw_kv_to_cache(
+        self,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> None:
+        """Apply the canonical fused FP32 KV transform and paged FP8 store."""
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
+        assert kv.shape[0] == positions.shape[0] == swa_loc.shape[0], (
+            "DSV4 fused KV store requires aligned raw rows, positions, and cache "
+            f"locations, got {kv.shape[0]}, {positions.shape[0]}, {swa_loc.shape[0]}"
+        )
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
-            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            swa_loc=swa_loc,
             kv=kv,
             kv_weight=self.kv_norm.weight.data,
             eps=self.eps,
             freqs_cis=self.freqs_cis,
             positions=positions,
         )
+
+    def _gather_exact_cp_raw_kv_to_cache(
+        self,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> None:
+        """Rebuild logical CP rows before the same fused store used by CP1."""
+        assert kv.dtype == torch.bfloat16
+        positions = positions.to(dtype=torch.int64).reshape(-1, 1).contiguous()
+        kv = gather_dsa_prefill_cp_rows(kv.contiguous(), forward_batch)
+        positions = gather_dsa_prefill_cp_rows(positions, forward_batch)
+        positions = positions.squeeze(-1)
+        self._store_raw_kv_to_cache(kv, positions, forward_batch, attn_backend)
 
     def _compute_kv_bf16(
         self,
@@ -1175,7 +1217,23 @@ class MQALayer(MqaAttentionBase):
             not unified and self.use_fused_qk_norm_rope
         )
 
-        if do_fused_store:
+        exact_nvidia_cp_raw_store = (
+            use_cp
+            and getattr(self, "dsv4_flash_exact_mode", False)
+            and _is_cuda
+            and not _is_hip
+            and not unified
+        )
+
+        if exact_nvidia_cp_raw_store:
+            q_lora = self.q_norm(q_lora)
+            q = self._compute_q_b(q_lora, positions, q_out)
+            kv = self._compute_raw_kv(x_linear, qkv_a=qkv_a)
+            self._gather_exact_cp_raw_kv_to_cache(
+                kv, positions, forward_batch, attn_backend
+            )
+            kv = None
+        elif do_fused_store:
             if _is_gfx95_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,

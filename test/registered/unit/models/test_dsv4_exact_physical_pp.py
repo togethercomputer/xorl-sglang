@@ -17,6 +17,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.layers.cp.utils import (
     cp_shard_model_inputs,
     cp_split_before_forward,
@@ -1064,11 +1065,80 @@ def test_cp_v1_model_boundary_still_splits_and_gathers_once():
     assert forward_batch.dsv4_exact_logits_owner_rows == 4
 
 
-def test_cp_v2_nvidia_kv_gathers_logical_rows_before_global_cache_store():
+def test_cp_v2_interleave_gathers_raw_rows_and_positions_without_physical_padding():
+    complete_raw_kv = torch.arange(21, dtype=torch.bfloat16).view(7, 3)
+    complete_positions = torch.tensor([8, 9, 0, 1, 2, 14, 15], dtype=torch.int64)
+    strategy = InterleaveCPStrategy(cp_size=4)
+    parallel = SimpleNamespace(
+        attn_cp_rank=2,
+        attn_cp_size=4,
+        attn_cp_group=object(),
+    )
+    metadata = strategy.build_metadata(
+        num_tokens=7,
+        seqs_len=None,
+        extend_seqs_len=[2, 3, 2],
+    )
+
+    with patch(
+        "sglang.srt.layers.cp.padding.get_cp_padding_align_size", return_value=4
+    ):
+        pad_logical_token_to_physical(metadata)
+    forward_batch = SimpleNamespace(attn_cp_metadata=metadata)
+
+    def all_gather(output, local_rows):
+        source = complete_raw_kv if output.ndim == 2 else complete_positions
+        output.zero_()
+        physical_rows = metadata.per_rank_actual_token[0]
+        for rank in range(strategy.cp_size):
+            shard = source[rank :: strategy.cp_size]
+            start = rank * physical_rows
+            output[start : start + shard.shape[0]].copy_(shard)
+        expected_local = source[2 :: strategy.cp_size]
+        assert torch.equal(local_rows[: expected_local.shape[0]], expected_local)
+        assert local_rows[expected_local.shape[0] :].count_nonzero().item() == 0
+
+    with (
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=parallel),
+        patch("sglang.srt.layers.cp.interleave.get_parallel", return_value=parallel),
+        patch(
+            "sglang.srt.layers.cp.interleave.attn_cp_all_gather_into_tensor",
+            side_effect=all_gather,
+        ),
+        patch(
+            "sglang.srt.layers.cp.interleave.is_allocation_symmetric",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.cp.interleave.use_symmetric_memory",
+            return_value=torch.no_grad(),
+        ),
+    ):
+        local_raw_kv = strategy.shard_hidden_states(complete_raw_kv, forward_batch)
+        local_positions = strategy.shard_position_ids(complete_positions, forward_batch)
+        gathered_raw_kv = strategy.gather_hidden_states(local_raw_kv, forward_batch)
+        gathered_positions = strategy.gather_hidden_states(
+            local_positions, forward_batch
+        )
+
+    assert metadata.per_rank_logical_token == [2, 2, 2, 1]
+    assert metadata.per_rank_actual_token == [4, 4, 4, 4]
+    assert local_raw_kv.shape == (4, 3)
+    assert local_positions.tolist() == [0, 15, 0, 0]
+    assert torch.equal(gathered_raw_kv, complete_raw_kv)
+    assert torch.equal(gathered_positions, complete_positions)
+
+
+@pytest.mark.parametrize("fused_qkv", [False, True])
+def test_cp_v2_nvidia_exact_kv_gathers_raw_rows_and_positions_before_fused_store(
+    fused_qkv,
+):
     input_ids = torch.arange(6, dtype=torch.int64)
-    positions = torch.arange(6, dtype=torch.int64)
-    complete_embeds = torch.arange(24, dtype=torch.float32).view(6, 4)
+    positions = torch.tensor([5, 6, 7, 20, 21, 0], dtype=torch.int64)
+    complete_embeds = torch.arange(24, dtype=torch.bfloat16).view(6, 4)
+    complete_raw_kv = complete_embeds * 3
     global_cache_loc = torch.arange(1, 7, dtype=torch.int64)
+    global_swa_loc = torch.arange(41, 47, dtype=torch.int32)
     forward_batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         input_ids=input_ids,
@@ -1085,28 +1155,57 @@ def test_cp_v2_nvidia_kv_gathers_logical_rows_before_global_cache_store():
 
     attn = MQALayer.__new__(MQALayer)
     nn.Module.__init__(attn)
-    attn.fuse_wqa_wkv = False
-    attn.wq_a = _TupleIdentity()
+    attn.fuse_wqa_wkv = fused_qkv
+    attn.q_lora_rank = 2
+    if fused_qkv:
+        attn.wqkv_a = lambda rows: (
+            torch.cat((rows[:, : attn.q_lora_rank], rows * 3), dim=-1),
+            None,
+        )
+    else:
+        attn.wq_a = _TupleIdentity()
+        attn.wkv = lambda rows: (rows * 3, None)
     attn.q_norm = nn.Identity()
     attn._compute_q_b = lambda q, _positions, _q_out: q
-    attn._compute_kv_bf16 = lambda x, _positions, qkv_a=None: x
+    attn._compute_kv_bf16 = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("exact NVIDIA CP must not pre-normalize KV before gather")
+    )
+    attn.kv_norm = nn.LayerNorm(4, dtype=torch.bfloat16)
+    attn.eps = 1e-6
+    attn.freqs_cis = torch.empty(0)
+    attn.dsv4_flash_exact_mode = True
     attn.dsa_enable_prefill_cp = True
     attn.cp_size = 4
-    attn.use_fused_qk_norm_rope = False
+    # The exact CP seam must win even if the ordinary fused-QK path is enabled;
+    # otherwise that path stores rank-local rows before the logical gather.
+    attn.use_fused_qk_norm_rope = True
     attn.indexer = None
     attn.compressor = None
     attn.layer_id = 0
 
     stored = {}
     backend = SimpleNamespace(
-        store_cache=lambda **kwargs: stored.update(kwargs),
+        get_swa_out_cache_loc=lambda _forward_batch: global_swa_loc,
+        store_cache=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("exact CP must use the canonical fused norm/RoPE store")
+        ),
+    )
+    token_pool = SimpleNamespace(
+        set_swa_key_buffer_radix_fused_norm_rope=lambda **kwargs: stored.update(kwargs)
     )
     gather_calls = []
 
     def gather(local_rows, _forward_batch, _stream=None):
-        gather_calls.append(tuple(local_rows.shape))
-        assert local_rows.shape == (4, 4)
-        return complete_embeds.clone()
+        if local_rows.dtype == torch.bfloat16:
+            gather_calls.append("raw_kv")
+            assert local_rows.shape == (4, 4)
+            assert torch.equal(local_rows[:2], complete_raw_kv[[0, 4]])
+            return complete_raw_kv.clone()
+        gather_calls.append("positions")
+        assert local_rows.dtype == torch.int64
+        assert local_rows.shape == (4, 1)
+        assert local_rows[:, 0].tolist() == [5, 21, 0, 0]
+        return positions[:, None].clone()
 
     with (
         patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
@@ -1119,7 +1218,13 @@ def test_cp_v2_nvidia_kv_gathers_logical_rows_before_global_cache_store():
         ),
         patch.object(strategy, "gather_hidden_states", side_effect=gather),
         patch("sglang.srt.models.deepseek_v4.dsa_use_prefill_cp", return_value=True),
+        patch("sglang.srt.models.deepseek_v4._is_cuda", True),
+        patch("sglang.srt.models.deepseek_v4._is_hip", False),
         patch("sglang.srt.models.deepseek_v4._is_npu", False),
+        patch(
+            "sglang.srt.models.deepseek_v4.get_token_to_kv_pool",
+            return_value=token_pool,
+        ),
         patch(
             "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
             "is_unified_kv_triton",
@@ -1139,11 +1244,102 @@ def test_cp_v2_nvidia_kv_gathers_logical_rows_before_global_cache_store():
         )
 
     assert q.shape[0] == 4
-    assert kv.shape == (6, 4)
-    assert gather_calls == [(4, 4)]
-    assert stored["swa_k"].shape == (6, 4)
-    assert torch.equal(stored["forward_batch"].out_cache_loc, global_cache_loc)
+    assert kv is None
+    assert gather_calls == ["raw_kv", "positions"]
+    assert torch.equal(stored["kv"], complete_raw_kv)
+    assert stored["kv"].dtype == torch.bfloat16
+    assert torch.equal(stored["positions"], positions)
+    assert stored["positions"].dtype == torch.int64
+    assert stored["swa_loc"] is global_swa_loc
+    assert stored["layer_id"] == 0
+    assert torch.equal(forward_batch.out_cache_loc, global_cache_loc)
     assert not hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+
+
+def test_legacy_zigzag_exact_kv_gathers_positions_as_column_before_fused_store():
+    complete_raw_kv = torch.arange(12, dtype=torch.bfloat16).view(4, 3)
+    complete_positions = torch.tensor([31, 32, 47, 48], dtype=torch.int64)
+    rank_major_order = torch.tensor([0, 3, 1, 2])
+    rank_major_raw_kv = complete_raw_kv.index_select(0, rank_major_order)
+    rank_major_positions = complete_positions.index_select(0, rank_major_order)
+
+    class _CPGroup:
+        def all_gather_into_tensor(self, output, _local_rows):
+            if output.dtype == torch.bfloat16:
+                output.copy_(rank_major_raw_kv)
+            else:
+                assert output.shape == (4, 1)
+                output.copy_(rank_major_positions[:, None])
+
+    parallel = SimpleNamespace(attn_cp_size=2, attn_cp_group=_CPGroup())
+    forward_batch = SimpleNamespace(
+        attn_cp_metadata=SimpleNamespace(
+            max_rank_len=[2, 2],
+            per_rank_actual_token=[2, 2],
+            reverse_split_len=[1, 1, 1, 1],
+            cp_reverse_index=[0, 2, 3, 1],
+        )
+    )
+    backend = SimpleNamespace(
+        get_swa_out_cache_loc=lambda _forward_batch: torch.tensor(
+            [71, 72, 73, 74], dtype=torch.int32
+        )
+    )
+    stored = {}
+    token_pool = SimpleNamespace(
+        set_swa_key_buffer_radix_fused_norm_rope=lambda **kwargs: stored.update(kwargs)
+    )
+    attn = MQALayer.__new__(MQALayer)
+    nn.Module.__init__(attn)
+    attn.layer_id = 3
+    attn.kv_norm = nn.LayerNorm(3, dtype=torch.bfloat16)
+    attn.eps = 1e-6
+    attn.freqs_cis = torch.empty(0)
+
+    with (
+        patch(
+            "sglang.srt.layers.cp.utils.is_cp_v2_active",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsa.utils.get_parallel",
+            return_value=parallel,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsa.utils."
+            "is_dsa_prefill_cp_round_robin_split",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsa.utils.torch.cuda.current_stream",
+            return_value=None,
+        ),
+        patch("sglang.srt.layers.utils.cp_utils.get_parallel", return_value=parallel),
+        patch(
+            "sglang.srt.layers.utils.cp_utils.is_allocation_symmetric",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.utils.cp_utils.use_symmetric_memory",
+            return_value=torch.no_grad(),
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.get_token_to_kv_pool",
+            return_value=token_pool,
+        ),
+    ):
+        attn._gather_exact_cp_raw_kv_to_cache(
+            rank_major_raw_kv[:2],
+            rank_major_positions[:2],
+            forward_batch,
+            backend,
+        )
+
+    assert torch.equal(stored["kv"], complete_raw_kv)
+    assert torch.equal(stored["positions"], complete_positions)
+    assert stored["positions"].shape == (4,)
+    assert stored["positions"].dtype == torch.int64
+    assert stored["swa_loc"].tolist() == [71, 72, 73, 74]
 
 
 def test_cp_v2_compressor_materializes_logical_rows_on_cuda_and_npu_paths():
