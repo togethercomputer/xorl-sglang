@@ -169,7 +169,7 @@ def test_dense_qwen3_ingress_admits_joint_sampling_filters():
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
-        ("tp_size", 2, "TP1/DP1/EP1/PP1"),
+        ("tp_size", 2, "stage-local TP1/DP1/EP1"),
         ("dtype", "float16", "BF16"),
         ("quantization", "fp8", "unquantized"),
         ("attention_backend", "triton", "FA4"),
