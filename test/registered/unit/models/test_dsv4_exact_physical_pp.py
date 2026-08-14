@@ -186,6 +186,39 @@ class _IdentityHeadNorm(nn.Module):
         return hidden
 
 
+def test_model_constructor_owns_config_used_by_exact_pp_and_graph_forward():
+    config = SimpleNamespace(
+        _dsv4_flash_exact_mode=True,
+        hidden_size=4,
+        rms_norm_eps=1e-6,
+        num_hidden_layers=3,
+        hc_eps=1e-6,
+        hc_mult=3,
+    )
+    middle_stage = _PPGroup(rank=1, world_size=3)
+    with (
+        patch("sglang.srt.models.deepseek_v4._is_cuda", False),
+        patch("sglang.srt.models.deepseek_v4._is_hip", False),
+        patch("sglang.srt.models.deepseek_v4._is_npu", False),
+        patch("sglang.srt.models.deepseek_v4.get_pp_group", return_value=middle_stage),
+        patch(
+            "sglang.srt.models.deepseek_v4.make_layers",
+            return_value=(nn.ModuleList(), 1, 2),
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.is_dsa_enable_prefill_cp",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4._is_fused_mhc_post_pre_enabled",
+            return_value=False,
+        ),
+    ):
+        model = DeepseekV4Model(config)
+
+    assert model.config is config
+
+
 def _make_exact_dsv4_stage(rank, world_size, layer_range, *, rows=3, hidden=4):
     model = DeepseekV4Model.__new__(DeepseekV4Model)
     nn.Module.__init__(model)
