@@ -679,6 +679,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
 
         if shared_output is not None:
             if use_fused_gate:
+                # The exact Qwen contributor leaf is already FP32/cast-once:
+                # this kernel loads routed and shared BF16 values into FP32,
+                # computes the gated join there, and stores BF16 only after
+                # the completed leaf.  The canonical cross-rank fold follows.
                 fused_gate_sigmoid_mul_add(
                     hidden_states,
                     self.shared_expert_gate.weight.squeeze(),

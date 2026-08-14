@@ -64,6 +64,7 @@ from sglang.srt.distributed.canonical_moe import (
     CanonicalMoEV3Workspace,
     CanonicalRowSlots,
     SamplerParallelPlan,
+    canonical_moe_leaf_fp32_v1,
     canonicalize_glm52_local_partial,
     canonicalize_glm52_local_partial_v3,
     canonicalize_glm52_local_partial_v3b,
@@ -142,6 +143,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    is_routed_scale_deferred_to_shared_add,
     maybe_fuse_routed_scale_and_shared_add,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -1113,6 +1115,29 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
 
+    def _canonical_exact_leaf(
+        self,
+        routed: torch.Tensor,
+        shared: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Finish one exact GLM/DSV contributor before low-precision transport."""
+        if routed.numel() == 0:
+            return routed
+        if shared is None:
+            raise RuntimeError(
+                "Exact canonical MoE requires an explicit shared-expert partial"
+            )
+        routed_scale = (
+            self.routed_scaling_factor
+            if is_routed_scale_deferred_to_shared_add(self.experts)
+            else 1.0
+        )
+        return canonical_moe_leaf_fp32_v1(
+            shared,
+            routed,
+            routed_scale=float(routed_scale),
+        )
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -1200,7 +1225,12 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
+        exact_leaf = self._glm52_canonical_contract or self._dsv4_exact_ordered_combine
         if deferred_finalize:
+            if exact_leaf:
+                raise RuntimeError(
+                    "Exact canonical MoE does not admit backend-fused leaf finalization"
+                )
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 finalize_flashinfer_trtllm_deferred_output,
             )
@@ -1208,6 +1238,11 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
                 final_hidden_states,
                 shared_output,
+            )
+        elif exact_leaf:
+            final_hidden_states = self._canonical_exact_leaf(
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
             )
         else:
             final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
@@ -1231,10 +1266,10 @@ class DeepseekV2MoE(nn.Module):
         """Post-experts TP sum; the DSV4 exact lane pins the canonical fold.
 
         The stock NCCL all_reduce has a topology-dependent reduction order.
-        The XoRL exact contract requires the canonical adjacent-pair BF16
-        fold over TP-rank-ordered partials (the same primitive as the
-        Qwen/GLM exact lanes) so the trainer's EP combine (raw exchange +
-        canonical_moe_fold_v1) can reproduce the serving bytes.
+        The XoRL exact contract requires the canonical source-ranked adjacent
+        FP32 tree over TP partials (the same primitive as Qwen/GLM) so the
+        trainer's raw exchange plus canonical_moe_fold_fp32_v2 reproduces the
+        serving bytes before the one final BF16 output cast.
         """
         global _dsv4_exact_combine_engagement_logged
         if not _dsv4_exact_combine_engagement_logged:
@@ -1378,12 +1413,18 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if self._glm52_canonical_contract or self._dsv4_exact_ordered_combine:
+            final_hidden_states = self._canonical_exact_leaf(
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+            )
+        else:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
         if self._glm52_canonical_contract:
             return self._canonicalize_glm52_partial(

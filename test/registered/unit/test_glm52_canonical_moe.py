@@ -1616,10 +1616,10 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             for ordinal in range(contributors):
                 partials[ordinal, :, 0] = [4096, -4096, 1, 0, 0][ordinal % 5]
                 partials[ordinal, :, 1] = ordinal + 1
-            expected = partials
+            expected = partials.float()
             while expected.shape[0] > 1:
-                expected = (expected[0::2] + expected[1::2]).to(torch.bfloat16)
-            expected = expected[0]
+                expected = expected[0::2] + expected[1::2]
+            expected = expected[0].to(torch.bfloat16)
             expected[~slots.valid_mask] = 0
             self.assertTrue(
                 torch.equal(canonical_moe_reference(partials, slots), expected)

@@ -8,6 +8,10 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.fla import qwen35_gdn_exact as exact
+from sglang.srt.distributed.canonical_moe import (
+    SamplerParallelPlan,
+    canonical_moe_fold_fp32_v2,
+)
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -331,6 +335,43 @@ def test_qwen35_moe_preserves_explicit_graph_program():
     assert args.cuda_graph_bs_decode == [8, 10]
 
 
+@pytest.mark.parametrize("contributors", (3, 5))
+def test_qwen35_moe_odd_contributor_plan_uses_deterministic_eager_fold(
+    contributors,
+):
+    args = _server_args(
+        tp_size=contributors,
+        dp_size=contributors,
+        ep_size=contributors,
+        disable_radix_cache=True,
+    )
+    args._resolve_qwen35_gdn_exact_contract(
+        _qwen_config(moe=True),
+        model_arch="Qwen3_5MoeForConditionalGeneration",
+    )
+    assert (args.tp_size, args.dp_size, args.ep_size) == (
+        contributors,
+        contributors,
+        contributors,
+    )
+
+    plan = SamplerParallelPlan.primitive(contributors)
+    assert plan.contributor_count == contributors
+    partials = torch.tensor(
+        [[4096.0, ordinal + 1.0] for ordinal in range(contributors)],
+        dtype=torch.bfloat16,
+    )
+    level = list(partials.float().unbind(0))
+    while len(level) > 1:
+        paired = [
+            level[index] + level[index + 1] for index in range(0, len(level) - 1, 2)
+        ]
+        if len(level) % 2:
+            paired.append(level[-1])
+        level = paired
+    assert torch.equal(canonical_moe_fold_fp32_v2(partials), level[0].bfloat16())
+
+
 def test_qwen35_moe_rejects_architecture_alias_with_unqualified_geometry():
     hf_config = _qwen_config(moe=True)
     hf_config.text_config.hidden_size += 1
@@ -488,7 +529,7 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         rendered = startup_args[0] % startup_args[1:]
         assert "decode, cached-row incremental" in rendered
         assert "rmsnorm_family=v2" in rendered
-        assert "moe_fold=canonical_moe_fold_v1" in rendered
+        assert "moe_fold=canonical_moe_fold_fp32_v2" in rendered
         force_family.assert_not_called()
 
 

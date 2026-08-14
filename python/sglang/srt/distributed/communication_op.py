@@ -39,9 +39,9 @@ def tensor_model_parallel_canonical_moe_all_reduce(
     # contribution from a full CUDA graph.
     group.all_gather_into_tensor(gathered, input_)
     partials = gathered.view(group.world_size, *input_.shape)
-    from sglang.srt.distributed.canonical_moe import canonical_moe_fold_v1
+    from sglang.srt.distributed.canonical_moe import canonical_moe_fold_fp32_v2
 
-    return canonical_moe_fold_v1(partials)
+    return canonical_moe_fold_fp32_v2(partials)
 
 
 def tensor_model_parallel_quant_all_reduce(input_: torch.Tensor) -> torch.Tensor:
