@@ -544,7 +544,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
-    # Has to be None when cuda graph is captured.
+    # Live batches carry their request-derived counts. Synthetic decode/dummy
+    # buckets may carry their fixed pruned-row counts. Prefill capture must
+    # leave this unset unless it separately computes post-pruning row counts.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
 
