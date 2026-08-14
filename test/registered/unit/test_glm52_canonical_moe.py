@@ -216,6 +216,286 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         self.assertTrue(torch.equal(aligned.values, expected_positions))
         self.assertTrue(torch.equal(aligned.valid_mask, expected_valid))
 
+    def test_ragged_mixed_dp_cp_uses_logical_cp_rows_and_round_trips_source(self):
+        from sglang.srt.layers.communicator import ScatterMode
+        from sglang.srt.layers.communicator_dsa_cp import (
+            DSACPLayerCommunicator,
+            DSAMLPOutputLayout,
+            align_glm52_moe_positions as align_runtime_positions,
+            gather_glm52_mlp_rows,
+        )
+        from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+
+        cases = (
+            (2, 8, [17, 29]),
+            (4, 4, [7, 13, 19, 25]),
+            (8, 2, [3, 5, 7, 9, 11, 13, 15, 17]),
+        )
+        for dp_size, cp_size, dp_lengths in cases:
+            with self.subTest(dp_size=dp_size, cp_size=cp_size):
+                dp_rank = dp_size - 1
+                cp_rank = cp_size - 1
+                local_logical_rows = dp_lengths[dp_rank]
+                per_rank_logical = [
+                    len(range(rank, local_logical_rows, cp_size))
+                    for rank in range(cp_size)
+                ]
+                max_logical = max(per_rank_logical)
+                physical_rows = (max_logical + cp_size - 1) // cp_size * cp_size
+                metadata = SimpleNamespace(
+                    total_seq_lens=local_logical_rows,
+                    per_rank_logical_token=per_rank_logical,
+                    per_rank_actual_token=[physical_rows] * cp_size,
+                )
+                forward_batch = SimpleNamespace(attn_cp_metadata=metadata)
+
+                global_rows = sum(dp_lengths)
+                global_hidden = torch.arange(
+                    global_rows * 2, dtype=torch.bfloat16
+                ).reshape(global_rows, 2)
+                global_positions = torch.arange(global_rows, dtype=torch.int64)
+                block_start = sum(dp_lengths[:dp_rank])
+                block_hidden = global_hidden[
+                    block_start : block_start + local_logical_rows
+                ]
+                block_positions = global_positions[
+                    block_start : block_start + local_logical_rows
+                ]
+
+                def physical_shards(logical):
+                    shards = []
+                    for rank in range(cp_size):
+                        shard = logical[rank::cp_size]
+                        padded = logical.new_zeros((physical_rows, *logical.shape[1:]))
+                        padded[: shard.shape[0]].copy_(shard)
+                        shards.append(padded)
+                    return shards
+
+                hidden_shards = physical_shards(block_hidden)
+                position_shards = physical_shards(block_positions)
+                valid_shards = physical_shards(
+                    torch.ones(local_logical_rows, dtype=torch.int32)
+                )
+                strategy = InterleaveCPStrategy(cp_size)
+                tp_device_group = object()
+                parallel = SimpleNamespace(
+                    attn_dp_size=dp_size,
+                    attn_dp_rank=dp_rank,
+                    attn_cp_size=cp_size,
+                    attn_cp_rank=cp_rank,
+                    attn_tp_size=1,
+                    tp_size=16,
+                    tp_rank=dp_rank * cp_size + cp_rank,
+                    tp_group=SimpleNamespace(device_group=tp_device_group),
+                )
+                cp_parallel = SimpleNamespace(
+                    attn_cp_rank=cp_rank,
+                    attn_cp_group=object(),
+                )
+
+                def fake_cp_all_gather(output, local):
+                    if local.dtype is torch.bfloat16:
+                        shards = hidden_shards
+                    elif local.dtype is torch.int64:
+                        shards = position_shards
+                    else:
+                        self.assertEqual(local.dtype, torch.int32)
+                        shards = valid_shards
+                    output.copy_(torch.cat(shards))
+
+                def fake_dp_all_reduce(output, *, group):
+                    self.assertIs(group, tp_device_group)
+                    if output.dtype is torch.bfloat16:
+                        output.copy_(global_hidden)
+                    elif output.dtype is torch.int64:
+                        output.copy_(global_positions)
+                    else:
+                        self.assertEqual(output.dtype, torch.int32)
+                        output.fill_(1)
+
+                with (
+                    patch(
+                        "sglang.srt.layers.cp.base.get_cp_strategy",
+                        return_value=strategy,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.interleave.get_parallel",
+                        return_value=cp_parallel,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.base.get_parallel",
+                        return_value=cp_parallel,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.interleave.use_symmetric_memory",
+                        side_effect=lambda *_args, **_kwargs: nullcontext(),
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.interleave.is_allocation_symmetric",
+                        return_value=False,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.interleave.attn_cp_all_gather_into_tensor",
+                        side_effect=fake_cp_all_gather,
+                    ),
+                    patch(
+                        "sglang.srt.layers.communicator_dsa_cp.get_parallel",
+                        return_value=parallel,
+                    ),
+                    patch(
+                        "sglang.srt.layers.communicator_dsa_cp.get_dp_global_num_tokens",
+                        return_value=dp_lengths,
+                    ),
+                    patch(
+                        "sglang.srt.layers.communicator_dsa_cp.get_global_dp_buffer",
+                        side_effect=lambda _group: torch.empty_like(global_hidden),
+                    ),
+                    patch(
+                        "sglang.srt.layers.communicator_dsa_cp.dist.all_reduce",
+                        side_effect=fake_dp_all_reduce,
+                    ),
+                    patch(
+                        "sglang.srt.layers.communicator_dsa_cp.dsa_use_prefill_cp",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.layers.communicator_dsa_cp.mla_use_prefill_cp",
+                        return_value=False,
+                    ),
+                ):
+                    gathered = gather_glm52_mlp_rows(
+                        hidden_shards[cp_rank], forward_batch
+                    )
+                    self.assertTrue(torch.equal(gathered, global_hidden))
+
+                    aligned = align_runtime_positions(
+                        position_shards[cp_rank], gathered, forward_batch
+                    )
+                    self.assertTrue(torch.equal(aligned.values, global_positions))
+                    self.assertTrue(torch.all(aligned.valid_mask))
+
+                    communicator = object.__new__(DSACPLayerCommunicator)
+                    communicator.mlp_output_layout = DSAMLPOutputLayout.COMPLETE
+                    communicator.layer_scatter_modes = SimpleNamespace(
+                        mlp_mode=ScatterMode.FULL
+                    )
+                    communicator._context = parallel
+                    residual = torch.zeros_like(hidden_shards[cp_rank])
+                    local, returned_residual = communicator.postprocess_layer(
+                        gathered, residual, forward_batch
+                    )
+                    self.assertTrue(torch.equal(local, hidden_shards[cp_rank]))
+                    self.assertIs(returned_residual, residual)
+
+    def test_ragged_dp1_cp_v2_preserves_consumer_sharded_physical_buckets(self):
+        from sglang.srt.layers.communicator import ScatterMode
+        from sglang.srt.layers.communicator_dsa_cp import (
+            DSACPLayerCommunicator,
+            DSAMLPOutputLayout,
+            gather_glm52_mlp_rows,
+        )
+
+        cp_size = 8
+        cp_rank = 5
+        logical_rows = 17
+        physical_rows = 8
+        logical = torch.arange(logical_rows * 2, dtype=torch.bfloat16).reshape(
+            logical_rows, 2
+        )
+        physical_shards = []
+        per_rank_logical = []
+        for rank in range(cp_size):
+            shard = logical[rank::cp_size]
+            per_rank_logical.append(shard.shape[0])
+            padded = torch.full((physical_rows, 2), -100 - rank, dtype=torch.bfloat16)
+            padded[: shard.shape[0]].copy_(shard)
+            physical_shards.append(padded)
+        expected_rank_major = torch.cat(physical_shards)
+        gathered_buffer = torch.empty_like(expected_rank_major)
+        metadata = SimpleNamespace(
+            total_seq_lens=logical_rows,
+            per_rank_logical_token=per_rank_logical,
+            per_rank_actual_token=[physical_rows] * cp_size,
+        )
+        forward_batch = SimpleNamespace(attn_cp_metadata=metadata)
+        parallel = SimpleNamespace(
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_cp_size=cp_size,
+            attn_cp_rank=cp_rank,
+            attn_tp_size=1,
+            tp_size=cp_size,
+            attn_cp_group=object(),
+        )
+
+        def fake_cp_all_gather(output, local):
+            self.assertTrue(torch.equal(local, physical_shards[cp_rank]))
+            output.copy_(expected_rank_major)
+
+        with (
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.get_local_dp_buffer",
+                return_value=gathered_buffer,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.attn_cp_all_gather_into_tensor",
+                side_effect=fake_cp_all_gather,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.dsa_use_prefill_cp",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.mla_use_prefill_cp",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.cp.base.get_cp_strategy",
+                side_effect=AssertionError(
+                    "DP1 canonical-v3b prefill must keep physical rank-major rows"
+                ),
+            ),
+        ):
+            gathered = gather_glm52_mlp_rows(physical_shards[cp_rank], forward_batch)
+            self.assertTrue(torch.equal(gathered, expected_rank_major))
+
+            communicator = object.__new__(DSACPLayerCommunicator)
+            communicator.mlp_output_layout = DSAMLPOutputLayout.COMPLETE
+            communicator.layer_scatter_modes = SimpleNamespace(
+                mlp_mode=ScatterMode.FULL
+            )
+            communicator._context = parallel
+            consumer_shard = physical_shards[cp_rank] + 1000
+            residual = torch.zeros_like(consumer_shard)
+            local, returned_residual = communicator.postprocess_layer(
+                consumer_shard, residual, forward_batch
+            )
+
+        self.assertTrue(torch.equal(local, consumer_shard))
+        self.assertIs(returned_residual, residual)
+
+    def test_cp_v2_logical_gather_rejects_invalid_strategy_row_count(self):
+        from sglang.srt.layers.communicator_dsa_cp import (
+            _gather_glm52_cp_logical_rows,
+        )
+
+        forward_batch = SimpleNamespace(
+            attn_cp_metadata=SimpleNamespace(total_seq_lens=7)
+        )
+        strategy = SimpleNamespace(gather_hidden_states=lambda rows, _batch: rows[:3])
+        with (
+            patch(
+                "sglang.srt.layers.cp.base.get_cp_strategy",
+                return_value=strategy,
+            ),
+            self.assertRaisesRegex(RuntimeError, "wrong logical row count"),
+        ):
+            _gather_glm52_cp_logical_rows(torch.zeros(4, 2), forward_batch)
+
     def test_cp16_dp1_does_not_request_mlp_tp_gather(self):
         from sglang.srt.utils.common import require_mlp_sync, require_mlp_tp_gather
 

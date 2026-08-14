@@ -29,7 +29,11 @@ from sglang.srt.lora.layers import (
 )
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
-from sglang.srt.lora.lora_manager import LoRAManager
+from sglang.srt.lora.lora_manager import (
+    LoRAManager,
+    _glm52_flatten_dp_request_segments,
+    _glm52_local_request_segments,
+)
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import LoRABatchInfo, get_normalized_target_modules
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -119,7 +123,7 @@ def _make_cp_lora_manager(batch_size, lengths=None):
 
 
 @pytest.mark.parametrize(("dp_size", "cp_size"), [(2, 8), (4, 4), (8, 2), (16, 1)])
-def test_mixed_dp_cp_lora_metadata_follows_logical_request_owner(
+def test_mixed_dp_cp_lora_metadata_preserves_ragged_requests_per_owner(
     monkeypatch, dp_size, cp_size
 ) -> None:
     import sglang.srt.lora.lora_manager as lora_manager_module
@@ -132,11 +136,14 @@ def test_mixed_dp_cp_lora_metadata_follows_logical_request_owner(
         def get_buffer_id(uid):
             return _MemoryPool.uid_to_buffer_id[uid]
 
-    adapter = SimpleNamespace(
-        config=SimpleNamespace(r=16),
-        scaling=2.0,
-        _glm52_exact_adapter_certified=True,
-    )
+    adapters = {
+        uid: SimpleNamespace(
+            config=SimpleNamespace(r=16),
+            scaling=2.0,
+            _glm52_exact_adapter_certified=True,
+        )
+        for uid in ("adapter-a", "adapter-b")
+    }
     backend = object.__new__(BaseLoRABackend)
     backend._is_moe_lora = True
     backend.batch_info = None
@@ -149,12 +156,12 @@ def test_mixed_dp_cp_lora_metadata_follows_logical_request_owner(
     manager.dp_size = dp_size
     manager.ep_size = 16
     manager.attn_cp_size = cp_size
-    manager.max_loras_per_batch = 2
+    manager.max_loras_per_batch = 3
     manager.device = torch.device("cpu")
     manager.lora_backend = backend
     manager.memory_pool = _MemoryPool()
-    manager.loras = {"adapter": adapter}
-    manager.lora_refs = {"adapter": object()}
+    manager.loras = adapters
+    manager.lora_refs = {uid: object() for uid in adapters}
 
     def _fetch(uids):
         for uid in sorted(uids, key=lambda value: (value is not None, value or "")):
@@ -163,16 +170,19 @@ def test_mixed_dp_cp_lora_metadata_follows_logical_request_owner(
             )
 
     manager.fetch_new_loras = _fetch
-    owner_rank = dp_size - 1
-    logical_uids = [None] * dp_size
-    logical_uids[owner_rank] = "adapter"
-    physical_uids = [uid for uid in logical_uids for _ in range(cp_size)]
+    owner_segments = [
+        (("adapter-a", dp_rank + 1), ("adapter-b", dp_rank + 2))
+        for dp_rank in range(dp_size)
+    ]
+    physical_segments = [
+        segments for segments in owner_segments for _ in range(cp_size)
+    ]
 
     class _Group:
         @staticmethod
-        def all_gather_object(local_uid):
-            assert local_uid is None
-            return physical_uids
+        def all_gather_object(local_segments):
+            assert local_segments == owner_segments[0]
+            return physical_segments
 
     monkeypatch.setattr(
         lora_manager_module,
@@ -183,27 +193,74 @@ def test_mixed_dp_cp_lora_metadata_follows_logical_request_owner(
             attn_cp_rank=0,
         ),
     )
-    token_counts = list(range(1, dp_size + 1))
+    token_counts = [sum(rows for _, rows in segments) for segments in owner_segments]
     forward_batch = SimpleNamespace(
-        lora_ids=[],
+        lora_ids=[uid for uid, _ in owner_segments[0]],
+        extend_seq_lens_cpu=[rows for _, rows in owner_segments[0]],
         global_num_tokens_cpu=token_counts,
         is_extend_in_batch=True,
-        forward_mode=ForwardMode.IDLE,
+        forward_mode=ForwardMode.EXTEND,
     )
 
     manager.prepare_glm52_exact_dp_lora_batch(forward_batch)
 
     info = backend.context_parallel_mlp_batch_info
     assert info.expected_tokens == sum(token_counts)
+    expected_segments = [segment for owner in owner_segments for segment in owner]
+    assert info.seg_lens.tolist() == [rows for _, rows in expected_segments]
     assert info.weight_indices.tolist() == [
-        _MemoryPool.uid_to_buffer_id["adapter" if rank == owner_rank else None]
-        for rank in range(dp_size)
+        _MemoryPool.uid_to_buffer_id[uid] for uid, _ in expected_segments
     ]
     assert info.moe_lora_info.token_lora_mapping.tolist() == [
-        _MemoryPool.uid_to_buffer_id["adapter" if rank == owner_rank else None]
-        for rank, count in enumerate(token_counts)
-        for _ in range(count)
+        _MemoryPool.uid_to_buffer_id[uid]
+        for uid, rows in expected_segments
+        for _ in range(rows)
     ]
+
+
+def test_mixed_dp_cp_lora_rejects_inconsistent_cp_request_replicas() -> None:
+    from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
+
+    ownership = LogicalRowOwnership(2, 8, 0, 0, 16)
+    owner_zero = (("adapter-a", 2), ("adapter-b", 3))
+    owner_one = (("adapter-b", 4),)
+    physical = [owner_zero] * 8 + [owner_one] * 8
+    physical[5] = (("adapter-a", 1), ("adapter-b", 4))
+    with pytest.raises(RuntimeError, match="CP replicas disagree"):
+        _glm52_flatten_dp_request_segments(ownership, physical, [5, 4])
+
+
+def test_mixed_dp_cp_lora_rejects_request_rows_beyond_owner_block() -> None:
+    from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
+
+    ownership = LogicalRowOwnership(2, 8, 0, 0, 16)
+    physical = [(("adapter-a", 2), ("adapter-b", 3))] * 8 + [()] * 8
+    with pytest.raises(RuntimeError, match="exceed their DP row block"):
+        _glm52_flatten_dp_request_segments(ownership, physical, [4, 0])
+
+
+def test_mixed_dp_cp_lora_assigns_owner_padding_to_base_slot() -> None:
+    from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
+
+    ownership = LogicalRowOwnership(2, 8, 0, 0, 16)
+    physical = [(("adapter-a", 3),)] * 8 + [(("adapter-b", 2),)] * 8
+    assert _glm52_flatten_dp_request_segments(ownership, physical, [5, 4]) == [
+        ("adapter-a", 3),
+        (None, 2),
+        ("adapter-b", 2),
+        (None, 2),
+    ]
+
+
+def test_mixed_dp_cp_lora_rejects_local_uid_length_mismatch() -> None:
+    forward_batch = SimpleNamespace(
+        lora_ids=["adapter-a", "adapter-b"],
+        extend_seq_lens_cpu=[7],
+        is_extend_in_batch=True,
+        forward_mode=ForwardMode.EXTEND,
+    )
+    with pytest.raises(RuntimeError, match="one row length per local request"):
+        _glm52_local_request_segments(forward_batch)
 
 
 def _cp_forward_batch(batch_size, lengths=None):

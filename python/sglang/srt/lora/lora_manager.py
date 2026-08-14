@@ -64,6 +64,99 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 logger = logging.getLogger(__name__)
 
 
+def _glm52_local_request_segments(
+    forward_batch: ForwardBatch,
+) -> tuple[tuple[Optional[str], int], ...]:
+    """Return the local DP owner's request UIDs and row lengths."""
+
+    lora_ids = list(forward_batch.lora_ids or [])
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    is_extend = bool(getattr(forward_batch, "is_extend_in_batch", False)) or bool(
+        forward_mode is not None and forward_mode.is_extend()
+    )
+    if is_extend:
+        lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
+        if lengths is None:
+            raise RuntimeError(
+                "GLM-5.2 gathered LoRA extend metadata requires request row lengths"
+            )
+        lengths = [int(length) for length in lengths]
+    else:
+        lengths = [1] * len(lora_ids)
+    if len(lengths) != len(lora_ids):
+        raise RuntimeError(
+            "GLM-5.2 gathered LoRA metadata requires one row length per local "
+            f"request: uids={len(lora_ids)}, lengths={len(lengths)}"
+        )
+    if any(length <= 0 for length in lengths):
+        raise RuntimeError(
+            f"GLM-5.2 gathered LoRA request row lengths must be positive: {lengths}"
+        )
+    return tuple(zip(lora_ids, lengths))
+
+
+def _glm52_flatten_dp_request_segments(
+    ownership: LogicalRowOwnership,
+    physical_segments: list[object],
+    dp_row_counts: list[int],
+) -> list[tuple[Optional[str], int]]:
+    """Collapse CP replicas and flatten each DP owner's request segments."""
+
+    if len(dp_row_counts) != ownership.dp_size or any(
+        count < 0 for count in dp_row_counts
+    ):
+        raise RuntimeError(
+            "GLM-5.2 gathered LoRA DP row metadata must provide one nonnegative "
+            "count per logical owner"
+        )
+    try:
+        owner_segments = ownership.select_dp_representatives(physical_segments)
+    except ValueError as error:
+        raise RuntimeError(str(error)) from error
+
+    flattened: list[tuple[Optional[str], int]] = []
+    for dp_rank, (segments, capacity) in enumerate(zip(owner_segments, dp_row_counts)):
+        if not isinstance(segments, (tuple, list)):
+            raise RuntimeError(
+                "GLM-5.2 gathered LoRA ownership metadata must contain request "
+                f"segments at dp_rank={dp_rank}"
+            )
+        normalized: list[tuple[Optional[str], int]] = []
+        for segment in segments:
+            if not isinstance(segment, (tuple, list)) or len(segment) != 2:
+                raise RuntimeError(
+                    "GLM-5.2 gathered LoRA request segments must be (uid, rows) pairs"
+                )
+            uid, rows = segment
+            if uid is not None and not isinstance(uid, str):
+                raise RuntimeError(
+                    "GLM-5.2 gathered LoRA request UIDs must be strings or None"
+                )
+            try:
+                rows = int(rows)
+            except (TypeError, ValueError) as error:
+                raise RuntimeError(
+                    "GLM-5.2 gathered LoRA request row counts must be integers"
+                ) from error
+            if rows <= 0:
+                raise RuntimeError(
+                    "GLM-5.2 gathered LoRA request row counts must be positive"
+                )
+            normalized.append((uid, rows))
+        request_rows = sum(rows for _, rows in normalized)
+        if request_rows > capacity:
+            raise RuntimeError(
+                "GLM-5.2 gathered LoRA requests exceed their DP row block: "
+                f"dp_rank={dp_rank}, requests={request_rows}, capacity={capacity}"
+            )
+        flattened.extend(normalized)
+        if request_rows < capacity:
+            # DP synchronization padding is appended after the owner's real
+            # requests. Keep those dummy rows on the base-model slot.
+            flattened.append((None, capacity - request_rows))
+    return flattened
+
+
 class LoRAManager:
     def __init__(
         self,
@@ -750,7 +843,7 @@ class LoRAManager:
         self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
 
     def prepare_glm52_exact_dp_lora_batch(self, forward_batch: ForwardBatch) -> None:
-        """Build logical-owner LoRA metadata for DP/CP-gathered GLM rows."""
+        """Build per-request LoRA metadata for DP/CP-gathered logical rows."""
 
         if not getattr(self.base_hf_config, "_glm52_exact_mode", False):
             return
@@ -773,30 +866,22 @@ class LoRAManager:
                 "Gather-aware GLM-5.2 active LoRA admits eager execution only."
             )
 
-        local_lora_ids = list(forward_batch.lora_ids or [])
-        if len(local_lora_ids) > 1:
-            raise RuntimeError(
-                "The exact GLM-5.2 DP-owned lane admits at most one logical "
-                f"request per DP rank, got {len(local_lora_ids)}."
-            )
-        local_uid = local_lora_ids[0] if local_lora_ids else None
-        physical_uids = parallel.tp_group.all_gather_object(local_uid)
-        try:
-            global_uids = ownership.select_dp_representatives(physical_uids)
-        except ValueError as error:
-            raise RuntimeError(str(error)) from error
+        local_segments = _glm52_local_request_segments(forward_batch)
+        physical_segments = parallel.tp_group.all_gather_object(local_segments)
         global_num_tokens = list(forward_batch.global_num_tokens_cpu or [])
-        if len(global_uids) != len(global_num_tokens):
-            raise RuntimeError(
-                "GLM-5.2 gathered LoRA ownership does not match the logical DP row "
-                f"layout: owners={len(global_uids)}, row_segments={len(global_num_tokens)}."
-            )
+        global_segments = _glm52_flatten_dp_request_segments(
+            ownership, physical_segments, global_num_tokens
+        )
+        global_uids = [uid for uid, _ in global_segments]
+        global_request_lens = [rows for _, rows in global_segments]
 
         active_uids = {uid for uid in global_uids if uid is not None}
-        if len(active_uids) > 1:
+        active_adapter_limit = self.max_loras_per_batch - 1
+        if len(active_uids) > active_adapter_limit:
             raise RuntimeError(
-                "The first exact GLM-5.2 DP-owned lane admits one active "
-                f"adapter globally, got {sorted(active_uids)}."
+                "GLM-5.2 gathered LoRA batch exceeds the one-base-plus-adapter "
+                f"resident layout: active={sorted(active_uids)}, "
+                f"adapter_limit={active_adapter_limit}."
             )
         missing = sorted(
             uid
@@ -832,23 +917,25 @@ class LoRAManager:
                 scalings[slot] = adapter.scaling
 
         device = self.device
-        segment_lens = torch.tensor(global_num_tokens, dtype=torch.int32, device=device)
+        segment_lens = torch.tensor(
+            global_request_lens, dtype=torch.int32, device=device
+        )
         segment_indptr = torch.zeros(
-            (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
+            (len(global_request_lens) + 1,), dtype=torch.int32, device=device
         )
         segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
-        total_tokens = sum(global_num_tokens)
+        total_tokens = sum(global_request_lens)
         global_batch_info = LoRABatchInfo(
             use_cuda_graph=False,
-            bs=len(global_num_tokens),
-            num_segments=len(global_num_tokens),
+            bs=len(global_request_lens),
+            num_segments=len(global_request_lens),
             seg_indptr=segment_indptr,
             weight_indices=torch.tensor(
                 weight_indices, dtype=torch.int32, device=device
             ),
             lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=device),
             scalings=torch.tensor(scalings, dtype=torch.float32, device=device),
-            max_len=max(global_num_tokens, default=0),
+            max_len=max(global_request_lens, default=0),
             seg_lens=segment_lens,
             permutation=None,
             expected_tokens=total_tokens,
@@ -860,15 +947,17 @@ class LoRAManager:
         )
 
         physical_batch = copy(forward_batch)
-        physical_batch.batch_size = len(global_num_tokens)
+        physical_batch.batch_size = len(global_request_lens)
         physical_batch.lora_ids = global_uids
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        is_extend = bool(getattr(forward_batch, "is_extend_in_batch", False)) or bool(
+            forward_mode is not None and forward_mode.is_extend()
+        )
         physical_batch.forward_mode = (
-            ForwardMode.EXTEND
-            if forward_batch.is_extend_in_batch
-            else ForwardMode.DECODE
+            ForwardMode.EXTEND if is_extend else ForwardMode.DECODE
         )
         physical_batch.extend_num_tokens = total_tokens
-        physical_batch.extend_seq_lens_cpu = global_num_tokens
+        physical_batch.extend_seq_lens_cpu = global_request_lens
         physical_batch.extend_seq_lens = segment_lens
         global_batch_info = self.lora_backend._add_moe_lora_info(
             physical_batch, global_batch_info
@@ -886,10 +975,11 @@ class LoRAManager:
         that metadata, so leaving the global sequence lengths installed while
         the body sees only rank-local rows can issue out-of-bounds accesses.
 
-        Sparse MLPs gather those local rows in raw rank-major order before
-        reducing/scattering them again. Build both rank-local body metadata and
-        DP-major/CP-minor physical MLP metadata, then restore the full object
-        before returning to logits processing.
+        Mixed DP/CP MLPs gather those local rows back into the CP strategy's
+        logical request order; DP1 retains its consumer-sharded rank-major
+        transport. Build rank-local physical metadata for the sharded body and
+        matching gathered metadata, then restore the full object before
+        returning to logits processing.
 
         This context is only for CP-v2 extend. WORLD16 decode does not shard
         rows through CP-v2: its CUDA graph uses the backend's fixed decode
@@ -1100,25 +1190,8 @@ class LoRAManager:
             local_request_indices, local_lens_cpu = physical_segments(cp_rank)
             local_batch_info = build_batch_info(local_request_indices, local_lens_cpu)
 
-            gathered_request_indices = []
-            gathered_lens_cpu = []
-            for rank in range(cp_size):
-                rank_request_indices, rank_lens_cpu = physical_segments(rank)
-                gathered_request_indices.extend(rank_request_indices)
-                gathered_lens_cpu.extend(rank_lens_cpu)
-            cp_gathered_batch_info = build_batch_info(
-                gathered_request_indices, gathered_lens_cpu
-            )
-            expected_gathered_tokens = sum(physical_rank_tokens)
-            if cp_gathered_batch_info.expected_tokens != expected_gathered_tokens:
-                raise RuntimeError(
-                    "GLM-5.2 CP-v2 LoRA gathered metadata has the wrong row count: "
-                    f"metadata_rows={cp_gathered_batch_info.expected_tokens}, "
-                    f"collective_rows={expected_gathered_tokens}."
-                )
-
-            gathered_batch_info = cp_gathered_batch_info
             if ownership.dp_size > 1:
+                gathered_batch_info = None
                 if prepared_global_mlp_info is None:
                     if full_batch_info.has_active_lora:
                         raise RuntimeError(
@@ -1132,6 +1205,23 @@ class LoRAManager:
                             f"metadata_rows={prepared_global_mlp_info.expected_tokens}, rows={global_rows}"
                         )
                     gathered_batch_info = prepared_global_mlp_info
+            else:
+                gathered_request_indices = []
+                gathered_lens_cpu = []
+                for rank in range(cp_size):
+                    rank_request_indices, rank_lens_cpu = physical_segments(rank)
+                    gathered_request_indices.extend(rank_request_indices)
+                    gathered_lens_cpu.extend(rank_lens_cpu)
+                gathered_batch_info = build_batch_info(
+                    gathered_request_indices, gathered_lens_cpu
+                )
+                expected_gathered_tokens = sum(physical_rank_tokens)
+                if gathered_batch_info.expected_tokens != expected_gathered_tokens:
+                    raise RuntimeError(
+                        "GLM-5.2 CP-v2 LoRA gathered metadata has the wrong row count: "
+                        f"metadata_rows={gathered_batch_info.expected_tokens}, "
+                        f"collective_rows={expected_gathered_tokens}."
+                    )
 
             backend.batch_info = local_batch_info
             backend.context_parallel_mlp_batch_info = gathered_batch_info
