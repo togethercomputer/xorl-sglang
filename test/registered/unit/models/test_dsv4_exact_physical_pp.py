@@ -318,7 +318,11 @@ def _make_exact_dsv4_stage(rank, world_size, layer_range, *, rows=3, hidden=4):
 
 
 def _forward_batch(positions):
-    return SimpleNamespace(can_run_tbo=False, positions=positions)
+    return SimpleNamespace(
+        can_run_tbo=False,
+        forward_mode=ForwardMode.EXTEND,
+        positions=positions,
+    )
 
 
 def test_cp_v2_ragged_prefill_aligns_fused_q_rows_and_keeps_full_pp_metadata():
@@ -1127,6 +1131,68 @@ def test_cp_v2_interleave_gathers_raw_rows_and_positions_without_physical_paddin
     assert local_positions.tolist() == [0, 15, 0, 0]
     assert torch.equal(gathered_raw_kv, complete_raw_kv)
     assert torch.equal(gathered_positions, complete_positions)
+
+
+@pytest.mark.parametrize("use_cp", [False, True])
+def test_exact_nvidia_cp_and_non_cp_share_canonical_q_kv_program(use_cp):
+    rows = torch.arange(12, dtype=torch.bfloat16).view(3, 4)
+    positions = torch.tensor([7, 8, 9], dtype=torch.int64)
+    forward_batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+    attn = MQALayer.__new__(MQALayer)
+    nn.Module.__init__(attn)
+    attn.fuse_wqa_wkv = False
+    attn.q_lora_rank = 2
+    attn.wq_a = _TupleIdentity()
+    attn.wkv = lambda values: (values * 3, None)
+    attn.q_norm = nn.Identity()
+    attn.dsv4_flash_exact_mode = True
+    attn.dsa_enable_prefill_cp = True
+    attn.use_fused_qk_norm_rope = True
+    attn.indexer = None
+    attn.compressor = None
+
+    calls = []
+
+    def compute_q_b(q, q_positions, q_out):
+        assert q_out is None
+        calls.append(("q", q.detach().clone(), q_positions.detach().clone()))
+        return q
+
+    def store_raw_kv(kv, kv_positions, got_forward_batch, got_backend):
+        calls.append(("store", kv.detach().clone(), kv_positions.detach().clone()))
+        assert got_forward_batch is forward_batch
+        assert got_backend is backend
+
+    def gather_raw_kv(kv, kv_positions, got_forward_batch, got_backend):
+        calls.append(("gather", kv.detach().clone(), kv_positions.detach().clone()))
+        assert got_forward_batch is forward_batch
+        assert got_backend is backend
+
+    attn._compute_q_b = compute_q_b
+    attn._store_raw_kv_to_cache = store_raw_kv
+    attn._gather_exact_cp_raw_kv_to_cache = gather_raw_kv
+    backend = object()
+
+    with (
+        patch("sglang.srt.models.deepseek_v4.dsa_use_prefill_cp", return_value=use_cp),
+        patch("sglang.srt.models.deepseek_v4._is_cuda", True),
+        patch("sglang.srt.models.deepseek_v4._is_hip", False),
+        patch(
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+            "is_unified_kv_triton",
+            return_value=False,
+        ),
+    ):
+        q, kv = attn._forward_prepare(rows, positions, forward_batch, backend)
+
+    assert q is not None
+    assert kv is None
+    assert [call[0] for call in calls] == ["q", "gather" if use_cp else "store"]
+    assert torch.equal(calls[0][1], rows)
+    assert torch.equal(calls[0][2], positions)
+    assert torch.equal(calls[1][1], rows * 3)
+    assert torch.equal(calls[1][2], positions)
 
 
 @pytest.mark.parametrize("fused_qkv", [False, True])

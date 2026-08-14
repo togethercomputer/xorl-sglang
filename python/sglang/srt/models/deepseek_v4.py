@@ -1236,21 +1236,23 @@ class MQALayer(MqaAttentionBase):
             not unified and self.use_fused_qk_norm_rope
         )
 
-        exact_nvidia_cp_raw_store = (
-            use_cp
-            and getattr(self, "dsv4_flash_exact_mode", False)
+        exact_nvidia_raw_store = (
+            getattr(self, "dsv4_flash_exact_mode", False)
             and _is_cuda
             and not _is_hip
             and not unified
         )
 
-        if exact_nvidia_cp_raw_store:
+        if exact_nvidia_raw_store:
             q_lora = self.q_norm(q_lora)
             q = self._compute_q_b(q_lora, positions, q_out)
             kv = self._compute_raw_kv(x_linear, qkv_a=qkv_a)
-            self._gather_exact_cp_raw_kv_to_cache(
-                kv, positions, forward_batch, attn_backend
-            )
+            if use_cp:
+                self._gather_exact_cp_raw_kv_to_cache(
+                    kv, positions, forward_batch, attn_backend
+                )
+            else:
+                self._store_raw_kv_to_cache(kv, positions, forward_batch, attn_backend)
             kv = None
         elif do_fused_store:
             if _is_gfx95_supported:
