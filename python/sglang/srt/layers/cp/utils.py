@@ -262,25 +262,31 @@ def cp_shard_model_inputs(
     local_cache_loc_marker_backup = getattr(
         forward_batch, "_cp_v2_out_cache_loc_is_local", False
     )
+    sharded_out_cache_loc = None
     if shard_out_cache_loc and out_cache_loc_backup is not None:
-        forward_batch.out_cache_loc = cp_shard_hidden_states(
+        sharded_out_cache_loc = cp_shard_hidden_states(
             out_cache_loc_backup, forward_batch
         )
-        forward_batch._cp_v2_out_cache_loc_is_local = True
 
     spec_info = getattr(forward_batch, "spec_info", None)
     spec_hidden_states = getattr(spec_info, "hidden_states", None)
     spec_hidden_states_backup = None
+    sharded_spec_hidden_states = None
     if (
         spec_hidden_states is not None
         and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
     ):
         spec_hidden_states_backup = spec_hidden_states
-        spec_info.hidden_states = cp_shard_hidden_states(
+        sharded_spec_hidden_states = cp_shard_hidden_states(
             spec_hidden_states, forward_batch
         )
 
     try:
+        if sharded_out_cache_loc is not None:
+            forward_batch.out_cache_loc = sharded_out_cache_loc
+            forward_batch._cp_v2_out_cache_loc_is_local = True
+        if sharded_spec_hidden_states is not None:
+            spec_info.hidden_states = sharded_spec_hidden_states
         yield sharded_hidden_states, sharded_positions
     finally:
         if shard_out_cache_loc and out_cache_loc_backup is not None:

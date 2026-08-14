@@ -21,6 +21,7 @@ from sglang.srt.layers.cp.padding import (
     pad_logical_token_to_physical,
 )
 from sglang.srt.layers.cp.utils import (
+    cp_shard_model_inputs,
     cp_split_before_forward,
     enable_cp_v2,
     is_cp_v2_active,
@@ -100,6 +101,79 @@ class TestCPStrategyUnit(CustomTestCase):
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
         ):
             self.assertIsNotNone(get_cp_strategy())
+
+    def test_shard_model_inputs_setup_failure_preserves_shared_batch(self):
+        complete_hidden_states = torch.arange(16).view(4, 4)
+        complete_position_ids = torch.arange(4)
+        original_out_cache_loc = torch.arange(1, 5)
+        original_spec_hidden_states = complete_hidden_states + 100
+        sharded_hidden_states = complete_hidden_states[:2]
+        sharded_position_ids = complete_position_ids[:2]
+        sharded_out_cache_loc = original_out_cache_loc[:2]
+        marker_sentinel = object()
+
+        def shard_hidden_states(value, _forward_batch):
+            if value is complete_hidden_states:
+                return sharded_hidden_states
+            if value is original_out_cache_loc:
+                return sharded_out_cache_loc
+            if value is original_spec_hidden_states:
+                raise RuntimeError("spec shard failed")
+            raise AssertionError("unexpected shard input")
+
+        for marker_exists in (False, True):
+            with self.subTest(marker_exists=marker_exists):
+                spec_info = SimpleNamespace(hidden_states=original_spec_hidden_states)
+                forward_batch = SimpleNamespace(
+                    out_cache_loc=original_out_cache_loc,
+                    spec_info=spec_info,
+                )
+                if marker_exists:
+                    forward_batch._cp_v2_out_cache_loc_is_local = marker_sentinel
+
+                with (
+                    patch(
+                        "sglang.srt.layers.cp.utils.is_cp_v2_active",
+                        return_value=True,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.utils.cp_shard_hidden_states",
+                        side_effect=shard_hidden_states,
+                    ),
+                    patch(
+                        "sglang.srt.layers.cp.utils.cp_shard_position_ids",
+                        return_value=sharded_position_ids,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "spec shard failed"),
+                ):
+                    with cp_shard_model_inputs(
+                        complete_hidden_states,
+                        complete_position_ids,
+                        forward_batch,
+                        shard_out_cache_loc=True,
+                    ):
+                        self.fail("context manager yielded after setup failure")
+
+                self.assertIs(forward_batch.out_cache_loc, original_out_cache_loc)
+                self.assertTrue(
+                    torch.equal(forward_batch.out_cache_loc, torch.arange(1, 5))
+                )
+                self.assertIs(spec_info.hidden_states, original_spec_hidden_states)
+                self.assertTrue(
+                    torch.equal(
+                        spec_info.hidden_states,
+                        complete_hidden_states + 100,
+                    )
+                )
+                if marker_exists:
+                    self.assertIs(
+                        forward_batch._cp_v2_out_cache_loc_is_local,
+                        marker_sentinel,
+                    )
+                else:
+                    self.assertFalse(
+                        hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+                    )
 
 
 class TestCPZigzagStrategy(CustomTestCase):
