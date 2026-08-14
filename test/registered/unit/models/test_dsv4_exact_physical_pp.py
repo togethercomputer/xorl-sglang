@@ -8,6 +8,10 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    is_dsa_enable_prefill_cp,
+)
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.layers.cp.utils import (
     cp_shard_model_inputs,
@@ -395,6 +399,13 @@ def test_cp_v2_keeps_dp_max_padding_in_exact_owner_block():
         attn_cp_size=4,
         attn_cp_group=object(),
     )
+    hf_config = SimpleNamespace(
+        architectures=["DeepseekV4ForCausalLM"],
+        index_topk=2048,
+    )
+    server_args = SimpleNamespace(
+        get_model_config=lambda: SimpleNamespace(hf_config=hf_config)
+    )
 
     def all_gather(output, _local):
         output.copy_(
@@ -427,6 +438,18 @@ def test_cp_v2_keeps_dp_max_padding_in_exact_owner_block():
         patch("sglang.srt.layers.cp.base.get_parallel", return_value=parallel),
         patch("sglang.srt.layers.cp.interleave.get_parallel", return_value=parallel),
         patch(
+            "sglang.srt.layers.attention.dsa.utils.envs.SGLANG_ENABLE_CP_V2.get",
+            return_value=True,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsa.utils.get_parallel",
+            return_value=parallel,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsa.utils.get_server_args",
+            return_value=server_args,
+        ),
+        patch(
             "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
             return_value=4,
         ),
@@ -446,17 +469,23 @@ def test_cp_v2_keeps_dp_max_padding_in_exact_owner_block():
     ):
         prepare_cp_forward(forward_batch)
         local_rows = strategy.shard_hidden_states(input_ids, forward_batch)
+        context_sharded = dsa_use_prefill_cp(
+            forward_batch,
+            dsa_enable_prefill_cp=is_dsa_enable_prefill_cp(),
+        )
         reconstructed = reconstruct_dsv4_dp_rows(
             local_rows,
             forward_batch,
             LogicalRowOwnership(2, 4, 0, 0, 8),
             [6, 6],
-            context_sharded=True,
+            context_sharded=context_sharded,
             strategy=strategy,
         )
 
     assert forward_batch.attn_cp_metadata.total_seq_lens == 6
     assert forward_batch.attn_cp_metadata.per_rank_logical_token == [2, 2, 1, 1]
+    assert local_rows.shape == (4,)
+    assert context_sharded
     assert forward_batch.out_cache_loc.shape[0] == 6
     assert torch.equal(reconstructed, input_ids)
 

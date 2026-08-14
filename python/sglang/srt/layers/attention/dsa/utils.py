@@ -108,12 +108,13 @@ def is_dsa_enable_prefill_cp():
 
     # Derive from the runtime CP topology + model arch rather than the legacy
     # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
-    # DeepSeek Sparse Attention model.
+    # DeepSeek Sparse Attention or DeepSeek-V4 model.
     if get_parallel().attn_cp_size <= 1:
         return False
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
-    return is_deepseek_dsa(get_server_args().get_model_config().hf_config)
+    hf_config = get_server_args().get_model_config().hf_config
+    return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():
