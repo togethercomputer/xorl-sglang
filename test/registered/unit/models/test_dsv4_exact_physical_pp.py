@@ -7,12 +7,15 @@ import pytest
 import torch
 from torch import nn
 
-from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.utils import cp_split_before_forward, prepare_cp_forward
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.runner_utils.buffers import (
     add_dsv4_exact_pp_proxy_buffers,
 )
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4Model,
+    MQALayer,
     pack_dsv4_exact_pp_proxy,
     unpack_dsv4_exact_pp_proxy,
 )
@@ -186,6 +189,36 @@ class _IdentityHeadNorm(nn.Module):
         return hidden
 
 
+class _TupleIdentity(nn.Module):
+    def forward(self, hidden):
+        return hidden, None
+
+
+class _FusedQContractLayer(_FusedMHCLayer):
+    """Reach DSV4's real fused-Q call from a small model-stage fixture."""
+
+    def __init__(self, layer_id: int, hc_mult: int, hidden_size: int):
+        super().__init__(layer_id, hc_mult)
+        self.attn = MQALayer.__new__(MQALayer)
+        nn.Module.__init__(self.attn)
+        self.attn.wq_b = _TupleIdentity()
+        self.attn.n_local_heads = 1
+        self.attn.head_dim = hidden_size
+        self.attn.eps = 1e-6
+        self.attn.freqs_cis = torch.empty(0)
+
+    def forward(self, **kwargs):
+        hidden_states = kwargs["hidden_states"]
+        positions = kwargs["positions"]
+        self.attn._compute_q_b(hidden_states.mean(dim=1), positions)
+        return super().forward(**kwargs)
+
+
+class _UnexpectedEmbedding(nn.Module):
+    def forward(self, _input_ids):
+        raise AssertionError("CP-local input_embeds must bypass full-id embedding")
+
+
 def test_model_constructor_owns_config_used_by_exact_pp_and_graph_forward():
     config = SimpleNamespace(
         _dsv4_flash_exact_mode=True,
@@ -246,8 +279,92 @@ def _make_exact_dsv4_stage(rank, world_size, layer_range, *, rows=3, hidden=4):
     return model
 
 
-def _forward_batch():
-    return SimpleNamespace(can_run_tbo=False)
+def _forward_batch(positions):
+    return SimpleNamespace(can_run_tbo=False, positions=positions)
+
+
+def test_cp_v2_ragged_prefill_aligns_fused_q_rows_and_keeps_full_pp_metadata():
+    """CP-local Q rows must coexist with full logical exact-PP metadata."""
+
+    input_ids = torch.arange(10, dtype=torch.int64)
+    positions = torch.arange(10, dtype=torch.int64)
+    complete_embeds = torch.arange(40, dtype=torch.float32).view(10, 4)
+    forward_batch = SimpleNamespace(
+        can_run_tbo=False,
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=positions,
+        seq_lens_cpu=torch.tensor([10]),
+        extend_seq_lens_cpu=[10],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=None,
+        out_cache_loc=None,
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    cp_parallel = SimpleNamespace(attn_cp_rank=2, attn_cp_size=4)
+
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=cp_parallel),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        local_embeds, local_positions = cp_split_before_forward(
+            complete_embeds, positions, forward_batch
+        )
+
+    metadata = forward_batch.attn_cp_metadata
+    assert metadata.per_rank_logical_token == [3, 3, 2, 2]
+    assert metadata.per_rank_actual_token == [4, 4, 4, 4]
+    assert torch.equal(local_positions, torch.tensor([2, 6, 0, 0]))
+    assert local_embeds.shape == (4, 4)
+
+    model = _make_exact_dsv4_stage(0, 2, (0, 1))
+    model.layers[0] = _FusedQContractLayer(0, model.hc_mult, model.hidden_size)
+    model.embed_tokens = _UnexpectedEmbedding()
+    fused_contract = {}
+
+    def _fused_q_norm_rope(q, q_out, _eps, _freqs_cis, q_positions):
+        fused_contract["q_rows"] = q.shape[0]
+        fused_contract["q"] = q[:, 0, :].detach().clone()
+        fused_contract["positions"] = q_positions.detach().clone()
+        assert q.shape[0] == q_positions.shape[0]
+        q_out.copy_(q)
+
+    with (
+        patch(
+            "sglang.srt.models.deepseek_v4.fused_q_norm_rope",
+            side_effect=_fused_q_norm_rope,
+        ),
+        patch("sglang.srt.models.deepseek_v4.dsa_use_prefill_cp", return_value=False),
+        patch(
+            "sglang.srt.models.deepseek_v4.check_cuda_graph_backend",
+            return_value=True,
+        ),
+    ):
+        proxy = model(
+            input_ids,
+            local_positions,
+            forward_batch,
+            input_embeds=local_embeds,
+        )
+
+    assert fused_contract["q_rows"] == 4
+    assert torch.equal(fused_contract["q"], local_embeds)
+    assert torch.equal(fused_contract["positions"], local_positions)
+    proxy_hidden, _, _, _, proxy_ids, proxy_positions = unpack_dsv4_exact_pp_proxy(
+        proxy,
+        hc_mult=model.hc_mult,
+        hidden_size=model.hidden_size,
+        deferred_mhc=True,
+    )
+    assert proxy_hidden.shape[0] == 4
+    assert torch.equal(proxy_ids, input_ids)
+    assert torch.equal(proxy_positions, positions)
 
 
 def test_fused_mhc_first_middle_last_flow_matches_uncut_model_and_backward():
@@ -269,7 +386,7 @@ def test_fused_mhc_first_middle_last_flow_matches_uncut_model_and_backward():
     ):
         uncut = _make_exact_dsv4_stage(0, 1, (0, 3))
         uncut_out, uncut_pre_head = uncut(
-            input_ids, positions, _forward_batch(), input_embeds=None
+            input_ids, positions, _forward_batch(positions), input_embeds=None
         )
 
         stages = [
@@ -277,21 +394,21 @@ def test_fused_mhc_first_middle_last_flow_matches_uncut_model_and_backward():
             _make_exact_dsv4_stage(1, 3, (1, 2)),
             _make_exact_dsv4_stage(2, 3, (2, 3)),
         ]
-        proxy = stages[0](input_ids, positions, _forward_batch(), None)
+        proxy = stages[0](input_ids, positions, _forward_batch(positions), None)
         assert isinstance(proxy, PPProxyTensors)
         # Later schedulers may hold stage-local placeholders. The proxy must
         # restore the logical owner's ids and positions before the layer runs.
         proxy = stages[1](
             torch.tensor([30, 30, 30]),
             torch.tensor([90, 90, 90]),
-            _forward_batch(),
+            _forward_batch(torch.tensor([90, 90, 90])),
             None,
             proxy,
         )
         staged_out, staged_pre_head = stages[2](
             torch.tensor([31, 31, 31]),
             torch.tensor([91, 91, 91]),
-            _forward_batch(),
+            _forward_batch(torch.tensor([91, 91, 91])),
             None,
             proxy,
         )

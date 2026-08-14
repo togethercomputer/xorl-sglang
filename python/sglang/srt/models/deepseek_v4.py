@@ -2675,7 +2675,10 @@ class DeepseekV4Model(nn.Module):
         use_fused = self.use_fused_mhc_post_pre
         prev_residual = prev_post = prev_comb = None
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            exact_positions = forward_batch.positions if dsv4_exact_mode else positions
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
@@ -2706,7 +2709,9 @@ class DeepseekV4Model(nn.Module):
             # scheduler fields, these tensors are explicitly forwarded through
             # every physical pipeline stage with the live mHC state.
             forward_batch._dsv4_exact_dp_input_ids = input_ids.reshape(-1)
-            forward_batch._dsv4_exact_dp_positions = positions.reshape(-1)
+            forward_batch._dsv4_exact_dp_positions = (
+                exact_positions if self.pp_group.is_first_rank else positions
+            ).reshape(-1)
             forward_batch.dsv4_exact_logits_rows_reconstructed = False
             forward_batch.dsv4_exact_logits_owner_rows = None
             forward_batch.dsv4_exact_logits_dp_rank = None
