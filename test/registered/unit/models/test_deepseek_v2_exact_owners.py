@@ -311,6 +311,83 @@ class TestGlm52ExactOwners(CustomTestCase):
                 mlp_reduce_scatter=False,
             )
 
+    def test_mixed_dp_cp_prefill_uses_transient_replicated_workspace(self):
+        moe = object.__new__(deepseek_v2.DeepseekV2MoE)
+        torch.nn.Module.__init__(moe)
+        moe.tp_size = 16
+        moe.moe_ep_size = 16
+        moe.glm52_parallel_plan = SamplerParallelPlan.glm52(
+            contributors=16,
+            attention_dp_size=4,
+        )
+        moe.gate = SimpleNamespace(
+            e_score_correction_bias=torch.zeros(16, dtype=torch.float32),
+            dsa_enable_prefill_cp=True,
+            mla_enable_prefill_cp=False,
+        )
+        moe._glm52_canonical_transport = "auto"
+        moe._glm52_deferred_status_book = None
+        moe.layer_id = 7
+
+        local_partial = torch.arange(64, dtype=torch.bfloat16).reshape(16, 4)
+        positions = torch.arange(16, dtype=torch.int64)
+        output = SimpleNamespace(
+            values=local_partial + 1,
+            contract_status=torch.zeros((), dtype=torch.int32),
+            raise_for_status=MagicMock(),
+        )
+        group = object()
+        workspace = object()
+        forward_batch = object()
+        with (
+            patch.object(deepseek_v2, "dsa_use_prefill_cp", return_value=True),
+            patch.object(deepseek_v2, "mla_use_prefill_cp", return_value=False),
+            patch.object(
+                deepseek_v2,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_group=SimpleNamespace(device_group=group)
+                ),
+            ),
+            patch.object(deepseek_v2, "get_is_capture_mode", return_value=False),
+            patch.object(
+                moe,
+                "_get_canonical_v3_workspace",
+                return_value=workspace,
+            ) as get_workspace,
+            patch.object(
+                deepseek_v2,
+                "canonicalize_glm52_local_partial_v3",
+                return_value=output,
+            ) as prefill_v3,
+        ):
+            actual = moe._canonicalize_glm52_partial(
+                local_partial,
+                positions,
+                forward_batch=forward_batch,
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=False,
+            )
+
+        self.assertIs(actual, output.values)
+        get_workspace.assert_called_once_with(
+            (
+                CanonicalDistribution.REPLICATED_CANONICAL.value,
+                16,
+                (4,),
+                torch.bfloat16,
+                local_partial.device,
+            ),
+            local_partial,
+            plan=moe.glm52_parallel_plan,
+            group=group,
+            distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+            capture_mode=False,
+            cache_eager=False,
+        )
+        prefill_v3.assert_called_once()
+        output.raise_for_status.assert_called_once()
+
     def test_complete_cp_owner_selects_rows_without_legacy_sum_and_fails_closed(self):
         communicator = object.__new__(DSACPLayerCommunicator)
         communicator.mlp_output_layout = DSAMLPOutputLayout.COMPLETE
@@ -375,7 +452,15 @@ class TestCanonicalWorkspaceRetention(CustomTestCase):
     def _key(distribution, capacity):
         return (distribution.value, capacity, (4,), torch.bfloat16, "cpu")
 
-    def _mint(self, moe, distribution, capacity, capture_mode):
+    def _mint(
+        self,
+        moe,
+        distribution,
+        capacity,
+        capture_mode,
+        *,
+        cache_eager=True,
+    ):
         with patch.object(
             deepseek_v2.CanonicalMoEV3Workspace, "allocate", return_value=object()
         ) as allocate:
@@ -386,6 +471,7 @@ class TestCanonicalWorkspaceRetention(CustomTestCase):
                 group=object(),
                 distribution=distribution,
                 capture_mode=capture_mode,
+                cache_eager=cache_eager,
             )
         return workspace, allocate
 
@@ -419,12 +505,18 @@ class TestCanonicalWorkspaceRetention(CustomTestCase):
         self._mint(moe, sharded, 512, capture_mode=False)
         self.assertIn(original_key, moe._canonical_v3_workspaces)
 
-    def test_capture_minted_and_replicated_entries_survive_eviction(self):
+    def test_capture_minted_and_cached_replicated_entries_survive_eviction(self):
         moe = self._moe()
         sharded = CanonicalDistribution.CONSUMER_SHARDED
         replicated = CanonicalDistribution.REPLICATED_CANONICAL
         # Captured decode bucket and a captured sharded entry: pinned.
-        self._mint(moe, replicated, 16, capture_mode=True)
+        self._mint(
+            moe,
+            replicated,
+            16,
+            capture_mode=True,
+            cache_eager=False,
+        )
         self._mint(moe, sharded, 256, capture_mode=True)
         # Eager replicated entry: outside the eviction scope.
         self._mint(moe, replicated, 32, capture_mode=False)
@@ -440,6 +532,30 @@ class TestCanonicalWorkspaceRetention(CustomTestCase):
                 self._key(sharded, 512),
             },
         )
+
+    def test_eager_replicated_prefill_workspace_is_transient(self):
+        moe = self._moe()
+        replicated = CanonicalDistribution.REPLICATED_CANONICAL
+
+        first, first_allocate = self._mint(
+            moe,
+            replicated,
+            1024,
+            capture_mode=False,
+            cache_eager=False,
+        )
+        second, second_allocate = self._mint(
+            moe,
+            replicated,
+            1024,
+            capture_mode=False,
+            cache_eager=False,
+        )
+
+        self.assertIsNot(first, second)
+        first_allocate.assert_called_once()
+        second_allocate.assert_called_once()
+        self.assertEqual(moe._canonical_v3_workspaces, {})
 
 
 if __name__ == "__main__":

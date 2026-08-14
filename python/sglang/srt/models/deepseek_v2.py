@@ -1452,8 +1452,9 @@ class DeepseekV2MoE(nn.Module):
         group,
         distribution,
         capture_mode: bool,
+        cache_eager: bool = True,
     ) -> CanonicalMoEV3Workspace:
-        """Get-or-allocate the canonical fold workspace, single-slot for prefill-CP.
+        """Get or allocate a canonical-fold workspace.
 
         The former unbounded keying retained one workspace set per distinct
         CP-padded capacity bucket (~92 MiB per sparse layer per 256-row bucket
@@ -1466,12 +1467,26 @@ class DeepseekV2MoE(nn.Module):
         evicted (decode's REPLICATED_CANONICAL bucket). Prefill CUDA graphs
         are disabled on this lane, so CONSUMER_SHARDED entries are
         eager-only and safe to drop when the capacity bucket changes.
+
+        Mixed DP x CP prefill is also REPLICATED_CANONICAL, but its collective
+        workspace is contributor-count times the prompt payload. Keeping one
+        such eager workspace in every sparse layer makes residency grow with
+        model depth. Callers therefore leave those eager workspaces uncached;
+        the returned result tensor keeps only its own storage alive.
         """
-        workspace = self._canonical_v3_workspaces.get(workspace_key)
-        if workspace is not None:
-            if capture_mode:
-                self._canonical_v3_pinned_keys.add(workspace_key)
-            return workspace
+        if capture_mode or cache_eager:
+            workspace = self._canonical_v3_workspaces.get(workspace_key)
+            if workspace is not None:
+                if capture_mode:
+                    self._canonical_v3_pinned_keys.add(workspace_key)
+                return workspace
+        if not capture_mode and not cache_eager:
+            return CanonicalMoEV3Workspace.allocate(
+                local_partial,
+                plan=plan,
+                group=group,
+                distribution=distribution,
+            )
         if not capture_mode and distribution is CanonicalDistribution.CONSUMER_SHARDED:
             stale_keys = [
                 key
@@ -1602,6 +1617,10 @@ class DeepseekV2MoE(nn.Module):
                 group=group,
                 distribution=distribution,
                 capture_mode=capture_mode,
+                cache_eager=not (
+                    prefill_cp
+                    and distribution is CanonicalDistribution.REPLICATED_CANONICAL
+                ),
             )
         if selected_transport == "canonical_v3":
             canonical = canonicalize_glm52_local_partial_v3(
