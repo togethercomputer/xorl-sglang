@@ -40,7 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_local_dp_buffer,
 )
-from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
+from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
 from sglang.srt.layers.glm52_positions import (
     CanonicalMoEPositions,
 )

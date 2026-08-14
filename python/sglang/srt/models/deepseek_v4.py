@@ -80,6 +80,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
     is_dp_gatherv_active,
 )
+from sglang.srt.layers.dsv4_ownership import (
+    gather_dsv4_owner_plane_rows,
+    reassemble_dsv4_local_rows,
+    reconstruct_dsv4_dp_rows,
+    resolve_dsv4_owner_plane,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -1799,6 +1805,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
+            positions=positions,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
@@ -1816,10 +1823,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         *,
+        positions: torch.Tensor,
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        _dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
+        if _dsv4_exact_mode:
+            return self._run_exact_moe_owner_sync(
+                hidden_states,
+                forward_batch,
+                positions=positions,
+                context_sharded=_use_cp,
+            )
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
@@ -1838,7 +1854,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         # in ONE op, REPLACING the MoE-internal post-experts all_reduce — so we
         # MUST tell the MoE to skip it (mlp_reduce_scatter=True) or it
         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
-        _dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
         _use_reduce_scatterv = (
             not _dsv4_exact_mode
             and _use_tp_moe_gather
@@ -1967,6 +1982,130 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
         return hidden_states
+
+    def _run_exact_moe_owner_sync(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        positions: torch.Tensor,
+        context_sharded: bool,
+    ) -> torch.Tensor:
+        """Run exact DSV4 MoE once per logical row on every EP8 contributor."""
+
+        del positions  # The unsplit absolute positions are cached on ForwardBatch.
+        ownership = resolve_dsv4_owner_plane()
+        segment_lengths = list(forward_batch.global_num_tokens_cpu or [])
+        if not segment_lengths and ownership.dp_size == 1:
+            segment_lengths = [hidden_states.shape[0]]
+
+        dp_hidden = reconstruct_dsv4_dp_rows(
+            hidden_states,
+            forward_batch,
+            ownership,
+            segment_lengths,
+            context_sharded=context_sharded,
+        )
+        global_hidden_buffer = get_global_dp_buffer(get_tp_group())
+        full_hidden = gather_dsv4_owner_plane_rows(
+            dp_hidden,
+            ownership,
+            segment_lengths,
+            output=global_hidden_buffer,
+            group=get_tp_group(),
+        )
+
+        def full_metadata(cache_name: str, source_name: str) -> torch.Tensor:
+            cached = getattr(forward_batch, cache_name, None)
+            if cached is not None:
+                return cached
+            source = getattr(forward_batch, source_name, None)
+            if source is None:
+                raise RuntimeError(
+                    f"Exact DSV4 owner movement is missing {source_name}"
+                )
+            dp_source = source.reshape(-1)
+            if context_sharded:
+                from sglang.srt.layers.cp.base import get_cp_strategy
+
+                strategy = get_cp_strategy()
+                if strategy is None:
+                    raise RuntimeError(
+                        "Exact DSV4 metadata requires an active context-parallel strategy"
+                    )
+                local_source = strategy.shard_hidden_states(
+                    dp_source, forward_batch
+                )
+                dp_source = reconstruct_dsv4_dp_rows(
+                    local_source,
+                    forward_batch,
+                    ownership,
+                    segment_lengths,
+                    context_sharded=True,
+                )
+            else:
+                dp_source = reconstruct_dsv4_dp_rows(
+                    dp_source,
+                    forward_batch,
+                    ownership,
+                    segment_lengths,
+                    context_sharded=False,
+                )
+            gathered = gather_dsv4_owner_plane_rows(
+                dp_source,
+                ownership,
+                segment_lengths,
+                group=get_tp_group(),
+            )
+            setattr(forward_batch, cache_name, gathered)
+            return gathered
+
+        full_input_ids = full_metadata(
+            "_dsv4_exact_owner_input_ids", "_dsv4_exact_dp_input_ids"
+        )
+        full_positions = full_metadata(
+            "_dsv4_exact_owner_positions", "_dsv4_exact_dp_positions"
+        )
+        if not (
+            full_hidden.shape[0]
+            == full_input_ids.numel()
+            == full_positions.numel()
+        ):
+            raise RuntimeError(
+                "Exact DSV4 hidden, token ID, and absolute-position rows diverged"
+            )
+
+        lora_backend = getattr(
+            getattr(self.mlp, "experts", None), "lora_backend", None
+        )
+        lora_context = (
+            lora_backend.use_gathered_mlp_batch_info(full_hidden.shape[0])
+            if lora_backend is not None
+            else nullcontext()
+        )
+        with (
+            get_forward().scoped(
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=False,
+            ),
+            lora_context,
+        ):
+            completed = self.mlp(
+                full_hidden,
+                forward_batch,
+                input_ids=full_input_ids,
+                input_ids_global=full_input_ids,
+                absolute_positions=full_positions,
+            )
+
+        return reassemble_dsv4_local_rows(
+            completed,
+            forward_batch,
+            ownership,
+            segment_lengths,
+            context_sharded=context_sharded,
+            expected_local_rows=hidden_states.shape[0],
+        )
 
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
@@ -2404,6 +2543,24 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        dsv4_exact_mode = bool(
+            getattr(self.config, "_dsv4_flash_exact_mode", False)
+        )
+        if dsv4_exact_mode:
+            # Keep the unsplit DP-owner metadata. The exact MLP reconstructs
+            # hidden rows through the live CP strategy before CP0 represents
+            # that owner on the TP8 plane.
+            forward_batch._dsv4_exact_dp_input_ids = input_ids.reshape(-1)
+            forward_batch._dsv4_exact_dp_positions = positions.reshape(-1)
+            forward_batch.dsv4_exact_logits_rows_reconstructed = False
+            forward_batch.dsv4_exact_logits_owner_rows = None
+            forward_batch.dsv4_exact_logits_dp_rank = None
+            for cache_name in (
+                "_dsv4_exact_owner_input_ids",
+                "_dsv4_exact_owner_positions",
+            ):
+                if hasattr(forward_batch, cache_name):
+                    delattr(forward_batch, cache_name)
         if self.pp_group.is_first_rank:
             hidden_states = self.embed_tokens(input_ids)
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
@@ -2416,7 +2573,11 @@ class DeepseekV4Model(nn.Module):
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if (
+            not dsv4_exact_mode
+            and get_parallel().attn_dp_size > 1
+            and get_moe_a2a_backend().is_none()
+        ):
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -2497,16 +2658,49 @@ class DeepseekV4Model(nn.Module):
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
         if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
+            if dsv4_exact_mode:
+                from sglang.srt.layers.cp.base import get_cp_strategy
+
+                strategy = get_cp_strategy()
+                if strategy is None:
+                    raise RuntimeError(
+                        "Exact DSV4 logits require the active CP strategy to "
+                        "reconstruct logical prefill rows"
+                    )
+                hidden_states = strategy.gather_hidden_states(
+                    hidden_states, forward_batch, torch.cuda.current_stream()
+                )
+                logical_rows = int(forward_batch.attn_cp_metadata.total_seq_lens)
+                if hidden_states.shape[0] != logical_rows:
+                    raise RuntimeError(
+                        "Exact DSV4 CP-prefill reconstruction returned the wrong "
+                        f"logical row count: rows={hidden_states.shape[0]}, "
+                        f"expected={logical_rows}"
+                    )
+            else:
+                hidden_states = cp_all_gather_rerange_output(
+                    hidden_states,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+
+        if dsv4_exact_mode:
+            owner_rows = int(forward_batch._dsv4_exact_dp_input_ids.numel())
+            if hidden_states.shape[0] != owner_rows:
+                raise RuntimeError(
+                    "Exact DSV4 model/head boundary does not contain one complete "
+                    f"logical DP-owner block: rows={hidden_states.shape[0]}, "
+                    f"expected={owner_rows}"
+                )
+            ownership = resolve_dsv4_owner_plane()
+            forward_batch.dsv4_exact_logits_rows_reconstructed = True
+            forward_batch.dsv4_exact_logits_owner_rows = owner_rows
+            forward_batch.dsv4_exact_logits_dp_rank = ownership.dp_rank
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -2566,7 +2760,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    # Exact DSV4 shards vocabulary over the complete
+                    # stage-local DP x CP owner plane, not the body TP1 group.
+                    use_attn_tp_group=(
+                        get_parallel().enable_dp_lm_head
+                        and not getattr(config, "_dsv4_flash_exact_mode", False)
+                    ),
                 )
         else:
             self.lm_head = PPMissingLayer()

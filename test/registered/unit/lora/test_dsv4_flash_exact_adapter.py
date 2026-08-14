@@ -240,6 +240,60 @@ def _exact_ingress_manager() -> TokenizerManager:
     return manager
 
 
+def _dsv4_parallel_context(
+    *, dp_size: int, cp_size: int, dp_rank: int = 0, cp_rank: int = 0, gather
+):
+    source_ordinal = dp_rank * cp_size + cp_rank
+
+    class _Group:
+        world_size = 8
+        rank_in_group = source_ordinal
+        ranks = list(range(8))
+
+        @staticmethod
+        def all_gather_object(value):
+            return gather(value)
+
+    cp_start = dp_rank * cp_size
+    return SimpleNamespace(
+        attn_dp_size=dp_size,
+        attn_cp_size=cp_size,
+        attn_dp_rank=dp_rank,
+        attn_cp_rank=cp_rank,
+        attn_tp_size=1,
+        moe_tp_size=1,
+        moe_ep_size=8,
+        tp_group=_Group(),
+        moe_ep_group=_Group(),
+        attn_cp_group=SimpleNamespace(
+            ranks=list(range(cp_start, cp_start + cp_size))
+        ),
+    )
+
+
+def test_exact_lora_segments_collapse_cp_replicas_and_keep_multiple_requests() -> None:
+    from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
+    from sglang.srt.lora.lora_manager import _flatten_dp_request_segments
+
+    ownership = LogicalRowOwnership(2, 4, 0, 0, 8)
+    dp0 = (("adapter-a", 2), ("adapter-b", 1))
+    dp1 = (("adapter-c", 1),)
+    physical = [dp0] * 4 + [dp1] * 4
+
+    assert _flatten_dp_request_segments(
+        ownership,
+        physical,
+        [4, 2],
+        family="DSV4-Flash",
+    ) == [
+        ("adapter-a", 2),
+        ("adapter-b", 1),
+        (None, 1),
+        ("adapter-c", 1),
+        (None, 1),
+    ]
+
+
 def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None:
     import sglang.srt.lora.lora_manager as lora_manager_module
     from sglang.srt.lora.backend.base_backend import BaseLoRABackend
@@ -297,21 +351,30 @@ def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None
                 if local_rank == owner_rank:
                     _MemoryPool.uid_to_buffer_id["adapter"] = 0
 
-                class _Group:
-                    @staticmethod
-                    def all_gather_object(local_uid):
-                        assert local_uid == global_uids[local_rank]
-                        return global_uids
+                physical_segments = [
+                    ((uid, token_counts[rank]),)
+                    for rank, uid in enumerate(global_uids)
+                ]
+
+                def gather(local_segments):
+                    assert local_segments == physical_segments[local_rank]
+                    return physical_segments
 
                 monkeypatch.setattr(
                     lora_manager_module,
                     "get_parallel",
-                    lambda: SimpleNamespace(tp_group=_Group()),
+                    lambda: _dsv4_parallel_context(
+                        dp_size=8,
+                        cp_size=1,
+                        dp_rank=local_rank,
+                        gather=gather,
+                    ),
                 )
                 forward_batch = SimpleNamespace(
-                    lora_ids=(["adapter"] if local_rank == owner_rank else []),
+                    lora_ids=[global_uids[local_rank]],
                     global_num_tokens_cpu=token_counts,
                     is_extend_in_batch=is_extend,
+                    extend_seq_lens_cpu=([token_counts[local_rank]] if is_extend else None),
                     forward_mode=ForwardMode.IDLE,
                 )
 
@@ -336,7 +399,7 @@ def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None
     assert fetched == [{None, "adapter"}] * 128
 
 
-@pytest.mark.parametrize("dp_size", [1, 4, 16])
+@pytest.mark.parametrize("dp_size", [1, 2, 4, 8])
 def test_exact_decode_graph_reuses_fixed_dp_row_metadata(
     monkeypatch, dp_size: int
 ) -> None:
@@ -386,20 +449,28 @@ def test_exact_decode_graph_reuses_fixed_dp_row_metadata(
     owners = [None] * dp_size
     owners[first_owner] = "adapter"
 
-    class _Group:
-        @staticmethod
-        def all_gather_object(local_uid):
-            assert local_uid == owners[0]
-            return list(owners)
+    cp_size = 8 // dp_size
+
+    def gather(local_segments):
+        expected_local = ((owners[0], 1),)
+        assert local_segments == expected_local
+        return [
+            ((owners[physical_rank // cp_size], 1),)
+            for physical_rank in range(8)
+        ]
 
     monkeypatch.setattr(
         lora_manager_module,
         "get_parallel",
-        lambda: SimpleNamespace(tp_group=_Group()),
+        lambda: _dsv4_parallel_context(
+            dp_size=dp_size,
+            cp_size=cp_size,
+            gather=gather,
+        ),
     )
     batch = SimpleNamespace(
         batch_size=1,
-        lora_ids=([owners[0]] if owners[0] is not None else []),
+        lora_ids=[owners[0]],
         global_num_tokens_cpu=[1] * dp_size,
         is_extend_in_batch=False,
         forward_mode=ForwardMode.DECODE,
@@ -430,7 +501,7 @@ def test_exact_decode_graph_reuses_fixed_dp_row_metadata(
 
     owners[first_owner] = None
     owners[second_owner] = "adapter"
-    batch.lora_ids = [owners[0]] if owners[0] is not None else []
+    batch.lora_ids = [owners[0]]
     manager.prepare_dsv4_flash_exact_dp_lora_batch(batch)
     expected = [0] * dp_size
     expected[second_owner] = 1
@@ -441,7 +512,7 @@ def test_exact_decode_graph_reuses_fixed_dp_row_metadata(
     } == fixed_tensor_ids
 
 
-@pytest.mark.parametrize("dp_size", [1, 4, 16])
+@pytest.mark.parametrize("dp_size", [1, 2, 4, 8])
 def test_exact_decode_graph_moe_buffers_cover_physical_dp_rows(
     monkeypatch, dp_size: int
 ) -> None:

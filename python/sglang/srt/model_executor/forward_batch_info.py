@@ -548,6 +548,13 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
 
+    # Exact DSV4 reconstructs CP-prefill rows into the logical DP-owner order
+    # before logits pruning.  Carry that boundary explicitly so the TP8 head
+    # never mistakes a physical CP shard for a complete owner block.
+    dsv4_exact_logits_rows_reconstructed: bool = False
+    dsv4_exact_logits_owner_rows: Optional[int] = None
+    dsv4_exact_logits_dp_rank: Optional[int] = None
+
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
     num_token_non_padded_cpu: int = None

@@ -27,7 +27,7 @@ import torch
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
+from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -67,8 +67,10 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 logger = logging.getLogger(__name__)
 
 
-def _glm52_local_request_segments(
+def _local_request_segments(
     forward_batch: ForwardBatch,
+    *,
+    family: str,
 ) -> tuple[tuple[Optional[str], int], ...]:
     """Return the local DP owner's request UIDs and row lengths."""
 
@@ -81,27 +83,29 @@ def _glm52_local_request_segments(
         lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if lengths is None:
             raise RuntimeError(
-                "GLM-5.2 gathered LoRA extend metadata requires request row lengths"
+                f"{family} gathered LoRA extend metadata requires request row lengths"
             )
         lengths = [int(length) for length in lengths]
     else:
         lengths = [1] * len(lora_ids)
     if len(lengths) != len(lora_ids):
         raise RuntimeError(
-            "GLM-5.2 gathered LoRA metadata requires one row length per local "
+            f"{family} gathered LoRA metadata requires one row length per local "
             f"request: uids={len(lora_ids)}, lengths={len(lengths)}"
         )
     if any(length <= 0 for length in lengths):
         raise RuntimeError(
-            f"GLM-5.2 gathered LoRA request row lengths must be positive: {lengths}"
+            f"{family} gathered LoRA request row lengths must be positive: {lengths}"
         )
     return tuple(zip(lora_ids, lengths))
 
 
-def _glm52_flatten_dp_request_segments(
+def _flatten_dp_request_segments(
     ownership: LogicalRowOwnership,
     physical_segments: list[object],
     dp_row_counts: list[int],
+    *,
+    family: str,
 ) -> list[tuple[Optional[str], int]]:
     """Collapse CP replicas and flatten each DP owner's request segments."""
 
@@ -109,7 +113,7 @@ def _glm52_flatten_dp_request_segments(
         count < 0 for count in dp_row_counts
     ):
         raise RuntimeError(
-            "GLM-5.2 gathered LoRA DP row metadata must provide one nonnegative "
+            f"{family} gathered LoRA DP row metadata must provide one nonnegative "
             "count per logical owner"
         )
     try:
@@ -121,35 +125,35 @@ def _glm52_flatten_dp_request_segments(
     for dp_rank, (segments, capacity) in enumerate(zip(owner_segments, dp_row_counts)):
         if not isinstance(segments, (tuple, list)):
             raise RuntimeError(
-                "GLM-5.2 gathered LoRA ownership metadata must contain request "
+                f"{family} gathered LoRA ownership metadata must contain request "
                 f"segments at dp_rank={dp_rank}"
             )
         normalized: list[tuple[Optional[str], int]] = []
         for segment in segments:
             if not isinstance(segment, (tuple, list)) or len(segment) != 2:
                 raise RuntimeError(
-                    "GLM-5.2 gathered LoRA request segments must be (uid, rows) pairs"
+                    f"{family} gathered LoRA request segments must be (uid, rows) pairs"
                 )
             uid, rows = segment
             if uid is not None and not isinstance(uid, str):
                 raise RuntimeError(
-                    "GLM-5.2 gathered LoRA request UIDs must be strings or None"
+                    f"{family} gathered LoRA request UIDs must be strings or None"
                 )
             try:
                 rows = int(rows)
             except (TypeError, ValueError) as error:
                 raise RuntimeError(
-                    "GLM-5.2 gathered LoRA request row counts must be integers"
+                    f"{family} gathered LoRA request row counts must be integers"
                 ) from error
             if rows <= 0:
                 raise RuntimeError(
-                    "GLM-5.2 gathered LoRA request row counts must be positive"
+                    f"{family} gathered LoRA request row counts must be positive"
                 )
             normalized.append((uid, rows))
         request_rows = sum(rows for _, rows in normalized)
         if request_rows > capacity:
             raise RuntimeError(
-                "GLM-5.2 gathered LoRA requests exceed their DP row block: "
+                f"{family} gathered LoRA requests exceed their DP row block: "
                 f"dp_rank={dp_rank}, requests={request_rows}, capacity={capacity}"
             )
         flattened.extend(normalized)
@@ -158,6 +162,25 @@ def _glm52_flatten_dp_request_segments(
             # requests. Keep those dummy rows on the base-model slot.
             flattened.append((None, capacity - request_rows))
     return flattened
+
+
+def _glm52_local_request_segments(
+    forward_batch: ForwardBatch,
+) -> tuple[tuple[Optional[str], int], ...]:
+    return _local_request_segments(forward_batch, family="GLM-5.2")
+
+
+def _glm52_flatten_dp_request_segments(
+    ownership: LogicalRowOwnership,
+    physical_segments: list[object],
+    dp_row_counts: list[int],
+) -> list[tuple[Optional[str], int]]:
+    return _flatten_dp_request_segments(
+        ownership,
+        physical_segments,
+        dp_row_counts,
+        family="GLM-5.2",
+    )
 
 
 class LoRAManager:
@@ -567,16 +590,9 @@ class LoRAManager:
                 "Gather-aware DSV4-Flash decode graphs currently require one "
                 "local one-token request per DP rank."
             )
-        if len(lora_ids) != 1:
-            raise RuntimeError(
-                "The exact DSV4-Flash active-LoRA contract admits exactly one "
-                f"logical request, got {len(lora_ids)}."
-            )
-        uid = lora_ids[0]
-        if uid is None:
-            self.lora_backend._dsv4_flash_exact_batch_certified = True
-            return
-        self._validate_dsv4_flash_exact_uid(uid)
+        for uid in set(lora_ids):
+            if uid is not None:
+                self._validate_dsv4_flash_exact_uid(uid)
         self.lora_backend._dsv4_flash_exact_batch_certified = True
 
     def _validate_dsv4_flash_exact_uid(self, uid: str) -> None:
@@ -749,26 +765,27 @@ class LoRAManager:
     def prepare_dsv4_flash_exact_dp_lora_batch(
         self, forward_batch: ForwardBatch
     ) -> None:
-        """Build rank-major LoRA metadata for the DP-gathered DSV4 MLP rows."""
+        """Build per-request metadata for DP/CP-owned exact DSV4 rows."""
 
         if not getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
             return
-        local_lora_ids = list(forward_batch.lora_ids or [])
-        if len(local_lora_ids) > 1:
-            raise RuntimeError(
-                "The exact DSV4-Flash lane admits at most one logical request "
-                f"per DP rank, got {len(local_lora_ids)}."
-            )
-        local_uid = local_lora_ids[0] if local_lora_ids else None
+        from sglang.srt.layers.dsv4_ownership import resolve_dsv4_owner_plane
 
-        tp_group = get_parallel().tp_group
-        global_uids = tp_group.all_gather_object(local_uid)
+        parallel = get_parallel()
+        ownership = resolve_dsv4_owner_plane(parallel)
+        local_segments = _local_request_segments(
+            forward_batch, family="DSV4-Flash"
+        )
+        physical_segments = parallel.tp_group.all_gather_object(local_segments)
         global_num_tokens = list(forward_batch.global_num_tokens_cpu or [])
-        if len(global_uids) != len(global_num_tokens):
-            raise RuntimeError(
-                "DSV4-Flash gathered LoRA ownership does not match the DP row "
-                f"layout: owners={len(global_uids)}, row_segments={len(global_num_tokens)}."
-            )
+        global_segments = _flatten_dp_request_segments(
+            ownership,
+            physical_segments,
+            global_num_tokens,
+            family="DSV4-Flash",
+        )
+        global_uids = [uid for uid, _ in global_segments]
+        global_request_lens = [rows for _, rows in global_segments]
 
         active_uids = {uid for uid in global_uids if uid is not None}
         active_adapter_limit = self.max_loras_per_batch - 1
@@ -827,13 +844,18 @@ class LoRAManager:
             return
 
         device = self.device
-        total_tokens = sum(global_num_tokens)
+        total_tokens = sum(global_request_lens)
         if uses_decode_cuda_graph:
-            if global_num_tokens != [1] * self.dp_size or total_tokens != self.dp_size:
+            if (
+                global_num_tokens != [1] * ownership.dp_size
+                or global_request_lens != [1] * ownership.dp_size
+                or total_tokens != ownership.dp_size
+            ):
                 raise RuntimeError(
                     "Gather-aware DSV4-Flash decode graph metadata requires one "
-                    "physical row per DP rank, got "
-                    f"dp_size={self.dp_size}, row_segments={global_num_tokens}."
+                    "row and one request segment per DP owner, got "
+                    f"dp_size={ownership.dp_size}, owner_rows={global_num_tokens}, "
+                    f"request_rows={global_request_lens}."
                 )
             global_batch_info = (
                 self.lora_backend.context_parallel_cuda_graph_batch_info
@@ -865,23 +887,23 @@ class LoRAManager:
             global_batch_info.has_active_lora = has_active_lora
         else:
             segment_lens = torch.tensor(
-                global_num_tokens, dtype=torch.int32, device=device
+                global_request_lens, dtype=torch.int32, device=device
             )
             segment_indptr = torch.zeros(
-                (len(global_num_tokens) + 1,), dtype=torch.int32, device=device
+                (len(global_request_lens) + 1,), dtype=torch.int32, device=device
             )
             segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
             global_batch_info = LoRABatchInfo(
                 use_cuda_graph=False,
-                bs=len(global_num_tokens),
-                num_segments=len(global_num_tokens),
+                bs=len(global_request_lens),
+                num_segments=len(global_request_lens),
                 seg_indptr=segment_indptr,
                 weight_indices=torch.tensor(
                     weight_indices, dtype=torch.int32, device=device
                 ),
                 lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=device),
                 scalings=torch.tensor(scalings, dtype=torch.float32, device=device),
-                max_len=max(global_num_tokens, default=0),
+                max_len=max(global_request_lens, default=0),
                 seg_lens=segment_lens,
                 permutation=None,
                 expected_tokens=total_tokens,
@@ -893,7 +915,7 @@ class LoRAManager:
             )
 
         physical_batch = copy(forward_batch)
-        physical_batch.batch_size = len(global_num_tokens)
+        physical_batch.batch_size = len(global_request_lens)
         physical_batch.lora_ids = global_uids
         physical_batch.forward_mode = (
             ForwardMode.EXTEND
@@ -901,7 +923,7 @@ class LoRAManager:
             else ForwardMode.DECODE
         )
         physical_batch.extend_num_tokens = total_tokens
-        physical_batch.extend_seq_lens_cpu = global_num_tokens
+        physical_batch.extend_seq_lens_cpu = global_request_lens
         physical_batch.extend_seq_lens = global_batch_info.seg_lens
         global_batch_info = self.lora_backend._add_moe_lora_info(
             physical_batch, global_batch_info
