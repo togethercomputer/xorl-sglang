@@ -2166,9 +2166,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                     raise RuntimeError(
                         "Exact DSV4 metadata requires an active context-parallel strategy"
                     )
-                local_source = strategy.shard_hidden_states(
-                    dp_source, forward_batch
-                )
+                local_source = strategy.shard_hidden_states(dp_source, forward_batch)
                 dp_source = reconstruct_dsv4_dp_rows(
                     local_source,
                     forward_batch,
@@ -2200,17 +2198,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             "_dsv4_exact_owner_positions", "_dsv4_exact_dp_positions"
         )
         if not (
-            full_hidden.shape[0]
-            == full_input_ids.numel()
-            == full_positions.numel()
+            full_hidden.shape[0] == full_input_ids.numel() == full_positions.numel()
         ):
             raise RuntimeError(
                 "Exact DSV4 hidden, token ID, and absolute-position rows diverged"
             )
 
-        lora_backend = getattr(
-            getattr(self.mlp, "experts", None), "lora_backend", None
-        )
+        lora_backend = getattr(getattr(self.mlp, "experts", None), "lora_backend", None)
         lora_context = (
             lora_backend.use_gathered_mlp_batch_info(full_hidden.shape[0])
             if lora_backend is not None
@@ -2676,9 +2670,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
-        dsv4_exact_mode = bool(
-            getattr(self.config, "_dsv4_flash_exact_mode", False)
-        )
+        dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
         use_fused = self.use_fused_mhc_post_pre
         prev_residual = prev_post = prev_comb = None
         if self.pp_group.is_first_rank:

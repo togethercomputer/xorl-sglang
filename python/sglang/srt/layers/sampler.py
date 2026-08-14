@@ -18,15 +18,15 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.logprob_processor import (
-    OutputLogprobProcessor,
-)
 from sglang.srt.layers.exact_sampling_transforms import (
     exact_masked_logits,
     exact_sampling_identity_rows,
     exact_seeded_gumbel_sample,
     exact_selected_logprob_partitioned_from_support,
+)
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logprob_processor import (
+    OutputLogprobProcessor,
 )
 from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
@@ -436,6 +436,7 @@ class Sampler(nn.Module):
 
                         score = bi_lm_head_selected_logprob_from_logits
                     return score(native_logits, native_ids, temperature=None)
+
             else:
                 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
                     log_softmax as _bi_log_softmax,

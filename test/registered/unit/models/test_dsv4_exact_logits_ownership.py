@@ -22,9 +22,7 @@ def test_ragged_prefill_next_token_pruning_uses_reconstructed_owner_rows() -> No
         dsv4_exact_logits_dp_rank=0,
     )
 
-    pruned = LogitsProcessor._get_pruned_states(
-        None, hidden, None, None, metadata
-    )[0]
+    pruned = LogitsProcessor._get_pruned_states(None, hidden, None, None, metadata)[0]
 
     assert pruned.flatten().tolist() == [3.0, 8.0, 14.0]
 

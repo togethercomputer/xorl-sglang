@@ -122,7 +122,7 @@ from sglang.srt.observability.request_metrics_exporter import (
     RequestMetricsExporterManager,
 )
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
-from sglang.srt.sampling.sampling_params import SamplingParams, _SAMPLING_EPS
+from sglang.srt.sampling.sampling_params import _SAMPLING_EPS, SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,

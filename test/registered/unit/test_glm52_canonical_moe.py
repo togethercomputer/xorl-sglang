@@ -221,7 +221,11 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         from sglang.srt.layers.communicator_dsa_cp import (
             DSACPLayerCommunicator,
             DSAMLPOutputLayout,
+        )
+        from sglang.srt.layers.communicator_dsa_cp import (
             align_glm52_moe_positions as align_runtime_positions,
+        )
+        from sglang.srt.layers.communicator_dsa_cp import (
             gather_glm52_mlp_rows,
         )
         from sglang.srt.layers.cp.interleave import InterleaveCPStrategy

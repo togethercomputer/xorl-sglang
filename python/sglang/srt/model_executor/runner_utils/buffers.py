@@ -60,18 +60,12 @@ def add_dsv4_exact_pp_proxy_buffers(
             "dsv4_mhc_residual": torch.zeros(
                 (max_num_token, hc_mult, hidden_size), dtype=dtype
             ),
-            "dsv4_mhc_post": torch.zeros(
-                (max_num_token, hc_mult), dtype=torch.float32
-            ),
+            "dsv4_mhc_post": torch.zeros((max_num_token, hc_mult), dtype=torch.float32),
             "dsv4_mhc_comb": torch.zeros(
                 (max_num_token, hc_mult, hc_mult), dtype=torch.float32
             ),
-            "dsv4_exact_input_ids": torch.zeros(
-                (max_num_token,), dtype=torch.int64
-            ),
-            "dsv4_exact_positions": torch.zeros(
-                (max_num_token,), dtype=torch.int64
-            ),
+            "dsv4_exact_input_ids": torch.zeros((max_num_token,), dtype=torch.int64),
+            "dsv4_exact_positions": torch.zeros((max_num_token,), dtype=torch.int64),
         }
     )
 

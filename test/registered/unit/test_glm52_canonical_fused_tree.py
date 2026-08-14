@@ -7,8 +7,8 @@ import torch
 from sglang.srt.distributed.canonical_moe import (
     CANONICAL_MOE_FOLD_VERSION,
     CANONICAL_MOE_LEAF_VERSION,
-    GLM52_CANONICAL_MOE_VERSION,
     GLM52_CANONICAL_MOE_V3B_VERSION,
+    GLM52_CANONICAL_MOE_VERSION,
     GLM52_SAMPLER_LOCAL_POLICY,
     CanonicalTransport,
     _canonical_moe_fold_fp32_tree,

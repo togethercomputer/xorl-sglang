@@ -266,9 +266,7 @@ def _dsv4_parallel_context(
         moe_ep_size=8,
         tp_group=_Group(),
         moe_ep_group=_Group(),
-        attn_cp_group=SimpleNamespace(
-            ranks=list(range(cp_start, cp_start + cp_size))
-        ),
+        attn_cp_group=SimpleNamespace(ranks=list(range(cp_start, cp_start + cp_size))),
     )
 
 
@@ -353,8 +351,7 @@ def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None
                     _MemoryPool.uid_to_buffer_id["adapter"] = 0
 
                 physical_segments = [
-                    ((uid, token_counts[rank]),)
-                    for rank, uid in enumerate(global_uids)
+                    ((uid, token_counts[rank]),) for rank, uid in enumerate(global_uids)
                 ]
 
                 def gather(local_segments):
@@ -375,7 +372,9 @@ def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None
                     lora_ids=[global_uids[local_rank]],
                     global_num_tokens_cpu=token_counts,
                     is_extend_in_batch=is_extend,
-                    extend_seq_lens_cpu=([token_counts[local_rank]] if is_extend else None),
+                    extend_seq_lens_cpu=(
+                        [token_counts[local_rank]] if is_extend else None
+                    ),
                     forward_mode=ForwardMode.IDLE,
                 )
 
@@ -455,10 +454,7 @@ def test_exact_decode_graph_reuses_fixed_dp_row_metadata(
     def gather(local_segments):
         expected_local = ((owners[0], 1),)
         assert local_segments == expected_local
-        return [
-            ((owners[physical_rank // cp_size], 1),)
-            for physical_rank in range(8)
-        ]
+        return [((owners[physical_rank // cp_size], 1),) for physical_rank in range(8)]
 
     monkeypatch.setattr(
         lora_manager_module,
@@ -613,9 +609,7 @@ def test_exact_speculative_request_boundary(
     monkeypatch.setattr(
         scheduler_module,
         "prepare_abort",
-        lambda req, message, status_code: aborted.append(
-            (req, message, status_code)
-        ),
+        lambda req, message, status_code: aborted.append((req, message, status_code)),
     )
     request = SimpleNamespace(
         rid="exact-speculative",
@@ -735,9 +729,7 @@ def test_exact_resolution_composes_physical_pp_and_preserves_runtime_options() -
         (Phase.DECODE, "max_bs"),
     }
 
-    args._resolve_dsv4_flash_exact_contract(
-        config, model_arch="DeepseekV4ForCausalLM"
-    )
+    args._resolve_dsv4_flash_exact_contract(config, model_arch="DeepseekV4ForCausalLM")
 
     assert (
         args.nnodes,

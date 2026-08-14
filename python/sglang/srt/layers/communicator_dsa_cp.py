@@ -36,14 +36,14 @@ from sglang.srt.layers.communicator import (
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     attn_cp_reduce_scatter_tensor,
-    get_global_dp_buffer,
     get_dp_global_num_tokens,
+    get_global_dp_buffer,
     get_local_dp_buffer,
 )
-from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
 from sglang.srt.layers.glm52_positions import (
     CanonicalMoEPositions,
 )
+from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
@@ -428,11 +428,11 @@ class DSACPLayerCommunicator(LayerCommunicator):
             metadata = getattr(forward_batch, "attn_cp_metadata", None)
             logical_rows = getattr(metadata, "total_seq_lens", None)
             segment_lengths = [
-                int(logical_rows)
-                if prefill_cp and logical_rows is not None
-                else local_rows * ownership.cp_size
-                if prefill_cp
-                else local_rows
+                (
+                    int(logical_rows)
+                    if prefill_cp and logical_rows is not None
+                    else local_rows * ownership.cp_size if prefill_cp else local_rows
+                )
             ]
         try:
             block = ownership.dp_block_slice(segment_lengths)

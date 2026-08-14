@@ -18,12 +18,9 @@ import torch
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
-
 TOP_K_ALL = 1 << 30
 EXACT_FILTER_ROW_CHUNK = 32
-EXACT_SAMPLING_TRANSFORM_PROGRAM = (
-    "temperature_then_stable_token_id_topk_inclusive_topp_original_max_minp_seeded_gumbel_v1"
-)
+EXACT_SAMPLING_TRANSFORM_PROGRAM = "temperature_then_stable_token_id_topk_inclusive_topp_original_max_minp_seeded_gumbel_v1"
 SamplingTransformRows = tuple[
     torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
 ]

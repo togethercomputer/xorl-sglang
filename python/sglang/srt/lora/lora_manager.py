@@ -26,8 +26,8 @@ import torch
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -773,9 +773,7 @@ class LoRAManager:
 
         parallel = get_parallel()
         ownership = resolve_dsv4_owner_plane(parallel)
-        local_segments = _local_request_segments(
-            forward_batch, family="DSV4-Flash"
-        )
+        local_segments = _local_request_segments(forward_batch, family="DSV4-Flash")
         physical_segments = parallel.tp_group.all_gather_object(local_segments)
         global_num_tokens = list(forward_batch.global_num_tokens_cpu or [])
         global_segments = _flatten_dp_request_segments(
@@ -857,9 +855,7 @@ class LoRAManager:
                     f"dp_size={ownership.dp_size}, owner_rows={global_num_tokens}, "
                     f"request_rows={global_request_lens}."
                 )
-            global_batch_info = (
-                self.lora_backend.context_parallel_cuda_graph_batch_info
-            )
+            global_batch_info = self.lora_backend.context_parallel_cuda_graph_batch_info
             if global_batch_info is None:
                 raise RuntimeError(
                     "Gathered DSV4-Flash decode graph metadata was not initialized."

@@ -3674,8 +3674,8 @@ class ServerArgs:
     # Capability bit set by an exact model resolver only when the model owns a
     # stage-local PP proxy contract for every bit-relevant boundary.  Admission
     # code consumes this capability rather than maintaining a family allowlist.
-    exact_physical_pp_capable: A[bool, NS("exec.deterministic")] = (
-        dataclasses.field(init=False, default=False, repr=False)
+    exact_physical_pp_capable: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
     )
 
     # -------------------------------------------------------------------------
@@ -5858,9 +5858,7 @@ class ServerArgs:
         if not self.dsv4_flash_exact_mode:
             return
         dsv4_cp_size = (
-            8 // self.dp_size
-            if self.dp_size > 0 and 8 % self.dp_size == 0
-            else None
+            8 // self.dp_size if self.dp_size > 0 and 8 % self.dp_size == 0 else None
         )
         expected = {
             "dtype": "bfloat16",
@@ -5896,9 +5894,7 @@ class ServerArgs:
                 dsv4_cp_size is not None and dsv4_cp_size > 1
             ),
             "cp_strategy": (
-                "interleave"
-                if dsv4_cp_size is not None and dsv4_cp_size > 1
-                else None
+                "interleave" if dsv4_cp_size is not None and dsv4_cp_size > 1 else None
             ),
             "dsa_prefill_cp_mode": "round-robin-split",
         }

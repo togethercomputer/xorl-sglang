@@ -26,9 +26,9 @@ def test_fused_mhc_proxy_round_trips_every_live_operand_bitwise():
     hidden = torch.arange(rows * hidden_size, dtype=torch.bfloat16).view(
         rows, hidden_size
     )
-    residual = torch.arange(
-        rows * hc_mult * hidden_size, dtype=torch.bfloat16
-    ).view(rows, hc_mult, hidden_size)
+    residual = torch.arange(rows * hc_mult * hidden_size, dtype=torch.bfloat16).view(
+        rows, hc_mult, hidden_size
+    )
     post = torch.arange(rows * hc_mult, dtype=torch.float32).view(rows, hc_mult)
     comb = torch.arange(rows * hc_mult * hc_mult, dtype=torch.float32).view(
         rows, hc_mult, hc_mult
@@ -65,9 +65,9 @@ def test_fused_mhc_proxy_round_trips_every_live_operand_bitwise():
 
 def test_unfused_mhc_proxy_round_trips_completed_hyperconnection_image():
     rows, hc_mult, hidden_size = 2, 3, 7
-    completed = torch.arange(
-        rows * hc_mult * hidden_size, dtype=torch.bfloat16
-    ).view(rows, hc_mult, hidden_size)
+    completed = torch.arange(rows * hc_mult * hidden_size, dtype=torch.bfloat16).view(
+        rows, hc_mult, hidden_size
+    )
     proxy = pack_dsv4_exact_pp_proxy(
         completed,
         input_ids=torch.tensor([4, 5]),
@@ -76,13 +76,11 @@ def test_unfused_mhc_proxy_round_trips_completed_hyperconnection_image():
         hidden_size=hidden_size,
         deferred_mhc=False,
     )
-    hidden, residual, post, comb, input_ids, positions = (
-        unpack_dsv4_exact_pp_proxy(
-            proxy,
-            hc_mult=hc_mult,
-            hidden_size=hidden_size,
-            deferred_mhc=False,
-        )
+    hidden, residual, post, comb, input_ids, positions = unpack_dsv4_exact_pp_proxy(
+        proxy,
+        hc_mult=hc_mult,
+        hidden_size=hidden_size,
+        deferred_mhc=False,
     )
     assert torch.equal(hidden, completed)
     assert residual is post is comb is None
@@ -167,9 +165,7 @@ class _FusedMHCLayer(nn.Module):
         completed = (
             hidden_states
             if prev_residual is None
-            else self.hc_post(
-                hidden_states, prev_residual, prev_post, prev_comb
-            )
+            else self.hc_post(hidden_states, prev_residual, prev_post, prev_comb)
         )
         hidden = completed.mean(dim=1) * self.scale + (self.layer_id + 1) / 16
         rows = hidden.shape[0]

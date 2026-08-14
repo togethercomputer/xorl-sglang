@@ -371,9 +371,7 @@ class LogitsProcessor(nn.Module):
         self.logit_scale = logit_scale
         self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
         self._qwen3_dense_exact_mode = is_qwen3_dense_exact_mode(get_server_args())
-        self._dsv4_exact_mode = bool(
-            getattr(config, "_dsv4_flash_exact_mode", False)
-        )
+        self._dsv4_exact_mode = bool(getattr(config, "_dsv4_flash_exact_mode", False))
         self.use_attn_tp_group = (
             get_parallel().enable_dp_lm_head and not self._dsv4_exact_mode
         )
@@ -1053,9 +1051,7 @@ class LogitsProcessor(nn.Module):
                     group=get_parallel().tp_group,
                 )
             else:
-                dp_gather_replicate(
-                    hidden_states, local_hidden_states, logits_metadata
-                )
+                dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 

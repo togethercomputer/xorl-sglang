@@ -33,9 +33,7 @@ def test_live_dsv4_owner_plane_accepts_every_factorization(
         moe_tp_size=1,
         moe_ep_size=8,
         tp_group=owner_group,
-        moe_ep_group=SimpleNamespace(
-            world_size=8, ranks=list(range(16, 24))
-        ),
+        moe_ep_group=SimpleNamespace(world_size=8, ranks=list(range(16, 24))),
         attn_cp_group=SimpleNamespace(
             ranks=list(range(16 + cp_start, 16 + cp_start + cp_size))
         ),
@@ -45,8 +43,7 @@ def test_live_dsv4_owner_plane_accepts_every_factorization(
     assert ownership.source_ordinal == source
 
 
-def test_ragged_cp_reconstruction_keeps_remote_rows_without_replica_scaling(
-) -> None:
+def test_ragged_cp_reconstruction_keeps_remote_rows_without_replica_scaling() -> None:
     """Distinct CP1 rows survive, while four reconstructed replicas count once."""
 
     # DP0's CP0 physical shard lacks 202; the active strategy reconstructs it

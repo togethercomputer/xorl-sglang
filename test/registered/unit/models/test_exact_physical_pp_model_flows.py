@@ -81,18 +81,14 @@ def _make_qwen_stage(model_cls, rank, world_size, layer_range):
     model.hidden_size = 5
     model._start_layer, model._end_layer = layer_range
     is_moe = model_cls is Qwen3_5MoeForCausalLM
-    model.layers = nn.ModuleList(
-        [_QwenBodyLayer(i, moe=is_moe) for i in range(4)]
-    )
+    model.layers = nn.ModuleList([_QwenBodyLayer(i, moe=is_moe) for i in range(4)])
     model.embed_tokens = nn.Identity()
     model.norm = _ResidualNorm()
     model.layers_to_capture = []
     return model
 
 
-@pytest.mark.parametrize(
-    "model_cls", [Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM]
-)
+@pytest.mark.parametrize("model_cls", [Qwen3_5ForCausalLM, Qwen3_5MoeForCausalLM])
 def test_qwen_exact_dense_and_moe_body_match_uncut_across_physical_pp(model_cls):
     """Exercise the real Qwen body/proxy/terminal-norm control flow."""
 
@@ -105,23 +101,17 @@ def test_qwen_exact_dense_and_moe_body_match_uncut_across_physical_pp(model_cls)
         return_value=recorder,
     ):
         uncut = _make_qwen_stage(model_cls, 0, 1, (0, 4))
-        expected = uncut(
-            ids, positions, _forward_batch(), input_embeds=hidden.clone()
-        )
+        expected = uncut(ids, positions, _forward_batch(), input_embeds=hidden.clone())
 
         stages = [
             _make_qwen_stage(model_cls, 0, 3, (0, 1)),
             _make_qwen_stage(model_cls, 1, 3, (1, 3)),
             _make_qwen_stage(model_cls, 2, 3, (3, 4)),
         ]
-        proxy = stages[0](
-            ids, positions, _forward_batch(), input_embeds=hidden.clone()
-        )
+        proxy = stages[0](ids, positions, _forward_batch(), input_embeds=hidden.clone())
         assert isinstance(proxy, PPProxyTensors)
         proxy = stages[1](ids, positions, _forward_batch(), pp_proxy_tensors=proxy)
-        actual = stages[2](
-            ids, positions, _forward_batch(), pp_proxy_tensors=proxy
-        )
+        actual = stages[2](ids, positions, _forward_batch(), pp_proxy_tensors=proxy)
 
     assert torch.equal(actual, expected)
 
@@ -159,9 +149,9 @@ class _GlmBodyLayer(nn.Module):
             None if prev_topk_indices is None else prev_topk_indices.clone()
         )
         residual = hidden_states if residual is None else residual + hidden_states
-        hidden_states = hidden_states * (1 + (self.layer_id + 1) / 32) + (
-            self.layer_id + 1
-        ) / 64
+        hidden_states = (
+            hidden_states * (1 + (self.layer_id + 1) / 32) + (self.layer_id + 1) / 64
+        )
         topk = torch.full(
             (hidden_states.shape[0], 2),
             self.layer_id,
@@ -221,18 +211,14 @@ def test_glm_exact_mixed_dp_cp_stage_plan_and_topk_proxy_match_uncut_body():
     )
     with patches[0], patches[1], patches[2], patches[3], patches[4]:
         uncut = _make_glm_stage(0, 1, (0, 3))
-        expected = uncut(
-            ids, positions, _forward_batch(), input_embeds=hidden.clone()
-        )
+        expected = uncut(ids, positions, _forward_batch(), input_embeds=hidden.clone())
 
         stages = [
             _make_glm_stage(0, 3, (0, 1)),
             _make_glm_stage(1, 3, (1, 2)),
             _make_glm_stage(2, 3, (2, 3)),
         ]
-        proxy = stages[0](
-            ids, positions, _forward_batch(), input_embeds=hidden.clone()
-        )
+        proxy = stages[0](ids, positions, _forward_batch(), input_embeds=hidden.clone())
         assert torch.equal(
             proxy["topk_indices"], torch.zeros((4, 2), dtype=torch.int32)
         )
@@ -241,9 +227,7 @@ def test_glm_exact_mixed_dp_cp_stage_plan_and_topk_proxy_match_uncut_body():
             stages[1].layers[1].prev_topk,
             torch.zeros((4, 2), dtype=torch.int32),
         )
-        actual = stages[2](
-            ids, positions, _forward_batch(), pp_proxy_tensors=proxy
-        )
+        actual = stages[2](ids, positions, _forward_batch(), pp_proxy_tensors=proxy)
 
     assert torch.equal(actual, expected)
     assert torch.equal(

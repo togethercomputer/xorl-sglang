@@ -10,7 +10,6 @@ import torch.distributed as dist
 from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
 from sglang.srt.runtime_context import get_parallel
 
-
 DSV4_EXACT_CONTRIBUTORS = 8
 
 
@@ -146,9 +145,7 @@ def gather_dsv4_owner_plane_rows(
 ) -> torch.Tensor:
     """Replicate one logical block per DP owner over the full TP8 plane."""
 
-    contribution = dsv4_owner_plane_contribution(
-        dp_rows, ownership, segment_lengths
-    )
+    contribution = dsv4_owner_plane_contribution(dp_rows, ownership, segment_lengths)
     if output is None:
         output = contribution
     else:

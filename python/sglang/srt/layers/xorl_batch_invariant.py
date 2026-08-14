@@ -300,8 +300,9 @@ def xorl_bi_sample_and_score(
     top_logprobs_nums: List[int] | None,
     token_ids_logprobs: List[List[int] | None] | None,
     positions: torch.Tensor,
-    sample_from_logprobs: Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor]
-    | None,
+    sample_from_logprobs: (
+        Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor] | None
+    ),
     sync_token_ids: Callable[[torch.Tensor, Any], None],
     enable_deterministic: bool,
     return_original_logprob: bool,

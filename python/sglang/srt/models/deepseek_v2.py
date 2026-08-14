@@ -60,8 +60,8 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDeferredStatusBook,
     CanonicalDistribution,
-    CanonicalMoEWorkspace,
     CanonicalMoEV3Workspace,
+    CanonicalMoEWorkspace,
     CanonicalRowSlots,
     SamplerParallelPlan,
     canonical_moe_leaf_fp32_v1,
@@ -291,9 +291,7 @@ def _uses_glm52_exact_contract(config, *, is_nextn: bool = False) -> bool:
 
 def _resolve_glm52_canonical_transport(config) -> str:
     if _glm52_exact_mode_enabled(config):
-        transport = str(
-            getattr(config, "_glm52_canonical_moe_transport", "auto")
-        )
+        transport = str(getattr(config, "_glm52_canonical_moe_transport", "auto"))
         if transport not in {"auto", "dense_v1", "canonical_v3", "canonical_v3b"}:
             raise RuntimeError(
                 "Exact GLM-5.2 transport must be auto, dense_v1, canonical_v3, "
@@ -1572,9 +1570,7 @@ class DeepseekV2MoE(nn.Module):
         selected_transport = _select_glm52_canonical_transport(
             self._glm52_canonical_transport,
             prefill_cp=prefill_cp,
-            consumer_sharded=(
-                distribution is CanonicalDistribution.CONSUMER_SHARDED
-            ),
+            consumer_sharded=(distribution is CanonicalDistribution.CONSUMER_SHARDED),
         )
         if selected_transport == "dense_v1":
             dense_workspaces = getattr(self, "_canonical_dense_workspaces", None)

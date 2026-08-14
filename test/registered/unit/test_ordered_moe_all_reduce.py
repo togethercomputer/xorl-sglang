@@ -19,8 +19,7 @@ class TestCanonicalMoeAllReduce(unittest.TestCase):
         level = tuple(partial.to(torch.float32) for partial in partials.unbind(0))
         while len(level) > 1:
             paired = tuple(
-                level[index] + level[index + 1]
-                for index in range(0, len(level) - 1, 2)
+                level[index] + level[index + 1] for index in range(0, len(level) - 1, 2)
             )
             level = paired + ((level[-1],) if len(level) % 2 else ())
         return level[0].to(partials.dtype)
