@@ -24,7 +24,9 @@ from sglang.srt.layers.logprob_processor import (
 )
 from sglang.srt.layers.exact_sampling_transforms import (
     exact_masked_logits,
-    exact_selected_logprob_from_support,
+    exact_sampling_identity_rows,
+    exact_seeded_gumbel_sample,
+    exact_selected_logprob_partitioned_from_support,
 )
 from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
@@ -155,7 +157,7 @@ class Sampler(nn.Module):
                 top_logprobs_nums=top_logprobs_nums,
                 token_ids_logprobs=token_ids_logprobs,
                 positions=positions,
-                sample_from_logprobs=self._sample_from_logprobs,
+                sample_from_logprobs=None,
                 sync_token_ids=self._sync_token_ids_across_tp,
                 enable_deterministic=self.enable_deterministic,
                 return_original_logprob=SGLANG_RETURN_ORIGINAL_LOGPROB,
@@ -393,19 +395,81 @@ class Sampler(nn.Module):
             sampling_info.top_ps,
             sampling_info.min_ps,
         )
-        batch_next_token_ids = self._sample_from_logprobs(
-            masked_logits,
-            sampling_info,
-            positions,
-        )
+        exact_sampler = getattr(self, "_sample_from_exact_logits", None)
+        if exact_sampler is None:
+            # Dependency-injection fallback for focused CPU unit tests.
+            batch_next_token_ids = self._sample_from_logprobs(
+                masked_logits,
+                sampling_info,
+                positions,
+            )
+        else:
+            batch_next_token_ids = exact_sampler(
+                transformed_logits,
+                sampling_info,
+                positions,
+                support,
+            )
 
         if return_logprob:
-            selected_logprobs, lse, _ = exact_selected_logprob_from_support(
+            identity_rows = exact_sampling_identity_rows(
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                vocab_size=transformed_logits.shape[1],
+            )
+            native_full_logprobs = None
+
+            if self.use_qwen35_bi_decode_rescore:
+
+                def _native_score(native_logits, native_ids):
+                    if is_bi_head_fastpath_enabled():
+                        from sglang.srt.batch_invariant_ops.bi_head_fastpath import (  # noqa: PLC0415
+                            bi_lm_head_selected_logprob_from_logits_fast,
+                        )
+
+                        score = bi_lm_head_selected_logprob_from_logits_fast
+                    else:
+                        from sglang.srt.batch_invariant_ops import (  # noqa: PLC0415
+                            bi_lm_head_selected_logprob_from_logits,
+                        )
+
+                        score = bi_lm_head_selected_logprob_from_logits
+                    return score(native_logits, native_ids, temperature=None)
+            else:
+                from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+                    log_softmax as _bi_log_softmax,
+                )
+
+                def _native_score(native_logits, native_ids):
+                    nonlocal native_full_logprobs
+                    native_full_logprobs = _bi_log_softmax(native_logits, dim=-1)
+                    native_selected = native_logits.gather(
+                        1, native_ids.unsqueeze(1)
+                    ).squeeze(1)
+                    native_logprob = native_full_logprobs.gather(
+                        1, native_ids.unsqueeze(1)
+                    ).squeeze(1)
+                    return (
+                        native_logprob,
+                        native_selected - native_logprob,
+                        native_selected,
+                    )
+
+            selected_logprobs, lse, _ = exact_selected_logprob_partitioned_from_support(
                 transformed_logits,
                 batch_next_token_ids.to(torch.int64),
                 support,
+                identity_rows,
+                _native_score,
             )
             filtered_logprobs = masked_logits - lse.unsqueeze(1)
+            if native_full_logprobs is not None:
+                filtered_logprobs = torch.where(
+                    identity_rows.unsqueeze(1),
+                    native_full_logprobs,
+                    filtered_logprobs,
+                )
             logprob_result = self.output_logprob_processor.compute_logprobs(
                 filtered_logprobs,
                 top_logprobs_nums,
@@ -687,6 +751,22 @@ class Sampler(nn.Module):
             logprobs, sampling_info.sampling_seed, positions
         )
         return sampled_index.view(-1).to(torch.int32)
+
+    def _sample_from_exact_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        positions: torch.Tensor,
+        support: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Exact-only endpoint-safe seeded Gumbel-max; generic sampling is unchanged."""
+
+        return exact_seeded_gumbel_sample(
+            logits,
+            sampling_info.sampling_seed,
+            positions,
+            support=support,
+        )
 
     def _sample_from_logits(
         self,

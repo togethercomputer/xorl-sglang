@@ -12,8 +12,11 @@ generic SGLang or FlashInfer filter semantics.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
+
+from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 
 
 TOP_K_ALL = 1 << 30
@@ -23,6 +26,10 @@ EXACT_SAMPLING_TRANSFORM_PROGRAM = (
 )
 SamplingTransformRows = tuple[
     torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+]
+NativeSelectedScore = Callable[
+    [torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ]
 
 
@@ -144,9 +151,18 @@ def exact_sampling_support(
             "exact sampling transform metadata must align one-to-one with logit rows"
         )
 
+    identity_rows = exact_sampling_identity_rows(
+        top_ks,
+        top_ps,
+        min_ps,
+        vocab_size=vocab,
+    )
     # The support is discrete metadata.  Detaching is essential: current logits
     # choose the support every forward, but gradients do not pass through sort
-    # indices or threshold comparisons.
+    # indices or threshold comparisons.  Identity rows are overwritten to full
+    # support after the fixed-shape program: a rounded FP32 cumulative sum may
+    # exceed one, but top-p=1 is mathematically unconditional.  Keeping the
+    # fixed row shape also preserves CUDA-graph capture in serving.
     probabilities = torch.softmax(logits.detach(), dim=-1)
     sorted_probs, sorted_indices = torch.sort(
         probabilities, dim=-1, descending=True, stable=True
@@ -159,7 +175,96 @@ def exact_sampling_support(
 
     support = torch.zeros((rows, vocab), dtype=torch.bool, device=logits.device)
     support.scatter_(1, sorted_indices, keep_sorted)
+    support |= identity_rows.unsqueeze(1)
     return support
+
+
+def exact_sampling_identity_rows(
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    *,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Return rows whose transforms are the exact mathematical identity."""
+
+    if vocab_size < 1:
+        raise ValueError("vocab_size must be >= 1")
+    if top_ks.ndim != 1 or top_ps.shape != top_ks.shape or min_ps.shape != top_ks.shape:
+        raise ValueError(
+            "exact sampling transform metadata must have aligned one-dimensional rows"
+        )
+    return (top_ks >= vocab_size) & (top_ps == 1.0) & (min_ps == 0.0)
+
+
+def exact_seeded_gumbel_scores(
+    logits: torch.Tensor,
+    seed: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    support: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return exact-lane Gumbel scores with finite endpoint/support semantics.
+
+    Interior uint32 hashes retain the established mapping.  Only the two closed
+    interval endpoints move to half-bin positions so Gumbel noise stays finite.
+    Reapplying support after adding noise prevents an excluded ``-inf`` from
+    becoming an argmax-winning NaN under any arithmetic edge case.
+    """
+
+    if logits.ndim != 2 or not logits.is_floating_point():
+        raise ValueError(
+            "exact seeded Gumbel sampling requires floating [rows, vocab] logits"
+        )
+    rows, vocab = logits.shape
+    if seed.shape != (rows,) or positions.shape != (rows,):
+        raise ValueError("exact seeded Gumbel seeds and positions must be row-aligned")
+    if seed.device != logits.device or positions.device != logits.device:
+        raise ValueError("exact seeded Gumbel metadata must share the logits device")
+    if support is not None:
+        if (
+            support.dtype is not torch.bool
+            or support.shape != logits.shape
+            or support.device != logits.device
+        ):
+            raise ValueError(
+                "exact seeded Gumbel support must be a bool tensor aligned with logits"
+            )
+        torch._assert_async(
+            support.any(dim=1).all(),
+            "exact seeded Gumbel support must contain at least one token per row",
+        )
+
+    col_indices = torch.arange(vocab, device=logits.device)
+    hashed = murmur_hash32(seed.to(torch.uint64), positions, col_indices)
+    hash_max = torch.iinfo(torch.uint32).max
+    uniform = hashed.to(torch.float64).div_(hash_max)
+    half_bin = 0.5 / hash_max
+    uniform.masked_fill_(hashed == 0, half_bin)
+    uniform.masked_fill_(hashed == hash_max, 1.0 - half_bin)
+    uniform.log_().neg_().log_().neg_()
+    scores = uniform.add_(logits.to(torch.float64))
+    if support is not None:
+        scores.masked_fill_(~support, -math.inf)
+    return scores
+
+
+def exact_seeded_gumbel_sample(
+    logits: torch.Tensor,
+    seed: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    support: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Stable token-ID argmax over endpoint-safe exact-lane Gumbel scores."""
+
+    scores = exact_seeded_gumbel_scores(
+        logits,
+        seed,
+        positions,
+        support=support,
+    )
+    return torch.argmax(scores, dim=1).to(torch.int32)
 
 
 def exact_masked_logits(
@@ -196,6 +301,33 @@ def exact_selected_logprob_from_support(
         selected_support, finite_logprob, torch.full_like(finite_logprob, -math.inf)
     )
     return logprob, lse, selected_support
+
+
+def exact_selected_logprob_partitioned_from_support(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    support: torch.Tensor,
+    identity_rows: torch.Tensor,
+    native_selected_score: NativeSelectedScore,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score identity rows natively and filtered rows on their exact support."""
+
+    rows = logits.shape[0]
+    if identity_rows.dtype is not torch.bool or identity_rows.shape != (rows,):
+        raise ValueError("identity_rows must be a row-aligned bool tensor")
+    native_logprob, native_lse, _ = native_selected_score(logits, token_ids)
+    filtered_logprob, filtered_lse, filtered_selected_support = (
+        exact_selected_logprob_from_support(logits, token_ids, support)
+    )
+    return (
+        torch.where(identity_rows, native_logprob, filtered_logprob),
+        torch.where(identity_rows, native_lse, filtered_lse),
+        torch.where(
+            identity_rows,
+            torch.ones_like(filtered_selected_support),
+            filtered_selected_support,
+        ),
+    )
 
 
 def exact_selected_logprob(
@@ -273,10 +405,14 @@ __all__ = [
     "EXACT_SAMPLING_TRANSFORM_PROGRAM",
     "TOP_K_ALL",
     "exact_masked_logits",
+    "exact_sampling_identity_rows",
     "exact_sampling_support",
+    "exact_seeded_gumbel_scores",
+    "exact_seeded_gumbel_sample",
     "exact_selected_logprob",
     "exact_selected_logprob_chunked",
     "exact_selected_logprob_from_support",
+    "exact_selected_logprob_partitioned_from_support",
     "exact_support_workspace_bytes",
     "normalize_exact_sampling_transforms",
 ]

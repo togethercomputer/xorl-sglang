@@ -15,7 +15,9 @@ from sglang.srt.batch_invariant_ops import (
 )
 from sglang.srt.layers.exact_sampling_transforms import (
     exact_masked_logits,
-    exact_selected_logprob_from_support,
+    exact_sampling_identity_rows,
+    exact_seeded_gumbel_sample,
+    exact_selected_logprob_partitioned_from_support,
 )
 
 XorlBiFamily = Literal["v1", "v2"]
@@ -298,7 +300,8 @@ def xorl_bi_sample_and_score(
     top_logprobs_nums: List[int] | None,
     token_ids_logprobs: List[List[int] | None] | None,
     positions: torch.Tensor,
-    sample_from_logprobs: Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor],
+    sample_from_logprobs: Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor]
+    | None,
     sync_token_ids: Callable[[torch.Tensor, Any], None],
     enable_deterministic: bool,
     return_original_logprob: bool,
@@ -380,19 +383,45 @@ def xorl_bi_sample_and_score(
     # Gumbel-max only depends on relative logits, so sampling directly from
     # the transformed contract logits is identical to sampling from their
     # normalized logprobs and keeps selection on the distribution we report.
-    batch_next_token_ids = sample_from_logprobs(
-        sampling_logits,
-        sampling_info,
-        positions,
-    )
+    if sample_from_logprobs is None:
+        batch_next_token_ids = exact_seeded_gumbel_sample(
+            transformed_logits,
+            sampling_info.sampling_seed,
+            positions,
+            support=support,
+        )
+    else:
+        # Dependency-injection hook retained for focused sampler tests.
+        batch_next_token_ids = sample_from_logprobs(
+            sampling_logits,
+            sampling_info,
+            positions,
+        )
     sync_token_ids(batch_next_token_ids, sampling_info)
 
     if return_logprob:
         if support is not None:
-            selected_logprobs, _, _ = exact_selected_logprob_from_support(
+            identity_rows = exact_sampling_identity_rows(
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                vocab_size=transformed_logits.shape[1],
+            )
+            score = (
+                head_v2_selected_logprob_from_logits
+                if family == "v2"
+                else bi_lm_head_selected_logprob_from_logits
+            )
+            selected_logprobs, _, _ = exact_selected_logprob_partitioned_from_support(
                 transformed_logits,
                 batch_next_token_ids.to(torch.int64),
                 support,
+                identity_rows,
+                lambda native_logits, native_ids: score(
+                    native_logits,
+                    native_ids,
+                    temperature=None,
+                ),
             )
         else:
             score = (
