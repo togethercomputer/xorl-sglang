@@ -107,9 +107,6 @@ def test_dense_qwen3_model_construction_uses_runtime_contract(monkeypatch):
 @pytest.mark.parametrize(
     ("sampling_params", "request_fields", "error"),
     (
-        ({"top_p": 0.9}, {}, "top_p=0.9"),
-        ({"top_k": 10}, {}, "top_k=10"),
-        ({"min_p": 0.1}, {}, "min_p=0.1"),
         ({}, {"top_logprobs_num": 2}, "top_logprobs_num=2"),
         ({}, {"token_ids_logprob": [7]}, "token_ids_logprob=set"),
     ),
@@ -138,6 +135,22 @@ def test_dense_qwen3_ingress_admits_positive_temperature_plain_sampling(temperat
     )
     request.normalize_batch_and_arguments()
 
+    _ingress_manager()._validate_one_request(request, [1])
+
+
+def test_dense_qwen3_ingress_admits_joint_sampling_filters():
+    request = GenerateReqInput(
+        input_ids=[1],
+        sampling_params={
+            "temperature": 0.7,
+            "top_k": 8,
+            "top_p": 0.9,
+            "min_p": 0.1,
+            "max_new_tokens": 1,
+        },
+        return_logprob=True,
+    )
+    request.normalize_batch_and_arguments()
     _ingress_manager()._validate_one_request(request, [1])
 
 

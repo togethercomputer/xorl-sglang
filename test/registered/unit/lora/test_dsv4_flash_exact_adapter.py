@@ -797,20 +797,14 @@ def test_gathered_mlp_lora_metadata_is_scoped_and_restored() -> None:
             pass
 
 
-@pytest.mark.parametrize(
-    ("name", "value"),
-    (("top_k", 8), ("top_p", 0.9), ("min_p", 0.1)),
-)
-def test_exact_ingress_rejects_filtered_sampling(name, value) -> None:
+def test_exact_ingress_allows_joint_filtered_sampling() -> None:
     request = GenerateReqInput(
         input_ids=[1],
-        sampling_params={name: value, "max_new_tokens": 1},
+        sampling_params={"top_k": 8, "top_p": 0.9, "min_p": 0.1, "max_new_tokens": 1},
         return_logprob=True,
     )
     request.normalize_batch_and_arguments()
-
-    with pytest.raises(ValueError, match=rf"{name}={value}"):
-        _exact_ingress_manager()._validate_one_request(request, [1])
+    _exact_ingress_manager()._validate_one_request(request, [1])
 
 
 def test_exact_ingress_allows_temperature_aware_sampling() -> None:

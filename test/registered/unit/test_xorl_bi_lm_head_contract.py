@@ -1002,9 +1002,6 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                 "requires FP32 logits",
             ),
             "deterministic": ("enable_deterministic", False, "deterministic inference"),
-            "top-p": ("need_top_p_sampling", True, "does not support top-p"),
-            "top-k": ("need_top_k_sampling", True, "does not support top-p"),
-            "min-p": ("need_min_p_sampling", True, "does not support top-p"),
             "penalty": (
                 "penalizer_orchestrator",
                 SimpleNamespace(is_required=True),

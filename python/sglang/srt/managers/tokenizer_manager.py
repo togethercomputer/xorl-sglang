@@ -174,8 +174,6 @@ def _get_bi_decode_strict_ingress_violations(
 
     violations = []
     plain_sampling_defaults = {
-        "top_p": 1.0,
-        "min_p": 0.0,
         "frequency_penalty": 0.0,
         "presence_penalty": 0.0,
         "repetition_penalty": 1.0,
@@ -185,10 +183,6 @@ def _get_bi_decode_strict_ingress_violations(
         value = sampling_params.get(name, expected)
         if value != expected:
             violations.append(f"{name}={value!r}")
-
-    top_k = sampling_params.get("top_k", -1)
-    if top_k not in (-1, None):
-        violations.append(f"top_k={top_k!r}")
 
     temperature = sampling_params.get("temperature", 1.0)
     try:
@@ -277,6 +271,9 @@ class ReqState:
     lifecycle_id: object = dataclasses.field(default_factory=object)
     dispatched: bool = False
     sampling_temperature: Optional[float] = None
+    sampling_top_k: Optional[int] = None
+    sampling_top_p: Optional[float] = None
+    sampling_min_p: Optional[float] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -1297,7 +1294,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 contract_name = (
                     "GLM-5.2"
                     if exact_glm
-                    else "dense Qwen3" if exact_qwen3 else "Qwen3.5-family"
+                    else "dense Qwen3"
+                    if exact_qwen3
+                    else "Qwen3.5-family"
                 )
                 if exact_dsv4:
                     contract_name = "DSV4-Flash"
@@ -1305,7 +1304,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     f"This server runs the exact {contract_name} RL on-policy "
                     "decode contract; requests must use finite multinomial temperature "
                     f">= {_SAMPLING_EPS} "
-                    "sampling without top-k/top-p/min-p, penalties, grammar, "
+                    "sampling without penalties, grammar, "
                     "logit bias, custom processors, or MTP (incompatible "
                     "fields: " + ", ".join(violations) + ")"
                 )
@@ -1547,9 +1546,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         state = self.rid_to_state[obj.rid]
         if isinstance(obj, GenerateReqInput):
-            # Relay the normalized value that the sampler actually consumes,
-            # including preferred sampling parameters and the default T=1 path.
+            # Relay normalized values that the sampler actually consumes,
+            # including preferred parameters and identity defaults.  Exact
+            # trainer replay recomputes support from these parameters and
+            # current logits; it never reuses a behavior-time support mask.
             state.sampling_temperature = float(sampling_params.temperature)
+            state.sampling_top_k = int(sampling_params.top_k)
+            state.sampling_top_p = float(sampling_params.top_p)
+            state.sampling_min_p = float(sampling_params.min_p)
         tokenized_obj.time_stats = state.time_stats
         state.time_stats.set_tokenize_finish_time()
 
@@ -1848,9 +1852,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we log finished results and metrics.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 self.request_logger.log_finished_request(
                     obj,
                     out,
@@ -1878,9 +1882,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 # Record response sent time right before we send response.
                 if not state.time_stats.response_sent_to_client_time:
                     state.time_stats.set_response_sent_to_client_time()
-                    out["meta_info"][
-                        "response_sent_to_client_ts"
-                    ] = state.time_stats.get_response_sent_to_client_realtime()
+                    out["meta_info"]["response_sent_to_client_ts"] = (
+                        state.time_stats.get_response_sent_to_client_realtime()
+                    )
                 yield out
             else:
                 if (
@@ -2142,9 +2146,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.model_update_lock.writer_lock if not is_paused else nullcontext()
         )
         async with lock_context:
-            success, message, num_paused_requests = (
-                await self._wait_for_model_update_from_disk(obj)
-            )
+            (
+                success,
+                message,
+                num_paused_requests,
+            ) = await self._wait_for_model_update_from_disk(obj)
 
         if success and obj.weight_version is not None:
             self._update_weight_version_if_provided(obj.weight_version)
@@ -2349,6 +2355,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             }
             if state.sampling_temperature is not None:
                 meta_info["sampling_temperature"] = state.sampling_temperature
+            if state.sampling_top_k is not None:
+                meta_info["sampling_top_k"] = state.sampling_top_k
+            if state.sampling_top_p is not None:
+                meta_info["sampling_top_p"] = state.sampling_top_p
+            if state.sampling_min_p is not None:
+                meta_info["sampling_min_p"] = state.sampling_min_p
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
@@ -2692,8 +2704,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         # shared batch-output loop; degrade to nested instead.
                         state.input_top_logprobs_flat_fields = None
                         logger.error(
-                            "Falling back to nested input top logprobs for "
-                            "rid=%s: %s",
+                            "Falling back to nested input top logprobs for rid=%s: %s",
                             meta_info.get("id"),
                             e,
                         )
@@ -3167,7 +3178,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 filename = os.path.join(
                     self.crash_dump_folder,
                     hostname,
-                    f'crash_dump_{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}.pkl',
+                    f"crash_dump_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.pkl",
                 )
                 os.makedirs(os.path.dirname(filename), exist_ok=True)
 
@@ -3378,9 +3389,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 scale_phase=self.elastic_scale_phase,
             )
         self.auto_create_handle_loop()
-        responses: List[ScaleElasticEPReqOutput] = (
-            await self.scale_elastic_ep_communicator(obj)
-        )
+        responses: List[
+            ScaleElasticEPReqOutput
+        ] = await self.scale_elastic_ep_communicator(obj)
         for res in responses:
             if not res.success:
                 self.elastic_scale_phase = res.scale_phase

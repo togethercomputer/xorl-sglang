@@ -2296,6 +2296,9 @@ class ServingChatTestCase(unittest.TestCase):
                     "finish_reason": {"type": "stop", "matched": None},
                     "weight_version": "default",
                     "sampling_temperature": 0.7,
+                    "sampling_top_k": 8,
+                    "sampling_top_p": 0.9,
+                    "sampling_min_p": 0.1,
                 },
             }
         ]
@@ -2304,7 +2307,13 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertEqual(
             response.metadata,
-            {"weight_version": "default", "sampling_temperature": 0.7},
+            {
+                "weight_version": "default",
+                "sampling_temperature": 0.7,
+                "sampling_top_k": 8,
+                "sampling_top_p": 0.9,
+                "sampling_min_p": 0.1,
+            },
         )
         self.assertIsNone(response.choices[0].meta_info)
 

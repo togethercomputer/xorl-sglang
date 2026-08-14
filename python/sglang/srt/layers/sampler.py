@@ -22,11 +22,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
+from sglang.srt.layers.exact_sampling_transforms import (
+    exact_masked_logits,
+    exact_selected_logprob_from_support,
+)
 from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import (
+    is_dsv4_flash_exact_mode,
     is_glm52_exact_mode,
     is_qwen3_dense_exact_mode,
     is_qwen35_gdn_exact_mode,
@@ -88,6 +93,7 @@ class Sampler(nn.Module):
         super().__init__()
         self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
         self._qwen3_dense_exact_mode = is_qwen3_dense_exact_mode(get_server_args())
+        self._dsv4_flash_exact_mode = is_dsv4_flash_exact_mode(get_server_args())
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
@@ -162,6 +168,25 @@ class Sampler(nn.Module):
         logits = self._preprocess_logits(logits, sampling_info)
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
         exact_sampling_logits = None
+
+        has_sampling_filter = (
+            sampling_info.need_top_p_sampling
+            or sampling_info.need_top_k_sampling
+            or sampling_info.need_min_p_sampling
+        )
+        if has_sampling_filter and (
+            self.use_qwen35_bi_decode_rescore or self._dsv4_flash_exact_mode
+        ):
+            return self._forward_exact_filtered(
+                logits_output,
+                logits,
+                sampling_info,
+                return_logprob,
+                top_logprobs_nums,
+                token_ids_logprobs,
+                positions,
+                return_sampling_mask=return_sampling_mask,
+            )
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -314,6 +339,100 @@ class Sampler(nn.Module):
 
         return batch_next_token_ids
 
+    def _forward_exact_filtered(
+        self,
+        logits_output: LogitsProcessorOutput,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        return_logprob: bool,
+        top_logprobs_nums: Optional[List[int]],
+        token_ids_logprobs: Optional[List[Optional[List[int]]]],
+        positions: torch.Tensor,
+        *,
+        return_sampling_mask: bool,
+    ) -> torch.Tensor:
+        """Sample and score one exact, jointly filtered distribution."""
+
+        if not self.enable_deterministic or sampling_info.sampling_seed is None:
+            raise RuntimeError(
+                "Exact filtered sampling requires deterministic inference and per-request seeds"
+            )
+        if self.return_original_logprob:
+            raise RuntimeError(
+                "Exact filtered sampling rejects SGLANG_RETURN_ORIGINAL_LOGPROB"
+            )
+        if (
+            sampling_info.has_custom_logit_processor
+            or sampling_info.logit_bias is not None
+            or sampling_info.grammars
+            or sampling_info.grammar_mask is not None
+            or sampling_info.acc_additive_penalties is not None
+            or sampling_info.acc_scaling_penalties is not None
+            or (
+                sampling_info.penalizer_orchestrator is not None
+                and sampling_info.penalizer_orchestrator.is_required
+            )
+        ):
+            raise RuntimeError(
+                "Exact filtered sampling does not support penalties, grammar, logit bias, or custom processors"
+            )
+
+        if self.use_qwen35_bi_decode_rescore:
+            transformed_logits = exact_temperature_scale_fp32_logits(
+                logits,
+                sampling_info.temperatures,
+            )
+        else:
+            transformed_logits = exact_temperature_scale_bf16_logits(
+                logits.bfloat16(),
+                sampling_info.temperatures,
+            )
+        masked_logits, support = exact_masked_logits(
+            transformed_logits,
+            sampling_info.top_ks,
+            sampling_info.top_ps,
+            sampling_info.min_ps,
+        )
+        batch_next_token_ids = self._sample_from_logprobs(
+            masked_logits,
+            sampling_info,
+            positions,
+        )
+
+        if return_logprob:
+            selected_logprobs, lse, _ = exact_selected_logprob_from_support(
+                transformed_logits,
+                batch_next_token_ids.to(torch.int64),
+                support,
+            )
+            filtered_logprobs = masked_logits - lse.unsqueeze(1)
+            logprob_result = self.output_logprob_processor.compute_logprobs(
+                filtered_logprobs,
+                top_logprobs_nums,
+                token_ids_logprobs,
+                batch_next_token_ids,
+            )
+            logprob_result.write_output_to(logits_output)
+            logits_output.next_token_logprobs = selected_logprobs
+
+        if return_sampling_mask:
+            # This output remains an observability aid only.  Trainer replay is
+            # parameter-based and recomputes support from current logits.
+            probabilities = torch.softmax(transformed_logits, dim=-1)
+            sampling_mask_data = self._compute_sampling_mask_from_probs(
+                probabilities,
+                sampling_info,
+            )
+            self._attach_sampling_mask_to_output(
+                logits_output,
+                sampling_info,
+                batch_next_token_ids,
+                sampling_mask_data,
+            )
+
+        self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        return batch_next_token_ids
+
     def _bi_contract_sampled_logprob(
         self,
         logits: torch.Tensor,
@@ -404,9 +523,9 @@ class Sampler(nn.Module):
         else:
             backend = get_exec().kernel.sampling_backend
             if backend == "flashinfer":
-                assert (
-                    sampling_info.sampling_seed is None
-                ), "Sampling seed is not supported for flashinfer backend"
+                assert sampling_info.sampling_seed is None, (
+                    "Sampling seed is not supported for flashinfer backend"
+                )
                 if sampling_info.need_min_p_sampling:
                     probs = top_k_renorm_prob(probs, sampling_info.top_ks)
                     probs = top_p_renorm_prob(probs, sampling_info.top_ps)
@@ -560,9 +679,9 @@ class Sampler(nn.Module):
         Used for deterministic sampling with simple cases (no top-k/top-p/min-p).
         Requires sampling_seed to be set in sampling_info.
         """
-        assert (
-            sampling_info.sampling_seed is not None
-        ), "sampling_seed is required for sampling from logprobs"
+        assert sampling_info.sampling_seed is not None, (
+            "sampling_seed is required for sampling from logprobs"
+        )
         sampled_index = multinomial_with_seed(
             logprobs, sampling_info.sampling_seed, positions
         )
@@ -590,9 +709,9 @@ class Sampler(nn.Module):
                 batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
             return batch_next_token_ids.to(torch.int32)
         else:
-            assert (
-                self.use_ascend_backend
-            ), "Only ascend backend supports sampling from logits"
+            assert self.use_ascend_backend, (
+                "Only ascend backend supports sampling from logits"
+            )
             batch_next_token_ids = top_k_top_p_min_p_sampling_from_logits_ascend(
                 logits,
                 sampling_info.top_ks,
@@ -724,9 +843,9 @@ def top_k_top_p_min_p_sampling_from_probs_torch(
 
     if need_min_p_sampling:
         # TODO: probs_sort should be re-normalized for the use of multinomial_with_seed
-        assert (
-            sampling_seed is None
-        ), "With sampling seed, multinomial_with_seed will provide wrong results"
+        assert sampling_seed is None, (
+            "With sampling seed, multinomial_with_seed will provide wrong results"
+        )
         min_p_thresholds = probs_sort[:, 0] * min_ps
         probs_sort[probs_sort < min_p_thresholds.view(-1, 1)] = 0.0
 

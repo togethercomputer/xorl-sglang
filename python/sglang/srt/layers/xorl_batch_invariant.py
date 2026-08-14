@@ -13,6 +13,10 @@ from sglang.srt.batch_invariant_ops import (
     head_v2_full_logits_with_lse,
     head_v2_selected_logprob_from_logits,
 )
+from sglang.srt.layers.exact_sampling_transforms import (
+    exact_masked_logits,
+    exact_selected_logprob_from_support,
+)
 
 XorlBiFamily = Literal["v1", "v2"]
 XorlGlm52NormSite = Literal["q_a", "kv_a", "input", "post_attention", "final"]
@@ -313,19 +317,15 @@ def xorl_bi_sample_and_score(
             "The XORL batch-invariant sampler requires deterministic inference "
             "and a per-request sampling seed."
         )
-    if sampling_info.is_all_greedy:
-        raise RuntimeError(
-            "The XORL batch-invariant sampler requires multinomial sampling, "
-            "not greedy decoding."
-        )
-    if (
+    has_sampling_filter = (
         sampling_info.need_top_p_sampling
         or sampling_info.need_top_k_sampling
         or sampling_info.need_min_p_sampling
-    ):
+    )
+    if sampling_info.is_all_greedy and not has_sampling_filter:
         raise RuntimeError(
-            "The XORL batch-invariant sampler does not support top-p, top-k, "
-            "or min-p filtering."
+            "The XORL batch-invariant sampler requires multinomial sampling, "
+            "not greedy decoding."
         )
     if sampling_info.has_custom_logit_processor:
         raise RuntimeError(
@@ -367,28 +367,44 @@ def xorl_bi_sample_and_score(
         logits,
         sampling_info.temperatures,
     )
+    sampling_logits = transformed_logits
+    support = None
+    if has_sampling_filter:
+        sampling_logits, support = exact_masked_logits(
+            transformed_logits,
+            sampling_info.top_ks,
+            sampling_info.top_ps,
+            sampling_info.min_ps,
+        )
 
     # Gumbel-max only depends on relative logits, so sampling directly from
     # the transformed contract logits is identical to sampling from their
     # normalized logprobs and keeps selection on the distribution we report.
     batch_next_token_ids = sample_from_logprobs(
-        transformed_logits,
+        sampling_logits,
         sampling_info,
         positions,
     )
     sync_token_ids(batch_next_token_ids, sampling_info)
 
     if return_logprob:
-        score = (
-            head_v2_selected_logprob_from_logits
-            if family == "v2"
-            else bi_lm_head_selected_logprob_from_logits
-        )
-        selected_logprobs, _, _ = score(
-            transformed_logits,
-            batch_next_token_ids,
-            temperature=None,
-        )
+        if support is not None:
+            selected_logprobs, _, _ = exact_selected_logprob_from_support(
+                transformed_logits,
+                batch_next_token_ids.to(torch.int64),
+                support,
+            )
+        else:
+            score = (
+                head_v2_selected_logprob_from_logits
+                if family == "v2"
+                else bi_lm_head_selected_logprob_from_logits
+            )
+            selected_logprobs, _, _ = score(
+                transformed_logits,
+                batch_next_token_ids,
+                temperature=None,
+            )
         logits_output.next_token_logprobs = selected_logprobs
 
     return batch_next_token_ids

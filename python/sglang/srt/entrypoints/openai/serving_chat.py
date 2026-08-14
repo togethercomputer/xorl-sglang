@@ -1888,10 +1888,14 @@ class OpenAIServingChat(OpenAIServingBase):
         )
 
         response_metadata = {"weight_version": ret[0]["meta_info"]["weight_version"]}
-        if "sampling_temperature" in ret[0]["meta_info"]:
-            response_metadata["sampling_temperature"] = ret[0]["meta_info"][
-                "sampling_temperature"
-            ]
+        for key in (
+            "sampling_temperature",
+            "sampling_top_k",
+            "sampling_top_p",
+            "sampling_min_p",
+        ):
+            if key in ret[0]["meta_info"]:
+                response_metadata[key] = ret[0]["meta_info"][key]
 
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],

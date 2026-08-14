@@ -350,12 +350,51 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
                 tokenized = tm._create_tokenized_object(obj, "", [1, 2])
                 self.assertEqual(tokenized.sampling_params.temperature, expected)
                 self.assertEqual(state.sampling_temperature, expected)
+                self.assertEqual(state.sampling_top_k, 1 << 30)
+                self.assertEqual(state.sampling_top_p, 1.0)
+                self.assertEqual(state.sampling_min_p, 0.0)
 
                 asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
                 self.assertEqual(
                     state.out_list[-1]["meta_info"]["sampling_temperature"],
                     expected,
                 )
+                self.assertEqual(
+                    state.out_list[-1]["meta_info"]["sampling_top_k"], 1 << 30
+                )
+                self.assertEqual(state.out_list[-1]["meta_info"]["sampling_top_p"], 1.0)
+                self.assertEqual(state.out_list[-1]["meta_info"]["sampling_min_p"], 0.0)
+
+    def test_normalized_sampling_filters_are_returned_per_request(self):
+        tm = _make_tokenizer_manager()
+        tm.sampling_params_class = SamplingParams
+        tm.tokenizer = None
+        tm.model_config = SimpleNamespace(vocab_size=128)
+        tm.preferred_sampling_params = {}
+        tm.server_args.disaggregation_transfer_backend = "none"
+        obj = GenerateReqInput(
+            input_ids=[1, 2],
+            rid="filtered",
+            sampling_params={"top_k": 8, "top_p": 0.9, "min_p": 0.1},
+        )
+        obj.normalize_batch_and_arguments()
+        state = ReqState(
+            out_list=[],
+            finished=False,
+            event=asyncio.Event(),
+            obj=obj,
+            time_stats=APIServerReqTimeStats(),
+        )
+        tm.rid_to_state[obj.rid] = state
+        tm._create_tokenized_object(obj, "", [1, 2])
+        asyncio.run(tm._handle_batch_output(_make_batch_str_output(obj.rid)))
+        self.assertEqual(
+            {
+                key: state.out_list[-1]["meta_info"][key]
+                for key in ("sampling_top_k", "sampling_top_p", "sampling_min_p")
+            },
+            {"sampling_top_k": 8, "sampling_top_p": 0.9, "sampling_min_p": 0.1},
+        )
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):
