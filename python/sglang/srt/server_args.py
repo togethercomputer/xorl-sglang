@@ -9115,6 +9115,12 @@ class ServerArgs:
             is_glm_dsa_backend = (
                 model_arch == "GlmMoeDsaForCausalLM" and attention_backend == "dsa"
             )
+            is_exact_dsv4_backend = (
+                model_arch == "DeepseekV4ForCausalLM"
+                and attention_backend == "dsv4"
+                and self.rl_on_policy_target == XORL_RL_TARGET
+                and self.dsv4_flash_exact_mode
+            )
             if is_deepseek_model:
                 if (
                     attention_backend
@@ -9135,6 +9141,7 @@ class ServerArgs:
             if (
                 attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
                 and not is_glm_dsa_backend
+                and not is_exact_dsv4_backend
             ):
                 # Currently, only certain backends support radix cache. Support for other backends is in progress
                 self.disable_radix_cache = True

@@ -1004,6 +1004,37 @@ def test_only_exact_dsv4_attention_is_admitted_for_deterministic_inference() -> 
         _deterministic_attention_backend(generic)
 
 
+def test_full_deterministic_resolution_retains_only_exact_dsv4_radix() -> None:
+    from sglang.srt.server_args import ServerArgs
+
+    config = _official_config()
+    exact = ServerArgs(model_path="dummy")
+    exact.rl_on_policy_target = "xorl"
+    exact.tp_size = 8
+    exact.ep_size = 8
+    exact.dp_size = 2
+    exact._resolve_dsv4_flash_exact_contract(config, model_arch="DeepseekV4ForCausalLM")
+    exact.get_model_config = lambda: SimpleNamespace(hf_config=config)
+
+    exact._handle_deterministic_inference()
+
+    assert exact.attention_backend == "dsv4"
+    assert exact.disable_radix_cache is False
+
+    ordinary = ServerArgs(
+        model_path="dummy",
+        attention_backend="flashinfer",
+        enable_deterministic_inference=True,
+    )
+    ordinary.get_model_config = lambda: SimpleNamespace(
+        hf_config=SimpleNamespace(architectures=["Qwen2ForCausalLM"])
+    )
+
+    ordinary._handle_deterministic_inference()
+
+    assert ordinary.disable_radix_cache is True
+
+
 def test_grouped_wo_a_lora_selects_only_the_matching_b_rows() -> None:
     from sglang.srt.lora.layers import ColumnParallelLinearWithLoRA
 
