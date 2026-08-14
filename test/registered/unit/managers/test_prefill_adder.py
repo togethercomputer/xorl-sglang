@@ -557,6 +557,100 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(adder._swa_budget_for_req(extend, max_new), expected)
 
+    def _build_hybrid_swa_admission_req(
+        self, *, prompt_len: int, max_new_tokens: int, rem_swa: int = 768
+    ):
+        self.mock_token_allocator.swa_available_size.return_value = rem_swa
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.available_size.return_value = 100_000
+        self.mock_tree_cache.sliding_window_size = 128
+        self.mock_tree_cache.is_tree_cache.return_value = False
+
+        adder = self.create_adder(
+            self.create_running_batch(),
+            page_size=256,
+        )
+        adder.is_hybrid_swa = True
+
+        req = self.create_mock_req(
+            f"prompt-{prompt_len}",
+            priority=0,
+            max_new_tokens=max_new_tokens,
+        )
+        req.full_untruncated_fill_ids = list(range(prompt_len))
+        req.swa_host_hit_length = 0
+        req.last_node = MagicMock()
+        req.set_extend_range = MagicMock(
+            side_effect=lambda start, end: setattr(
+                req, "extend_range", Range(start, end)
+            )
+        )
+        req.sampling_params.ignore_eos = False
+        return adder, req
+
+    def test_swa_admission_allows_exact_fit_before_and_after_prefix_lock(self):
+        adder, req = self._build_hybrid_swa_admission_req(
+            prompt_len=257,
+            max_new_tokens=4,
+        )
+        self.assertEqual(adder._swa_budget_for_req(512, 4), 768)
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        # The unchanged 768-slot capacity is checked once before and once after
+        # the temporary prefix lock. Equality is a valid fit at both gates.
+        self.assertGreaterEqual(
+            self.mock_token_allocator.swa_available_size.call_count, 2
+        )
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(adder.rem_swa_tokens, 0)
+
+    def test_swa_admission_allows_exact_fit_after_prefix_lock(self):
+        adder, req = self._build_hybrid_swa_admission_req(
+            prompt_len=257,
+            max_new_tokens=4,
+            rem_swa=1024,
+        )
+
+        def pin_prefix_to_exact_fit(_node):
+            self.mock_token_allocator.swa_available_size.return_value = 768
+            return IncLockRefResult()
+
+        self.mock_tree_cache.inc_lock_ref.side_effect = pin_prefix_to_exact_fit
+
+        adder.add_one_req(req, has_chunked_req=False, truncation_align_size=None)
+
+        # The request passes with 1024 slots before locking. The lock then
+        # leaves exactly its 768-slot budget for the post-lock recheck.
+        self.assertIn(req, adder.can_run_list)
+        self.assertEqual(adder.rem_swa_tokens, 0)
+
+    def test_swa_admission_rejects_over_capacity_but_keeps_warmup_case(self):
+        over_adder, over_req = self._build_hybrid_swa_admission_req(
+            prompt_len=513,
+            max_new_tokens=4,
+        )
+        self.assertEqual(over_adder._swa_budget_for_req(768, 4), 1024)
+
+        over_result = over_adder.add_one_req(
+            over_req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIs(over_result, AddReqResult.NO_TOKEN)
+        self.assertNotIn(over_req, over_adder.can_run_list)
+
+        warmup_adder, warmup_req = self._build_hybrid_swa_admission_req(
+            prompt_len=256,
+            max_new_tokens=4,
+        )
+        self.assertEqual(warmup_adder._swa_budget_for_req(256, 4), 512)
+
+        warmup_adder.add_one_req(
+            warmup_req, has_chunked_req=False, truncation_align_size=None
+        )
+
+        self.assertIn(warmup_req, warmup_adder.can_run_list)
+
     def test_swa_admission_admits_short_cached_resume_at_two_window_pool(self):
         # Livelock regression (real incident). At an SWA pool ~= 2 sliding
         # windows, a cached-prefix resume matches >= 1 window (locked, excluded
