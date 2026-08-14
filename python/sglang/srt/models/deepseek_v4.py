@@ -350,6 +350,25 @@ def unpack_dsv4_exact_pp_proxy(
     )
 
 
+def _align_exact_dsv4_eager_decode_logits_counts(
+    forward_batch: ForwardBatch,
+) -> None:
+    """Make eager DP decode use the same physical logits rows as decode graphs."""
+    if (
+        not forward_batch.forward_mode.is_decode_or_idle()
+        or forward_batch.is_extend_in_batch
+        or forward_batch._original_batch_size is None
+    ):
+        return
+
+    forward_batch.global_num_tokens_for_logprob_cpu = list(
+        forward_batch.global_num_tokens_cpu
+    )
+    forward_batch.global_num_tokens_for_logprob_gpu.copy_(
+        forward_batch.global_num_tokens_gpu
+    )
+
+
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
     # not read that flag and dispatches independently for both small and large
@@ -2917,6 +2936,7 @@ class DeepseekV4Model(nn.Module):
                     f"expected={owner_rows}"
                 )
             ownership = resolve_dsv4_owner_plane()
+            _align_exact_dsv4_eager_decode_logits_counts(forward_batch)
             forward_batch.dsv4_exact_logits_rows_reconstructed = True
             forward_batch.dsv4_exact_logits_owner_rows = owner_rows
             forward_batch.dsv4_exact_logits_dp_rank = ownership.dp_rank

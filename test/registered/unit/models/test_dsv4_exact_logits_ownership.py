@@ -7,10 +7,14 @@ import torch
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
+    ForwardBatch,
     ForwardMode,
 )
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+)
+from sglang.srt.models.deepseek_v4 import (
+    _align_exact_dsv4_eager_decode_logits_counts,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -109,6 +113,85 @@ def test_dp2_decode_capture_carries_exact_per_dp_pruned_row_segments() -> None:
     pruned = LogitsProcessor._get_pruned_states(None, hidden, None, None, metadata)[0]
 
     assert torch.equal(pruned, hidden)
+
+
+@pytest.mark.parametrize(
+    ("forward_mode", "dp_rank", "original_batch_size"),
+    [(ForwardMode.DECODE, 0, 1), (ForwardMode.IDLE, 1, 0)],
+    ids=("active-rank", "idle-rank"),
+)
+def test_exact_dsv4_eager_decode_uses_padded_logits_rows_and_trims_them(
+    forward_mode: ForwardMode, dp_rank: int, original_batch_size: int
+) -> None:
+    forward_batch = ForwardBatch(
+        forward_mode=forward_mode,
+        batch_size=1,
+        input_ids=torch.tensor([7]),
+        req_pool_indices=torch.tensor([0]),
+        seq_lens=torch.tensor([11]),
+        seq_lens_cpu=torch.tensor([11]),
+        out_cache_loc=torch.tensor([3]),
+        seq_lens_sum=11,
+        positions=torch.tensor([10]),
+        is_extend_in_batch=False,
+        global_num_tokens_cpu=[1, 1],
+        global_num_tokens_gpu=torch.tensor([1, 1]),
+        global_num_tokens_for_logprob_cpu=[1, 0],
+        global_num_tokens_for_logprob_gpu=torch.tensor([1, 0]),
+    )
+    forward_batch._original_batch_size = original_batch_size
+    forward_batch._original_num_tokens = original_batch_size
+
+    _align_exact_dsv4_eager_decode_logits_counts(forward_batch)
+
+    assert forward_batch.global_num_tokens_for_logprob_cpu == [1, 1]
+    assert forward_batch.global_num_tokens_for_logprob_gpu.tolist() == [1, 1]
+    assert forward_batch._original_batch_size == original_batch_size
+    forward_batch.dsv4_exact_logits_rows_reconstructed = True
+    forward_batch.dsv4_exact_logits_owner_rows = 1
+    forward_batch.dsv4_exact_logits_dp_rank = dp_rank
+    metadata = LogitsMetadata.from_forward_batch(forward_batch)
+    hidden = torch.arange(4, dtype=torch.float32).view(1, 4)
+    pruned = LogitsProcessor._get_pruned_states(None, hidden, None, None, metadata)[0]
+    assert torch.equal(pruned, hidden)
+
+    logits_output = SimpleNamespace(
+        next_token_logits=torch.ones((1, 8)), hidden_states=hidden.clone()
+    )
+    forward_batch.post_forward_mlp_sync_batch(logits_output)
+    assert forward_batch.batch_size == original_batch_size
+    assert forward_batch.positions.shape[0] == original_batch_size
+    assert logits_output.next_token_logits.shape[0] == original_batch_size
+    assert logits_output.hidden_states.shape[0] == original_batch_size
+
+
+@pytest.mark.parametrize(
+    "forward_mode", [ForwardMode.EXTEND, ForwardMode.IDLE], ids=("active", "idle")
+)
+def test_exact_dsv4_mixed_prefill_keeps_logical_logits_rows(
+    forward_mode: ForwardMode,
+) -> None:
+    forward_batch = ForwardBatch(
+        forward_mode=forward_mode,
+        batch_size=1,
+        input_ids=torch.tensor([7]),
+        req_pool_indices=torch.tensor([0]),
+        seq_lens=torch.tensor([11]),
+        out_cache_loc=torch.tensor([3]),
+        seq_lens_sum=11,
+        positions=torch.tensor([10]),
+        is_extend_in_batch=True,
+        global_num_tokens_cpu=[10, 10],
+        global_num_tokens_gpu=torch.tensor([10, 10]),
+        global_num_tokens_for_logprob_cpu=[1, 0],
+        global_num_tokens_for_logprob_gpu=torch.tensor([1, 0]),
+    )
+    forward_batch._original_batch_size = 1
+
+    _align_exact_dsv4_eager_decode_logits_counts(forward_batch)
+
+    assert forward_batch.global_num_tokens_for_logprob_cpu == [1, 0]
+    assert forward_batch.global_num_tokens_for_logprob_gpu.tolist() == [1, 0]
 
 
 def test_exact_dsv4_eager_logits_still_reject_missing_dp_segments() -> None:
