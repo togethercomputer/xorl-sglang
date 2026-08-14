@@ -1,9 +1,11 @@
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.layers.exact_sampling_transforms import (
+    EXACT_SAMPLING_TRANSFORM_PROGRAM,
     TOP_K_ALL,
     exact_sampling_support,
     exact_selected_logprob,
@@ -16,40 +18,54 @@ def _fp32(values):
     return torch.tensor(values, dtype=torch.float32)
 
 
-def _native_sgl_support(logits, top_ks, top_ps, min_ps):
-    """Use SGLang's production sampling-mask implementation as an oracle."""
+def _independent_support_reference(raw_logits, temperatures, top_ks, top_ps, min_ps):
+    expected = torch.zeros_like(raw_logits, dtype=torch.bool)
+    scaled_rows = []
+    for row in range(raw_logits.shape[0]):
+        scaled = [float(value) / float(temperatures[row]) for value in raw_logits[row]]
+        scaled_rows.append(scaled)
+        row_max = max(scaled)
+        weights = [math.exp(value - row_max) for value in scaled]
+        denominator = sum(weights)
+        probabilities = [value / denominator for value in weights]
+        ordered = sorted(
+            range(len(probabilities)),
+            key=lambda token: (-probabilities[token], token),
+        )
+        cumulative_before = 0.0
+        original_max = probabilities[ordered[0]]
+        for rank, token in enumerate(ordered):
+            probability = probabilities[token]
+            expected[row, token] = (
+                rank < min(int(top_ks[row]), len(probabilities))
+                and cumulative_before <= float(top_ps[row])
+                and probability >= original_max * float(min_ps[row])
+            )
+            cumulative_before += probability
+    return torch.tensor(scaled_rows, dtype=raw_logits.dtype), expected
 
-    sampling_info = SimpleNamespace(
-        top_ks=top_ks.to(torch.int32),
-        top_ps=top_ps,
-        min_ps=min_ps,
-        need_min_p_sampling=bool((min_ps > 0).any()),
-        sampling_mask_max_top_k=0,
-    )
-    indices, _, keep_sorted, _ = Sampler._compute_sampling_mask_from_probs(
-        object(),
-        logits.softmax(-1),
-        sampling_info,
-    )
-    support = torch.zeros_like(logits, dtype=torch.bool)
-    support.scatter_(1, indices, keep_sorted)
-    return support
 
-
-def test_exact_joint_filter_matches_native_sgl_semantics_on_boundary_rows():
-    logits = _fp32(
+def test_temperature_then_joint_filters_match_independent_reference():
+    raw_logits = _fp32(
         [
             [4.0, 3.0, 2.0, 1.0, 0.0],
             [1.0, 0.9, 0.8, 0.7, 0.6],
-            [3.0, 2.0, 1.0, 0.0, -1.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0],
         ]
     )
-    top_ks = torch.tensor([2, TOP_K_ALL, TOP_K_ALL], dtype=torch.int64)
-    top_ps = _fp32([1.0, 0.7, 1.0])
-    min_ps = _fp32([0.0, 0.0, 0.2])
+    temperatures = _fp32([0.5, 2.0, 1.0])
+    top_ks = torch.tensor([4, TOP_K_ALL, 3], dtype=torch.int64)
+    top_ps = _fp32([0.88, 0.70, 0.60])
+    min_ps = _fp32([0.05, 0.80, 0.0])
+    score_logits, expected = _independent_support_reference(
+        raw_logits, temperatures, top_ks, top_ps, min_ps
+    )
+
     assert torch.equal(
-        exact_sampling_support(logits, top_ks, top_ps, min_ps),
-        _native_sgl_support(logits, top_ks, top_ps, min_ps),
+        exact_sampling_support(score_logits, top_ks, top_ps, min_ps), expected
+    )
+    assert EXACT_SAMPLING_TRANSFORM_PROGRAM.startswith(
+        "temperature_then_stable_token_id"
     )
 
 
