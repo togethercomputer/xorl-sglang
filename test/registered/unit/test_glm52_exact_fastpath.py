@@ -157,7 +157,6 @@ class TestGlm52ExactFastpath(unittest.TestCase):
     def test_exact_request_ingress_rejects_sampler_fatal_options(self):
         manager = self._ingress_manager()
         cases = (
-            ({"temperature": 0.5}, {}, "temperature=0.5"),
             ({"temperature": 0.0}, {}, "temperature=0.0"),
             ({}, {"top_logprobs_num": 2}, "top_logprobs_num=2"),
             ({}, {"token_ids_logprob": [7]}, "token_ids_logprob=set"),
@@ -176,14 +175,16 @@ class TestGlm52ExactFastpath(unittest.TestCase):
 
     def test_exact_request_ingress_admits_contract_request(self):
         manager = self._ingress_manager()
-        request = GenerateReqInput(
-            input_ids=[1],
-            sampling_params={"temperature": 1.0, "max_new_tokens": 4},
-            return_logprob=True,
-        )
-        request.normalize_batch_and_arguments()
+        for temperature in (0.7, 1.0, 1.3):
+            with self.subTest(temperature=temperature):
+                request = GenerateReqInput(
+                    input_ids=[1],
+                    sampling_params={"temperature": temperature, "max_new_tokens": 4},
+                    return_logprob=True,
+                )
+                request.normalize_batch_and_arguments()
 
-        manager._validate_one_request(request, [1])
+                manager._validate_one_request(request, [1])
 
     def test_tier_a_tables_answer_only_when_selected(self):
         with patch.object(bi_gemm_configs, "_GLM52_TIER_A", False):
@@ -508,6 +509,10 @@ class TestGlm52ExactFastpath(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_exact_request_completion_path_end_to_end(self):
+        from sglang.srt.batch_invariant_ops import (
+            exact_temperature_scale_fp32_logits,
+            head_v2_selected_logprob_from_logits,
+        )
         from sglang.srt.layers import xorl_batch_invariant
         from sglang.srt.layers.xorl_batch_invariant import (
             xorl_bi_lm_head,
@@ -524,8 +529,13 @@ class TestGlm52ExactFastpath(unittest.TestCase):
                 SimpleNamespace(weight=weight),
                 use_fp32_lm_head=False,
             )
+            temperatures = torch.tensor(
+                [[0.7], [1.3]],
+                dtype=torch.float32,
+                device="cuda",
+            )
             sampling_info = SimpleNamespace(
-                temperatures=torch.ones((n, 1), dtype=torch.float32, device="cuda"),
+                temperatures=temperatures,
                 sampling_seed=torch.arange(1, n + 1, dtype=torch.int64, device="cuda"),
                 is_all_greedy=False,
                 need_top_p_sampling=False,
@@ -557,6 +567,23 @@ class TestGlm52ExactFastpath(unittest.TestCase):
         self.assertTrue(torch.equal(ids, sampled))
         self.assertEqual(output.next_token_logprobs.shape, (n,))
         self.assertTrue(torch.isfinite(output.next_token_logprobs).all())
+        transformed = exact_temperature_scale_fp32_logits(
+            logits,
+            temperatures.reshape(-1),
+        )
+        expected, _, _ = head_v2_selected_logprob_from_logits(
+            transformed,
+            sampled,
+            temperature=None,
+        )
+        self.assertTrue(torch.equal(output.next_token_logprobs, expected))
+        unit_scaled = exact_temperature_scale_fp32_logits(
+            logits,
+            torch.ones(n, dtype=torch.float32, device="cuda"),
+        )
+        self.assertTrue(
+            torch.equal(unit_scaled.view(torch.uint8), logits.view(torch.uint8))
+        )
 
 
 class TestGlm52ActivationBoundary(unittest.TestCase):

@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.batch_invariant_ops import exact_temperature_scale_bf16_logits
 from sglang.srt.lora.dsv4 import (
     DSV4_FLASH_LOGICAL_FACTOR_COUNT,
     DSV4_FLASH_LORA_FORMAT,
@@ -821,6 +822,37 @@ def test_exact_ingress_allows_temperature_aware_sampling() -> None:
     request.normalize_batch_and_arguments()
 
     _exact_ingress_manager()._validate_one_request(request, [1])
+
+
+def test_exact_ingress_rejects_nonpositive_temperature() -> None:
+    request = GenerateReqInput(
+        input_ids=[1],
+        sampling_params={"temperature": 0.0, "max_new_tokens": 1},
+        return_logprob=True,
+    )
+    request.normalize_batch_and_arguments()
+
+    with pytest.raises(ValueError, match="temperature=0.0"):
+        _exact_ingress_manager()._validate_one_request(request, [1])
+
+
+def test_exact_temperature_preserves_dsv4_bf16_boundary() -> None:
+    logits = torch.tensor(
+        [[1.25, -0.5, 0.75], [-1.0, 2.0, 0.25]],
+        dtype=torch.bfloat16,
+    )
+    ones = torch.ones(2, dtype=torch.float32)
+    mixed = torch.tensor([0.7, 1.3], dtype=torch.float32)
+
+    assert exact_temperature_scale_bf16_logits(logits, None) is logits
+    assert torch.equal(
+        exact_temperature_scale_bf16_logits(logits, ones).view(torch.uint8),
+        logits.view(torch.uint8),
+    )
+    assert torch.equal(
+        exact_temperature_scale_bf16_logits(logits, mixed).view(torch.uint8),
+        logits.bfloat16().div(mixed.unsqueeze(1)).bfloat16().view(torch.uint8),
+    )
 
 
 def test_dsv4_attention_targets_do_not_alias_dsa_indexer_and_have_exact_dims() -> None:

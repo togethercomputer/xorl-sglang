@@ -943,6 +943,55 @@ def test_qwen35_sampler_forward_overwrites_stock_logprob_with_contract_value():
     sampler._bi_contract_sampled_logprob.assert_called_once()
 
 
+def test_qwen35_sampler_selects_and_scores_from_one_exact_temperature_tensor():
+    import sglang.srt.layers.sampler as sampler_module
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    sampler = sampler_module.Sampler.__new__(sampler_module.Sampler)
+    torch.nn.Module.__init__(sampler)
+    sampler.return_original_logprob = False
+    sampler._glm52_exact_mode = False
+    sampler._qwen3_dense_exact_mode = False
+    sampler.use_qwen35_bi_decode_rescore = True
+    sampler.rl_on_policy_target = "xorl"
+    sampler.use_log_softmax_logprob = True
+    sampler.enable_deterministic = True
+    sampler.use_ascend_backend = False
+    sampler._preprocess_logits = MagicMock(side_effect=lambda logits, _: logits)
+    sampled = torch.tensor([2, 1], dtype=torch.int32)
+    sampler._sample_from_logprobs = MagicMock(return_value=sampled)
+    sampler._sync_token_ids_across_tp = MagicMock()
+    expected_logprob = torch.tensor([-0.25, -0.5])
+    sampler._bi_contract_sampled_logprob = MagicMock(return_value=expected_logprob)
+    sampler.output_logprob_processor = MagicMock()
+    stock = MagicMock()
+    stock.write_output_to.side_effect = lambda output: setattr(
+        output, "next_token_logprobs", torch.tensor([-9.0, -9.0])
+    )
+    sampler.output_logprob_processor.compute_logprobs.return_value = stock
+
+    logits = torch.tensor([[1.25, -0.5, 0.75], [-1.0, 2.0, 0.25]])
+    temperatures = torch.tensor([[0.7], [1.3]])
+    output = LogitsProcessorOutput(next_token_logits=logits)
+
+    actual_ids = sampler.forward(
+        output,
+        _exact_sampling_info(temperatures=temperatures),
+        return_logprob=True,
+        top_logprobs_nums=[0, 0],
+        token_ids_logprobs=[None, None],
+        positions=torch.tensor([0, 0]),
+    )
+
+    transformed = sampler._sample_from_logprobs.call_args.args[0]
+    assert torch.equal(transformed, logits * (1.0 / temperatures))
+    assert torch.equal(actual_ids, sampled)
+    rescore = sampler._bi_contract_sampled_logprob.call_args
+    assert rescore.args[0] is transformed
+    assert rescore.kwargs == {"temperature_applied": True}
+    assert output.next_token_logprobs is expected_logprob
+
+
 def test_qwen35_sampler_rescore_fails_closed_after_logit_mutation():
     import sglang.srt.layers.sampler as sampler_module
 

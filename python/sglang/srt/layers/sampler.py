@@ -10,6 +10,10 @@ from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     is_bi_head_fastpath_enabled,
 )
+from sglang.srt.batch_invariant_ops.bi_families_v2 import (
+    exact_temperature_scale_bf16_logits,
+    exact_temperature_scale_fp32_logits,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -157,6 +161,7 @@ class Sampler(nn.Module):
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
+        exact_sampling_logits = None
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -188,14 +193,23 @@ class Sampler(nn.Module):
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
             if self.rl_on_policy_target is not None:
-                # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
+                if self.use_qwen35_bi_decode_rescore:
+                    exact_sampling_logits = exact_temperature_scale_fp32_logits(
+                        logits,
+                        sampling_info.temperatures,
+                    )
+                    logits_div_temperature = exact_sampling_logits
+                else:
+                    # TODO: use more inplace ops to save memory
+                    logits_div_temperature = exact_temperature_scale_bf16_logits(
+                        logits.bfloat16(),
+                        sampling_info.temperatures,
+                    )
                 logprobs_via_logsoftmax_kernel = torch.log_softmax(
                     logits_div_temperature, dim=-1
                 )
-                del logits_div_temperature
+                if exact_sampling_logits is None:
+                    del logits_div_temperature
 
             if self.use_ascend_backend:
                 # Ascend backend: sample from logits directly.
@@ -213,7 +227,11 @@ class Sampler(nn.Module):
             ):
                 # RL on-policy path: sample from logprobs to match the trainer.
                 batch_next_token_ids = self._sample_from_logprobs(
-                    logprobs_via_logsoftmax_kernel,
+                    (
+                        exact_sampling_logits
+                        if exact_sampling_logits is not None
+                        else logprobs_via_logsoftmax_kernel
+                    ),
                     sampling_info,
                     positions,
                 )
@@ -275,9 +293,14 @@ class Sampler(nn.Module):
             logprob_result.write_output_to(logits_output)
             if self.use_qwen35_bi_decode_rescore:
                 logits_output.next_token_logprobs = self._bi_contract_sampled_logprob(
-                    logits_output.next_token_logits,
+                    (
+                        exact_sampling_logits
+                        if exact_sampling_logits is not None
+                        else logits_output.next_token_logits
+                    ),
                     batch_next_token_ids,
                     sampling_info,
+                    temperature_applied=exact_sampling_logits is not None,
                 )
                 global _bi_decode_rescore_logged
                 if not _bi_decode_rescore_logged:
@@ -296,6 +319,8 @@ class Sampler(nn.Module):
         logits: torch.Tensor,
         batch_next_token_ids: torch.Tensor,
         sampling_info: SamplingBatchInfo,
+        *,
+        temperature_applied: bool = False,
     ) -> torch.Tensor:
         """Rescore selected tokens through the pinned contract LSE reduction."""
         from sglang.srt.batch_invariant_ops import (
@@ -329,7 +354,7 @@ class Sampler(nn.Module):
             )
 
         temperature = None
-        if not sampling_info.is_all_greedy:
+        if not sampling_info.is_all_greedy and not temperature_applied:
             if not (
                 self.use_log_softmax_logprob
                 and self.enable_deterministic

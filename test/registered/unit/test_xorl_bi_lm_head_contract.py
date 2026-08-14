@@ -717,8 +717,9 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                         events.append(("sync", token_ids.clone()))
                         token_ids.add_(1)
 
-                    def selected_logprob(actual_logits, token_ids):
+                    def selected_logprob(actual_logits, token_ids, *, temperature):
                         events.append(("score", actual_logits, token_ids.clone()))
+                        self.assertIsNone(temperature)
                         return selected_logprobs, object(), object()
 
                     with (
@@ -763,8 +764,9 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                     self.assertEqual(
                         [event[0] for event in events], ["sample", "sync", "score"]
                     )
-                    self.assertIs(events[0][1], logits)
-                    self.assertIs(events[2][1], logits)
+                    self.assertTrue(torch.equal(events[0][1], logits))
+                    self.assertTrue(torch.equal(events[2][1], logits))
+                    self.assertIs(events[0][1], events[2][1])
                     torch.testing.assert_close(
                         events[1][1], torch.zeros(n, dtype=torch.int32)
                     )
@@ -772,6 +774,54 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                         events[2][2], torch.ones(n, dtype=torch.int32)
                     )
                     self.assertIs(output.next_token_logprobs, selected_logprobs)
+
+    def test_mixed_temperature_is_applied_once_before_sampling_and_scoring(self):
+        logits = torch.tensor(
+            [[1.25, -0.5, 0.75], [-1.0, 2.0, 0.25]],
+            dtype=torch.float32,
+        )
+        temperatures = torch.tensor([[0.7], [1.3]], dtype=torch.float32)
+        sampling_info = self._sampling_info(2)
+        sampling_info.temperatures = temperatures
+        output = SimpleNamespace(next_token_logits=logits, next_token_logprobs=None)
+        sampled = torch.tensor([2, 1], dtype=torch.int32)
+        seen = {}
+
+        def sample_from_logprobs(transformed, *_args):
+            seen["sample"] = transformed
+            return sampled
+
+        def score(transformed, token_ids, *, temperature):
+            seen["score"] = transformed
+            self.assertIsNone(temperature)
+            self.assertTrue(torch.equal(token_ids, sampled))
+            return torch.tensor([-0.5, -0.75]), None, None
+
+        with (
+            _paired_family("v2"),
+            patch(
+                "sglang.srt.layers.xorl_batch_invariant."
+                "head_v2_selected_logprob_from_logits",
+                side_effect=score,
+            ),
+        ):
+            xorl_bi_sample_and_score(
+                output,
+                sampling_info,
+                return_logprob=True,
+                top_logprobs_nums=[0, 0],
+                token_ids_logprobs=[None, None],
+                positions=torch.arange(2),
+                sample_from_logprobs=sample_from_logprobs,
+                sync_token_ids=lambda *_args: None,
+                enable_deterministic=True,
+                return_original_logprob=False,
+                family="v2",
+            )
+
+        expected = logits * (1.0 / temperatures)
+        self.assertTrue(torch.equal(seen["sample"], expected))
+        self.assertIs(seen["sample"], seen["score"])
 
     def test_sampler_accepts_absent_optional_logprob_lists(self):
         output = SimpleNamespace(
@@ -952,11 +1002,6 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                 "requires FP32 logits",
             ),
             "deterministic": ("enable_deterministic", False, "deterministic inference"),
-            "temperature": (
-                "temperatures",
-                torch.tensor([[0.5]]),
-                "temperature == 1",
-            ),
             "top-p": ("need_top_p_sampling", True, "does not support top-p"),
             "top-k": ("need_top_k_sampling", True, "does not support top-p"),
             "min-p": ("need_min_p_sampling", True, "does not support top-p"),

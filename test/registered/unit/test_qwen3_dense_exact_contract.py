@@ -107,7 +107,6 @@ def test_dense_qwen3_model_construction_uses_runtime_contract(monkeypatch):
 @pytest.mark.parametrize(
     ("sampling_params", "request_fields", "error"),
     (
-        ({"temperature": 0.5}, {}, "temperature=0.5"),
         ({"top_p": 0.9}, {}, "top_p=0.9"),
         ({"top_k": 10}, {}, "top_k=10"),
         ({"min_p": 0.1}, {}, "min_p=0.1"),
@@ -130,10 +129,11 @@ def test_dense_qwen3_ingress_rejects_sampler_fatal_options(
         _ingress_manager()._validate_one_request(request, [1])
 
 
-def test_dense_qwen3_ingress_admits_unit_temperature_plain_sampling():
+@pytest.mark.parametrize("temperature", [0.7, 1.0, 1.3])
+def test_dense_qwen3_ingress_admits_positive_temperature_plain_sampling(temperature):
     request = GenerateReqInput(
         input_ids=[1],
-        sampling_params={"temperature": 1.0, "max_new_tokens": 1},
+        sampling_params={"temperature": temperature, "max_new_tokens": 1},
         return_logprob=True,
     )
     request.normalize_batch_and_arguments()

@@ -9,6 +9,7 @@ from sglang.srt.batch_invariant_ops import (
     RMSNormFamily,
     bi_lm_head_full_logits,
     bi_lm_head_selected_logprob_from_logits,
+    exact_temperature_scale_fp32_logits,
     head_v2_full_logits_with_lse,
     head_v2_selected_logprob_from_logits,
 )
@@ -299,7 +300,7 @@ def xorl_bi_sample_and_score(
     return_original_logprob: bool,
     family: XorlBiFamily | None = None,
 ) -> torch.Tensor:
-    """Sample and score under the strict public XORL T=1 contract."""
+    """Sample and score under the exact per-row FP32 temperature contract."""
     family = resolve_or_validate_xorl_bi_family(family)
     logits = logits_output.next_token_logits
     if logits is None or logits.dtype != torch.float32:
@@ -358,17 +359,23 @@ def xorl_bi_sample_and_score(
         )
 
     torch._assert_async(
-        (sampling_info.temperatures == 1).all(),
-        "The XORL batch-invariant sampler requires temperature == 1.",
-    )
-    torch._assert_async(
         torch.isfinite(logits).all(),
         "The XORL batch-invariant sampler requires finite logits.",
     )
 
+    transformed_logits = exact_temperature_scale_fp32_logits(
+        logits,
+        sampling_info.temperatures,
+    )
+
     # Gumbel-max only depends on relative logits, so sampling directly from
-    # the contract logits is identical to sampling from logits - logsumexp.
-    batch_next_token_ids = sample_from_logprobs(logits, sampling_info, positions)
+    # the transformed contract logits is identical to sampling from their
+    # normalized logprobs and keeps selection on the distribution we report.
+    batch_next_token_ids = sample_from_logprobs(
+        transformed_logits,
+        sampling_info,
+        positions,
+    )
     sync_token_ids(batch_next_token_ids, sampling_info)
 
     if return_logprob:
@@ -377,7 +384,11 @@ def xorl_bi_sample_and_score(
             if family == "v2"
             else bi_lm_head_selected_logprob_from_logits
         )
-        selected_logprobs, _, _ = score(logits, batch_next_token_ids)
+        selected_logprobs, _, _ = score(
+            transformed_logits,
+            batch_next_token_ids,
+            temperature=None,
+        )
         logits_output.next_token_logprobs = selected_logprobs
 
     return batch_next_token_ids

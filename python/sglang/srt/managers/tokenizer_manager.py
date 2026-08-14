@@ -20,6 +20,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
@@ -165,7 +166,6 @@ def _get_bi_decode_strict_ingress_violations(
     obj: GenerateReqInput,
     preferred_sampling_params: Optional[Dict[str, Any]] = None,
     *,
-    require_unit_temperature: bool = False,
     sampled_logprob_only: bool = False,
 ) -> List[str]:
     """Return request transforms that the exact decode path cannot rescore."""
@@ -190,10 +190,13 @@ def _get_bi_decode_strict_ingress_violations(
     if top_k not in (-1, None):
         violations.append(f"top_k={top_k!r}")
 
-    if require_unit_temperature:
-        temperature = sampling_params.get("temperature", 1.0)
-        if temperature != 1.0:
-            violations.append(f"temperature={temperature!r}")
+    temperature = sampling_params.get("temperature", 1.0)
+    try:
+        normalized_temperature = float(temperature)
+    except (TypeError, ValueError):
+        normalized_temperature = float("nan")
+    if not math.isfinite(normalized_temperature) or normalized_temperature <= 0.0:
+        violations.append(f"temperature={temperature!r}")
 
     for name in ("json_schema", "regex", "ebnf", "structural_tag", "logit_bias"):
         if sampling_params.get(name) is not None:
@@ -1284,7 +1287,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             violations = _get_bi_decode_strict_ingress_violations(
                 obj,
                 self.preferred_sampling_params,
-                require_unit_temperature=exact_glm or exact_qwen3,
                 sampled_logprob_only=exact_glm or exact_qwen3,
             )
             if violations:
@@ -1295,14 +1297,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 if exact_dsv4:
                     contract_name = "DSV4-Flash"
-                temperature_contract = (
-                    "unit-temperature"
-                    if exact_glm or exact_qwen3
-                    else "temperature-aware" if exact_dsv4 else "plain-temperature"
-                )
                 raise ValueError(
                     f"This server runs the exact {contract_name} RL on-policy "
-                    f"decode contract; requests must use {temperature_contract} "
+                    "decode contract; requests must use positive finite temperature "
                     "sampling without top-k/top-p/min-p, penalties, grammar, "
                     "logit bias, custom processors, or MTP (incompatible "
                     "fields: " + ", ".join(violations) + ")"
