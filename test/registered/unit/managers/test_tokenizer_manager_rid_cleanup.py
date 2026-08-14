@@ -14,6 +14,7 @@ Covers:
 
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock
 
 import msgspec
@@ -36,6 +37,7 @@ from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
 from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams  # noqa: E402
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -314,6 +316,46 @@ class TestRidToStateCleanupOnBatchOutput(CustomTestCase):
         asyncio.run(tm._handle_batch_output(batch_output))
 
         self.assertIn(rid, tm.rid_to_state)
+
+    def test_normalized_sampling_temperature_is_returned_per_request(self):
+        tm = _make_tokenizer_manager()
+        tm.sampling_params_class = SamplingParams
+        tm.tokenizer = None
+        tm.model_config = SimpleNamespace(vocab_size=128)
+        tm.preferred_sampling_params = {"temperature": 0.7}
+        tm.server_args.disaggregation_transfer_backend = "none"
+
+        cases = [
+            ("preferred-temperature", {}, 0.7),
+            ("request-override", {"temperature": 1.3}, 1.3),
+            ("unit-temperature", {"temperature": 1.0}, 1.0),
+        ]
+        for rid, sampling_params, expected in cases:
+            with self.subTest(rid=rid):
+                obj = GenerateReqInput(
+                    input_ids=[1, 2],
+                    rid=rid,
+                    sampling_params=sampling_params,
+                )
+                obj.normalize_batch_and_arguments()
+                state = ReqState(
+                    out_list=[],
+                    finished=False,
+                    event=asyncio.Event(),
+                    obj=obj,
+                    time_stats=APIServerReqTimeStats(),
+                )
+                tm.rid_to_state[rid] = state
+
+                tokenized = tm._create_tokenized_object(obj, "", [1, 2])
+                self.assertEqual(tokenized.sampling_params.temperature, expected)
+                self.assertEqual(state.sampling_temperature, expected)
+
+                asyncio.run(tm._handle_batch_output(_make_batch_str_output(rid)))
+                self.assertEqual(
+                    state.out_list[-1]["meta_info"]["sampling_temperature"],
+                    expected,
+                )
 
 
 class TestInitReqStateDuplicateDetection(CustomTestCase):

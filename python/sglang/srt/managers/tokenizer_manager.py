@@ -273,6 +273,7 @@ class ReqState:
     abort_requested: bool = False
     lifecycle_id: object = dataclasses.field(default_factory=object)
     dispatched: bool = False
+    sampling_temperature: Optional[float] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -1540,8 +1541,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
-        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
-        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        state = self.rid_to_state[obj.rid]
+        if isinstance(obj, GenerateReqInput):
+            # Relay the normalized value that the sampler actually consumes,
+            # including preferred sampling parameters and the default T=1 path.
+            state.sampling_temperature = float(sampling_params.temperature)
+        tokenized_obj.time_stats = state.time_stats
+        state.time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
 
@@ -2337,6 +2343,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "weight_version": self.config_value("weight_version"),
                 "num_retractions": recv_obj.retraction_counts[i],
             }
+            if state.sampling_temperature is not None:
+                meta_info["sampling_temperature"] = state.sampling_temperature
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
