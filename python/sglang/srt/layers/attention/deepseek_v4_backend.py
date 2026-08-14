@@ -58,6 +58,7 @@ from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillWorkspace,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_spec
@@ -354,6 +355,59 @@ class DSV4AttnMetadata:
                 f"apply_cp_reindex post-condition: global field {field_name}.shape[0]={val.shape[0]} "
                 f"!= pre_global_len={pre_global_len} (must remain global for compressor write path)"
             )
+
+    def apply_cp_v2_reindex(self, forward_batch: ForwardBatch) -> None:
+        """Shard ragged query metadata while retaining global cache-write rows."""
+        from sglang.srt.layers.cp.base import get_cp_strategy
+
+        strategy = get_cp_strategy()
+        if strategy is None:
+            raise RuntimeError("DSV4 CP-v2 metadata requires an active strategy")
+        cp_metadata = forward_batch.attn_cp_metadata
+        if cp_metadata is None:
+            raise RuntimeError("DSV4 CP-v2 metadata requires a prepared CP layout")
+
+        cp_rank = get_parallel().attn_cp_rank
+        total_rows = int(cp_metadata.total_seq_lens)
+        logical_rows = int(cp_metadata.per_rank_logical_token[cp_rank])
+        physical_rows = int(cp_metadata.per_rank_actual_token[cp_rank])
+        for field_name in self._CP_REINDEX_FIELDS:
+            value = getattr(self, field_name, None)
+            if not isinstance(value, torch.Tensor) or value.shape[0] != total_rows:
+                raise RuntimeError(
+                    "DSV4 CP-v2 query metadata must cover every logical row: "
+                    f"{field_name}.shape={getattr(value, 'shape', None)}, "
+                    f"expected_rows={total_rows}"
+                )
+            local_value = strategy.shard_hidden_states(value, forward_batch)
+            if local_value.shape[0] != physical_rows:
+                raise RuntimeError(
+                    "DSV4 CP-v2 query metadata returned the wrong physical row "
+                    f"count for {field_name}: rows={local_value.shape[0]}, "
+                    f"expected={physical_rows}"
+                )
+            setattr(self, field_name, local_value)
+
+        # Preserve the backend's dummy-query invariants: clamped lengths are at
+        # least one and safely address dummy page zero, while the unclamped c4
+        # length remains zero.
+        padding_values = {
+            "seq_lens_casual": 1,
+            "swa_topk_lengths": 1,
+            "c4_topk_lengths_raw": 0,
+            "c4_topk_lengths_clamp1": 1,
+            "c128_topk_lengths_clamp1": 1,
+        }
+        for field_name, padding_value in padding_values.items():
+            getattr(self, field_name)[logical_rows:].fill_(padding_value)
+
+        for field_name in self._CP_GLOBAL_FIELDS:
+            value = getattr(self, field_name, None)
+            if value is not None and value.shape[0] != total_rows:
+                raise RuntimeError(
+                    "DSV4 CP-v2 cache-write metadata must remain global: "
+                    f"{field_name}.shape[0]={value.shape[0]}, expected={total_rows}"
+                )
 
     def init_flashmla_related(self, is_prefill: bool = False):
         # c4_sparse_topk is set from model_config.index_topk per-model
@@ -1357,6 +1411,22 @@ class DeepseekV4AttnBackend(
         self.forward_metadata = self._build_forward_metadata(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
 
+    def _finalize_cp_v2_prefill_metadata(
+        self,
+        metadata: DSV4Metadata,
+        forward_batch: ForwardBatch,
+        *,
+        use_prefill_cuda_graph: bool,
+    ) -> None:
+        core_metadata = metadata.core_attn_metadata
+        core_metadata.apply_cp_v2_reindex(forward_batch)
+        core_metadata.init_flashmla_related(is_prefill=True)
+        if metadata.indexer_metadata is not None:
+            metadata.indexer_metadata = self.init_forward_metadata_indexer(
+                core_metadata,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+            )
+
     def _build_forward_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -1461,6 +1531,15 @@ class DeepseekV4AttnBackend(
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
+
+        if is_cp_v2_active(forward_batch):
+            if not isinstance(metadata, DSV4Metadata):
+                raise RuntimeError("DSV4 CP-v2 requires materialized prefill metadata")
+            self._finalize_cp_v2_prefill_metadata(
+                metadata,
+                forward_batch,
+                use_prefill_cuda_graph=use_prefill_cuda_graph,
+            )
 
         return metadata
 

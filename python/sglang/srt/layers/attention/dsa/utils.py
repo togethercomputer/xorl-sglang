@@ -329,6 +329,30 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return False
 
 
+def gather_dsa_prefill_cp_rows(input_: torch.Tensor, forward_batch):
+    """Materialize logical prefill rows under the active DSA CP protocol."""
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    if is_cp_v2_active(forward_batch):
+        from sglang.srt.layers.cp.base import get_cp_strategy
+
+        strategy = get_cp_strategy()
+        if strategy is None:
+            raise RuntimeError("DSA CP-v2 row gather requires an active strategy")
+        return strategy.gather_hidden_states(
+            input_, forward_batch, torch.cuda.current_stream()
+        )
+
+    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+
+    return cp_all_gather_rerange_output(
+        input_,
+        get_parallel().attn_cp_size,
+        forward_batch,
+        torch.cuda.current_stream(),
+    )
+
+
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:
     return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
 

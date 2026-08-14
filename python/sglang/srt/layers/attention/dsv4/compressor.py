@@ -23,17 +23,18 @@ from sglang.kernels.ops.attention.dsv4.quant_k_cache import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.dsa.utils import (
+    dsa_use_prefill_cp,
+    gather_dsa_prefill_cp_rows,
+)
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
-from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.deepseek_v2 import _is_hip
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu, set_weight_attrs
 
 _is_npu = is_npu()
@@ -436,12 +437,7 @@ class Compressor(BaseFusedOp):
 
         # CUDA path: delegate to backend
         if dsa_use_prefill_cp(forward_batch):
-            kv_score = cp_all_gather_rerange_output(
-                kv_score,
-                get_parallel().attn_cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
+            kv_score = gather_dsa_prefill_cp_rows(kv_score, forward_batch)
         return kv_score
 
     def forward_native(
@@ -486,11 +482,6 @@ class Compressor(BaseFusedOp):
             return x.new_empty(0, self.head_dim)
 
         if dsa_use_prefill_cp(forward_batch):
-            x = cp_all_gather_rerange_output(
-                x,
-                get_parallel().attn_cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
+            x = gather_dsa_prefill_cp_rows(x, forward_batch)
 
         return get_attn_backend().forward_compress(self, x, forward_batch)

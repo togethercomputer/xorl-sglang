@@ -7,7 +7,11 @@ import pytest
 import torch
 from torch import nn
 
-from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.attention.deepseek_v4_backend import (
+    DeepseekV4AttnBackend,
+    DSV4AttnMetadata,
+    DSV4Metadata,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -20,8 +24,9 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dsv4_ownership import reconstruct_dsv4_dp_rows
 from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner_utils.buffers import (
     add_dsv4_exact_pp_proxy_buffers,
 )
@@ -223,6 +228,26 @@ class _FusedQContractLayer(_FusedMHCLayer):
         hidden_states = kwargs["hidden_states"]
         positions = kwargs["positions"]
         self.attn._compute_q_b(hidden_states.mean(dim=1), positions)
+        return super().forward(**kwargs)
+
+
+class _OwnerReconstructLayer(_FusedMHCLayer):
+    """Exercise the exact owner-row seam from a CP-local model body."""
+
+    def __init__(self, layer_id: int, hc_mult: int, strategy):
+        super().__init__(layer_id, hc_mult)
+        self.strategy = strategy
+        self.reconstructed = None
+
+    def forward(self, **kwargs):
+        self.reconstructed = reconstruct_dsv4_dp_rows(
+            kwargs["hidden_states"],
+            kwargs["forward_batch"],
+            LogicalRowOwnership(2, 4, 0, 0, 8),
+            [6, 6],
+            context_sharded=True,
+            strategy=self.strategy,
+        )
         return super().forward(**kwargs)
 
 
@@ -490,123 +515,299 @@ def test_cp_v2_keeps_dp_max_padding_in_exact_owner_block():
     assert torch.equal(reconstructed, input_ids)
 
 
-def test_cp_v2_ragged_prefill_shards_radix_locations_for_fused_kv_store():
-    """The fused KV store must see one physical cache location per local row."""
+@pytest.mark.parametrize(
+    ("cp_rank", "expected_positions", "logical_rows"),
+    ((0, [0, 4, 0, 0], 2), (2, [2, 0, 0, 0], 1)),
+)
+def test_cp_v2_ragged_metadata_reindex_keeps_global_cache_rows(
+    cp_rank, expected_positions, logical_rows
+):
+    input_ids = torch.arange(6, dtype=torch.int64)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=torch.arange(6, dtype=torch.int64),
+        seq_lens_cpu=torch.tensor([4]),
+        extend_seq_lens_cpu=[4],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=None,
+        out_cache_loc=None,
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    parallel = SimpleNamespace(attn_cp_rank=cp_rank, attn_cp_size=4)
+    core = object.__new__(DSV4AttnMetadata)
+    length_fields = {
+        "seq_lens_casual",
+        "swa_topk_lengths",
+        "c4_topk_lengths_raw",
+        "c4_topk_lengths_clamp1",
+        "c128_topk_lengths_clamp1",
+    }
+    for field_name in core._CP_REINDEX_FIELDS:
+        values = torch.arange(1, 7) if field_name in length_fields else torch.arange(6)
+        setattr(core, field_name, values)
+    global_fields = {}
+    for offset, field_name in enumerate(core._CP_GLOBAL_FIELDS):
+        value = torch.arange(6) + 100 * (offset + 1)
+        setattr(core, field_name, value)
+        global_fields[field_name] = value
 
-    input_ids = torch.arange(10, dtype=torch.int64)
-    positions = torch.arange(10, dtype=torch.int64)
-    complete_embeds = torch.arange(40, dtype=torch.float32).view(10, 4)
-    complete_cache_loc = torch.arange(1, 11, dtype=torch.int64)
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=parallel),
+        patch(
+            "sglang.srt.layers.attention.deepseek_v4_backend.get_parallel",
+            return_value=parallel,
+        ),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        core.apply_cp_v2_reindex(forward_batch)
 
-    attn = MQALayer.__new__(MQALayer)
-    nn.Module.__init__(attn)
-    attn.layer_id = 0
-    attn.wkv = _TupleIdentity()
-    attn.kv_norm = nn.LayerNorm(4)
-    attn.eps = 1e-6
-    attn.freqs_cis = torch.empty(0)
+    assert core.positions_casual.tolist() == expected_positions
+    for field_name in (
+        "positions_casual",
+        "page_table",
+        "swa_page_indices",
+        "c128_page_indices",
+    ):
+        assert getattr(core, field_name)[logical_rows:].count_nonzero().item() == 0
+    assert core.seq_lens_casual.shape == (4,)
+    assert core.seq_lens_casual[logical_rows:].tolist() == [1] * (4 - logical_rows)
+    assert core.swa_topk_lengths[logical_rows:].tolist() == [1] * (4 - logical_rows)
+    assert core.c4_topk_lengths_raw[logical_rows:].tolist() == [0] * (4 - logical_rows)
+    assert core.c4_topk_lengths_clamp1[logical_rows:].tolist() == [1] * (
+        4 - logical_rows
+    )
+    assert core.c128_topk_lengths_clamp1[logical_rows:].tolist() == [1] * (
+        4 - logical_rows
+    )
+    for field_name, value in global_fields.items():
+        assert getattr(core, field_name) is value
+        assert value.shape == (6,)
 
-    token_pool = object.__new__(DeepSeekV4TokenToKVPool)
-    token_pool._stage_start = 0
-    token_pool.swa_kv_pool = SimpleNamespace(
-        page_size=64,
-        kv_buffer=[torch.empty(0)],
+
+def test_cp_v2_metadata_finalization_rebuilds_flash_and_indexer_plans():
+    calls = []
+    forward_batch = SimpleNamespace()
+    core = SimpleNamespace(
+        apply_cp_v2_reindex=lambda batch: calls.append(("reindex", batch)),
+        init_flashmla_related=lambda **kwargs: calls.append(("flash", kwargs)),
+    )
+    original_indexer = object()
+    rebuilt_indexer = object()
+    metadata = DSV4Metadata(core, original_indexer)
+    backend = object.__new__(DeepseekV4AttnBackend)
+
+    def rebuild(received_core, *, use_prefill_cuda_graph):
+        calls.append(("indexer", received_core, use_prefill_cuda_graph))
+        return rebuilt_indexer
+
+    backend.init_forward_metadata_indexer = rebuild
+    backend._finalize_cp_v2_prefill_metadata(
+        metadata,
+        forward_batch,
+        use_prefill_cuda_graph=True,
     )
 
-    full_to_swa = torch.arange(32, dtype=torch.int64) * 10
-    expected_local_locations = (
-        [10, 50, 90, 0],
-        [20, 60, 100, 0],
-        [30, 70, 0, 0],
-        [40, 80, 0, 0],
+    assert calls == [
+        ("reindex", forward_batch),
+        ("flash", {"is_prefill": True}),
+        ("indexer", core, True),
+    ]
+    assert metadata.indexer_metadata is rebuilt_indexer
+
+
+def test_cp_v2_eager_extend_owns_shard_gather_and_exact_owner_handoff():
+    """CP-v2 must not re-enter DSV4's legacy model-side CP-v1 boundary."""
+
+    input_ids = torch.arange(6, dtype=torch.int64)
+    positions = torch.arange(6, dtype=torch.int64)
+    complete_embeds = torch.arange(24, dtype=torch.float32).view(6, 4)
+    out_cache_loc = torch.arange(1, 7, dtype=torch.int64)
+    forward_batch = SimpleNamespace(
+        can_run_tbo=False,
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=positions,
+        seq_lens_cpu=torch.tensor([4]),
+        extend_seq_lens_cpu=[4],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=[6, 6],
+        out_cache_loc=out_cache_loc,
+        spec_info=None,
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    cp_parallel = SimpleNamespace(
+        attn_cp_rank=0,
+        attn_cp_size=4,
+        attn_cp_group=object(),
     )
 
-    for cp_rank, expected_swa_loc in enumerate(expected_local_locations):
-        forward_batch = SimpleNamespace(
-            can_run_tbo=False,
-            forward_mode=ForwardMode.EXTEND,
-            input_ids=input_ids,
-            positions=positions,
-            seq_lens_cpu=torch.tensor([10]),
-            extend_seq_lens_cpu=[10],
-            attn_cp_metadata=None,
-            global_num_tokens_cpu=None,
-            out_cache_loc=complete_cache_loc,
-        )
-        strategy = InterleaveCPStrategy(cp_size=4)
-        cp_parallel = SimpleNamespace(attn_cp_rank=cp_rank, attn_cp_size=4)
-        backend = object.__new__(DeepseekV4AttnBackend)
-        backend.forward_metadata = SimpleNamespace(
-            core_attn_metadata=SimpleNamespace(
-                # Attention metadata was initialized before CP-local model input
-                # sharding, so this global value must not win by shape alone.
-                swa_out_cache_loc=torch.full((10,), -1, dtype=torch.int32)
-            )
-        )
-        backend.token_to_kv_pool = SimpleNamespace(
-            translate_loc_from_full_to_swa=lambda loc: full_to_swa[loc]
-        )
-        fused_store = {}
+    body = _make_exact_dsv4_stage(0, 1, (0, 1))
+    owner_layer = _OwnerReconstructLayer(0, body.hc_mult, strategy)
+    body.layers[0] = owner_layer
+    body.embed_tokens = _UnexpectedEmbedding()
+    body.dsa_enable_prefill_cp = True
 
-        def _fused_k_norm_rope_flashmla(**kwargs):
-            fused_store.update(kwargs)
-            assert kwargs["kv"].shape[0] == kwargs["positions"].shape[0]
-            assert kwargs["kv"].shape[0] == kwargs["out_loc"].shape[0]
+    logits_call = {}
 
-        with (
-            patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
-            patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
-            patch("sglang.srt.layers.cp.base.get_parallel", return_value=cp_parallel),
-            patch(
-                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
-                return_value=4,
-            ),
-            patch(
-                "sglang.srt.models.deepseek_v4.get_token_to_kv_pool",
-                return_value=token_pool,
-            ),
-            patch(
-                "sglang.srt.models.deepseek_v4.envs."
-                "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get",
-                return_value=False,
-            ),
-            patch(
-                "sglang.srt.mem_cache.deepseek_v4_memory_pool."
-                "fused_k_norm_rope_flashmla",
-                side_effect=_fused_k_norm_rope_flashmla,
-            ),
+    def logits_processor(
+        logits_input_ids,
+        hidden_states,
+        _lm_head,
+        logits_forward_batch,
+        *,
+        aux_hidden_states,
+        hidden_states_before_norm,
+    ):
+        logits_call.update(
+            input_ids=logits_input_ids.detach().clone(),
+            hidden_states=hidden_states.detach().clone(),
+            forward_batch=logits_forward_batch,
+            aux_hidden_states=aux_hidden_states,
+            hidden_states_before_norm=hidden_states_before_norm.detach().clone(),
+        )
+        return hidden_states
+
+    wrapper = SimpleNamespace(
+        model=body,
+        pp_group=body.pp_group,
+        capture_aux_hidden_states=False,
+        logits_processor=logits_processor,
+        lm_head=object(),
+    )
+    eager = EagerRunner.__new__(EagerRunner)
+    eager.model_runner = SimpleNamespace(
+        model=wrapper,
+        server_args=SimpleNamespace(enable_lora=False),
+    )
+
+    gather_calls = []
+
+    def gather_hidden_states(local_rows, _forward_batch, _stream=None):
+        gather_calls.append(tuple(local_rows.shape))
+        rows_shape = (6, *local_rows.shape[1:])
+        return torch.arange(
+            torch.tensor(rows_shape).prod().item(), dtype=local_rows.dtype
+        ).view(rows_shape)
+
+    owner = SimpleNamespace(dp_rank=0)
+    forbidden_cp_v1 = {
+        "cp_split_and_rebuild_data": patch(
+            "sglang.srt.models.deepseek_v4.cp_split_and_rebuild_data",
+            side_effect=AssertionError("CP-v1 data split ran under CP-v2"),
+        ),
+        "cp_split_and_rebuild_position": patch(
+            "sglang.srt.models.deepseek_v4.cp_split_and_rebuild_position",
+            side_effect=AssertionError("CP-v1 position split ran under CP-v2"),
+        ),
+        "cp_round_robin_input_ids": patch(
+            "sglang.srt.models.deepseek_v4.cp_round_robin_input_ids",
+            side_effect=AssertionError("CP-v1 input-id split ran under CP-v2"),
+        ),
+        "cp_all_gather_rerange_output": patch(
+            "sglang.srt.models.deepseek_v4.cp_all_gather_rerange_output",
+            side_effect=AssertionError("CP-v1 terminal gather ran under CP-v2"),
+        ),
+    }
+
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=cp_parallel),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+        patch("sglang.srt.layers.dp_attention.set_local_dp_buffer_len"),
+        patch.object(
+            strategy, "gather_hidden_states", side_effect=gather_hidden_states
+        ),
+        patch("sglang.srt.models.deepseek_v4.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.models.deepseek_v4.dsa_use_prefill_cp", return_value=True),
+        patch(
+            "sglang.srt.models.deepseek_v4.check_cuda_graph_backend",
+            return_value=True,
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.resolve_dsv4_owner_plane",
+            return_value=owner,
+        ),
+        forbidden_cp_v1["cp_split_and_rebuild_data"],
+        forbidden_cp_v1["cp_split_and_rebuild_position"],
+        forbidden_cp_v1["cp_round_robin_input_ids"],
+        forbidden_cp_v1["cp_all_gather_rerange_output"],
+        patch(
+            "sglang.srt.model_executor.runner.eager_runner.torch.cuda.current_stream",
+            return_value=None,
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        result = eager._execute_extend_cp_v2(
+            forward_batch, {"input_embeds": complete_embeds}
+        )
+
+    metadata = forward_batch.attn_cp_metadata
+    assert metadata.per_rank_logical_token == [2, 2, 1, 1]
+    assert metadata.per_rank_actual_token == [4, 4, 4, 4]
+    assert gather_calls == [(4, 3, 4), (4, 4), (4, 12)]
+    assert owner_layer.reconstructed.shape == (6, 3, 4)
+    assert result.shape == (6, 4)
+    assert logits_call["hidden_states"].shape == (6, 4)
+    assert logits_call["hidden_states_before_norm"].shape == (6, 12)
+    assert torch.equal(logits_call["input_ids"], input_ids)
+    assert logits_call["aux_hidden_states"] is None
+    assert logits_call["forward_batch"] is forward_batch
+    assert forward_batch.dsv4_exact_logits_rows_reconstructed
+    assert forward_batch.dsv4_exact_logits_owner_rows == 6
+    assert forward_batch.dsv4_exact_logits_dp_rank == 0
+    assert torch.equal(forward_batch.out_cache_loc, out_cache_loc)
+    assert not hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+
+
+def test_cp_v2_exact_logits_reject_local_rows_and_accept_gathered_owner_rows():
+    metadata = LogitsMetadata(
+        forward_mode=ForwardMode.EXTEND,
+        extend_seq_lens=torch.tensor([6], dtype=torch.int64),
+        extend_seq_lens_cpu=[6],
+        extend_return_logprob=False,
+        global_num_tokens_for_logprob_cpu=[1, 1],
+        dsv4_exact_logits_rows_reconstructed=True,
+        dsv4_exact_logits_owner_rows=6,
+        dsv4_exact_logits_dp_rank=0,
+    )
+
+    with pytest.raises(RuntimeError, match="complete reconstructed DP-owner rows"):
+        LogitsProcessor._get_pruned_states(
+            None, torch.zeros((4, 4)), None, None, metadata
+        )
+
+    gathered = torch.arange(24, dtype=torch.float32).view(6, 4)
+    pruned = LogitsProcessor._get_pruned_states(None, gathered, None, None, metadata)[0]
+    assert torch.equal(pruned, gathered[-1:])
+
+
+def test_cp_v2_eager_preserves_tensor_body_hidden_none_convention():
+    class _HiddenNoneBody(nn.Module):
+        def forward(
+            self,
+            _input_ids,
+            _positions,
+            _forward_batch,
+            *,
+            input_embeds,
         ):
-            prepare_cp_forward(forward_batch)
-            logical_cache_loc = forward_batch.out_cache_loc
-            with pytest.raises(RuntimeError, match="after fused store"):
-                with cp_shard_model_inputs(
-                    complete_embeds,
-                    positions,
-                    forward_batch,
-                    shard_out_cache_loc=True,
-                ) as (local_embeds, local_positions):
-                    attn._compute_kv_to_cache(
-                        local_embeds,
-                        local_positions,
-                        forward_batch,
-                        backend,
-                    )
-                    raise RuntimeError("after fused store")
+            return input_embeds, None
 
-        assert forward_batch.out_cache_loc is logical_cache_loc
-        assert torch.equal(logical_cache_loc, complete_cache_loc)
-        assert fused_store["kv"].shape == (4, 4)
-        assert fused_store["positions"].shape == (4,)
-        assert fused_store["out_loc"].dtype is torch.int32
-        assert fused_store["out_loc"].tolist() == expected_swa_loc
-
-
-def test_cp_v2_local_radix_locations_bypass_same_shape_global_cache():
-    """A padded local shard can have the same row count as the global batch."""
-
-    input_ids = torch.arange(4, dtype=torch.int64)
-    positions = torch.arange(4, dtype=torch.int64)
-    complete_embeds = torch.arange(16, dtype=torch.float32).view(4, 4)
+    input_ids = torch.arange(6, dtype=torch.int64)
+    positions = torch.arange(6, dtype=torch.int64)
+    complete_embeds = torch.arange(24, dtype=torch.float32).view(6, 4)
     forward_batch = SimpleNamespace(
         forward_mode=ForwardMode.EXTEND,
         input_ids=input_ids,
@@ -615,21 +816,431 @@ def test_cp_v2_local_radix_locations_bypass_same_shape_global_cache():
         extend_seq_lens_cpu=[4],
         attn_cp_metadata=None,
         global_num_tokens_cpu=None,
-        out_cache_loc=torch.arange(1, 5, dtype=torch.int64),
+        out_cache_loc=None,
+        spec_info=None,
     )
     strategy = InterleaveCPStrategy(cp_size=4)
-    cp_parallel = SimpleNamespace(attn_cp_rank=1, attn_cp_size=4)
-    backend = object.__new__(DeepseekV4AttnBackend)
-    backend.forward_metadata = SimpleNamespace(
-        core_attn_metadata=SimpleNamespace(
-            swa_out_cache_loc=torch.tensor([10, 20, 30, 40], dtype=torch.int32)
-        )
+    parallel = SimpleNamespace(attn_cp_rank=0, attn_cp_size=4)
+    logits_call = {}
+
+    def logits_processor(
+        _input_ids,
+        hidden_states,
+        _lm_head,
+        _forward_batch,
+        *,
+        aux_hidden_states,
+        hidden_states_before_norm,
+    ):
+        logits_call["aux"] = aux_hidden_states
+        logits_call["before_norm"] = hidden_states_before_norm
+        return hidden_states
+
+    wrapper = SimpleNamespace(
+        model=_HiddenNoneBody(),
+        pp_group=_PPGroup(0, 1),
+        capture_aux_hidden_states=False,
+        logits_processor=logits_processor,
+        lm_head=object(),
     )
-    full_to_swa = torch.arange(16, dtype=torch.int64) * 10
-    backend.token_to_kv_pool = SimpleNamespace(
-        translate_loc_from_full_to_swa=lambda loc: full_to_swa[loc]
+    eager = EagerRunner.__new__(EagerRunner)
+    eager.model_runner = SimpleNamespace(
+        model=wrapper,
+        server_args=SimpleNamespace(enable_lora=False),
     )
 
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=parallel),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+        patch.object(
+            strategy,
+            "gather_hidden_states",
+            return_value=complete_embeds,
+        ) as gather,
+        patch(
+            "sglang.srt.model_executor.runner.eager_runner.torch.cuda.current_stream",
+            return_value=None,
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        result = eager._execute_extend_cp_v2(
+            forward_batch, {"input_embeds": complete_embeds}
+        )
+
+    assert torch.equal(result, complete_embeds)
+    assert gather.call_count == 1
+    assert logits_call == {"aux": None, "before_norm": None}
+
+
+def test_cp_v2_pp2_keeps_local_positions_and_global_owner_metadata():
+    input_ids = torch.arange(6, dtype=torch.int64)
+    positions = torch.arange(6, dtype=torch.int64)
+    complete_embeds = torch.arange(24, dtype=torch.float32).view(6, 4)
+    forward_batch = SimpleNamespace(
+        can_run_tbo=False,
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=positions,
+        seq_lens_cpu=torch.tensor([4]),
+        extend_seq_lens_cpu=[4],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=None,
+        out_cache_loc=None,
+        spec_info=None,
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    parallel = SimpleNamespace(attn_cp_rank=0, attn_cp_size=4)
+    first = _make_exact_dsv4_stage(0, 2, (0, 1))
+    last = _make_exact_dsv4_stage(1, 2, (1, 2))
+    first.embed_tokens = _UnexpectedEmbedding()
+    first.dsa_enable_prefill_cp = True
+    last.dsa_enable_prefill_cp = True
+
+    final_call = {}
+
+    def logits_processor(
+        _input_ids,
+        hidden_states,
+        _lm_head,
+        logits_forward_batch,
+        *,
+        aux_hidden_states,
+        hidden_states_before_norm,
+    ):
+        final_call.update(
+            hidden=hidden_states,
+            before=hidden_states_before_norm,
+            forward_batch=logits_forward_batch,
+            aux=aux_hidden_states,
+        )
+        return hidden_states
+
+    first_wrapper = SimpleNamespace(
+        model=first,
+        pp_group=first.pp_group,
+        capture_aux_hidden_states=False,
+    )
+    last_wrapper = SimpleNamespace(
+        model=last,
+        pp_group=last.pp_group,
+        capture_aux_hidden_states=False,
+        logits_processor=logits_processor,
+        lm_head=object(),
+    )
+    eager = EagerRunner.__new__(EagerRunner)
+    server_args = SimpleNamespace(enable_lora=False)
+    gather_calls = []
+
+    def gather(local_rows, _forward_batch, _stream=None):
+        gather_calls.append(tuple(local_rows.shape))
+        return local_rows.new_zeros((6, *local_rows.shape[1:]))
+
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=parallel),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+        patch.object(strategy, "gather_hidden_states", side_effect=gather),
+        patch("sglang.srt.models.deepseek_v4.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.models.deepseek_v4.dsa_use_prefill_cp", return_value=True),
+        patch(
+            "sglang.srt.models.deepseek_v4.check_cuda_graph_backend",
+            return_value=True,
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.resolve_dsv4_owner_plane",
+            return_value=SimpleNamespace(dp_rank=0),
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.cp_split_and_rebuild_data",
+            side_effect=AssertionError("CP-v1 data split ran under CP-v2"),
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.cp_split_and_rebuild_position",
+            side_effect=AssertionError("CP-v1 position split ran under CP-v2"),
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.cp_round_robin_input_ids",
+            side_effect=AssertionError("CP-v1 input-id split ran under CP-v2"),
+        ),
+        patch(
+            "sglang.srt.model_executor.runner.eager_runner.torch.cuda.current_stream",
+            return_value=None,
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        eager.model_runner = SimpleNamespace(
+            model=first_wrapper, server_args=server_args
+        )
+        proxy = eager._execute_extend_cp_v2(
+            forward_batch, {"input_embeds": complete_embeds}
+        )
+        eager.model_runner = SimpleNamespace(
+            model=last_wrapper, server_args=server_args
+        )
+        result = eager._execute_extend_cp_v2(
+            forward_batch,
+            {"input_embeds": complete_embeds, "pp_proxy_tensors": proxy},
+        )
+
+    assert isinstance(proxy, PPProxyTensors)
+    proxy_hidden, _, _, _, proxy_ids, proxy_positions = unpack_dsv4_exact_pp_proxy(
+        proxy,
+        hc_mult=first.hc_mult,
+        hidden_size=first.hidden_size,
+        deferred_mhc=True,
+    )
+    assert proxy_hidden.shape[0] == 4
+    assert torch.equal(proxy_ids, input_ids)
+    assert torch.equal(proxy_positions, positions)
+    assert last.layers[1].last_positions.tolist() == [0, 4, 0, 0]
+    assert last.layers[1].last_positions.shape[0] == proxy_hidden.shape[0]
+    assert gather_calls == [(4, 4), (4, 12)]
+    assert result.shape == (6, 4)
+    assert final_call["before"].shape == (6, 12)
+    assert final_call["forward_batch"] is forward_batch
+    assert final_call["aux"] is None
+    assert torch.equal(forward_batch._dsv4_exact_dp_positions, positions)
+
+
+def test_cp_v1_model_boundary_still_splits_and_gathers_once():
+    input_ids = torch.arange(4, dtype=torch.int64)
+    positions = torch.arange(4, dtype=torch.int64)
+    forward_batch = _forward_batch(positions)
+    forward_batch.attn_cp_metadata = SimpleNamespace(total_seq_lens=4)
+    model = _make_exact_dsv4_stage(0, 1, (0, 1))
+    strategy = SimpleNamespace(
+        gather_hidden_states=lambda rows, _forward_batch, _stream: torch.cat(
+            (rows, rows), dim=0
+        )
+    )
+
+    with (
+        patch("sglang.srt.models.deepseek_v4.is_cp_v2_active", return_value=False),
+        patch("sglang.srt.models.deepseek_v4.dsa_use_prefill_cp", return_value=True),
+        patch(
+            "sglang.srt.models.deepseek_v4.cp_split_and_rebuild_data",
+            side_effect=lambda _forward_batch, rows: rows[:2],
+        ) as split_data,
+        patch(
+            "sglang.srt.models.deepseek_v4.cp_split_and_rebuild_position",
+            return_value=torch.tensor([0, 2]),
+        ) as split_positions,
+        patch(
+            "sglang.srt.models.deepseek_v4.cp_round_robin_input_ids",
+            return_value=torch.tensor([0, 2]),
+        ) as split_ids,
+        patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy),
+        patch(
+            "sglang.srt.models.deepseek_v4.check_cuda_graph_backend",
+            return_value=True,
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.resolve_dsv4_owner_plane",
+            return_value=SimpleNamespace(dp_rank=0),
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v4.torch.cuda.current_stream", return_value=None
+        ),
+    ):
+        hidden, pre_head = model(input_ids, positions, forward_batch, input_embeds=None)
+
+    split_data.assert_called_once()
+    split_positions.assert_called_once()
+    split_ids.assert_called_once()
+    assert model.layers[0].last_positions.tolist() == [0, 2]
+    assert model.layers[0].last_input_ids.tolist() == [0, 2]
+    assert hidden.shape == (4, 4)
+    assert pre_head.shape == (4, 12)
+    assert forward_batch.dsv4_exact_logits_rows_reconstructed
+    assert forward_batch.dsv4_exact_logits_owner_rows == 4
+
+
+def test_cp_v2_nvidia_kv_gathers_logical_rows_before_global_cache_store():
+    input_ids = torch.arange(6, dtype=torch.int64)
+    positions = torch.arange(6, dtype=torch.int64)
+    complete_embeds = torch.arange(24, dtype=torch.float32).view(6, 4)
+    global_cache_loc = torch.arange(1, 7, dtype=torch.int64)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=positions,
+        seq_lens_cpu=torch.tensor([4]),
+        extend_seq_lens_cpu=[4],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=None,
+        out_cache_loc=global_cache_loc,
+        spec_info=None,
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    cp_parallel = SimpleNamespace(attn_cp_rank=0, attn_cp_size=4)
+
+    attn = MQALayer.__new__(MQALayer)
+    nn.Module.__init__(attn)
+    attn.fuse_wqa_wkv = False
+    attn.wq_a = _TupleIdentity()
+    attn.q_norm = nn.Identity()
+    attn._compute_q_b = lambda q, _positions, _q_out: q
+    attn._compute_kv_bf16 = lambda x, _positions, qkv_a=None: x
+    attn.dsa_enable_prefill_cp = True
+    attn.cp_size = 4
+    attn.use_fused_qk_norm_rope = False
+    attn.indexer = None
+    attn.compressor = None
+    attn.layer_id = 0
+
+    stored = {}
+    backend = SimpleNamespace(
+        store_cache=lambda **kwargs: stored.update(kwargs),
+    )
+    gather_calls = []
+
+    def gather(local_rows, _forward_batch, _stream=None):
+        gather_calls.append(tuple(local_rows.shape))
+        assert local_rows.shape == (4, 4)
+        return complete_embeds.clone()
+
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=cp_parallel),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+        patch.object(strategy, "gather_hidden_states", side_effect=gather),
+        patch("sglang.srt.models.deepseek_v4.dsa_use_prefill_cp", return_value=True),
+        patch("sglang.srt.models.deepseek_v4._is_npu", False),
+        patch(
+            "sglang.kernels.ops.attention.dsv4.unified_kv_kernels.env_gate."
+            "is_unified_kv_triton",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsa.utils.torch.cuda.current_stream",
+            return_value=None,
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        local_embeds, local_positions = cp_split_before_forward(
+            complete_embeds, positions, forward_batch
+        )
+        q, kv = attn._forward_prepare(
+            local_embeds, local_positions, forward_batch, backend
+        )
+
+    assert q.shape[0] == 4
+    assert kv.shape == (6, 4)
+    assert gather_calls == [(4, 4)]
+    assert stored["swa_k"].shape == (6, 4)
+    assert torch.equal(stored["forward_batch"].out_cache_loc, global_cache_loc)
+    assert not hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+
+
+def test_cp_v2_compressor_materializes_logical_rows_on_cuda_and_npu_paths():
+    from sglang.srt.layers.attention.dsv4.compressor import Compressor
+
+    input_ids = torch.arange(6, dtype=torch.int64)
+    positions = torch.arange(6, dtype=torch.int64)
+    complete_rows = torch.arange(24, dtype=torch.float32).view(6, 4)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=positions,
+        seq_lens_cpu=torch.tensor([4]),
+        extend_seq_lens_cpu=[4],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=None,
+        out_cache_loc=None,
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    parallel = SimpleNamespace(attn_cp_rank=0, attn_cp_size=4)
+    compressor = Compressor.__new__(Compressor)
+    nn.Module.__init__(compressor)
+    compressor.wkv_gate = SimpleNamespace(weight=torch.empty(0))
+    backend = SimpleNamespace(forward_compress=lambda _compressor, x, _batch: x)
+    gather_calls = []
+
+    def gather(local_rows, _forward_batch, _stream=None):
+        gather_calls.append(tuple(local_rows.shape))
+        return complete_rows.clone()
+
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=parallel),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+        patch.object(strategy, "gather_hidden_states", side_effect=gather),
+        patch(
+            "sglang.srt.layers.attention.dsv4.compressor.dsa_use_prefill_cp",
+            return_value=True,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsv4.compressor.linear_bf16_fp32",
+            side_effect=lambda x, _weight: x,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsv4.compressor.get_attn_backend",
+            return_value=backend,
+        ),
+        patch(
+            "sglang.srt.layers.attention.dsa.utils.torch.cuda.current_stream",
+            return_value=None,
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        local_rows, _ = cp_split_before_forward(complete_rows, positions, forward_batch)
+        cuda_rows = compressor.compute_kv_score(local_rows, forward_batch)
+        npu_rows = compressor.forward_npu(local_rows, forward_batch)
+
+    assert gather_calls == [(4, 4), (4, 4)]
+    assert torch.equal(cuda_rows, complete_rows)
+    assert torch.equal(npu_rows, complete_rows)
+
+
+def test_cp_v2_dsv4_keeps_global_cache_locations_at_eager_boundary():
+    from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+
+    input_ids = torch.arange(6, dtype=torch.int64)
+    positions = torch.arange(6, dtype=torch.int64)
+    complete_embeds = torch.arange(24, dtype=torch.float32).view(6, 4)
+    global_cache_loc = torch.arange(1, 7, dtype=torch.int64)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=positions,
+        seq_lens_cpu=torch.tensor([4]),
+        extend_seq_lens_cpu=[4],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=None,
+        out_cache_loc=global_cache_loc,
+        spec_info=None,
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    cp_parallel = SimpleNamespace(attn_cp_rank=0, attn_cp_size=4)
+    cached_swa_loc = torch.arange(10, 16, dtype=torch.int32)
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.forward_metadata = SimpleNamespace(
+        core_attn_metadata=SimpleNamespace(swa_out_cache_loc=cached_swa_loc)
+    )
+    backend.token_to_kv_pool = SimpleNamespace(
+        translate_loc_from_full_to_swa=lambda loc: loc.to(torch.int32)
+    )
+
+    assert not hasattr(DeepseekV4ForCausalLM, "cp_v2_local_kv_write_locations")
     with (
         patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
         patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
@@ -640,33 +1251,21 @@ def test_cp_v2_local_radix_locations_bypass_same_shape_global_cache():
         ),
     ):
         prepare_cp_forward(forward_batch)
-        logical_cache_loc = forward_batch.out_cache_loc
-        with cp_shard_model_inputs(complete_embeds, positions, forward_batch) as (
-            _local_embeds,
-            _local_positions,
-        ):
-            assert forward_batch.out_cache_loc is logical_cache_loc
-            assert not hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
-
         with cp_shard_model_inputs(
             complete_embeds,
             positions,
             forward_batch,
-            shard_out_cache_loc=True,
-        ) as (
-            _local_embeds,
-            _local_positions,
+            shard_out_cache_loc=getattr(
+                DeepseekV4ForCausalLM,
+                "cp_v2_local_kv_write_locations",
+                False,
+            ),
         ):
-            assert forward_batch.out_cache_loc.tolist() == [2, 0, 0, 0]
-            assert backend.get_swa_out_cache_loc(forward_batch).tolist() == [
-                20,
-                0,
-                0,
-                0,
-            ]
+            assert torch.equal(forward_batch.out_cache_loc, global_cache_loc)
+            assert not hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+            assert backend.get_swa_out_cache_loc(forward_batch) is cached_swa_loc
 
-    assert forward_batch.out_cache_loc is logical_cache_loc
-    assert not hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+    assert torch.equal(forward_batch.out_cache_loc, global_cache_loc)
 
 
 def test_fused_mhc_first_middle_last_flow_matches_uncut_model_and_backward():

@@ -49,6 +49,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
+    gather_dsa_prefill_cp_rows,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
@@ -60,6 +61,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -1234,12 +1236,7 @@ class MQALayer(MqaAttentionBase):
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                kv = gather_dsa_prefill_cp_rows(kv.contiguous(), forward_batch)
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
@@ -1285,22 +1282,12 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_all_gather_rerange_output(
-                        kv.contiguous(),
-                        self.cp_size,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                    kv = gather_dsa_prefill_cp_rows(kv.contiguous(), forward_batch)
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                kv = gather_dsa_prefill_cp_rows(kv.contiguous(), forward_batch)
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
                     swa_k=kv,
@@ -2672,6 +2659,7 @@ class DeepseekV4Model(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
+        cp_v2_active = is_cp_v2_active(forward_batch)
         use_fused = self.use_fused_mhc_post_pre
         prev_residual = prev_post = prev_comb = None
         if self.pp_group.is_first_rank:
@@ -2689,13 +2677,17 @@ class DeepseekV4Model(nn.Module):
                     prev_post,
                     prev_comb,
                     input_ids,
-                    positions,
+                    exact_positions,
                 ) = unpack_dsv4_exact_pp_proxy(
                     pp_proxy_tensors,
                     hc_mult=self.hc_mult,
                     hidden_size=self.hidden_size,
                     deferred_mhc=use_fused,
                 )
+                # The proxy carries global owner metadata.  CP-v2 separately
+                # supplies this stage's already-sharded RoPE positions.
+                if not cp_v2_active:
+                    positions = exact_positions
             else:
                 hidden_states = pp_proxy_tensors["hidden_states"]
                 # Unflatten 2D PP IPC tensor back to 3D mHC shape.
@@ -2709,9 +2701,7 @@ class DeepseekV4Model(nn.Module):
             # scheduler fields, these tensors are explicitly forwarded through
             # every physical pipeline stage with the live mHC state.
             forward_batch._dsv4_exact_dp_input_ids = input_ids.reshape(-1)
-            forward_batch._dsv4_exact_dp_positions = (
-                exact_positions if self.pp_group.is_first_rank else positions
-            ).reshape(-1)
+            forward_batch._dsv4_exact_dp_positions = (exact_positions).reshape(-1)
             forward_batch.dsv4_exact_logits_rows_reconstructed = False
             forward_batch.dsv4_exact_logits_owner_rows = None
             forward_batch.dsv4_exact_logits_dp_rank = None
@@ -2739,7 +2729,12 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
+        context_sharded = dsa_use_prefill_cp(forward_batch)
+        # CP-v2 already shards the embeddings, positions, and KV locations at
+        # the eager-runner boundary.  The model-side split/gather below is the
+        # legacy CP-v1 boundary and must not run a second time.
+        use_cp_v1 = context_sharded and not cp_v2_active
+        if use_cp_v1:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2751,7 +2746,7 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         capture_dspark = self.dspark_layers_to_capture is not None
-        if capture_dspark and dsa_use_prefill_cp(forward_batch):
+        if capture_dspark and context_sharded:
             raise NotImplementedError(
                 "DSpark aux hidden-state capture is not supported together with "
                 "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
@@ -2807,7 +2802,7 @@ class DeepseekV4Model(nn.Module):
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
+        if self.pp_group.is_last_rank and use_cp_v1:
             if dsv4_exact_mode:
                 from sglang.srt.layers.cp.base import get_cp_strategy
 
@@ -2853,7 +2848,11 @@ class DeepseekV4Model(nn.Module):
 
         if dsv4_exact_mode:
             owner_rows = int(forward_batch._dsv4_exact_dp_input_ids.numel())
-            if hidden_states.shape[0] != owner_rows:
+            # CP-v1 reconstructs logical rows above.  CP-v2 deliberately
+            # returns the physical local shard here; EagerRunner gathers it at
+            # the shared model boundary before LogitsProcessor snapshots and
+            # validates this ownership metadata.
+            if not cp_v2_active and hidden_states.shape[0] != owner_rows:
                 raise RuntimeError(
                     "Exact DSV4 model/head boundary does not contain one complete "
                     f"logical DP-owner block: rows={hidden_states.shape[0]}, "
@@ -2878,7 +2877,6 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
-    cp_v2_local_kv_write_locations = True
     supported_lora_modules = (
         "wq_a",
         "self_attn.wq_b",
@@ -3025,7 +3023,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

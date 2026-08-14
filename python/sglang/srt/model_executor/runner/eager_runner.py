@@ -382,15 +382,36 @@ class EagerRunner(BaseRunner):
                 else hidden_states
             )
 
+        # Some model bodies return the pre-normalization image alongside the
+        # normalized hidden states.  Both are token-aligned and therefore both
+        # must cross the CP-v2 gather boundary before logits/hidden capture.
+        hidden_states_before_norm = None
+        if isinstance(hidden_states, tuple):
+            if len(hidden_states) != 2 or not (
+                hidden_states[1] is None or torch.is_tensor(hidden_states[1])
+            ):
+                raise RuntimeError(
+                    "CP-v2 model bodies may only return a token-aligned "
+                    "(hidden_states, hidden_states_before_norm) pair"
+                )
+            hidden_states, hidden_states_before_norm = hidden_states
+
         hidden_states = cp_gather_after_forward(
             hidden_states, forward_batch, torch.cuda.current_stream()
         )
+        if hidden_states_before_norm is not None:
+            hidden_states_before_norm = cp_gather_after_forward(
+                hidden_states_before_norm,
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
         return model.logits_processor(
             forward_batch.input_ids,
             hidden_states,
             model.lm_head,
             forward_batch,
-            aux_hidden_states,
+            aux_hidden_states=aux_hidden_states,
+            hidden_states_before_norm=hidden_states_before_norm,
         )
 
     def _execute_idle(
