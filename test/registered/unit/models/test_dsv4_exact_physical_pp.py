@@ -292,3 +292,9 @@ def test_fused_mhc_first_middle_last_flow_matches_uncut_model_and_backward():
         stages[0].embed_tokens.weight.grad,
         uncut.embed_tokens.weight.grad,
     )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

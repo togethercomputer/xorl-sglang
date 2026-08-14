@@ -293,3 +293,9 @@ def test_eager_exact_hooks_are_safe_and_stage_local_with_lora_off_or_on(
         )
     else:
         assert not hasattr(runner, "lora_manager")
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

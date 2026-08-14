@@ -14,6 +14,9 @@ from sglang.srt.layers.exact_sampling_transforms import (
 )
 from sglang.srt.layers.sampler import Sampler
 from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _fp32(values):
@@ -423,3 +426,11 @@ def test_dsv4_identity_native_score_is_unchanged_beside_filtered_row():
     alone = run(identity, [TOP_K_ALL])
     mixed = run(torch.cat((identity, _fp32([[2.0, 0.0, -1.0]]))), [TOP_K_ALL, 1])
     assert torch.equal(mixed[0], alone[0])
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

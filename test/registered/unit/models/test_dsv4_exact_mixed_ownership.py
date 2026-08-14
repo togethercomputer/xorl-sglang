@@ -83,3 +83,9 @@ def test_ragged_cp_reconstruction_keeps_remote_rows_without_replica_scaling(
 
     assert owner_plane.tolist() == [101, 202, 303, 404, 505]
     assert owner_plane.tolist() != [value * 4 for value in [101, 202, 303, 404, 505]]
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

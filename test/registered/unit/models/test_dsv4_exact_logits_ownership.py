@@ -67,3 +67,11 @@ def test_ragged_prefill_input_rescoring_uses_reconstructed_owner_rows() -> None:
     assert sample_indices.tolist() == [3, 4, 7]
     assert input_logprob_indices.tolist() == [0, 1, 2, 3, 5, 6, 7]
     assert token_to_seq_idx == [0, 0, 0, 0, 1, 2, 2, 2]
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
