@@ -2878,6 +2878,7 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    cp_v2_local_kv_write_locations = True
     supported_lora_modules = (
         "wq_a",
         "self_attn.wq_b",

@@ -7,8 +7,14 @@ import pytest
 import torch
 from torch import nn
 
+from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
-from sglang.srt.layers.cp.utils import cp_split_before_forward, prepare_cp_forward
+from sglang.srt.layers.cp.utils import (
+    cp_shard_model_inputs,
+    cp_split_before_forward,
+    prepare_cp_forward,
+)
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_executor.runner_utils.buffers import (
     add_dsv4_exact_pp_proxy_buffers,
@@ -365,6 +371,185 @@ def test_cp_v2_ragged_prefill_aligns_fused_q_rows_and_keeps_full_pp_metadata():
     assert proxy_hidden.shape[0] == 4
     assert torch.equal(proxy_ids, input_ids)
     assert torch.equal(proxy_positions, positions)
+
+
+def test_cp_v2_ragged_prefill_shards_radix_locations_for_fused_kv_store():
+    """The fused KV store must see one physical cache location per local row."""
+
+    input_ids = torch.arange(10, dtype=torch.int64)
+    positions = torch.arange(10, dtype=torch.int64)
+    complete_embeds = torch.arange(40, dtype=torch.float32).view(10, 4)
+    complete_cache_loc = torch.arange(1, 11, dtype=torch.int64)
+
+    attn = MQALayer.__new__(MQALayer)
+    nn.Module.__init__(attn)
+    attn.layer_id = 0
+    attn.wkv = _TupleIdentity()
+    attn.kv_norm = nn.LayerNorm(4)
+    attn.eps = 1e-6
+    attn.freqs_cis = torch.empty(0)
+
+    token_pool = object.__new__(DeepSeekV4TokenToKVPool)
+    token_pool._stage_start = 0
+    token_pool.swa_kv_pool = SimpleNamespace(
+        page_size=64,
+        kv_buffer=[torch.empty(0)],
+    )
+
+    full_to_swa = torch.arange(32, dtype=torch.int64) * 10
+    expected_local_locations = (
+        [10, 50, 90, 0],
+        [20, 60, 100, 0],
+        [30, 70, 0, 0],
+        [40, 80, 0, 0],
+    )
+
+    for cp_rank, expected_swa_loc in enumerate(expected_local_locations):
+        forward_batch = SimpleNamespace(
+            can_run_tbo=False,
+            forward_mode=ForwardMode.EXTEND,
+            input_ids=input_ids,
+            positions=positions,
+            seq_lens_cpu=torch.tensor([10]),
+            extend_seq_lens_cpu=[10],
+            attn_cp_metadata=None,
+            global_num_tokens_cpu=None,
+            out_cache_loc=complete_cache_loc,
+        )
+        strategy = InterleaveCPStrategy(cp_size=4)
+        cp_parallel = SimpleNamespace(attn_cp_rank=cp_rank, attn_cp_size=4)
+        backend = object.__new__(DeepseekV4AttnBackend)
+        backend.forward_metadata = SimpleNamespace(
+            core_attn_metadata=SimpleNamespace(
+                # Attention metadata was initialized before CP-local model input
+                # sharding, so this global value must not win by shape alone.
+                swa_out_cache_loc=torch.full((10,), -1, dtype=torch.int32)
+            )
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            translate_loc_from_full_to_swa=lambda loc: full_to_swa[loc]
+        )
+        fused_store = {}
+
+        def _fused_k_norm_rope_flashmla(**kwargs):
+            fused_store.update(kwargs)
+            assert kwargs["kv"].shape[0] == kwargs["positions"].shape[0]
+            assert kwargs["kv"].shape[0] == kwargs["out_loc"].shape[0]
+
+        with (
+            patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+            patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+            patch("sglang.srt.layers.cp.base.get_parallel", return_value=cp_parallel),
+            patch(
+                "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+                return_value=4,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.get_token_to_kv_pool",
+                return_value=token_pool,
+            ),
+            patch(
+                "sglang.srt.models.deepseek_v4.envs."
+                "SGLANG_DSV4_USE_BF16_KV_QUANT_SOURCE.get",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.mem_cache.deepseek_v4_memory_pool."
+                "fused_k_norm_rope_flashmla",
+                side_effect=_fused_k_norm_rope_flashmla,
+            ),
+        ):
+            prepare_cp_forward(forward_batch)
+            logical_cache_loc = forward_batch.out_cache_loc
+            with pytest.raises(RuntimeError, match="after fused store"):
+                with cp_shard_model_inputs(
+                    complete_embeds,
+                    positions,
+                    forward_batch,
+                    shard_out_cache_loc=True,
+                ) as (local_embeds, local_positions):
+                    attn._compute_kv_to_cache(
+                        local_embeds,
+                        local_positions,
+                        forward_batch,
+                        backend,
+                    )
+                    raise RuntimeError("after fused store")
+
+        assert forward_batch.out_cache_loc is logical_cache_loc
+        assert torch.equal(logical_cache_loc, complete_cache_loc)
+        assert fused_store["kv"].shape == (4, 4)
+        assert fused_store["positions"].shape == (4,)
+        assert fused_store["out_loc"].dtype is torch.int32
+        assert fused_store["out_loc"].tolist() == expected_swa_loc
+
+
+def test_cp_v2_local_radix_locations_bypass_same_shape_global_cache():
+    """A padded local shard can have the same row count as the global batch."""
+
+    input_ids = torch.arange(4, dtype=torch.int64)
+    positions = torch.arange(4, dtype=torch.int64)
+    complete_embeds = torch.arange(16, dtype=torch.float32).view(4, 4)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        input_ids=input_ids,
+        positions=positions,
+        seq_lens_cpu=torch.tensor([4]),
+        extend_seq_lens_cpu=[4],
+        attn_cp_metadata=None,
+        global_num_tokens_cpu=None,
+        out_cache_loc=torch.arange(1, 5, dtype=torch.int64),
+    )
+    strategy = InterleaveCPStrategy(cp_size=4)
+    cp_parallel = SimpleNamespace(attn_cp_rank=1, attn_cp_size=4)
+    backend = object.__new__(DeepseekV4AttnBackend)
+    backend.forward_metadata = SimpleNamespace(
+        core_attn_metadata=SimpleNamespace(
+            swa_out_cache_loc=torch.tensor([10, 20, 30, 40], dtype=torch.int32)
+        )
+    )
+    full_to_swa = torch.arange(16, dtype=torch.int64) * 10
+    backend.token_to_kv_pool = SimpleNamespace(
+        translate_loc_from_full_to_swa=lambda loc: full_to_swa[loc]
+    )
+
+    with (
+        patch("sglang.srt.layers.cp.utils.is_cp_v2_active", return_value=True),
+        patch("sglang.srt.layers.cp.utils.get_cp_strategy", return_value=strategy),
+        patch("sglang.srt.layers.cp.base.get_parallel", return_value=cp_parallel),
+        patch(
+            "sglang.srt.layers.cp.padding.get_cp_padding_align_size",
+            return_value=4,
+        ),
+    ):
+        prepare_cp_forward(forward_batch)
+        logical_cache_loc = forward_batch.out_cache_loc
+        with cp_shard_model_inputs(complete_embeds, positions, forward_batch) as (
+            _local_embeds,
+            _local_positions,
+        ):
+            assert forward_batch.out_cache_loc is logical_cache_loc
+            assert not hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+
+        with cp_shard_model_inputs(
+            complete_embeds,
+            positions,
+            forward_batch,
+            shard_out_cache_loc=True,
+        ) as (
+            _local_embeds,
+            _local_positions,
+        ):
+            assert forward_batch.out_cache_loc.tolist() == [2, 0, 0, 0]
+            assert backend.get_swa_out_cache_loc(forward_batch).tolist() == [
+                20,
+                0,
+                0,
+                0,
+            ]
+
+    assert forward_batch.out_cache_loc is logical_cache_loc
+    assert not hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
 
 
 def test_fused_mhc_first_middle_last_flow_matches_uncut_model_and_backward():

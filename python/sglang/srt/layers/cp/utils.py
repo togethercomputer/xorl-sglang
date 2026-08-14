@@ -243,6 +243,8 @@ def cp_shard_model_inputs(
     complete_hidden_states: Any,
     complete_position_ids: Any,
     forward_batch,
+    *,
+    shard_out_cache_loc: bool = False,
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
     assert is_cp_v2_active(forward_batch)
@@ -250,6 +252,21 @@ def cp_shard_model_inputs(
         complete_hidden_states, forward_batch
     )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
+
+    # KV writes happen inside the model body and must use the same CP-local row
+    # layout as the sharded activations and positions.  Slot 0 is the reserved
+    # dummy sink for physical padding rows.  Restore the logical/global layout
+    # before the gather/logits tail (and on exceptions).
+    out_cache_loc_backup = getattr(forward_batch, "out_cache_loc", None)
+    had_local_cache_loc_marker = hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+    local_cache_loc_marker_backup = getattr(
+        forward_batch, "_cp_v2_out_cache_loc_is_local", False
+    )
+    if shard_out_cache_loc and out_cache_loc_backup is not None:
+        forward_batch.out_cache_loc = cp_shard_hidden_states(
+            out_cache_loc_backup, forward_batch
+        )
+        forward_batch._cp_v2_out_cache_loc_is_local = True
 
     spec_info = getattr(forward_batch, "spec_info", None)
     spec_hidden_states = getattr(spec_info, "hidden_states", None)
@@ -266,6 +283,14 @@ def cp_shard_model_inputs(
     try:
         yield sharded_hidden_states, sharded_positions
     finally:
+        if shard_out_cache_loc and out_cache_loc_backup is not None:
+            forward_batch.out_cache_loc = out_cache_loc_backup
+            if had_local_cache_loc_marker:
+                forward_batch._cp_v2_out_cache_loc_is_local = (
+                    local_cache_loc_marker_backup
+                )
+            else:
+                del forward_batch._cp_v2_out_cache_loc_is_local
         if spec_hidden_states_backup is not None:
             spec_info.hidden_states = spec_hidden_states_backup
 

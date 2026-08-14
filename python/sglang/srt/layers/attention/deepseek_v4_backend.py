@@ -1570,8 +1570,9 @@ class DeepseekV4AttnBackend(
         never run the in-graph init — eager idle (forward_idle skips attn init),
         runners that only run the out-graph prep (e.g.
         EAGLEDraftExtendCudaGraphRunner) — or whose batch was re-padded after
-        init (shape mismatch). Idle always falls back: its metadata is absent or
-        left over from a previous forward, and translating the zero-padded
+        init (shape mismatch), or whose CP-v2 model body has rebound the field
+        to rank-local locations. Idle always falls back: its metadata is absent
+        or left over from a previous forward, and translating the zero-padded
         out_cache_loc writes to the dummy slot.
         """
         out_cache_loc = forward_batch.out_cache_loc
@@ -1580,6 +1581,7 @@ class DeepseekV4AttnBackend(
         if (
             cached is not None
             and not forward_batch.forward_mode.is_idle()
+            and not getattr(forward_batch, "_cp_v2_out_cache_loc_is_local", False)
             and cached.shape[0] == out_cache_loc.shape[0]
         ):
             return cached

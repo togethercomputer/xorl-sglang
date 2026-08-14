@@ -348,7 +348,10 @@ class EagerRunner(BaseRunner):
         if input_embeds is None:
             input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
         with cp_shard_model_inputs(
-            input_embeds, forward_batch.positions, forward_batch
+            input_embeds,
+            forward_batch.positions,
+            forward_batch,
+            shard_out_cache_loc=getattr(model, "cp_v2_local_kv_write_locations", False),
         ) as (sharded_input_embeds, sharded_positions):
             model_kwargs = {"input_embeds": sharded_input_embeds}
             if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
