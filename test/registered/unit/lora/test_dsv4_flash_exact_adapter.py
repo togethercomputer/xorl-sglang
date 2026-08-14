@@ -681,7 +681,7 @@ def test_dynamic_lora_reload_mints_a_new_radix_generation() -> None:
     assert latest_id == observed_ids[1]
 
 
-def test_exact_resolution_preserves_topology_capacity_lora_and_cache_options() -> None:
+def test_exact_resolution_composes_physical_pp_and_preserves_runtime_options() -> None:
     from sglang.srt.model_executor.cuda_graph_config import (
         Backend,
         CudaGraphConfig,
@@ -695,12 +695,12 @@ def test_exact_resolution_preserves_topology_capacity_lora_and_cache_options() -
     args = ServerArgs(model_path="dummy", enable_lora=True)
     args.rl_on_policy_target = "xorl"
     args.nnodes = 2
-    args.tp_size = 4
+    args.tp_size = 8
     args.dp_size = 2
-    args.ep_size = 4
+    args.ep_size = 8
     args.pp_size = 2
-    args.moe_dp_size = 2
-    args.attn_cp_size = 2
+    args.moe_dp_size = 1
+    args.attn_cp_size = 4
     args.dcp_size = 2
     args.enable_dp_attention = True
     args.enable_prefill_cp = True
@@ -748,10 +748,10 @@ def test_exact_resolution_preserves_topology_capacity_lora_and_cache_options() -
         args.moe_dp_size,
         args.attn_cp_size,
         args.dcp_size,
-    ) == (2, 4, 2, 4, 2, 2, 2, 2)
+    ) == (2, 8, 2, 8, 2, 1, 4, 2)
     assert args.enable_dp_attention is True
     assert args.enable_prefill_cp is True
-    assert args.enable_prefill_context_parallel is True
+    assert args.enable_prefill_context_parallel is False
     assert args.enable_dsa_prefill_context_parallel is True
     assert args.chunked_prefill_size == 4096
     assert args.max_prefill_tokens == 12288
@@ -773,6 +773,73 @@ def test_exact_resolution_preserves_topology_capacity_lora_and_cache_options() -
     assert args.cuda_graph_bs_decode == [1]
     assert args.cuda_graph_max_bs_decode == 1
     assert args.cuda_graph_config.decode.backend == Backend.FULL
+
+
+@pytest.mark.parametrize("dp_size", (1, 2, 4, 8))
+def test_exact_resolution_supports_every_dsv4_dp_cp_factorization(dp_size) -> None:
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="dummy")
+    args.rl_on_policy_target = "xorl"
+    args.tp_size = 8
+    args.ep_size = 8
+    args.dp_size = dp_size
+    args.pp_size = 3
+
+    args._resolve_dsv4_flash_exact_contract(
+        _official_config(), model_arch="DeepseekV4ForCausalLM"
+    )
+
+    assert args.attn_cp_size == 8 // dp_size
+    assert args.enable_prefill_cp is (dp_size < 8)
+    assert args.enable_dsa_prefill_context_parallel is (dp_size < 8)
+    assert args.exact_physical_pp_capable
+
+
+def test_exact_resolution_admits_torch_compile_as_execution_policy() -> None:
+    from sglang.srt.environ import envs
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="dummy", enable_torch_compile=True)
+    args.rl_on_policy_target = "xorl"
+    args.tp_size = 8
+    args.ep_size = 8
+    args.dp_size = 8
+
+    args._resolve_dsv4_flash_exact_contract(
+        _official_config(), model_arch="DeepseekV4ForCausalLM"
+    )
+
+    assert args.enable_torch_compile is True
+    with envs.SGLANG_OPT_FUSE_WQA_WKV.override(False):
+        args._validate_dsv4_flash_exact_resolved_contract()
+
+
+@pytest.mark.parametrize(
+    ("name", "value", "message"),
+    (
+        ("tp_size", 4, "TP8"),
+        ("ep_size", 4, "same eight"),
+        ("moe_dp_size", 2, "same eight"),
+        ("dp_size", 3, "positive divisor"),
+    ),
+)
+def test_exact_resolution_rejects_changed_dsv4_logical_leaves(
+    name, value, message
+) -> None:
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="dummy")
+    args.rl_on_policy_target = "xorl"
+    args.tp_size = 8
+    args.ep_size = 8
+    args.dp_size = 8
+    setattr(args, name, value)
+
+    with pytest.raises(ValueError, match=message):
+        args._resolve_dsv4_flash_exact_contract(
+            _official_config(), model_arch="DeepseekV4ForCausalLM"
+        )
 
 
 def test_gathered_mlp_lora_metadata_is_scoped_and_restored() -> None:

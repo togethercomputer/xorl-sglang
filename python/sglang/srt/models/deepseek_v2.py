@@ -60,9 +60,11 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDeferredStatusBook,
     CanonicalDistribution,
+    CanonicalMoEWorkspace,
     CanonicalMoEV3Workspace,
     CanonicalRowSlots,
     SamplerParallelPlan,
+    canonicalize_glm52_local_partial,
     canonicalize_glm52_local_partial_v3,
     canonicalize_glm52_local_partial_v3b,
 )
@@ -288,13 +290,12 @@ def _uses_glm52_exact_contract(config, *, is_nextn: bool = False) -> bool:
 def _resolve_glm52_canonical_transport(config) -> str:
     if _glm52_exact_mode_enabled(config):
         transport = str(
-            getattr(config, "_glm52_canonical_moe_transport", "canonical_v3b")
+            getattr(config, "_glm52_canonical_moe_transport", "auto")
         )
-        if transport != "canonical_v3b":
+        if transport not in {"auto", "dense_v1", "canonical_v3", "canonical_v3b"}:
             raise RuntimeError(
-                "The exact GLM-5.2 XORL contract serves the certified "
-                "canonical_v3b transport; "
-                f"{transport!r} is not a selectable alternative"
+                "Exact GLM-5.2 transport must be auto, dense_v1, canonical_v3, "
+                f"or canonical_v3b; got {transport!r}"
             )
         return transport
     transport = str(getattr(config, "_glm52_canonical_moe_transport", "dense_v1"))
@@ -304,6 +305,31 @@ def _resolve_glm52_canonical_transport(config) -> str:
             "or canonical_v3b"
         )
     return transport
+
+
+def _select_glm52_canonical_transport(
+    configured: str, *, prefill_cp: bool, consumer_sharded: bool = False
+) -> str:
+    """Choose transport without making it an exact-mode admission gate.
+
+    Consumer-sharded CP prefill needs v3's destination-routed exchange: dense
+    v1 returns a full-capacity owner plane and therefore cannot substitute for
+    that local row layout. For replicated batches, dense v1 remains available
+    as the independent executable oracle; auto selects the allocation-light
+    v3b fused fold while explicit v3 keeps its independent transport. All three
+    compose the same versioned FP32 fold.
+    """
+
+    if configured == "dense_v1":
+        if consumer_sharded:
+            raise RuntimeError(
+                "dense_v1 cannot produce the consumer-sharded CP prefill row layout; "
+                "use auto or canonical_v3"
+            )
+        return configured
+    if prefill_cp or configured == "canonical_v3":
+        return "canonical_v3"
+    return "canonical_v3b"
 
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
@@ -944,6 +970,7 @@ class DeepseekV2MoE(nn.Module):
         self._glm52_canonical_contract = _uses_glm52_exact_contract(
             config, is_nextn=is_nextn
         )
+        self._canonical_dense_workspaces: dict[tuple, CanonicalMoEWorkspace] = {}
         self._canonical_v3_workspaces: dict[tuple, CanonicalMoEV3Workspace] = {}
         # Keys minted while a CUDA graph was being captured: the captured
         # graph replays against those tensor addresses forever, so they are
@@ -1472,11 +1499,6 @@ class DeepseekV2MoE(nn.Module):
             raise RuntimeError(
                 "GLM-5.2 correction bias must remain FP32 through weight loading"
             )
-        if self._glm52_canonical_transport != "canonical_v3b":
-            raise RuntimeError(
-                "The exact GLM-5.2 owner requires canonical_v3b transport"
-            )
-
         prefill_cp = forward_batch is not None and (
             dsa_use_prefill_cp(forward_batch, self.gate.dsa_enable_prefill_cp)
             or mla_use_prefill_cp(forward_batch, self.gate.mla_enable_prefill_cp)
@@ -1506,16 +1528,26 @@ class DeepseekV2MoE(nn.Module):
             local_partial.device,
         )
         capture_mode = get_is_capture_mode()
-        workspace = self._get_canonical_v3_workspace(
-            workspace_key,
-            local_partial,
-            plan=plan,
-            group=group,
-            distribution=distribution,
-            capture_mode=capture_mode,
+        selected_transport = _select_glm52_canonical_transport(
+            self._glm52_canonical_transport,
+            prefill_cp=prefill_cp,
+            consumer_sharded=(
+                distribution is CanonicalDistribution.CONSUMER_SHARDED
+            ),
         )
-        if prefill_cp:
-            canonical = canonicalize_glm52_local_partial_v3(
+        if selected_transport == "dense_v1":
+            dense_workspaces = getattr(self, "_canonical_dense_workspaces", None)
+            if dense_workspaces is None:
+                dense_workspaces = self._canonical_dense_workspaces = {}
+            workspace = dense_workspaces.get(workspace_key)
+            if workspace is None:
+                workspace = CanonicalMoEWorkspace.allocate(
+                    local_partial,
+                    plan=plan,
+                    group=group,
+                )
+                dense_workspaces[workspace_key] = workspace
+            canonical = canonicalize_glm52_local_partial(
                 local_partial,
                 slots,
                 plan=plan,
@@ -1526,6 +1558,26 @@ class DeepseekV2MoE(nn.Module):
                 workspace=workspace,
             )
         else:
+            workspace = self._get_canonical_v3_workspace(
+                workspace_key,
+                local_partial,
+                plan=plan,
+                group=group,
+                distribution=distribution,
+                capture_mode=capture_mode,
+            )
+        if selected_transport == "canonical_v3":
+            canonical = canonicalize_glm52_local_partial_v3(
+                local_partial,
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=self.layer_id,
+                distribution=distribution,
+                graph_capture=capture_mode,
+                workspace=workspace,
+            )
+        elif selected_transport == "canonical_v3b":
             canonical = canonicalize_glm52_local_partial_v3b(
                 local_partial,
                 slots,
@@ -3079,6 +3131,7 @@ class DeepseekV2Model(nn.Module):
                 pp_rank=self.pp_group.rank_in_group,
                 physical_ranks=physical_ranks,
                 attention_dp_size=get_parallel().attn_dp_size,
+                ep_size=get_parallel().moe_ep_size,
             )
             self.glm52_parallel_plan.validate_cuda_graph_policy(
                 disable_cuda_graph=server_args.disable_cuda_graph
@@ -3491,9 +3544,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, DeepseekV2MoE)
             }
         )
         self.capture_aux_hidden_states = False

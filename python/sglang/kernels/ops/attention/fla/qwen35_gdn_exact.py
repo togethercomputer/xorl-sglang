@@ -44,6 +44,12 @@ QWEN35_REQUIRED_BI_OPS = (
 _applied = False
 
 
+def _defer_incremental_state_writeback(server_args, *, exact_graph: bool) -> bool:
+    """Defer recurrent-state writes only when no radix insertion can observe them."""
+
+    return exact_graph and server_args.disable_radix_cache
+
+
 def _apply_qwen35_gdn_exact(server_args) -> None:
     """Install the one certified implementation tuple once per worker."""
     global _applied
@@ -51,7 +57,8 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
         return
 
     is_moe = bool(server_args.qwen35_gdn_exact_is_moe)
-    exact_graph = is_moe and not server_args.disable_cuda_graph
+    exact_graph = not server_args.disable_cuda_graph
+    slot_direct = is_moe or exact_graph
     rmsnorm_family = getattr(server_args, "qwen35_rmsnorm_family", "v2")
     if rmsnorm_family not in ("v1", "v2"):
         raise RuntimeError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
@@ -82,23 +89,31 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     # old request-serial warm loop; its slim composition must persist gcum rows
     # as well as the other cached intermediates.
     _prefill.BI_GDN_PREFILL_ENABLED = True
-    _prefill.BI_GDN_SOLVE_TRIL_DECODE = is_moe
+    _prefill.BI_GDN_SOLVE_TRIL_DECODE = slot_direct
     # FAST, INCR, and HEAL import this scalar by value, so the resolver must
     # update all bound copies as part of the atomic implementation selection.
-    _fast.BI_GDN_SOLVE_TRIL_DECODE = is_moe
-    _incr.BI_GDN_SOLVE_TRIL_DECODE = is_moe
-    _heal.BI_GDN_SOLVE_TRIL_DECODE = is_moe
+    _fast.BI_GDN_SOLVE_TRIL_DECODE = slot_direct
+    _incr.BI_GDN_SOLVE_TRIL_DECODE = slot_direct
+    _heal.BI_GDN_SOLVE_TRIL_DECODE = slot_direct
     _decode.BI_GDN_DECODE_ENABLED = True
-    _decode.BI_GDN_BS1_STATIC = is_moe
+    _decode.BI_GDN_BS1_STATIC = slot_direct
     _decode.BI_GDN_DECODE_GRAPH = exact_graph
     # The modern attention backend uses the slot-direct transport for exact
     # graph replay.  Its arithmetic stages are the oracle prefill binaries;
     # unlike the retired single-bucket staging path it supports every exact
     # decode graph shape through the graph-32 ceiling.
-    _fast.BI_GDN_DECODE_FAST_ENABLED = is_moe
-    _fast.BI_GDN_FUSE_SMALL_ENABLED = is_moe
+    _fast.BI_GDN_DECODE_FAST_ENABLED = slot_direct
+    _fast.BI_GDN_FUSE_SMALL_ENABLED = slot_direct
     _incr.BI_GDN_DECODE_INCR_ENABLED = exact_graph
-    _incr.BI_GDN_INCR_DEFER_ENABLED = exact_graph
+    # Deferred writeback is a graph optimization, not part of the arithmetic.
+    # Aligned extra-buffer radix snapshots need the live recurrent state at
+    # every track boundary, so use the same incremental runner with immediate
+    # writeback when prefix reuse is enabled.  ServerArgs rejects no_buffer:
+    # it can expose arbitrary-prefix checkpoints without the private exact-GDN
+    # boundary and partial-row buffers needed to resume them.
+    _incr.BI_GDN_INCR_DEFER_ENABLED = _defer_incremental_state_writeback(
+        server_args, exact_graph=exact_graph
+    )
     _incr.BI_GDN_VNEW_SLIM_ENABLED = exact_graph
     _heal.BI_GDN_LAZY_HEAL_ENABLED = exact_graph
     _gemm_configs._force_bi_gemm_config_table(is_moe)
@@ -126,11 +141,7 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
         ),
         rmsnorm_family,
         CANONICAL_MOE_FOLD_VERSION if is_moe else "none",
-        (
-            "qwen3.6-moe:tp8/dp8/ep8/pp1,graph32,no-radix,full-prefill"
-            if is_moe
-            else "qwen3.5-dense:tp1/dp1/ep1/pp1,eager,no-radix"
-        ),
+        "physical-pp,stage-local-owners,graph-or-eager,radix-optional",
     )
     _applied = True
 

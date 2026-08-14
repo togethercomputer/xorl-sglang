@@ -512,22 +512,58 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             self.assertFalse(require_mlp_tp_gather(SimpleNamespace(tp_size=16)))
             self.assertTrue(require_mlp_sync(SimpleNamespace(tp_size=16)))
 
-    def test_exact_mode_serves_the_certified_v3b_and_rejects_dense_override(self):
+    def test_exact_mode_selects_v3_or_v3b_without_transport_admission_gate(self):
         if importlib.util.find_spec("sgl_kernel") is None:
             self.skipTest("sgl_kernel is required to import the serving model")
         from sglang.srt.models.deepseek_v2 import (
             _resolve_glm52_canonical_transport,
+            _select_glm52_canonical_transport,
         )
 
         self.assertEqual(
             _resolve_glm52_canonical_transport(SimpleNamespace(_glm52_exact_mode=True)),
+            "auto",
+        )
+        for configured in ("auto", "dense_v1", "canonical_v3", "canonical_v3b"):
+            with self.subTest(configured=configured):
+                resolved = _resolve_glm52_canonical_transport(
+                    SimpleNamespace(
+                        _glm52_exact_mode=True,
+                        _glm52_canonical_moe_transport=configured,
+                    )
+                )
+                self.assertEqual(resolved, configured)
+                if configured != "dense_v1":
+                    self.assertEqual(
+                        _select_glm52_canonical_transport(
+                            resolved,
+                            prefill_cp=True,
+                        ),
+                        "canonical_v3",
+                    )
+        self.assertEqual(
+            _select_glm52_canonical_transport("auto", prefill_cp=False),
             "canonical_v3b",
         )
-        with self.assertRaisesRegex(RuntimeError, "not a selectable alternative"):
+        self.assertEqual(
+            _select_glm52_canonical_transport("canonical_v3", prefill_cp=False),
+            "canonical_v3",
+        )
+        self.assertEqual(
+            _select_glm52_canonical_transport("dense_v1", prefill_cp=False),
+            "dense_v1",
+        )
+        with self.assertRaisesRegex(RuntimeError, "consumer-sharded"):
+            _select_glm52_canonical_transport(
+                "dense_v1",
+                prefill_cp=True,
+                consumer_sharded=True,
+            )
+        with self.assertRaisesRegex(RuntimeError, "must be auto"):
             _resolve_glm52_canonical_transport(
                 SimpleNamespace(
                     _glm52_exact_mode=True,
-                    _glm52_canonical_moe_transport="dense_v1",
+                    _glm52_canonical_moe_transport="not-a-transport",
                 )
             )
 
@@ -1590,8 +1626,8 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             )
 
         production = SamplerParallelPlan.glm52()
-        with self.assertRaisesRegex(ValueError, "identity logical contributor"):
-            replace(production, physical_to_logical=tuple(reversed(range(8))))
+        permuted = replace(production, physical_to_logical=tuple(reversed(range(8))))
+        self.assertNotEqual(permuted.identity, production.identity)
 
         with (
             patch("torch.distributed.get_world_size", return_value=8),
@@ -1690,8 +1726,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         self.assertEqual(stage_one.physical_ranks, tuple(range(8, 16)))
         stage_one_bound = replace(stage_one, stage_layer_range=(38, 78))
         self.assertNotEqual(stage_one.identity, stage_one_bound.identity)
-        with self.assertRaisesRegex(RuntimeError, "requires --disable-cuda-graph"):
-            stage_one_bound.validate_cuda_graph_policy(disable_cuda_graph=False)
+        stage_one_bound.validate_cuda_graph_policy(disable_cuda_graph=False)
         stage_one_bound.validate_cuda_graph_policy(disable_cuda_graph=True)
         SamplerParallelPlan.glm52().validate_cuda_graph_policy(disable_cuda_graph=False)
         with (
@@ -1712,12 +1747,15 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 ep_size=8,
                 attention_cp_size=8,
             )
-        with self.assertRaisesRegex(ValueError, "ordered ranks of this pipeline stage"):
-            SamplerParallelPlan.glm52(
-                pp_size=2,
-                pp_rank=1,
-                physical_ranks=tuple(range(8)),
-            )
+        noncontiguous = SamplerParallelPlan.glm52(
+            pp_size=3,
+            pp_rank=1,
+            physical_ranks=(1, 4, 7, 10, 13, 16, 19, 22),
+        )
+        self.assertEqual(noncontiguous.pp_size, 3)
+        self.assertEqual(noncontiguous.ep_size, 8)
+        with self.assertRaisesRegex(ValueError, "EP must equal"):
+            SamplerParallelPlan.glm52(ep_size=2)
 
     def test_mocked_raw_transport_owner_fold_and_replication(self):
         contributors = 8

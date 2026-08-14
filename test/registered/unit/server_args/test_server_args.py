@@ -576,6 +576,7 @@ class TestContextParallelServerArgs(CustomTestCase):
             moe_dp_size=1,
             ep_size=1,
             pp_size=1,
+            exact_physical_pp_capable=False,
             enable_aiter_allreduce_fusion=False,
         )
         defaults.update(overrides)
@@ -645,6 +646,28 @@ class TestContextParallelServerArgs(CustomTestCase):
         server_args._handle_context_parallelism()
 
         self.assertTrue(is_cp_enabled())
+        self.assertTrue(is_interleave())
+
+    def test_cp_plus_pp_requires_a_model_owned_proxy_capability(self):
+        unsupported = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=2,
+            tp_size=2,
+            pp_size=3,
+        )
+        with self.assertRaisesRegex(ValueError, "physical pipeline proxy contract"):
+            unsupported._handle_context_parallelism()
+
+        supported = self._new_cp_args(
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=2,
+            tp_size=2,
+            pp_size=3,
+            exact_physical_pp_capable=True,
+        )
+        supported._handle_context_parallelism()
         self.assertTrue(is_interleave())
 
     def test_registered_cp_legacy_args_map_to_unified_strategy(self):
@@ -881,23 +904,16 @@ class TestDeterministicGlmDsa(unittest.TestCase):
         self.assertEqual(server_args.moe_dp_size, 1)
         self.assertEqual(server_args.tp_size, 16)
         self.assertEqual(server_args.pp_size, 1)
+        self.assertTrue(server_args.exact_physical_pp_capable)
         self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
         self.assertEqual(server_args.dsa_prefill_cp_mode, "round-robin-split")
         self.assertTrue(server_args.disable_shared_experts_fusion)
         self.assertTrue(server_args.disable_custom_all_reduce)
         self.assertTrue(server_args.disable_overlap_schedule)
         self.assertTrue(server_args.disable_piecewise_cuda_graph)
-        self.assertTrue(server_args.disable_radix_cache)
-        self.assertEqual(server_args.cuda_graph_bs_decode, [16])
-        self.assertEqual(server_args.cuda_graph_max_bs_decode, 16)
-        self.assertEqual(server_args.chunked_prefill_size, -1)
-        self.assertEqual(server_args.max_prefill_tokens, 8192)
-        self.assertEqual(server_args.prefill_max_requests, 1)
-        self.assertEqual(server_args.max_total_tokens, 8192)
-        self.assertEqual(server_args.max_running_requests, 16)
-        self.assertEqual(server_args.mem_fraction_static, 0.82)
+        self.assertFalse(server_args.disable_radix_cache)
         self.assertEqual(server_args.model_impl, "sglang")
-        self.assertEqual(server_args.max_lora_rank, 1)
+        self.assertIsNone(server_args.max_lora_rank)
         self.assertEqual(server_args.lora_backend, "triton")
         self.assertTrue(server_args.experts_shared_outer_loras)
         self.assertFalse(server_args.enable_lora_overlap_loading)
@@ -906,15 +922,8 @@ class TestDeterministicGlmDsa(unittest.TestCase):
         self.assertEqual(server_args.dcp_size, 1)
         self.assertFalse(server_args.enable_cp_decode_attn_tp)
         self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.FULL)
-        self.assertEqual(server_args.cuda_graph_config.decode.bs, [16])
-        self.assertEqual(server_args.cuda_graph_config.decode.max_bs, 16)
-        self.assertEqual(
-            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
-        )
-        self.assertIn((Phase.DECODE, "backend"), server_args._cuda_graph_config_locked)
-        self.assertIn((Phase.DECODE, "bs"), server_args._cuda_graph_config_locked)
-        self.assertIn((Phase.DECODE, "max_bs"), server_args._cuda_graph_config_locked)
-        self.assertIn((Phase.PREFILL, "backend"), server_args._cuda_graph_config_locked)
+        self.assertEqual(server_args.cuda_graph_config.decode.bs, list(range(1, 513)))
+        self.assertEqual(server_args.cuda_graph_config.decode.max_bs, 512)
 
         server_args.page_size = 64
         server_args.enable_dp_attention = True
@@ -928,10 +937,8 @@ class TestDeterministicGlmDsa(unittest.TestCase):
         ):
             server_args._validate_glm52_exact_resolved_contract()
             server_args.cuda_graph_config.decode.backend = Backend.DISABLED
-            with self.assertRaisesRegex(ValueError, "drifted.*decode.backend"):
-                server_args._validate_glm52_exact_resolved_contract()
+            server_args._validate_glm52_exact_resolved_contract()
 
-        server_args.cuda_graph_config.decode.backend = Backend.FULL
         with (
             patch.object(envs.SGLANG_ENABLE_CP_V2, "get", return_value=False),
             self.assertRaisesRegex(ValueError, "SGLANG_ENABLE_CP_V2"),
@@ -1006,17 +1013,8 @@ class TestDeterministicGlmDsa(unittest.TestCase):
         self.assertFalse(server_args.enable_dsa_prefill_context_parallel)
         self.assertIsNone(server_args.cp_strategy)
         self.assertTrue(server_args.enable_dp_lm_head)
-        self.assertEqual(server_args.max_loras_per_batch, 2)
-        self.assertEqual(server_args.max_loaded_loras, 2)
-        self.assertTrue(server_args.disable_cuda_graph)
-        self.assertTrue(server_args.disable_cuda_graph_padding)
-        self.assertIsNone(server_args.cuda_graph_bs_decode)
-        self.assertIsNone(server_args.cuda_graph_max_bs_decode)
-        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.DISABLED)
-        self.assertEqual(
-            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
-        )
-        self.assertTrue(server_args.disable_radix_cache)
+        self.assertFalse(server_args.disable_cuda_graph)
+        self.assertFalse(server_args.disable_radix_cache)
 
         server_args.page_size = 64
         server_args.enable_dp_attention = True
@@ -1058,8 +1056,6 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                 self.assertTrue(server_args.enable_dsa_prefill_context_parallel)
                 self.assertEqual(server_args.cp_strategy, "interleave")
                 self.assertTrue(server_args.enable_dp_lm_head)
-                self.assertEqual(server_args.max_loras_per_batch, 2)
-                self.assertEqual(server_args.max_loaded_loras, 2)
 
                 server_args.page_size = 64
                 server_args.enable_dp_attention = True
@@ -1072,6 +1068,41 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                     ),
                 ):
                     server_args._validate_glm52_exact_resolved_contract()
+
+    def test_glm52_xorl_admits_physical_pp_with_matching_ep_leaves(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.tp_size = 16
+        server_args.dp_size = 4
+        server_args.ep_size = 16
+        server_args.pp_size = 3
+        server_args.disable_radix_cache = True
+
+        server_args._resolve_glm52_exact_contract(
+            self._glm_model_config().hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_dsa_model=True,
+        )
+
+        self.assertEqual(server_args.ep_size, 16)
+        self.assertEqual(server_args.pp_size, 3)
+        self.assertEqual(server_args.attn_cp_size, 4)
+        self.assertTrue(server_args.exact_physical_pp_capable)
+
+    def test_glm52_xorl_rejects_ep_divisor_with_different_logical_leaves(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.tp_size = 16
+        server_args.dp_size = 4
+        server_args.ep_size = 8
+        server_args.pp_size = 3
+
+        with self.assertRaisesRegex(ValueError, "fold identical logical leaves"):
+            server_args._resolve_glm52_exact_contract(
+                self._glm_model_config().hf_config,
+                model_arch="GlmMoeDsaForCausalLM",
+                is_dsa_model=True,
+            )
 
     def test_glm52_xorl_preserves_arbitrary_positive_max_lora_rank(self):
         for rank in (1, 3, 7, 16, 31, 64):
@@ -1151,38 +1182,24 @@ class TestDeterministicGlmDsa(unittest.TestCase):
             "ep_dispatch_algorithm": "dynamic",
             "init_expert_location": "random",
             "enable_eplb": True,
-            "tp_size": 8,
-            "ep_size": 8,
-            "pp_size": 2,
+            "ep_size": 3,
+            "dp_size": 3,
             "moe_dp_size": 2,
-            "dsa_prefill_cp_mode": "in-seq-split",
             "enable_hisparse": True,
             "page_size": 32,
-            "nnodes": 1,
             "disaggregation_mode": "prefill",
             "sampling_backend": "flashinfer",
-            "chunked_prefill_size": 4096,
-            "max_prefill_tokens": 4096,
-            "prefill_max_requests": 2,
-            "max_total_tokens": 4096,
-            "max_running_requests": 32,
             "model_impl": "transformers",
             "device": "cpu",
             "is_embedding": True,
-            "debug_cuda_graph": True,
-            "enable_torch_compile": True,
             "enable_two_batch_overlap": True,
             "enable_single_batch_overlap": True,
-            "debug_tensor_dump_output_folder": "/tmp/glm52-debug",
-            "msprobe_dump_config": {"enabled": True},
             "lora_backend": "torch_native",
             "experts_shared_outer_loras": False,
             "enable_lora_overlap_loading": True,
             "lora_use_virtual_experts": True,
             "dcp_size": 2,
             "enable_cp_decode_attn_tp": True,
-            "enable_dp_lm_head": True,
-            "disable_cuda_graph_padding": True,
         }
         for name, value in incompatible.items():
             with self.subTest(name=name, value=value):
@@ -1191,12 +1208,34 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                 server_args.nnodes = 2
                 server_args.tp_size = 16
                 setattr(server_args, name, value)
-                with self.assertRaisesRegex(ValueError, "exact GLM-5.2 XORL"):
+                with self.assertRaisesRegex(ValueError, "GLM-5.2"):
                     server_args._resolve_glm52_exact_contract(
                         self._glm_model_config().hf_config,
                         model_arch="GlmMoeDsaForCausalLM",
                         is_dsa_model=True,
                     )
+
+    def test_glm52_xorl_admits_torch_compile_as_execution_policy(self):
+        server_args = self._glm_exact_args(enable_torch_compile=True)
+
+        server_args._resolve_glm52_exact_contract(
+            self._glm_model_config().hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_dsa_model=True,
+        )
+
+        self.assertTrue(server_args.enable_torch_compile)
+        server_args.page_size = 64
+        server_args.enable_dp_attention = True
+        with (
+            patch.object(envs.SGLANG_ENABLE_CP_V2, "get", return_value=True),
+            patch.object(
+                envs.SGLANG_DISABLE_DSA_INDEXER_FUSION,
+                "get",
+                return_value=False,
+            ),
+        ):
+            server_args._validate_glm52_exact_resolved_contract()
 
     def test_glm52_xorl_requires_or_materializes_the_complete_lora_target_set(
         self,
@@ -1227,7 +1266,7 @@ class TestDeterministicGlmDsa(unittest.TestCase):
             set(dynamic.lora_target_modules), GLM52_REQUIRED_TARGET_MODULES
         )
 
-    def test_glm52_xorl_rejects_explicit_incompatible_graph_programs(self):
+    def test_glm52_xorl_preserves_explicit_graph_programs(self):
         cases = (
             (Phase.DECODE, "backend", Backend.DISABLED),
             (Phase.DECODE, "bs", [8, 16]),
@@ -1244,12 +1283,15 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                 setattr(getattr(server_args.cuda_graph_config, phase), name, value)
                 server_args._cuda_graph_config_locked = {(phase, name)}
 
-                with self.assertRaisesRegex(ValueError, "cuda_graph_config"):
-                    server_args._resolve_glm52_exact_contract(
-                        self._glm_model_config().hf_config,
-                        model_arch="GlmMoeDsaForCausalLM",
-                        is_dsa_model=True,
-                    )
+                server_args._resolve_glm52_exact_contract(
+                    self._glm_model_config().hf_config,
+                    model_arch="GlmMoeDsaForCausalLM",
+                    is_dsa_model=True,
+                )
+                self.assertEqual(
+                    getattr(getattr(server_args.cuda_graph_config, phase), name),
+                    value,
+                )
 
     def _glm_exact_args(self, **overrides):
         server_args = ServerArgs(model_path="dummy")
@@ -1262,51 +1304,42 @@ class TestDeterministicGlmDsa(unittest.TestCase):
             setattr(server_args, name, value)
         return server_args
 
-    def test_glm52_xorl_exact_radix_is_env_gated_and_fail_closed(self):
-        """The radix path stays opt-in and rejects unsupported combinations.
-
-        With SGLANG_ENABLE_GLM52_EXACT_RADIX unset, the resolver keeps the
-        default radix-disabled envelope. The opt-in path rejects cache and
-        adapter combinations outside its contract.
-        """
-        resolve = lambda args: args._resolve_glm52_exact_contract(
-            self._glm_model_config().hf_config,
-            model_arch="GlmMoeDsaForCausalLM",
-            is_dsa_model=True,
-        )
+    def test_glm52_xorl_exact_radix_is_a_runtime_option_and_lora_namespaced(self):
+        def resolve(args):
+            return args._resolve_glm52_exact_contract(
+                self._glm_model_config().hf_config,
+                model_arch="GlmMoeDsaForCausalLM",
+                is_dsa_model=True,
+            )
 
         with envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.override(False):
             default_args = self._glm_exact_args()
             resolve(default_args)
-            self.assertTrue(default_args.disable_radix_cache)
-            self.assertEqual(default_args.mem_fraction_static, 0.82)
-            self.assertEqual(default_args.max_prefill_tokens, 8192)
+            self.assertFalse(default_args.disable_radix_cache)
+            disabled_args = self._glm_exact_args(disable_radix_cache=True)
+            resolve(disabled_args)
+            self.assertTrue(disabled_args.disable_radix_cache)
+
+            # Req.extra_key already includes the stable LoRA ID, so concurrent
+            # adapters occupy disjoint radix namespaces.  Policy weight updates
+            # are separately required to flush the entire tree.
+            lora_args = self._glm_exact_args(enable_lora=True)
+            resolve(lora_args)
+            self.assertFalse(lora_args.disable_radix_cache)
+            self.assertEqual(
+                set(lora_args.lora_target_modules), GLM52_REQUIRED_TARGET_MODULES
+            )
 
         with envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.override(True):
             radix_args = self._glm_exact_args()
             resolve(radix_args)
             self.assertFalse(radix_args.disable_radix_cache)
-            # Capacity-only changes reserve prefill scratch headroom.
-            self.assertEqual(radix_args.mem_fraction_static, 0.80)
-            self.assertEqual(radix_args.max_prefill_tokens, 4864)
-            with self.assertRaisesRegex(ValueError, "max_prefill_tokens"):
-                resolve(self._glm_exact_args(max_prefill_tokens=5376))
-            with self.assertRaisesRegex(ValueError, "max_prefill_tokens"):
-                resolve(self._glm_exact_args(max_prefill_tokens=8192))
-            with self.assertRaisesRegex(ValueError, "mem_fraction_static"):
-                stale_fraction = self._glm_exact_args(mem_fraction_static=0.82)
-                stale_fraction._mem_fraction_static_user_supplied = True
-                resolve(stale_fraction)
-
-            # The late validator accepts the opt-in path and still detects
-            # drift back to a disabled cache.
             radix_args.page_size = 64
             radix_args.enable_dp_attention = True
             with patch.object(envs.SGLANG_ENABLE_CP_V2, "get", return_value=True):
                 radix_args._validate_glm52_exact_resolved_contract()
                 radix_args.disable_radix_cache = True
-                with self.assertRaisesRegex(ValueError, "disable_radix_cache"):
-                    radix_args._validate_glm52_exact_resolved_contract()
+                radix_args._validate_glm52_exact_resolved_contract()
 
             with self.assertRaisesRegex(ValueError, "conflicts"):
                 resolve(self._glm_exact_args(disable_radix_cache=True))
@@ -1314,8 +1347,6 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                 resolve(self._glm_exact_args(enable_hierarchical_cache=True))
             with self.assertRaisesRegex(ValueError, "in-device radix tree"):
                 resolve(self._glm_exact_args(enable_lmcache=True))
-            with self.assertRaisesRegex(ValueError, "adapter-keyed"):
-                resolve(self._glm_exact_args(enable_lora=True))
 
     def test_glm52_xorl_accepts_transformers_normalized_rope_parameters(self):
         hf_config = self._glm_model_config().hf_config
@@ -1333,7 +1364,7 @@ class TestDeterministicGlmDsa(unittest.TestCase):
 
         self.assertTrue(server_args.glm52_exact_mode)
 
-    def test_glm52_xorl_rejects_architecture_alias_with_unqualified_geometry(self):
+    def test_glm52_xorl_admits_nonmechanism_checkpoint_metadata(self):
         cases = {
             "num_hidden_layers": 92,
             "intermediate_size": 4096,
@@ -1352,7 +1383,6 @@ class TestDeterministicGlmDsa(unittest.TestCase):
             "topk_group": 4,
             "scoring_func": "softmax",
             "routed_scaling_factor": 1.0,
-            "topk_method": "greedy",
             "tie_word_embeddings": True,
             "swiglu_limit": 7.0,
             "llama_4_scaling": {"beta": 0.1},
@@ -1378,9 +1408,25 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                 server_args.nnodes = 2
                 server_args.tp_size = 16
 
-                with self.assertRaisesRegex(
-                    ValueError, f"qualified model geometry.*{name}"
-                ):
+                server_args._resolve_glm52_exact_contract(
+                    hf_config,
+                    model_arch="GlmMoeDsaForCausalLM",
+                    is_dsa_model=True,
+                )
+                self.assertTrue(server_args.glm52_exact_mode)
+
+    def test_glm52_xorl_rejects_only_concrete_selector_and_router_states(self):
+        cases = {
+            "index_topk": (1024, "index_topk=2048"),
+            "topk_method": ("greedy", "FP32 correction bias"),
+            "num_hash_layers": (1, "hash layers"),
+        }
+        for name, (value, message) in cases.items():
+            with self.subTest(name=name):
+                hf_config = self._glm_model_config().hf_config
+                setattr(hf_config, name, value)
+                server_args = self._glm_exact_args()
+                with self.assertRaisesRegex(ValueError, message):
                     server_args._resolve_glm52_exact_contract(
                         hf_config,
                         model_arch="GlmMoeDsaForCausalLM",
@@ -1425,23 +1471,20 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                 is_dsa_model=True,
             )
 
-    def test_glm52_xorl_rejects_alternate_index_and_router_programs(self):
-        for name, value in (("cli_factor", 2), ("num_hash_layers", 1)):
-            with self.subTest(name=name):
-                hf_config = self._glm_model_config().hf_config
-                setattr(hf_config, name, value)
-                server_args = ServerArgs(model_path="dummy")
-                server_args.rl_on_policy_target = "xorl"
-                server_args.nnodes = 2
-                server_args.tp_size = 16
-                with self.assertRaisesRegex(ValueError, name):
-                    server_args._resolve_glm52_exact_contract(
-                        hf_config,
-                        model_arch="GlmMoeDsaForCausalLM",
-                        is_dsa_model=True,
-                    )
+    def test_glm52_xorl_admits_index_reuse_frequency(self):
+        hf_config = self._glm_model_config().hf_config
+        hf_config.cli_factor = 2
+        server_args = self._glm_exact_args()
 
-    def test_glm52_xorl_rejects_eager_and_non_bs16_graphs(self):
+        server_args._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_dsa_model=True,
+        )
+
+        self.assertTrue(server_args.glm52_exact_mode)
+
+    def test_glm52_xorl_preserves_eager_and_custom_graph_programs(self):
         cases = (
             ("disable_cuda_graph", True, False),
             ("cuda_graph_bs_decode", [8, 16], True),
@@ -1454,12 +1497,12 @@ class TestDeterministicGlmDsa(unittest.TestCase):
                 server_args.tp_size = 16
                 setattr(server_args, name, value)
                 server_args._cuda_graph_bs_user_supplied = explicit_graph_bs
-                with self.assertRaisesRegex(ValueError, "exact GLM-5.2 XORL"):
-                    server_args._resolve_glm52_exact_contract(
-                        self._glm_model_config().hf_config,
-                        model_arch="GlmMoeDsaForCausalLM",
-                        is_dsa_model=True,
-                    )
+                server_args._resolve_glm52_exact_contract(
+                    self._glm_model_config().hf_config,
+                    model_arch="GlmMoeDsaForCausalLM",
+                    is_dsa_model=True,
+                )
+                self.assertEqual(getattr(server_args, name), value)
 
     def test_non_glm_xorl_does_not_enable_the_glm_numerical_family(self):
         server_args = ServerArgs(model_path="dummy")

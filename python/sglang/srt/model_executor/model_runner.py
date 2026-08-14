@@ -830,6 +830,17 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def uses_dsv4_exact_pp_proxy(self) -> bool:
+        """Whether physical PP must carry DSV4's exact deferred mHC state."""
+
+        return self.ps.pp_size > 1 and bool(
+            getattr(
+                self.model_config.hf_text_config,
+                "_dsv4_flash_exact_mode",
+                False,
+            )
+        )
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:

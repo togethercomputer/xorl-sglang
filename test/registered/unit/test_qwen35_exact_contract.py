@@ -8,11 +8,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.fla import qwen35_gdn_exact as exact
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    default_cuda_graph_config,
-)
+from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -61,9 +57,19 @@ def _qwen_config(*, moe: bool, **overrides):
     return SimpleNamespace(text_config=text_config)
 
 
-def test_qwen35_moe_plain_config_resolves_certified_topology():
+def test_qwen35_moe_admits_physical_pp_without_rewriting_perf_knobs():
     hf_config = _qwen_config(moe=True)
-    args = _server_args(tp_size=8, ep_size=1, disable_cuda_graph_padding=True)
+    args = _server_args(
+        tp_size=8,
+        dp_size=8,
+        ep_size=8,
+        pp_size=3,
+        disable_cuda_graph_padding=True,
+        cuda_graph_bs_decode=[3, 7],
+        max_running_requests=37,
+        max_mamba_cache_size=777,
+        disable_radix_cache=False,
+    )
     # Match the real __post_init__ ordering: generic graph resolution has
     # already materialized defaults before model-specific contracts run.
     args.cuda_graph_config = default_cuda_graph_config()
@@ -91,35 +97,29 @@ def test_qwen35_moe_plain_config_resolves_certified_topology():
     assert args.sampling_defaults == "openai"
     assert args.disable_custom_all_reduce
     assert not args.enable_fused_qk_norm_rope
-    assert args.tp_size == args.dp_size == args.ep_size == 8
-    assert args.pp_size == 1
+    assert (args.tp_size, args.dp_size, args.ep_size, args.pp_size) == (8, 8, 8, 3)
     assert args.enable_dp_attention
     assert args.enable_dp_lm_head
     assert args.disable_piecewise_cuda_graph
-    assert args.max_mamba_cache_size == 1280
-    assert args.cuda_graph_bs_decode == list(range(1, 33))
-    assert args.cuda_graph_max_bs_decode == 32
-    assert args.cuda_graph_config.decode.bs == list(range(1, 33))
-    assert args.cuda_graph_config.decode.max_bs == 32
-    assert (Phase.DECODE, "bs") in args._cuda_graph_config_locked
-    assert (Phase.DECODE, "max_bs") in args._cuda_graph_config_locked
-    assert args.disable_prefill_cuda_graph
-    assert args.cuda_graph_config.prefill.backend == Backend.DISABLED
-    assert (Phase.PREFILL, "backend") in args._cuda_graph_config_locked
-    assert args.disable_overlap_schedule
     assert args.disable_cuda_graph_padding
-    assert args.max_running_requests == 256
-    assert args.max_queued_requests == 512
-    assert args.chunked_prefill_size == -1
-    assert args.max_prefill_tokens == 32768
-    assert args.mem_fraction_static == 0.38
-    assert not args.disable_cuda_graph
-    assert args.disable_radix_cache
+    assert args.max_running_requests == 37
+    assert args.max_mamba_cache_size == 777
+    assert args.cuda_graph_bs_decode == [3, 7]
+    assert not args.disable_radix_cache
+    assert args.mamba_radix_cache_strategy == "extra_buffer"
+    assert args.exact_physical_pp_capable
 
 
-def test_qwen35_dense_resolves_only_the_certified_single_rank_topology():
+def test_qwen35_dense_admits_physical_pp_and_preserves_graph_and_radix_policy():
     hf_config = _qwen_config(moe=False)
-    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=1)
+    args = _server_args(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        pp_size=4,
+        disable_cuda_graph=False,
+        disable_radix_cache=False,
+    )
 
     args._resolve_qwen35_gdn_exact_contract(
         hf_config, model_arch="Qwen3_5ForConditionalGeneration"
@@ -135,8 +135,56 @@ def test_qwen35_dense_resolves_only_the_certified_single_rank_topology():
     assert args.sampling_backend == "pytorch"
     assert args.sampling_defaults == "openai"
     assert args.disable_piecewise_cuda_graph
-    assert args.disable_cuda_graph
-    assert args.disable_radix_cache
+    assert not args.disable_cuda_graph
+    assert not args.disable_radix_cache
+    assert args.mamba_radix_cache_strategy == "extra_buffer"
+    assert args.pp_size == 4
+    assert args.exact_physical_pp_capable
+
+
+@pytest.mark.parametrize("strategy", ["no_buffer"])
+def test_qwen35_exact_rejects_arbitrary_prefix_mamba_radix_checkpoints(strategy):
+    args = _server_args(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        disable_radix_cache=False,
+        mamba_radix_cache_strategy=strategy,
+    )
+
+    with pytest.raises(ValueError, match="aligned Mamba checkpoint strategy"):
+        args._resolve_qwen35_gdn_exact_contract(
+            _qwen_config(moe=False),
+            model_arch="Qwen3_5ForConditionalGeneration",
+        )
+
+
+def test_qwen35_exact_radix_requires_lossless_aligned_checkpoints():
+    bad_interval = _server_args(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        disable_radix_cache=False,
+        mamba_track_interval=96,
+    )
+    with pytest.raises(ValueError, match="64-token GDN chunk boundary"):
+        bad_interval._resolve_qwen35_gdn_exact_contract(
+            _qwen_config(moe=False),
+            model_arch="Qwen3_5ForConditionalGeneration",
+        )
+
+    lossy = _server_args(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        disable_radix_cache=False,
+        enable_int8_mamba_checkpoint=True,
+    )
+    with pytest.raises(ValueError, match="lossless recurrent state checkpoints"):
+        lossy._resolve_qwen35_gdn_exact_contract(
+            _qwen_config(moe=False),
+            model_arch="Qwen3_5ForConditionalGeneration",
+        )
 
 
 @pytest.mark.parametrize("moe", (False, True))
@@ -173,31 +221,20 @@ def test_non_qwen_keeps_conservative_norm_and_rope_defaults():
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
-        ("tp_size", 4, "TP8/DP8"),
-        ("dp_size", 4, "DP8"),
-        ("ep_size", 4, "EP8"),
-        ("pp_size", 2, "PP1"),
+        ("dp_size", 4, "DP to equal"),
+        ("ep_size", 4, "EP to equal"),
         ("dtype", "float16", "BF16"),
         ("quantization", "fp8", "unquantized"),
         ("attention_backend", "triton", "FA4"),
         ("linear_attn_prefill_backend", "flashinfer", "triton"),
         ("moe_a2a_backend", "deepep", "moe-a2a-backend none"),
         ("speculative_algorithm", "EAGLE", "speculative"),
-        ("disable_cuda_graph", True, "CUDA graph bucket"),
-        ("max_running_requests", 16, "max-running-requests 256"),
-        ("mem_fraction_static", 0.40, "mem-fraction-static 0.38"),
-        ("max_mamba_cache_size", 512, "max-mamba-cache-size 1280"),
     ],
 )
-def test_qwen35_moe_rejects_programs_outside_the_certified_envelope(
-    name, value, message
-):
+def test_qwen35_moe_rejects_incompatible_arithmetic_mechanisms(name, value, message):
     hf_config = _qwen_config(moe=True)
     args = _server_args(tp_size=8, ep_size=1)
     setattr(args, name, value)
-    if name == "mem_fraction_static":
-        args._mem_fraction_static_user_supplied = True
-
     with pytest.raises(ValueError, match=message):
         args._resolve_qwen35_gdn_exact_contract(
             hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
@@ -240,24 +277,58 @@ def test_qwen35_class_b_is_automatic_and_preserves_exact_envelope():
     assert args.attention_backend == "fa4"
 
 
-@pytest.mark.parametrize("name", ("tp_size", "dp_size", "ep_size", "pp_size"))
-def test_qwen35_dense_rejects_unqualified_distributed_topologies(name):
+@pytest.mark.parametrize("pp_size", (2, 3, 7))
+def test_qwen35_dense_admits_physical_pipeline_stages(pp_size):
     hf_config = _qwen_config(moe=False)
-    args = _server_args()
-    setattr(args, name, 2)
-    with pytest.raises(ValueError, match="TP1/DP1/EP1/PP1"):
+    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=pp_size)
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config, model_arch="Qwen3_5ForConditionalGeneration"
+    )
+    assert args.exact_physical_pp_capable
+
+
+def test_qwen3_dense_admits_only_physical_not_stage_local_parallelism():
+    hf_config = _qwen_config(moe=False, head_dim=128)
+    physical_pp = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=4)
+    physical_pp._resolve_qwen3_dense_exact_contract(
+        hf_config, model_arch="Qwen3ForCausalLM"
+    )
+    assert physical_pp.qwen3_dense_exact_mode
+    assert physical_pp.exact_physical_pp_capable
+    assert physical_pp.pp_size == 4
+
+    stage_local_tp = _server_args(tp_size=2, dp_size=1, ep_size=1, pp_size=4)
+    with pytest.raises(ValueError, match="stage-local TP1/DP1/EP1"):
+        stage_local_tp._resolve_qwen3_dense_exact_contract(
+            _qwen_config(moe=False, head_dim=128),
+            model_arch="Qwen3ForCausalLM",
+        )
+
+
+@pytest.mark.parametrize(
+    "topology",
+    (
+        dict(tp_size=2, dp_size=1, ep_size=1),
+        dict(tp_size=1, dp_size=2, ep_size=1),
+        dict(tp_size=1, dp_size=1, ep_size=2),
+    ),
+)
+def test_qwen35_dense_rejects_stage_local_parallel_arithmetic(topology):
+    hf_config = _qwen_config(moe=False)
+    args = _server_args(**topology, pp_size=3)
+    with pytest.raises(ValueError, match="stage-local TP1/DP1/EP1"):
         args._resolve_qwen35_gdn_exact_contract(
             hf_config, model_arch="Qwen3_5ForConditionalGeneration"
         )
 
 
-def test_qwen35_moe_rejects_explicit_non_graph32_program():
+def test_qwen35_moe_preserves_explicit_graph_program():
     hf_config = _qwen_config(moe=True)
     args = _server_args(tp_size=8, cuda_graph_bs_decode=[8, 10])
-    with pytest.raises(ValueError, match="graph buckets through 32"):
-        args._resolve_qwen35_gdn_exact_contract(
-            hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
-        )
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
+    )
+    assert args.cuda_graph_bs_decode == [8, 10]
 
 
 def test_qwen35_moe_rejects_architecture_alias_with_unqualified_geometry():
@@ -393,6 +464,7 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
 
         server_args = SimpleNamespace(
             disable_cuda_graph=False,
+            disable_radix_cache=True,
             qwen35_gdn_exact_is_moe=True,
         )
         exact._apply_qwen35_gdn_exact(server_args)
@@ -418,6 +490,18 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         assert "rmsnorm_family=v2" in rendered
         assert "moe_fold=canonical_moe_fold_v1" in rendered
         force_family.assert_not_called()
+
+
+def test_qwen35_graph_with_radix_uses_immediate_recurrent_state_writeback():
+    assert not exact._defer_incremental_state_writeback(
+        SimpleNamespace(disable_radix_cache=False), exact_graph=True
+    )
+    assert exact._defer_incremental_state_writeback(
+        SimpleNamespace(disable_radix_cache=True), exact_graph=True
+    )
+    assert not exact._defer_incremental_state_writeback(
+        SimpleNamespace(disable_radix_cache=True), exact_graph=False
+    )
 
 
 def test_qwen35_public_module_has_no_partial_selection_api():

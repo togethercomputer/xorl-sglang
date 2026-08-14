@@ -214,6 +214,139 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "up_proj", 1),
 ]
 
+_DSV4_PP_RESIDUAL = "dsv4_mhc_residual"
+_DSV4_PP_POST = "dsv4_mhc_post"
+_DSV4_PP_COMB = "dsv4_mhc_comb"
+_DSV4_PP_INPUT_IDS = "dsv4_exact_input_ids"
+_DSV4_PP_POSITIONS = "dsv4_exact_positions"
+
+
+def pack_dsv4_exact_pp_proxy(
+    hidden_states: torch.Tensor,
+    *,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hc_mult: int,
+    hidden_size: int,
+    deferred_mhc: bool,
+    residual: Optional[torch.Tensor] = None,
+    post: Optional[torch.Tensor] = None,
+    comb: Optional[torch.Tensor] = None,
+) -> PPProxyTensors:
+    """Pack the exact DSV4 state that crosses one physical PP boundary.
+
+    The ordinary mHC PP ABI stores a completed ``[T, hc_mult, H]`` image in a
+    flattened hidden-state slot.  The fused exact lane must instead preserve
+    the deferred FFN ``hc_post`` operands so that the next stage executes the
+    same fused post/pre operation as an unsplit layer sequence.  We keep the
+    existing fixed-width hidden slot by placing the live ``[T, H]`` partial in
+    its first slice; the remaining slices are padding and are never consumed.
+    """
+
+    input_ids = input_ids.reshape(-1)
+    positions = positions.reshape(-1)
+    if input_ids.shape != positions.shape:
+        raise ValueError("Exact DSV4 PP token ids and positions must have one shape")
+
+    rows = hidden_states.shape[0]
+    if deferred_mhc:
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != hidden_size:
+            raise ValueError(
+                "Deferred exact DSV4 PP hidden state must have shape [rows, hidden_size]"
+            )
+        if residual is None or post is None or comb is None:
+            raise ValueError("Deferred exact DSV4 PP requires all mHC operands")
+        expected = (
+            (rows, hc_mult, hidden_size),
+            (rows, hc_mult),
+            (rows, hc_mult, hc_mult),
+        )
+        actual = (tuple(residual.shape), tuple(post.shape), tuple(comb.shape))
+        if actual != expected:
+            raise ValueError(
+                f"Exact DSV4 PP mHC operand shapes must be {expected}, got {actual}"
+            )
+        proxy_hidden = F.pad(hidden_states, (0, (hc_mult - 1) * hidden_size))
+    else:
+        if hidden_states.ndim != 3 or tuple(hidden_states.shape[1:]) != (
+            hc_mult,
+            hidden_size,
+        ):
+            raise ValueError(
+                "Completed exact DSV4 PP hidden state must have shape "
+                "[rows, hc_mult, hidden_size]"
+            )
+        proxy_hidden = hidden_states.flatten(1)
+        residual = hidden_states.new_zeros((rows, hc_mult, hidden_size))
+        post = torch.zeros(
+            (rows, hc_mult), dtype=torch.float32, device=hidden_states.device
+        )
+        comb = torch.zeros(
+            (rows, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+
+    return PPProxyTensors(
+        {
+            "hidden_states": proxy_hidden,
+            _DSV4_PP_RESIDUAL: residual,
+            _DSV4_PP_POST: post,
+            _DSV4_PP_COMB: comb,
+            _DSV4_PP_INPUT_IDS: input_ids,
+            _DSV4_PP_POSITIONS: positions,
+        }
+    )
+
+
+def unpack_dsv4_exact_pp_proxy(
+    pp_proxy_tensors: PPProxyTensors,
+    *,
+    hc_mult: int,
+    hidden_size: int,
+    deferred_mhc: bool,
+) -> tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Inverse of :func:`pack_dsv4_exact_pp_proxy`."""
+
+    hidden_states = pp_proxy_tensors["hidden_states"]
+    required = (
+        _DSV4_PP_RESIDUAL,
+        _DSV4_PP_POST,
+        _DSV4_PP_COMB,
+        _DSV4_PP_INPUT_IDS,
+        _DSV4_PP_POSITIONS,
+    )
+    missing = [key for key in required if key not in pp_proxy_tensors.tensors]
+    if missing:
+        raise KeyError(f"Exact DSV4 PP proxy is missing: {', '.join(missing)}")
+    if hidden_states.ndim != 2 or hidden_states.shape[1] != hc_mult * hidden_size:
+        raise ValueError(
+            "Exact DSV4 PP hidden slot must have width hc_mult * hidden_size"
+        )
+    if deferred_mhc:
+        hidden_states = hidden_states[:, :hidden_size]
+        residual = pp_proxy_tensors[_DSV4_PP_RESIDUAL]
+        post = pp_proxy_tensors[_DSV4_PP_POST]
+        comb = pp_proxy_tensors[_DSV4_PP_COMB]
+    else:
+        hidden_states = hidden_states.view(-1, hc_mult, hidden_size)
+        residual = post = comb = None
+    return (
+        hidden_states,
+        residual,
+        post,
+        comb,
+        pp_proxy_tensors[_DSV4_PP_INPUT_IDS],
+        pp_proxy_tensors[_DSV4_PP_POSITIONS],
+    )
+
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
     # SM120 disables the standalone TileLang pre path. mhc_fused_post_pre does
@@ -2546,10 +2679,39 @@ class DeepseekV4Model(nn.Module):
         dsv4_exact_mode = bool(
             getattr(self.config, "_dsv4_flash_exact_mode", False)
         )
+        use_fused = self.use_fused_mhc_post_pre
+        prev_residual = prev_post = prev_comb = None
+        if self.pp_group.is_first_rank:
+            hidden_states = self.embed_tokens(input_ids)
+            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        else:
+            assert pp_proxy_tensors is not None
+            if dsv4_exact_mode:
+                (
+                    hidden_states,
+                    prev_residual,
+                    prev_post,
+                    prev_comb,
+                    input_ids,
+                    positions,
+                ) = unpack_dsv4_exact_pp_proxy(
+                    pp_proxy_tensors,
+                    hc_mult=self.hc_mult,
+                    hidden_size=self.hidden_size,
+                    deferred_mhc=use_fused,
+                )
+            else:
+                hidden_states = pp_proxy_tensors["hidden_states"]
+                # Unflatten 2D PP IPC tensor back to 3D mHC shape.
+                if hidden_states.ndim == 2:
+                    hidden_states = hidden_states.view(
+                        hidden_states.shape[0], self.hc_mult, self.hidden_size
+                    )
+
         if dsv4_exact_mode:
-            # Keep the unsplit DP-owner metadata. The exact MLP reconstructs
-            # hidden rows through the live CP strategy before CP0 represents
-            # that owner on the TP8 plane.
+            # Keep the unsplit DP-owner metadata.  Unlike ForwardBatch's local
+            # scheduler fields, these tensors are explicitly forwarded through
+            # every physical pipeline stage with the live mHC state.
             forward_batch._dsv4_exact_dp_input_ids = input_ids.reshape(-1)
             forward_batch._dsv4_exact_dp_positions = positions.reshape(-1)
             forward_batch.dsv4_exact_logits_rows_reconstructed = False
@@ -2561,17 +2723,6 @@ class DeepseekV4Model(nn.Module):
             ):
                 if hasattr(forward_batch, cache_name):
                     delattr(forward_batch, cache_name)
-        if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
-            hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        else:
-            assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            # Unflatten 2D PP IPC tensor back to 3D mHC shape.
-            if hidden_states.ndim == 2:
-                hidden_states = hidden_states.view(
-                    hidden_states.shape[0], self.hc_mult, self.hidden_size
-                )
 
         if (
             not dsv4_exact_mode
@@ -2621,8 +2772,6 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            use_fused = self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
             last_layer = None
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
@@ -2651,7 +2800,10 @@ class DeepseekV4Model(nn.Module):
                     else:
                         completed = hidden_states
                     dspark_aux_hidden_states.append(completed.mean(dim=1))
-            if use_fused and last_layer is not None:
+            # A fused exact lane carries the deferred FFN hc_post state across
+            # physical PP boundaries.  Only the terminal stage completes it;
+            # otherwise a pipeline cut would silently change the mHC program.
+            if use_fused and last_layer is not None and self.pp_group.is_last_rank:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
@@ -2686,6 +2838,18 @@ class DeepseekV4Model(nn.Module):
                 )
 
         if not self.pp_group.is_last_rank:
+            if dsv4_exact_mode:
+                return pack_dsv4_exact_pp_proxy(
+                    hidden_states,
+                    input_ids=forward_batch._dsv4_exact_dp_input_ids,
+                    positions=forward_batch._dsv4_exact_dp_positions,
+                    hc_mult=self.hc_mult,
+                    hidden_size=self.hidden_size,
+                    deferred_mhc=use_fused,
+                    residual=prev_residual,
+                    post=prev_post,
+                    comb=prev_comb,
+                )
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 

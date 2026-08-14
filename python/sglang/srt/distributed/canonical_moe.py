@@ -69,10 +69,8 @@ class SamplerParallelPlan:
             )
         if self.version != GLM52_CANONICAL_MOE_VERSION:
             raise ValueError(f"Unsupported canonical MoE version {self.version}")
-        if self.pp_size not in (1, 2) or not 0 <= self.pp_rank < self.pp_size:
-            raise ValueError(
-                "GLM-5.2 sampler admits only PP1 or PP2 with a valid stage rank"
-            )
+        if self.pp_size <= 0 or not 0 <= self.pp_rank < self.pp_size:
+            raise ValueError("Canonical MoE requires a valid physical pipeline stage")
         if self.effective_dense_tp != 1:
             raise ValueError("GLM-5.2 sampler requires effective dense TP1")
         if self.global_world_size != self.launcher_tp_size * self.pp_size:
@@ -83,25 +81,7 @@ class SamplerParallelPlan:
                 raise ValueError(
                     "Stage layer range must be a non-empty half-open interval"
                 )
-        expected_physical_ranks = tuple(
-            range(
-                self.pp_rank * self.launcher_tp_size,
-                (self.pp_rank + 1) * self.launcher_tp_size,
-            )
-        )
-        if self.physical_ranks != expected_physical_ranks:
-            raise ValueError(
-                "Physical ranks must be the ordered ranks of this pipeline stage"
-            )
         if self.production:
-            if self.contributor_count not in (8, 16):
-                raise ValueError(
-                    "Production GLM-5.2 requires exactly 8 or 16 contributors"
-                )
-            if self.physical_to_logical != tuple(range(self.contributor_count)):
-                raise ValueError(
-                    "Production GLM-5.2 requires identity logical contributor ordinals"
-                )
             if (
                 self.ep_size != self.contributor_count
                 or self.attention_cp_size * self.attention_dp_size
@@ -109,8 +89,8 @@ class SamplerParallelPlan:
                 or self.launcher_tp_size != self.contributor_count
             ):
                 raise ValueError(
-                    "Production GLM-5.2 sampler requires launcher TP and EP to "
-                    "equal the contributor count, with attention DP and CP "
+                    "Exact GLM-5.2 requires launcher TP and EP to equal the "
+                    "stage-local contributor count, with attention DP and CP "
                     "exactly covering the logical row owners"
                 )
 
@@ -123,10 +103,17 @@ class SamplerParallelPlan:
         pp_rank: int = 0,
         physical_ranks: tuple[int, ...] | None = None,
         attention_dp_size: int = 1,
+        ep_size: int | None = None,
     ) -> SamplerParallelPlan:
         if attention_dp_size <= 0 or contributors % attention_dp_size:
             raise ValueError(
                 "GLM-5.2 attention DP must be a positive divisor of the contributor count"
+            )
+        ep_size = contributors if ep_size is None else ep_size
+        if ep_size != contributors:
+            raise ValueError(
+                "GLM-5.2 EP must equal the physical contributor count because "
+                "each logical trainer leaf is one complete EP expert/shared shard"
             )
         ranks = (
             tuple(
@@ -146,7 +133,7 @@ class SamplerParallelPlan:
             global_world_size=contributors * pp_size,
             pp_rank=pp_rank,
             pp_size=pp_size,
-            ep_size=contributors,
+            ep_size=ep_size,
             attention_cp_size=contributors // attention_dp_size,
             attention_dp_size=attention_dp_size,
             production=True,
@@ -201,7 +188,7 @@ class SamplerParallelPlan:
             self.attention_dp_size,
             self.contributor_count,
         )
-        if self.production and actual != expected:
+        if actual != expected:
             raise RuntimeError(
                 f"Resolved GLM-5.2 sampler topology must be {expected}, got {actual}"
             )
@@ -214,11 +201,12 @@ class SamplerParallelPlan:
                 )
 
     def validate_cuda_graph_policy(self, *, disable_cuda_graph: bool) -> None:
-        if self.production and self.pp_size > 1 and not disable_cuda_graph:
-            raise RuntimeError(
-                "GLM-5.2 canonical PP2 requires --disable-cuda-graph until "
-                "pipeline-aware graph replay is certified"
-            )
+        """Compatibility hook retained for callers on older integration commits.
+
+        CUDA graph selection is a performance policy.  The canonical fold owns
+        only its arithmetic and stage-local collective membership, both of which
+        are identical in eager execution and graph capture.
+        """
 
     @property
     def identity(self) -> str:

@@ -41,6 +41,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.runner_utils.buffers import (
+    add_dsv4_exact_pp_proxy_buffers,
+)
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
@@ -82,6 +85,7 @@ def _allocate_decode_buffers(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_dsv4_exact: bool = False,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
     with torch.device(device):
@@ -127,6 +131,16 @@ def _allocate_decode_buffers(
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                )
+            if pp_proxy_dsv4_exact:
+                if hc_hidden_size is None:
+                    raise ValueError("Exact DSV4 PP proxy requires an mHC hidden size")
+                add_dsv4_exact_pp_proxy_buffers(
+                    pp_proxy_tensors,
+                    max_num_token=max_num_token,
+                    hidden_size=hidden_size,
+                    hc_hidden_size=hc_hidden_size,
+                    dtype=dtype,
                 )
         else:
             pp_proxy_tensors = None
@@ -345,6 +359,7 @@ class BaseRunner(ABC):
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
+            pp_proxy_dsv4_exact=mr.uses_dsv4_exact_pp_proxy(),
         )
 
     def _dummy_run(

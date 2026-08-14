@@ -181,23 +181,54 @@ class TestGlm52CanonicalFusedTree(unittest.TestCase):
                 self.assertFalse(torch.equal(first, folded))
                 self.assertTrue(torch.equal(folded, _balanced_adjacent_tree(partials)))
 
-    def test_exact_transport_is_the_certified_v3b_and_nothing_slower(self):
+    def test_exact_transport_admits_auto_v3_and_v3b(self):
         try:
             from sglang.srt.models.deepseek_v2 import (
                 _resolve_glm52_canonical_transport,
+                _select_glm52_canonical_transport,
             )
         except ImportError:
             self.skipTest("sgl_kernel is required to import the serving model")
         exact = SimpleNamespace(_glm52_exact_mode=True)
-        self.assertEqual(_resolve_glm52_canonical_transport(exact), "canonical_v3b")
-        for slower in ("canonical_v3", "dense_v1"):
-            with self.assertRaisesRegex(RuntimeError, "not a selectable alternative"):
-                _resolve_glm52_canonical_transport(
-                    SimpleNamespace(
-                        _glm52_exact_mode=True,
-                        _glm52_canonical_moe_transport=slower,
-                    )
+        self.assertEqual(_resolve_glm52_canonical_transport(exact), "auto")
+        for configured in ("auto", "dense_v1", "canonical_v3", "canonical_v3b"):
+            resolved = _resolve_glm52_canonical_transport(
+                SimpleNamespace(
+                    _glm52_exact_mode=True,
+                    _glm52_canonical_moe_transport=configured,
                 )
+            )
+            self.assertEqual(resolved, configured)
+            if configured != "dense_v1":
+                self.assertEqual(
+                    _select_glm52_canonical_transport(resolved, prefill_cp=True),
+                    "canonical_v3",
+                )
+        self.assertEqual(
+            _select_glm52_canonical_transport("auto", prefill_cp=False),
+            "canonical_v3b",
+        )
+        self.assertEqual(
+            _select_glm52_canonical_transport("canonical_v3", prefill_cp=False),
+            "canonical_v3",
+        )
+        self.assertEqual(
+            _select_glm52_canonical_transport("dense_v1", prefill_cp=False),
+            "dense_v1",
+        )
+        with self.assertRaisesRegex(RuntimeError, "consumer-sharded"):
+            _select_glm52_canonical_transport(
+                "dense_v1",
+                prefill_cp=True,
+                consumer_sharded=True,
+            )
+        with self.assertRaisesRegex(RuntimeError, "must be auto"):
+            _resolve_glm52_canonical_transport(
+                SimpleNamespace(
+                    _glm52_exact_mode=True,
+                    _glm52_canonical_moe_transport="not-a-transport",
+                )
+            )
         dense = SimpleNamespace(
             _glm52_exact_mode=False,
             _glm52_canonical_moe_transport="dense_v1",

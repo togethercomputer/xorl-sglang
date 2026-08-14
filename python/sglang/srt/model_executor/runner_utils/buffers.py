@@ -39,6 +39,43 @@ from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
 
 
+def add_dsv4_exact_pp_proxy_buffers(
+    pp_proxy_tensors: Dict[str, torch.Tensor],
+    *,
+    max_num_token: int,
+    hidden_size: int,
+    hc_hidden_size: int,
+    dtype: torch.dtype,
+) -> None:
+    """Add the stage-carried exact DSV4 metadata and deferred mHC operands."""
+
+    if hc_hidden_size <= 0 or hc_hidden_size % hidden_size:
+        raise ValueError(
+            "Exact DSV4 PP requires hc_hidden_size to be a positive multiple "
+            "of hidden_size"
+        )
+    hc_mult = hc_hidden_size // hidden_size
+    pp_proxy_tensors.update(
+        {
+            "dsv4_mhc_residual": torch.zeros(
+                (max_num_token, hc_mult, hidden_size), dtype=dtype
+            ),
+            "dsv4_mhc_post": torch.zeros(
+                (max_num_token, hc_mult), dtype=torch.float32
+            ),
+            "dsv4_mhc_comb": torch.zeros(
+                (max_num_token, hc_mult, hc_mult), dtype=torch.float32
+            ),
+            "dsv4_exact_input_ids": torch.zeros(
+                (max_num_token,), dtype=torch.int64
+            ),
+            "dsv4_exact_positions": torch.zeros(
+                (max_num_token,), dtype=torch.int64
+            ),
+        }
+    )
+
+
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
 
@@ -106,6 +143,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         hc_hidden_size: Optional[int] = None,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
+        pp_proxy_dsv4_exact: bool = False,
     ) -> DecodeInputBuffers:
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
@@ -149,6 +187,18 @@ class DecodeInputBuffers(ForwardInputBuffers):
                 if pp_proxy_topk_size is not None:
                     pp_proxy_tensors["topk_indices"] = torch.zeros(
                         (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                    )
+                if pp_proxy_dsv4_exact:
+                    if hc_hidden_size is None:
+                        raise ValueError(
+                            "Exact DSV4 PP proxy requires an mHC hidden size"
+                        )
+                    add_dsv4_exact_pp_proxy_buffers(
+                        pp_proxy_tensors,
+                        max_num_token=max_num_token,
+                        hidden_size=hidden_size,
+                        hc_hidden_size=hc_hidden_size,
+                        dtype=dtype,
                     )
             else:
                 pp_proxy_tensors = None

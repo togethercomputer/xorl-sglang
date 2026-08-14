@@ -35,6 +35,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
     PPProxyTensors,
 )
+from sglang.srt.model_executor.runner_utils.buffers import (
+    add_dsv4_exact_pp_proxy_buffers,
+)
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -678,6 +681,20 @@ class SchedulerPPMixin:
                         dtype=torch.int32,
                         device=self.device,
                     )
+                if model_runner.uses_dsv4_exact_pp_proxy():
+                    hc_hidden_size = getattr(model_config, "hc_hidden_size", None)
+                    if hc_hidden_size is None:
+                        raise ValueError(
+                            "Exact DSV4 PP profiling requires an mHC hidden size"
+                        )
+                    with torch.device(self.device):
+                        add_dsv4_exact_pp_proxy_buffers(
+                            proxy_tensors,
+                            max_num_token=current_seq_len,
+                            hidden_size=model_config.hidden_size,
+                            hc_hidden_size=hc_hidden_size,
+                            dtype=model_config.dtype,
+                        )
 
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
