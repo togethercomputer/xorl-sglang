@@ -6270,10 +6270,6 @@ class ServerArgs:
         self.sampling_backend = "pytorch"
         self.sampling_defaults = "openai"
         self.disable_custom_all_reduce = True
-        # The generic server warmup issues a greedy request.  The exact XORL
-        # sampler deliberately admits only multinomial sampling, so graph
-        # capture is the applicable warmup for this program.
-        self.skip_server_warmup = True
         logger.info(
             "Dense Qwen3 exact numerics: Class-B RoPE, RMSNorm families-v2, "
             "shape-aware exact SwiGLU, and the families-v2 BF16 lm-head"

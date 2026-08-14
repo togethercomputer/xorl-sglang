@@ -915,7 +915,7 @@ def test_exact_ingress_allows_temperature_aware_sampling() -> None:
     _exact_ingress_manager()._validate_one_request(request, [1])
 
 
-def test_exact_ingress_rejects_nonpositive_temperature() -> None:
+def test_exact_ingress_allows_zero_temperature_greedy_sampling() -> None:
     request = GenerateReqInput(
         input_ids=[1],
         sampling_params={"temperature": 0.0, "max_new_tokens": 1},
@@ -923,8 +923,7 @@ def test_exact_ingress_rejects_nonpositive_temperature() -> None:
     )
     request.normalize_batch_and_arguments()
 
-    with pytest.raises(ValueError, match="temperature=0.0"):
-        _exact_ingress_manager()._validate_one_request(request, [1])
+    _exact_ingress_manager()._validate_one_request(request, [1])
 
 
 def test_exact_temperature_preserves_dsv4_bf16_boundary() -> None:

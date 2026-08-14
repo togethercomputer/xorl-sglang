@@ -395,21 +395,31 @@ class Sampler(nn.Module):
             sampling_info.top_ps,
             sampling_info.min_ps,
         )
-        exact_sampler = getattr(self, "_sample_from_exact_logits", None)
-        if exact_sampler is None:
-            # Dependency-injection fallback for focused CPU unit tests.
-            batch_next_token_ids = self._sample_from_logprobs(
-                masked_logits,
-                sampling_info,
-                positions,
-            )
+        greedy_rows = sampling_info.top_ks <= 1
+        if sampling_info.is_all_greedy:
+            batch_next_token_ids = torch.argmax(transformed_logits, dim=-1)
         else:
-            batch_next_token_ids = exact_sampler(
-                transformed_logits,
-                sampling_info,
-                positions,
-                support,
-            )
+            exact_sampler = getattr(self, "_sample_from_exact_logits", None)
+            if exact_sampler is None:
+                # Dependency-injection fallback for focused CPU unit tests.
+                batch_next_token_ids = self._sample_from_logprobs(
+                    masked_logits,
+                    sampling_info,
+                    positions,
+                )
+            else:
+                batch_next_token_ids = exact_sampler(
+                    transformed_logits,
+                    sampling_info,
+                    positions,
+                    support,
+                )
+            if sampling_info.is_any_greedy:
+                batch_next_token_ids = torch.where(
+                    greedy_rows,
+                    torch.argmax(transformed_logits, dim=-1),
+                    batch_next_token_ids,
+                )
 
         if return_logprob:
             identity_rows = exact_sampling_identity_rows(
@@ -464,6 +474,14 @@ class Sampler(nn.Module):
                 identity_rows,
                 _native_score,
             )
+            if sampling_info.is_any_greedy:
+                # top_k=1 is the normalized temperature=0 decision program:
+                # the selected argmax has probability one and logprob +0.
+                selected_logprobs = torch.where(
+                    greedy_rows,
+                    torch.zeros_like(selected_logprobs),
+                    selected_logprobs,
+                )
             filtered_logprobs = masked_logits - lse.unsqueeze(1)
             if native_full_logprobs is not None:
                 filtered_logprobs = torch.where(

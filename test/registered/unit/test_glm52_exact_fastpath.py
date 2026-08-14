@@ -157,8 +157,9 @@ class TestGlm52ExactFastpath(unittest.TestCase):
     def test_exact_request_ingress_rejects_sampler_fatal_options(self):
         manager = self._ingress_manager()
         cases = (
-            ({"temperature": 0.0}, {}, "temperature=0.0"),
-            ({"temperature": 1e-7}, {}, "temperature=1e-07"),
+            ({"temperature": -0.1}, {}, "temperature=-0.1"),
+            ({"temperature": float("nan")}, {}, "temperature=nan"),
+            ({"temperature": float("inf")}, {}, "temperature=inf"),
             ({}, {"top_logprobs_num": 2}, "top_logprobs_num=2"),
             ({}, {"token_ids_logprob": [7]}, "token_ids_logprob=set"),
         )
@@ -176,7 +177,7 @@ class TestGlm52ExactFastpath(unittest.TestCase):
 
     def test_exact_request_ingress_admits_contract_request(self):
         manager = self._ingress_manager()
-        for temperature in (0.7, 1.0, 1.3):
+        for temperature in (0.0, 1e-7, 0.7, 1.0, 1.3):
             with self.subTest(temperature=temperature):
                 request = GenerateReqInput(
                     input_ids=[1],

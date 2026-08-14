@@ -211,6 +211,7 @@ def _filtered_sampling_info():
         min_ps=_fp32([0.0]),
         sampling_seed=torch.tensor([17], dtype=torch.int64),
         is_all_greedy=False,
+        is_any_greedy=False,
         need_top_p_sampling=False,
         need_top_k_sampling=True,
         need_min_p_sampling=False,
@@ -224,15 +225,18 @@ def _filtered_sampling_info():
     )
 
 
-def _sampling_info_for_rows(top_ks):
+def _sampling_info_for_rows(top_ks, temperatures=None):
     rows = len(top_ks)
+    if temperatures is None:
+        temperatures = [1.0] * rows
     return SimpleNamespace(
-        temperatures=torch.ones((rows, 1), dtype=torch.float32),
+        temperatures=torch.tensor(temperatures, dtype=torch.float32).reshape(rows, 1),
         top_ks=torch.tensor(top_ks, dtype=torch.int32),
         top_ps=torch.ones(rows, dtype=torch.float32),
         min_ps=torch.zeros(rows, dtype=torch.float32),
         sampling_seed=torch.arange(17, 17 + rows, dtype=torch.int64),
-        is_all_greedy=False,
+        is_all_greedy=all(value <= 1 for value in top_ks),
+        is_any_greedy=any(value <= 1 for value in top_ks),
         need_top_p_sampling=False,
         need_top_k_sampling=any(value < TOP_K_ALL for value in top_ks),
         need_min_p_sampling=False,
@@ -244,6 +248,81 @@ def _sampling_info_for_rows(top_ks):
         grammar_mask=None,
         logit_bias=None,
     )
+
+
+def test_qwen_glm_greedy_tie_uses_first_argmax_and_reports_decision_logprob_zero():
+    logits = _fp32([[3.0, 3.0, 1.0]])
+    output = SimpleNamespace(next_token_logits=logits, next_token_logprobs=None)
+
+    with patch(
+        "sglang.srt.layers.xorl_batch_invariant.resolve_or_validate_xorl_bi_family",
+        return_value="v2",
+    ):
+        actual = xorl_bi_sample_and_score(
+            output,
+            _sampling_info_for_rows([1]),
+            return_logprob=True,
+            top_logprobs_nums=[0],
+            token_ids_logprobs=[None],
+            positions=torch.tensor([0]),
+            sample_from_logprobs=lambda *_args: (_ for _ in ()).throw(
+                AssertionError("greedy decoding must not call the multinomial sampler")
+            ),
+            sync_token_ids=lambda *_args: None,
+            enable_deterministic=True,
+            return_original_logprob=False,
+            family="v2",
+        )
+
+    assert actual.tolist() == [0]
+    assert torch.equal(output.next_token_logprobs, _fp32([0.0]))
+    assert not torch.signbit(output.next_token_logprobs).any()
+
+
+def test_qwen_glm_mixed_greedy_and_positive_temperature_rows_share_one_batch():
+    logits = _fp32([[3.0, 3.0, 1.0], [0.0, 1.0, 2.0]])
+    output = SimpleNamespace(next_token_logits=logits, next_token_logprobs=None)
+    captured = {}
+
+    def sample(masked_logits, *_args):
+        captured["masked_logits"] = masked_logits.clone()
+        return torch.tensor([2, 2], dtype=torch.int64)
+
+    def native_score(values, ids, **_kwargs):
+        selected = values.gather(1, ids.to(torch.int64).unsqueeze(1)).squeeze(1)
+        lse = torch.logsumexp(values, dim=-1)
+        return selected - lse, lse, selected
+
+    with (
+        patch(
+            "sglang.srt.layers.xorl_batch_invariant.resolve_or_validate_xorl_bi_family",
+            return_value="v2",
+        ),
+        patch(
+            "sglang.srt.layers.xorl_batch_invariant.head_v2_selected_logprob_from_logits",
+            side_effect=native_score,
+        ),
+    ):
+        actual = xorl_bi_sample_and_score(
+            output,
+            _sampling_info_for_rows([1, TOP_K_ALL], [1.0, 0.5]),
+            return_logprob=True,
+            top_logprobs_nums=[0, 0],
+            token_ids_logprobs=[None, None],
+            positions=torch.tensor([0, 0]),
+            sample_from_logprobs=sample,
+            sync_token_ids=lambda *_args: None,
+            enable_deterministic=True,
+            return_original_logprob=False,
+            family="v2",
+        )
+
+    assert actual.tolist() == [0, 2]
+    assert captured["masked_logits"][0].tolist() == [3.0, -torch.inf, -torch.inf]
+    assert torch.equal(captured["masked_logits"][1], _fp32([0.0, 2.0, 4.0]))
+    expected_positive = _fp32([4.0]) - torch.logsumexp(_fp32([0.0, 2.0, 4.0]), dim=0)
+    assert torch.equal(output.next_token_logprobs[0], _fp32([0.0])[0])
+    assert torch.equal(output.next_token_logprobs[1], expected_positive[0])
 
 
 def test_qwen_glm_exact_sampler_samples_and_scores_the_same_filtered_logits():
@@ -380,6 +459,49 @@ def test_dsv4_exact_sampler_samples_and_scores_the_same_bf16_filtered_logits():
     assert torch.isneginf(captured["masked_logits"][0, 2])
     assert torch.equal(output.next_token_logprobs, expected.unsqueeze(0))
     assert output.filtered_logprobs_written
+
+
+def test_dsv4_exact_greedy_tie_uses_first_argmax_and_reports_decision_logprob_zero():
+    logits = _fp32([[3.0, 3.0, 1.0]])
+    output = SimpleNamespace(next_token_logprobs=None)
+
+    class _LogprobResult:
+        def write_output_to(self, _logits_output):
+            return None
+
+    class _OutputLogprobProcessor:
+        def compute_logprobs(self, *_args):
+            return _LogprobResult()
+
+    sampler = SimpleNamespace(
+        enable_deterministic=True,
+        return_original_logprob=False,
+        use_qwen35_bi_decode_rescore=False,
+        output_logprob_processor=_OutputLogprobProcessor(),
+        _sample_from_logprobs=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("greedy decoding must not call the multinomial sampler")
+        ),
+        _sync_token_ids_across_tp=lambda *_args: None,
+    )
+    with patch(
+        "sglang.srt.batch_invariant_ops.batch_invariant_ops.log_softmax",
+        side_effect=torch.log_softmax,
+    ):
+        actual = Sampler._forward_exact_filtered(
+            sampler,
+            output,
+            logits,
+            _sampling_info_for_rows([1]),
+            True,
+            [0],
+            [None],
+            torch.tensor([0]),
+            return_sampling_mask=False,
+        )
+
+    assert actual.tolist() == [0]
+    assert torch.equal(output.next_token_logprobs, _fp32([0.0]).bfloat16())
+    assert not torch.signbit(output.next_token_logprobs).any()
 
 
 def test_dsv4_identity_native_score_is_unchanged_beside_filtered_row():

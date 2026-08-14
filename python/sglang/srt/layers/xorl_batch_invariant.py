@@ -326,11 +326,6 @@ def xorl_bi_sample_and_score(
         or sampling_info.need_top_k_sampling
         or sampling_info.need_min_p_sampling
     )
-    if sampling_info.is_all_greedy and not has_sampling_filter:
-        raise RuntimeError(
-            "The XORL batch-invariant sampler requires multinomial sampling, "
-            "not greedy decoding."
-        )
     if sampling_info.has_custom_logit_processor:
         raise RuntimeError(
             "The XORL batch-invariant sampler does not support custom logit processors."
@@ -381,27 +376,59 @@ def xorl_bi_sample_and_score(
             sampling_info.min_ps,
         )
 
-    # Gumbel-max only depends on relative logits, so sampling directly from
-    # the transformed contract logits is identical to sampling from their
-    # normalized logprobs and keeps selection on the distribution we report.
-    if sample_from_logprobs is None:
-        batch_next_token_ids = exact_seeded_gumbel_sample(
-            transformed_logits,
-            sampling_info.sampling_seed,
-            positions,
-            support=support,
+    is_any_greedy = bool(
+        getattr(sampling_info, "is_any_greedy", sampling_info.is_all_greedy)
+    )
+    greedy_rows = (
+        sampling_info.top_ks <= 1
+        if is_any_greedy
+        else torch.zeros(
+            transformed_logits.shape[0],
+            dtype=torch.bool,
+            device=transformed_logits.device,
         )
+    )
+    if sampling_info.is_all_greedy:
+        # SamplingParams represents temperature=0 as temperature=1/top_k=1.
+        # Select the stable first argmax directly; this avoids dividing by
+        # zero while preserving SGLang's established greedy normalization.
+        batch_next_token_ids = torch.argmax(transformed_logits, dim=-1)
     else:
-        # Dependency-injection hook retained for focused sampler tests.
-        batch_next_token_ids = sample_from_logprobs(
-            sampling_logits,
-            sampling_info,
-            positions,
-        )
+        # Gumbel-max only depends on relative logits, so sampling directly from
+        # the transformed contract logits is identical to sampling from their
+        # normalized logprobs and keeps selection on the distribution we report.
+        if sample_from_logprobs is None:
+            batch_next_token_ids = exact_seeded_gumbel_sample(
+                transformed_logits,
+                sampling_info.sampling_seed,
+                positions,
+                support=support,
+            )
+        else:
+            # Dependency-injection hook retained for focused sampler tests.
+            batch_next_token_ids = sample_from_logprobs(
+                sampling_logits,
+                sampling_info,
+                positions,
+            )
+        if is_any_greedy:
+            batch_next_token_ids = torch.where(
+                greedy_rows,
+                torch.argmax(transformed_logits, dim=-1),
+                batch_next_token_ids,
+            )
     sync_token_ids(batch_next_token_ids, sampling_info)
 
     if return_logprob:
-        if support is not None:
+        if sampling_info.is_all_greedy:
+            # A deterministic argmax decision has probability one under the
+            # decision-time distribution, hence an exact logprob of +0.
+            selected_logprobs = torch.zeros(
+                transformed_logits.shape[0],
+                dtype=transformed_logits.dtype,
+                device=transformed_logits.device,
+            )
+        elif support is not None:
             identity_rows = exact_sampling_identity_rows(
                 sampling_info.top_ks,
                 sampling_info.top_ps,
@@ -434,6 +461,12 @@ def xorl_bi_sample_and_score(
                 transformed_logits,
                 batch_next_token_ids,
                 temperature=None,
+            )
+        if is_any_greedy and not sampling_info.is_all_greedy:
+            selected_logprobs = torch.where(
+                greedy_rows,
+                torch.zeros_like(selected_logprobs),
+                selected_logprobs,
             )
         logits_output.next_token_logprobs = selected_logprobs
 

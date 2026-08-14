@@ -77,7 +77,7 @@ def test_dense_qwen3_resolves_architecture_owned_exact_program():
     assert args.sampling_backend == "pytorch"
     assert args.sampling_defaults == "openai"
     assert args.disable_custom_all_reduce
-    assert args.skip_server_warmup
+    assert not args.skip_server_warmup
     assert _exact_batch_invariant_ops(args) == ("addmm", "bmm", "mm")
 
 
@@ -126,8 +126,10 @@ def test_dense_qwen3_ingress_rejects_sampler_fatal_options(
         _ingress_manager()._validate_one_request(request, [1])
 
 
-@pytest.mark.parametrize("temperature", [0.7, 1.0, 1.3])
-def test_dense_qwen3_ingress_admits_positive_temperature_plain_sampling(temperature):
+@pytest.mark.parametrize("temperature", [0.0, 1e-7, 0.7, 1.0, 1.3])
+def test_dense_qwen3_ingress_admits_non_negative_temperature_plain_sampling(
+    temperature,
+):
     request = GenerateReqInput(
         input_ids=[1],
         sampling_params={"temperature": temperature, "max_new_tokens": 1},
@@ -136,6 +138,16 @@ def test_dense_qwen3_ingress_admits_positive_temperature_plain_sampling(temperat
     request.normalize_batch_and_arguments()
 
     _ingress_manager()._validate_one_request(request, [1])
+
+
+def test_dense_qwen3_preserves_explicit_server_warmup_skip():
+    args = _args(skip_server_warmup=True)
+    args._resolve_qwen3_dense_exact_contract(
+        _config(),
+        model_arch="Qwen3ForCausalLM",
+    )
+
+    assert args.skip_server_warmup
 
 
 def test_dense_qwen3_ingress_admits_joint_sampling_filters():
