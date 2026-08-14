@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Optional, Tuple, Union
 
 import torch
@@ -984,7 +986,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         value: torch.Tensor,
         a: torch.Tensor,
         b: torch.Tensor,
-        layer_cache: "MambaPool.SpeculativeState",
+        layer_cache: MambaPool.SpeculativeState,
         ssm_states: torch.Tensor,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
@@ -1068,7 +1070,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         a: torch.Tensor,
         b: torch.Tensor,
         mamba_pool: MambaPool,
-        layer_cache: "MambaPool.SpeculativeState",
+        layer_cache: MambaPool.SpeculativeState,
         cache_indices: torch.Tensor,
         query_start_loc: torch.Tensor,
         draft_token_num: int,

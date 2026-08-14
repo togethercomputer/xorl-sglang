@@ -616,12 +616,39 @@ def test_gdn_backend_reads_architecture_resolver_flags_at_call_time():
 
     with (
         patch.object(backend, "is_cuda", return_value=True),
-        patch.object(backend._bi_decode_mod, "BI_GDN_DECODE_ENABLED", True),
-        patch.object(backend._bi_fast_mod, "BI_GDN_DECODE_FAST_ENABLED", True),
-        patch.object(backend._bi_incr_mod, "BI_GDN_DECODE_INCR_ENABLED", True),
-        patch.object(backend._bi_incr_mod, "BI_GDN_INCR_DEFER_ENABLED", True),
-        patch.object(backend._bi_heal_mod, "BI_GDN_LAZY_HEAL_ENABLED", True),
-        patch.object(backend._bi_prefill_mod, "BI_GDN_PREFILL_ENABLED", True),
+        patch.object(
+            backend,
+            "_bi_decode_mod",
+            SimpleNamespace(BI_GDN_DECODE_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_fast_mod",
+            SimpleNamespace(BI_GDN_DECODE_FAST_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_incr_mod",
+            SimpleNamespace(
+                BI_GDN_DECODE_INCR_ENABLED=True,
+                BI_GDN_INCR_DEFER_ENABLED=True,
+            ),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_heal_mod",
+            SimpleNamespace(BI_GDN_LAZY_HEAL_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_prefill_mod",
+            SimpleNamespace(BI_GDN_PREFILL_ENABLED=True),
+            create=True,
+        ),
     ):
         assert backend._bi_gdn_decode_enabled()
         assert backend._bi_gdn_decode_fast_enabled()
@@ -637,10 +664,25 @@ def test_gdn_backend_selects_cached_row_runner_atomically():
     sentinel = object()
     with (
         patch.object(backend, "is_cuda", return_value=True),
-        patch.object(backend._bi_fast_mod, "BI_GDN_DECODE_FAST_ENABLED", True),
-        patch.object(backend._bi_incr_mod, "BI_GDN_DECODE_INCR_ENABLED", True),
-        patch.object(backend, "BIGDNIncrDecodeRunner", return_value=sentinel) as incr,
-        patch.object(backend, "BIGDNFastDecodeRunner") as rescan,
+        patch.object(
+            backend,
+            "_bi_fast_mod",
+            SimpleNamespace(BI_GDN_DECODE_FAST_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_incr_mod",
+            SimpleNamespace(BI_GDN_DECODE_INCR_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "BIGDNIncrDecodeRunner",
+            return_value=sentinel,
+            create=True,
+        ) as incr,
+        patch.object(backend, "BIGDNFastDecodeRunner", create=True) as rescan,
     ):
         assert backend._make_bi_gdn_decode_runner() is sentinel
         incr.assert_called_once_with()
