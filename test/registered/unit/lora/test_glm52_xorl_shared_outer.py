@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.srt.layers.communicator import ScatterMode
 from sglang.srt.lora import lora_moe_runners
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.glm52 import (
@@ -37,6 +38,7 @@ from sglang.srt.lora.lora_manager import (
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
 from sglang.srt.lora.utils import LoRABatchInfo, get_normalized_target_modules
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.models.deepseek_v2 import DeepseekV2DecoderLayer
 from sglang.srt.models.glm4_moe import GlmMoeDsaForCausalLM
 from sglang.srt.runtime_context import get_forward
 from sglang.srt.server_args import ServerArgs
@@ -507,6 +509,49 @@ def test_triton_lora_selects_cp_gathered_metadata_only_for_gathered_rows():
     with get_forward().scoped(mlp_reduce_scatter=True):
         assert backend._sgemm_info(num_tokens=256) is local_batch_info
         assert backend._sgemm_info(num_tokens=4096) is gathered_batch_info
+
+
+@pytest.mark.parametrize("gathered_mode", [ScatterMode.FULL, ScatterMode.MOE_FULL])
+def test_glm_decoder_routes_mlp_metadata_by_post_prepare_layout(gathered_mode):
+    local_batch_info = SimpleNamespace(expected_tokens=None)
+    gathered_batch_info = SimpleNamespace(expected_tokens=512)
+    backend = object.__new__(TritonLoRABackend)
+    backend.batch_info = local_batch_info
+    backend.context_parallel_mlp_batch_info = gathered_batch_info
+    backend.sgemm_batch_info = None
+    dense_layer = SimpleNamespace(
+        glm52_xorl_bi_contract=True,
+        layer_scatter_modes=SimpleNamespace(mlp_mode=ScatterMode.SCATTERED),
+        mlp=SimpleNamespace(
+            gate_up_proj=SimpleNamespace(lora_backend=backend),
+        ),
+    )
+
+    with DeepseekV2DecoderLayer._glm52_mlp_lora_context(dense_layer, 32):
+        assert backend.batch_info is local_batch_info
+
+    class FakeMoE:
+        def __init__(self):
+            self.experts = SimpleNamespace(lora_backend=backend)
+
+    sparse_layer = SimpleNamespace(
+        glm52_xorl_bi_contract=True,
+        layer_scatter_modes=SimpleNamespace(mlp_mode=gathered_mode),
+        mlp=FakeMoE(),
+    )
+    with patch("sglang.srt.models.deepseek_v2.DeepseekV2MoE", FakeMoE):
+        with DeepseekV2DecoderLayer._glm52_mlp_lora_context(sparse_layer, 512):
+            assert backend.batch_info is gathered_batch_info
+
+        assert backend.batch_info is local_batch_info
+        with pytest.raises(RuntimeError, match="metadata_rows=512, activation_rows=32"):
+            with DeepseekV2DecoderLayer._glm52_mlp_lora_context(sparse_layer, 32):
+                pass
+
+    sparse_layer.layer_scatter_modes.mlp_mode = ScatterMode.TP_ATTN_FULL
+    with pytest.raises(RuntimeError, match="no certified metadata routing"):
+        with DeepseekV2DecoderLayer._glm52_mlp_lora_context(sparse_layer, 32):
+            pass
 
 
 def test_fused_moe_uses_cp_gathered_metadata_and_row_guard():

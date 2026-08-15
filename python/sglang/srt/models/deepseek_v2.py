@@ -91,6 +91,7 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -2963,10 +2964,18 @@ class DeepseekV2DecoderLayer(nn.Module):
         return ""
 
     def _glm52_mlp_lora_context(self, num_tokens: int):
-        """Route all GLM MLP LoRA sites with metadata for gathered DP/CP rows."""
+        """Route GLM MLP LoRA metadata according to the post-prepare row layout."""
 
         if not getattr(self, "glm52_xorl_bi_contract", False):
             return nullcontext()
+        mlp_mode = self.layer_scatter_modes.mlp_mode
+        if mlp_mode is ScatterMode.SCATTERED:
+            return nullcontext()
+        if mlp_mode not in (ScatterMode.FULL, ScatterMode.MOE_FULL):
+            raise RuntimeError(
+                "GLM-5.2 MLP LoRA has no certified metadata routing for "
+                f"post-prepare layout {mlp_mode}."
+            )
         if isinstance(self.mlp, DeepseekV2MoE):
             backend = getattr(self.mlp.experts, "lora_backend", None)
         else:
