@@ -12,7 +12,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig  # noqa: E402
+from sglang.srt.layers.moe.moe_runner.base import (  # noqa: E402
+    MoeRunnerConfig,
+    should_singleton_mxfp4_marlin_base,
+)
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo  # noqa: E402
 from sglang.srt.layers.moe.token_dispatcher.standard import (  # noqa: E402
     StandardDispatchOutput,
@@ -25,13 +28,34 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestMxfp4MarlinBatchInvariance(CustomTestCase):
-    def test_base_gemms_are_singleton_and_lora_hooks_stay_batched(self) -> None:
-        """Unrelated token routes must not share an MXFP4 base launch.
+    def test_singleton_base_scope_is_exact_mxfp4_multitoken_only(self) -> None:
+        cases = (
+            (True, True, 3, True),
+            (False, True, 3, False),
+            (True, False, 3, False),
+            (True, True, 1, False),
+        )
+        for dsv4_exact_mode, is_mxfp4_marlin, num_tokens, expected in cases:
+            with self.subTest(
+                dsv4_exact_mode=dsv4_exact_mode,
+                is_mxfp4_marlin=is_mxfp4_marlin,
+                num_tokens=num_tokens,
+            ):
+                self.assertEqual(
+                    should_singleton_mxfp4_marlin_base(
+                        dsv4_exact_mode=dsv4_exact_mode,
+                        is_mxfp4_marlin=is_mxfp4_marlin,
+                        num_tokens=num_tokens,
+                    ),
+                    expected,
+                )
 
-        MXFP4 Marlin derives its K-stripe partition from all local expert blocks
-        in a launch. The base gate/up and down projections must therefore see
-        one logical token at a time, while each LoRA hook must still see the
-        complete batch exactly once.
+    def _run_base_gemm_case(self, *, dsv4_exact_mode: bool) -> None:
+        """Exercise exact singleton and ordinary batched MXFP4 execution.
+
+        In DSV4 exact mode, unrelated token routes must not share an MXFP4 base
+        launch. Outside that mode, preserve the established batched base GEMMs.
+        In both cases each LoRA hook must see the complete batch exactly once.
         """
 
         num_tokens = 3
@@ -67,7 +91,7 @@ class TestMxfp4MarlinBatchInvariance(CustomTestCase):
         runner_config = MoeRunnerConfig(
             activation="silu",
             swiglu_limit=10.0,
-            dsv4_exact_mode=True,
+            dsv4_exact_mode=dsv4_exact_mode,
         )
 
         aligned_batches = []
@@ -192,52 +216,85 @@ class TestMxfp4MarlinBatchInvariance(CustomTestCase):
             )
 
         self.assertEqual(len(selected_geometries), 1)
-        self.assertEqual(selected_geometries[0]["num_tokens"], 1)
-        self.assertEqual(len(aligned_batches), num_tokens)
-        self.assertTrue(
-            all(
-                torch.equal(ids, topk_ids[token : token + 1])
-                for token, (ids, _, _) in enumerate(aligned_batches)
-            )
-        )
         self.assertEqual(
-            [
-                (block_size_m, num_experts)
-                for _, block_size_m, num_experts in aligned_batches
-            ],
-            [(8, quant_info.global_num_experts)] * num_tokens,
+            selected_geometries[0]["num_tokens"],
+            1 if dsv4_exact_mode else num_tokens,
         )
-        self.assertEqual(
-            [call["input_shape"] for call in gemm_calls[:num_tokens]],
-            [(1, hidden_size)] * num_tokens,
-        )
-        self.assertEqual(
-            [call["output_shape"] for call in gemm_calls[:num_tokens]],
-            [(topk, 2 * intermediate_size)] * num_tokens,
-        )
-        self.assertEqual(
-            [call["input_shape"] for call in gemm_calls[num_tokens:]],
-            [(topk, intermediate_size)] * num_tokens,
-        )
-        self.assertEqual(
-            [call["output_shape"] for call in gemm_calls[num_tokens:]],
-            [(topk, hidden_size)] * num_tokens,
-        )
-        for token, call in enumerate(gemm_calls[:num_tokens]):
+        if dsv4_exact_mode:
+            self.assertEqual(len(aligned_batches), num_tokens)
             self.assertTrue(
-                torch.equal(call["input"], hidden_states[token : token + 1])
+                all(
+                    torch.equal(ids, topk_ids[token : token + 1])
+                    for token, (ids, _, _) in enumerate(aligned_batches)
+                )
             )
-            self.assertTrue(
-                torch.equal(call["topk_weights"], topk_weights[token : token + 1])
+            self.assertEqual(
+                [
+                    (block_size_m, num_experts)
+                    for _, block_size_m, num_experts in aligned_batches
+                ],
+                [(8, quant_info.global_num_experts)] * num_tokens,
             )
-            self.assertEqual(call["size_m"], 1)
-            self.assertEqual(call["top_k"], topk)
-        for token, call in enumerate(gemm_calls[num_tokens:]):
-            self.assertTrue(
-                torch.equal(call["topk_weights"], topk_weights[token : token + 1])
+            self.assertEqual(
+                [call["input_shape"] for call in gemm_calls[:num_tokens]],
+                [(1, hidden_size)] * num_tokens,
             )
-            self.assertEqual(call["size_m"], topk)
-            self.assertEqual(call["top_k"], 1)
+            self.assertEqual(
+                [call["output_shape"] for call in gemm_calls[:num_tokens]],
+                [(topk, 2 * intermediate_size)] * num_tokens,
+            )
+            self.assertEqual(
+                [call["input_shape"] for call in gemm_calls[num_tokens:]],
+                [(topk, intermediate_size)] * num_tokens,
+            )
+            self.assertEqual(
+                [call["output_shape"] for call in gemm_calls[num_tokens:]],
+                [(topk, hidden_size)] * num_tokens,
+            )
+            for token, call in enumerate(gemm_calls[:num_tokens]):
+                self.assertTrue(
+                    torch.equal(call["input"], hidden_states[token : token + 1])
+                )
+                self.assertTrue(
+                    torch.equal(call["topk_weights"], topk_weights[token : token + 1])
+                )
+                self.assertEqual(call["size_m"], 1)
+                self.assertEqual(call["top_k"], topk)
+            for token, call in enumerate(gemm_calls[num_tokens:]):
+                self.assertTrue(
+                    torch.equal(call["topk_weights"], topk_weights[token : token + 1])
+                )
+                self.assertEqual(call["size_m"], topk)
+                self.assertEqual(call["top_k"], 1)
+        else:
+            self.assertEqual(len(aligned_batches), 1)
+            ids, block_size_m, num_experts = aligned_batches[0]
+            self.assertTrue(torch.equal(ids, topk_ids))
+            self.assertEqual(
+                (block_size_m, num_experts),
+                (8, quant_info.global_num_experts),
+            )
+            self.assertEqual(len(gemm_calls), 2)
+            gate_up_call, down_call = gemm_calls
+            self.assertEqual(gate_up_call["input_shape"], (num_tokens, hidden_size))
+            self.assertEqual(
+                gate_up_call["output_shape"],
+                (num_tokens * topk, 2 * intermediate_size),
+            )
+            self.assertTrue(torch.equal(gate_up_call["topk_weights"], topk_weights))
+            self.assertEqual(gate_up_call["size_m"], num_tokens)
+            self.assertEqual(gate_up_call["top_k"], topk)
+            self.assertEqual(
+                down_call["input_shape"],
+                (num_tokens * topk, intermediate_size),
+            )
+            self.assertEqual(
+                down_call["output_shape"],
+                (num_tokens * topk, hidden_size),
+            )
+            self.assertTrue(torch.equal(down_call["topk_weights"], topk_weights))
+            self.assertEqual(down_call["size_m"], num_tokens * topk)
+            self.assertEqual(down_call["top_k"], 1)
         self.assertEqual(
             hook_calls,
             [
@@ -248,6 +305,16 @@ class TestMxfp4MarlinBatchInvariance(CustomTestCase):
         self.assertTrue(
             torch.equal(result.hidden_states, torch.full_like(hidden_states, 10))
         )
+
+    def test_exact_base_gemms_are_singleton_and_lora_hooks_stay_batched(
+        self,
+    ) -> None:
+        self._run_base_gemm_case(dsv4_exact_mode=True)
+
+    def test_nonexact_base_gemms_stay_batched_and_lora_hooks_stay_batched(
+        self,
+    ) -> None:
+        self._run_base_gemm_case(dsv4_exact_mode=False)
 
 
 if __name__ == "__main__":

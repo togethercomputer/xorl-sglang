@@ -33,6 +33,16 @@ def moe_output_buffer_ctx(buf: torch.Tensor):
     return get_forward().scoped(moe_output_buffer=buf)
 
 
+def should_singleton_mxfp4_marlin_base(
+    *,
+    dsv4_exact_mode: bool,
+    is_mxfp4_marlin: bool,
+    num_tokens: int,
+) -> bool:
+    """Whether exact DSV4 should decompose MXFP4 base GEMMs by token."""
+    return dsv4_exact_mode and is_mxfp4_marlin and num_tokens > 1
+
+
 @dataclass
 class MoeRunnerConfig:
     # MoE parameters
@@ -58,7 +68,7 @@ class MoeRunnerConfig:
     swiglu_limit: Optional[float] = None
     # Admit DSV4's block-64 Marlin row program. This must be explicit so
     # official-geometry models outside the exact lane keep the stock row-block
-    # heuristic. MXFP4 singleton decomposition is backend-wide and independent.
+    # heuristic and batched MXFP4 execution.
     dsv4_exact_mode: bool = False
     # Whether gate/up weights are stored interleaved (vs split). Only the
     # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,

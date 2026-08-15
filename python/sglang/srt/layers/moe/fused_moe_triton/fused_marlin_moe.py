@@ -6,6 +6,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.layers.moe.moe_runner.base import (
+    should_singleton_mxfp4_marlin_base,
+)
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -301,7 +304,11 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    if is_mxfp4_marlin and M > 1:
+    if should_singleton_mxfp4_marlin_base(
+        dsv4_exact_mode=dsv4_exact_mode,
+        is_mxfp4_marlin=is_mxfp4_marlin,
+        num_tokens=M,
+    ):
         # Marlin partitions each expert's K reduction using the total number of
         # local expert blocks in the launch. Use the same one-token program for
         # batched and singleton execution so unrelated routes cannot change

@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.base import (
+    MoeRunnerConfig,
+    should_singleton_mxfp4_marlin_base,
+)
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
 from sglang.srt.utils import is_cuda
 
@@ -218,7 +221,11 @@ class MarlinLoraRunnerCore:
             hidden_states.dtype == torch.float16
             or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
         ) and not is_mxfp4_marlin
-        singleton_base = is_mxfp4_marlin and M > 1
+        singleton_base = should_singleton_mxfp4_marlin_base(
+            dsv4_exact_mode=runner_config.dsv4_exact_mode,
+            is_mxfp4_marlin=is_mxfp4_marlin,
+            num_tokens=M,
+        )
 
         block_size_m = select_marlin_moe_block_size_m(
             dsv4_exact_mode=runner_config.dsv4_exact_mode,
