@@ -1,9 +1,14 @@
 # flash_mla
 # sm90 dense decode HEAD_DIM_K=512 support (sgl-project/FlashMLA#9, merged).
+find_program(FLASHMLA_PATCH_EXECUTABLE NAMES patch REQUIRED)
 FetchContent_Declare(
     repo-flashmla
     URL      https://${GITHUB_ARTIFACTORY}/sgl-project/FlashMLA/archive/05e26647fe840b8baedae486c2d86d5ce4efeb7c.tar.gz
     URL_HASH SHA256=ce369489bbfc42cdfbba9aa949de0270e64469d530748dea9f4f60b3c69dea9b
+    PATCH_COMMAND
+        ${CMAKE_COMMAND} -E chdir <SOURCE_DIR>
+        ${FLASHMLA_PATCH_EXECUTABLE} --batch --forward --fuzz=0 -p1
+        -i ${CMAKE_CURRENT_LIST_DIR}/../patches/flashmla-model1-fixed-k2.patch
 )
 FetchContent_Populate(repo-flashmla)
 
