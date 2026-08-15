@@ -22,6 +22,7 @@ from sglang.srt.layers.exact_sampling_transforms import (
     exact_masked_logits,
     exact_sampling_identity_rows,
     exact_seeded_gumbel_sample,
+    exact_selected_logprob_from_support,
     exact_selected_logprob_partitioned_from_support,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -499,18 +500,12 @@ class Sampler(nn.Module):
             logits_output.next_token_logprobs = selected_logprobs
 
         if return_sampling_mask:
-            # This output remains an observability aid only.  Trainer replay is
-            # parameter-based and recomputes support from current logits.
-            probabilities = torch.softmax(transformed_logits, dim=-1)
-            sampling_mask_data = self._compute_sampling_mask_from_probs(
-                probabilities,
-                sampling_info,
-            )
-            self._attach_sampling_mask_to_output(
+            self._attach_exact_sampling_mask_to_output(
                 logits_output,
                 sampling_info,
                 batch_next_token_ids,
-                sampling_mask_data,
+                transformed_logits,
+                support,
             )
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
@@ -682,6 +677,59 @@ class Sampler(nn.Module):
             else:
                 masks.append(None)
                 logprobs.append(None)
+        logits_output.next_token_sampling_mask_idx = masks
+        logits_output.next_token_sampling_logprobs = logprobs
+
+    def _attach_exact_sampling_mask_to_output(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        batch_next_token_ids: torch.Tensor,
+        transformed_logits: torch.Tensor,
+        support: torch.Tensor,
+    ) -> None:
+        """Return the support and normalization used by exact sampling."""
+        return_sampling_masks = sampling_info.return_sampling_masks or []
+        if not return_sampling_masks:
+            logits_output.next_token_sampling_mask_idx = []
+            logits_output.next_token_sampling_logprobs = []
+            return
+
+        selected_logprobs, _, _ = exact_selected_logprob_from_support(
+            transformed_logits,
+            batch_next_token_ids.to(torch.int64),
+            support,
+        )
+
+        # Preserve the established descending-score response order while using
+        # the exact support as the sole source of membership. Stable sorting
+        # makes token ID the tie breaker, matching exact_sampling_support.
+        ordered_ids = torch.argsort(
+            transformed_logits.detach(), dim=-1, descending=True, stable=True
+        )
+        ordered_support = support.gather(1, ordered_ids)
+        flat_rows, flat_cols = ordered_support.nonzero(as_tuple=True)
+        flat_ids = ordered_ids[flat_rows, flat_cols].to(torch.int32)
+        mask_lengths = ordered_support.sum(dim=-1, dtype=torch.int32)
+
+        flat_ids_cpu = flat_ids.cpu().tolist()
+        mask_lengths_cpu = mask_lengths.cpu().tolist()
+        selected_logprobs_cpu = selected_logprobs.cpu().tolist()
+
+        masks = []
+        logprobs = []
+        cursor = 0
+        for i, should_return in enumerate(return_sampling_masks):
+            mask_len = int(mask_lengths_cpu[i])
+            row_ids = flat_ids_cpu[cursor : cursor + mask_len]
+            cursor += mask_len
+            if should_return:
+                masks.append(row_ids)
+                logprobs.append(float(selected_logprobs_cpu[i]))
+            else:
+                masks.append(None)
+                logprobs.append(None)
+
         logits_output.next_token_sampling_mask_idx = masks
         logits_output.next_token_sampling_logprobs = logprobs
 

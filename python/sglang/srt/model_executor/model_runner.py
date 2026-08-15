@@ -187,7 +187,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     _exact_batch_invariant_ops,
     add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
-    is_batch_invariant_rl_target,
     is_glm52_exact_mode,
     is_qwen35_gdn_exact_mode,
     set_global_server_args_for_scheduler,
@@ -783,9 +782,7 @@ class ModelRunner:
 
     def maybe_enable_batch_invariant_mode(self):
         exact_ops = _exact_batch_invariant_ops(self.server_args)
-        if exact_ops is not None or is_batch_invariant_rl_target(
-            self.server_args.rl_on_policy_target
-        ):
+        if exact_ops is not None:
             from sglang.srt.batch_invariant_ops import (
                 enable_batch_invariant_mode,
                 get_batch_invariant_ops,

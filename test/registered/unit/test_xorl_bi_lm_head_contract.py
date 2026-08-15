@@ -39,7 +39,6 @@ from sglang.srt.server_args import (
     RL_ON_POLICY_TARGET_CHOICES,
     XORL_RL_TARGET,
     ServerArgs,
-    is_batch_invariant_rl_target,
     is_glm52_exact_mode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -153,10 +152,19 @@ def _scheduler_response_processor():
 
 class TestXorlBatchInvariantTarget(unittest.TestCase):
     def test_xorl_exact_mode_is_resolved_from_the_model(self):
-        self.assertIn(XORL_RL_TARGET, RL_ON_POLICY_TARGET_CHOICES)
-        self.assertFalse(is_batch_invariant_rl_target(XORL_RL_TARGET))
+        self.assertEqual(RL_ON_POLICY_TARGET_CHOICES, [XORL_RL_TARGET])
         self.assertFalse(is_glm52_exact_mode(SimpleNamespace()))
         self.assertTrue(is_glm52_exact_mode(SimpleNamespace(glm52_exact_mode=True)))
+
+    def test_legacy_rl_targets_are_rejected_before_dummy_short_circuit(self):
+        for target in ("fsdp", "xorl-batch-invariant", "another-trainer"):
+            with (
+                self.subTest(target=target),
+                self.assertRaisesRegex(
+                    ValueError, "only supports the current exact XORL contract"
+                ),
+            ):
+                ServerArgs(model_path="dummy", rl_on_policy_target=target)
 
     def test_standard_unfiltered_request_sets_no_rejected_sampling_flag(self):
         params = SamplingParams(

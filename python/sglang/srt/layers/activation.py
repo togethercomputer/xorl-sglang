@@ -33,7 +33,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.server_args import is_xorl_exact_mode
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -130,7 +131,7 @@ logger = logging.getLogger(__name__)
 class SiluAndMul(BaseFusedOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_exec().deterministic.rl_on_policy_target is not None:
+        if is_xorl_exact_mode(get_server_args()):
             self._forward_method = self.forward_exact
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter

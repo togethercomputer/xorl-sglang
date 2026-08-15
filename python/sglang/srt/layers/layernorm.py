@@ -456,11 +456,7 @@ class RMSNorm(BaseFusedOp):
                     residual,
                     post_residual_addition,
                 )
-            if (
-                residual is not None
-                or self.cast_x_before_out_mul
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None or self.cast_x_before_out_mul:
                 return self.forward_native(x, residual, post_residual_addition)
             out = rms_norm_batch_invariant(
                 x,
@@ -630,7 +626,6 @@ class RMSNorm(BaseFusedOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
                 or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -688,11 +683,7 @@ class RMSNorm(BaseFusedOp):
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or self.cast_x_before_out_mul
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None or self.cast_x_before_out_mul:
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
@@ -818,10 +809,7 @@ class RMSNorm(BaseFusedOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None:
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,

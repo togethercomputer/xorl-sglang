@@ -461,6 +461,62 @@ def test_dsv4_exact_sampler_samples_and_scores_the_same_bf16_filtered_logits():
     assert output.filtered_logprobs_written
 
 
+def test_exact_sampling_mask_returns_exact_support_and_normalization_across_dtypes():
+    logits = _fp32(
+        [
+            [0.0, 0.0, 0.0, 0.0],
+            [3.0, 2.0, 1.0, 0.0],
+            [2.0, 0.0, -1.0, -2.0],
+        ]
+    )
+    sampled = torch.tensor([1, 2, 3], dtype=torch.int32)
+    sampling_info = _sampling_info_for_rows([2, 3, 4])
+    sampling_info.return_sampling_masks = [True, True, True]
+    # The generic response helper would truncate its reconstruction here. The
+    # exact response must instead return the support that sampling already used.
+    sampling_info.sampling_mask_max_top_k = 1
+
+    for use_fp32_contract in (True, False):
+        output = SimpleNamespace(next_token_logprobs=None)
+        sampler = Sampler.__new__(Sampler)
+        torch.nn.Module.__init__(sampler)
+        sampler.enable_deterministic = True
+        sampler.return_original_logprob = False
+        sampler.use_qwen35_bi_decode_rescore = use_fp32_contract
+        sampler._sample_from_exact_logits = lambda *_args: sampled
+        sampler._sync_token_ids_across_tp = lambda *_args: None
+
+        actual = sampler._forward_exact_filtered(
+            output,
+            logits,
+            sampling_info,
+            False,
+            [0, 0, 0],
+            [None, None, None],
+            torch.tensor([0, 0, 0]),
+            return_sampling_mask=True,
+        )
+
+        assert actual is sampled
+        assert output.next_token_sampling_mask_idx == [
+            [0, 1],
+            [0, 1, 2],
+            [0, 1, 2, 3],
+        ]
+        transformed = logits if use_fp32_contract else logits.bfloat16()
+        expected = torch.stack(
+            (
+                transformed[0, 1] - torch.logsumexp(transformed[0, :2], dim=0),
+                transformed[1, 2] - torch.logsumexp(transformed[1, :3], dim=0),
+                transformed[2, 3] - torch.logsumexp(transformed[2], dim=0),
+            )
+        )
+        assert torch.equal(
+            torch.tensor(output.next_token_sampling_logprobs, dtype=transformed.dtype),
+            expected,
+        )
+
+
 def test_dsv4_exact_greedy_tie_uses_first_argmax_and_reports_decision_logprob_zero():
     logits = _fp32([[3.0, 3.0, 1.0]])
     output = SimpleNamespace(next_token_logprobs=None)

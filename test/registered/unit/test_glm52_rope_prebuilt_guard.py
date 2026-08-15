@@ -56,9 +56,8 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
     def test_cpu_cache_provenance_is_per_architecture(self):
         # GLM-5.2's certified table provenance is split: CPU inverse
         # frequencies, CUDA outer product and cos/sin — so its table pin is
-        # None (ambient). Qwen3.5-family exact serving and every other RL
-        # on-policy target evaluate the full table on CPU, matching their
-        # trainers.
+        # None (ambient). Qwen3.5-family exact serving evaluates the full table
+        # on CPU, matching its trainer.
         rope = _rope(128)
         cases = (
             ({"glm52_exact_mode": True, "rl_on_policy_target": "xorl"}, None),
@@ -66,7 +65,6 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
                 {"qwen35_gdn_exact_mode": True, "rl_on_policy_target": "xorl"},
                 torch.device("cpu"),
             ),
-            ({"rl_on_policy_target": "another-trainer"}, torch.device("cpu")),
         )
         for exec_config, expected in cases:
             with (

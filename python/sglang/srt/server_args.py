@@ -310,8 +310,7 @@ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 XORL_RL_TARGET = "xorl"
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "xorl-batch-invariant", XORL_RL_TARGET]
-BATCH_INVARIANT_RL_TARGETS = frozenset({"fsdp", "xorl-batch-invariant"})
+RL_ON_POLICY_TARGET_CHOICES = [XORL_RL_TARGET]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
@@ -429,14 +428,6 @@ def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
 
 
-def add_rl_on_policy_target_choices(choices):
-    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
-
-
-def is_batch_invariant_rl_target(target: Optional[str]) -> bool:
-    return target in BATCH_INVARIANT_RL_TARGETS
-
-
 def is_glm52_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "glm52_exact_mode", False))
 
@@ -451,6 +442,18 @@ def is_qwen35_gdn_exact_mode(server_args: ServerArgs) -> bool:
 
 def is_qwen3_dense_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "qwen3_dense_exact_mode", False))
+
+
+def is_xorl_exact_mode(server_args: ServerArgs) -> bool:
+    """Return whether a resolved architecture-owned XORL contract is active."""
+    return any(
+        (
+            is_glm52_exact_mode(server_args),
+            is_dsv4_flash_exact_mode(server_args),
+            is_qwen35_gdn_exact_mode(server_args),
+            is_qwen3_dense_exact_mode(server_args),
+        )
+    )
 
 
 def is_qwen35_rope_class_b(server_args: ServerArgs) -> bool:
@@ -3643,7 +3646,7 @@ class ServerArgs:
     rl_on_policy_target: A[
         Optional[str],
         Arg(
-            help="The training system that SGLang needs to match for true on-policy.",
+            help="Enable the current exact XoRL on-policy contract.",
             choices=RL_ON_POLICY_TARGET_CHOICES,
         ),
         NS("exec.deterministic"),
@@ -3898,6 +3901,7 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_return_hidden_states_mode()
+        self._validate_rl_on_policy_target()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -9047,6 +9051,14 @@ class ServerArgs:
         # the user input before it ever takes effect.
         if not (0 < self._resolved().swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
+
+    def _validate_rl_on_policy_target(self) -> None:
+        if self.rl_on_policy_target not in (None, XORL_RL_TARGET):
+            raise ValueError(
+                "--rl-on-policy-target only supports the current exact XORL "
+                f"contract ({XORL_RL_TARGET!r}); got "
+                f"{self.rl_on_policy_target!r}"
+            )
 
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:

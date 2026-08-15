@@ -19,19 +19,33 @@ def _one_round_reference(input_tensor: torch.Tensor) -> torch.Tensor:
     return (F.silu(gate.float()) * up.float()).to(input_tensor.dtype)
 
 
-def test_on_policy_swiglu_selects_exact_auto_resolver():
-    execution = SimpleNamespace(
-        deterministic=SimpleNamespace(rl_on_policy_target="xorl")
-    )
-    with patch("sglang.srt.layers.activation.get_exec", return_value=execution):
+EXACT_MODE_FIELDS = (
+    "glm52_exact_mode",
+    "dsv4_flash_exact_mode",
+    "qwen35_gdn_exact_mode",
+    "qwen3_dense_exact_mode",
+)
+
+
+def _execution(*, target=None, exact_mode=None):
+    values = {field: field == exact_mode for field in EXACT_MODE_FIELDS}
+    values["rl_on_policy_target"] = target
+    return SimpleNamespace(**values)
+
+
+@pytest.mark.parametrize("exact_mode", EXACT_MODE_FIELDS)
+def test_resolved_exact_contract_selects_exact_swiglu(exact_mode):
+    execution = _execution(target="xorl", exact_mode=exact_mode)
+    with patch("sglang.srt.layers.activation.get_server_args", return_value=execution):
         operation = SiluAndMul()
 
     assert operation._forward_method.__name__ == "forward_exact"
 
 
-def test_nonexact_swiglu_preserves_standard_dispatch():
-    execution = SimpleNamespace(deterministic=SimpleNamespace(rl_on_policy_target=None))
-    with patch("sglang.srt.layers.activation.get_exec", return_value=execution):
+@pytest.mark.parametrize("target", [None, "xorl", "fsdp", "xorl-batch-invariant"])
+def test_target_without_exact_contract_preserves_standard_dispatch(target):
+    execution = _execution(target=target)
+    with patch("sglang.srt.layers.activation.get_server_args", return_value=execution):
         operation = SiluAndMul()
 
     assert operation._forward_method is None
