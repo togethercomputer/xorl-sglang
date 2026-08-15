@@ -54,6 +54,10 @@ from sglang.srt.layers.dp_attention import (
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
+from sglang.srt.layers.glm52_positions import (
+    Glm52MlpRowLayout,
+    set_glm52_mlp_row_state,
+)
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
@@ -1177,6 +1181,12 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 dp_scatter(residual, hidden_states, forward_batch)
                 if hidden_states.shape[0] != 0:
                     hidden_states = layernorm(hidden_states)
+            if getattr(forward_batch, "_glm52_mlp_row_state", None) is not None:
+                set_glm52_mlp_row_state(
+                    forward_batch,
+                    Glm52MlpRowLayout.GLOBAL_LOGICAL,
+                    hidden_states.shape[0],
+                )
         else:
             handled = False
             if (

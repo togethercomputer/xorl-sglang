@@ -1,6 +1,7 @@
 """Lightweight GLM-5.2 absolute-position alignment helpers."""
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable
 
 import torch
@@ -10,6 +11,67 @@ import torch
 class CanonicalMoEPositions:
     values: torch.Tensor
     valid_mask: torch.Tensor
+
+
+class Glm52MlpRowLayout(str, Enum):
+    """Runtime row order produced at the GLM MLP boundary."""
+
+    LOCAL_LOGICAL = "local_logical"
+    OWNER_LOGICAL = "owner_logical"
+    OWNER_CP_PHYSICAL = "owner_cp_physical"
+    GLOBAL_LOGICAL = "global_logical"
+    GLOBAL_CP_PHYSICAL = "global_cp_physical"
+
+    @property
+    def uses_gathered_lora_metadata(self) -> bool:
+        return self is not Glm52MlpRowLayout.LOCAL_LOGICAL
+
+
+@dataclass(frozen=True)
+class Glm52MlpRowState:
+    layout: Glm52MlpRowLayout
+    rows: int
+
+
+def set_glm52_mlp_row_state(
+    forward_batch,
+    layout: Glm52MlpRowLayout,
+    rows: int,
+) -> Glm52MlpRowState:
+    """Record the row order actually produced for the next GLM MLP."""
+
+    rows = int(rows)
+    if rows < 0:
+        raise ValueError("GLM-5.2 MLP row count must be nonnegative")
+    state = Glm52MlpRowState(layout=layout, rows=rows)
+    forward_batch._glm52_mlp_row_state = state
+    return state
+
+
+def get_glm52_mlp_row_state(
+    forward_batch,
+    *,
+    expected_rows: int,
+) -> Glm52MlpRowState:
+    """Return the runtime row order and verify its activation capacity."""
+
+    state = getattr(forward_batch, "_glm52_mlp_row_state", None)
+    if not isinstance(state, Glm52MlpRowState):
+        raise RuntimeError("GLM-5.2 MLP row layout was not recorded by prepare_mlp")
+    if state.rows != int(expected_rows):
+        raise RuntimeError(
+            "GLM-5.2 MLP row layout does not match the activation rows: "
+            f"layout_rows={state.rows}, activation_rows={int(expected_rows)}."
+        )
+    return state
+
+
+def reset_glm52_mlp_row_state(forward_batch) -> None:
+    """Clear row-layout data derived during a previous model forward."""
+
+    forward_batch._glm52_mlp_row_state = None
+    forward_batch._glm52_owned_moe_positions = None
+    forward_batch._glm52_owned_moe_position_row_state = None
 
 
 def align_glm52_moe_positions(
@@ -56,4 +118,12 @@ def align_glm52_moe_positions(
     return CanonicalMoEPositions(full_positions, full_valid.to(torch.bool))
 
 
-__all__ = ["CanonicalMoEPositions", "align_glm52_moe_positions"]
+__all__ = [
+    "CanonicalMoEPositions",
+    "Glm52MlpRowLayout",
+    "Glm52MlpRowState",
+    "align_glm52_moe_positions",
+    "get_glm52_mlp_row_state",
+    "reset_glm52_mlp_row_state",
+    "set_glm52_mlp_row_state",
+]

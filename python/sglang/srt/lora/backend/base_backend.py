@@ -85,8 +85,10 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         gathered = self.context_parallel_mlp_batch_info
         if gathered is None:
-            yield
-            return
+            raise RuntimeError(
+                "Gathered MLP LoRA metadata is missing for gathered activation "
+                f"rows: activation_rows={num_tokens}."
+            )
         if gathered.expected_tokens != num_tokens:
             raise RuntimeError(
                 "Gathered MLP LoRA metadata does not match the activation rows: "

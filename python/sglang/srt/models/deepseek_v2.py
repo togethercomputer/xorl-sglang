@@ -91,7 +91,6 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    ScatterMode,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -106,6 +105,12 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
+)
+from sglang.srt.layers.glm52_positions import (
+    Glm52MlpRowLayout,
+    get_glm52_mlp_row_state,
+    reset_glm52_mlp_row_state,
+    set_glm52_mlp_row_state,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -319,7 +324,7 @@ def _select_glm52_canonical_transport(
     that local row layout. For replicated batches, dense v1 remains available
     as the independent executable oracle; auto selects the allocation-light
     v3b fused fold while explicit v3 keeps its independent transport. All three
-    compose the same versioned FP32 fold.
+    compose the same versioned FP64 fold.
     """
 
     if configured == "dense_v1":
@@ -1266,8 +1271,8 @@ class DeepseekV2MoE(nn.Module):
 
         The stock NCCL all_reduce has a topology-dependent reduction order.
         The XoRL exact contract requires the canonical source-ranked adjacent
-        FP32 tree over TP partials (the same primitive as Qwen/GLM) so the
-        trainer's raw exchange plus canonical_moe_fold_fp32_v2 reproduces the
+        FP64 tree over TP partials (the same primitive as Qwen/GLM) so the
+        trainer's raw exchange plus canonical_moe_fold_fp64_v3 reproduces the
         serving bytes before the one final BF16 output cast.
         """
         global _dsv4_exact_combine_engagement_logged
@@ -2963,26 +2968,32 @@ class DeepseekV2DecoderLayer(nn.Module):
             return "fp8"
         return ""
 
-    def _glm52_mlp_lora_context(self, num_tokens: int):
-        """Route GLM MLP LoRA metadata according to the post-prepare row layout."""
+    def _glm52_mlp_lora_context(self, forward_batch: ForwardBatch, num_tokens: int):
+        """Route GLM MLP LoRA metadata by the rows actually prepared."""
 
         if not getattr(self, "glm52_xorl_bi_contract", False):
             return nullcontext()
-        mlp_mode = self.layer_scatter_modes.mlp_mode
-        if mlp_mode is ScatterMode.SCATTERED:
-            return nullcontext()
-        if mlp_mode not in (ScatterMode.FULL, ScatterMode.MOE_FULL):
-            raise RuntimeError(
-                "GLM-5.2 MLP LoRA has no certified metadata routing for "
-                f"post-prepare layout {mlp_mode}."
-            )
         if isinstance(self.mlp, DeepseekV2MoE):
             backend = getattr(self.mlp.experts, "lora_backend", None)
         else:
             backend = getattr(self.mlp.gate_up_proj, "lora_backend", None)
         if backend is None:
             return nullcontext()
-        return backend.use_gathered_mlp_batch_info(num_tokens)
+        row_state = get_glm52_mlp_row_state(
+            forward_batch,
+            expected_rows=num_tokens,
+        )
+        if row_state.layout.uses_gathered_lora_metadata:
+            return backend.use_gathered_mlp_batch_info(num_tokens)
+
+        local_batch_info = backend.batch_info
+        expected_tokens = getattr(local_batch_info, "expected_tokens", None)
+        if expected_tokens is not None and expected_tokens != num_tokens:
+            raise RuntimeError(
+                "Local GLM-5.2 MLP LoRA metadata does not match the activation rows: "
+                f"metadata_rows={expected_tokens}, activation_rows={num_tokens}."
+            )
+        return nullcontext()
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         mlp_layer_types = getattr(self.config, "mlp_layer_types", None)
@@ -3047,6 +3058,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
+        if self.glm52_xorl_bi_contract:
+            set_glm52_mlp_row_state(
+                forward_batch,
+                Glm52MlpRowLayout.LOCAL_LOGICAL,
+                hidden_states.shape[0],
+            )
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -3088,7 +3105,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            with _mlp_ctx, self._glm52_mlp_lora_context(hidden_states.shape[0]):
+            with (
+                _mlp_ctx,
+                self._glm52_mlp_lora_context(forward_batch, hidden_states.shape[0]),
+            ):
                 if moe_positions is None:
                     hidden_states = self.mlp(
                         hidden_states,
@@ -3454,6 +3474,12 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if getattr(self, "glm52_xorl_bi_contract", False):
+            # A CUDA-graph shape is warmed up repeatedly with the same
+            # ForwardBatch before capture. Derived row-layout tensors may be
+            # reused by later MoE layers in this invocation, but must be rebuilt
+            # on every model entry so their alignment operations are captured.
+            reset_glm52_mlp_row_state(forward_batch)
         total_num_layers = self.end_layer - self.start_layer
         dsa_forward_uses_topk = self._dsa_forward_uses_topk()
         if self.pp_group.is_first_rank:

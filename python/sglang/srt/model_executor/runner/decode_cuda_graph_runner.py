@@ -996,6 +996,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+                self.model_runner.lora_manager.prepare_glm52_exact_dp_lora_batch(
+                    forward_batch,
+                    dp_row_counts=[num_tokens] * self.dp_size,
+                )
 
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
@@ -1165,6 +1169,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = bs * self.captured_req_width
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
+            )
+
+        if forward_batch.lora_ids is not None:
+            self.model_runner.lora_manager.prepare_glm52_exact_dp_lora_batch(
+                forward_batch,
+                dp_row_counts=[padded_num_tokens] * self.dp_size,
             )
 
         self.buffer_registry.fill_from(

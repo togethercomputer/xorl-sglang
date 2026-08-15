@@ -42,6 +42,9 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.glm52_positions import (
     CanonicalMoEPositions,
+    Glm52MlpRowLayout,
+    get_glm52_mlp_row_state,
+    set_glm52_mlp_row_state,
 )
 from sglang.srt.layers.logical_row_ownership import LogicalRowOwnership
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
@@ -192,22 +195,42 @@ def gather_glm52_mlp_rows(
         forward_batch
     )
     if context_sharded:
-        dp_local_rows = (
-            _gather_glm52_cp_logical_rows(hidden_states, forward_batch)
-            if ownership.dp_size > 1
+        if (
+            ownership.dp_size > 1
             and getattr(forward_batch, "attn_cp_metadata", None) is not None
-            else dsa_cp_gather_hidden_states(hidden_states)
-        )
+        ):
+            dp_local_rows = _gather_glm52_cp_logical_rows(hidden_states, forward_batch)
+            owner_layout = Glm52MlpRowLayout.OWNER_LOGICAL
+        else:
+            dp_local_rows = dsa_cp_gather_hidden_states(hidden_states)
+            owner_layout = Glm52MlpRowLayout.OWNER_CP_PHYSICAL
     else:
         dp_local_rows = hidden_states
+        owner_layout = Glm52MlpRowLayout.LOCAL_LOGICAL
     if ownership.dp_size == 1:
+        set_glm52_mlp_row_state(
+            forward_batch,
+            owner_layout,
+            dp_local_rows.shape[0],
+        )
         return dp_local_rows
     global_rows = get_global_dp_buffer(get_parallel().tp_group)
-    return _gather_dp_owned_rows(
+    global_rows = _gather_dp_owned_rows(
         dp_local_rows,
         output=global_rows,
         ownership=ownership,
     )
+    global_layout = (
+        Glm52MlpRowLayout.GLOBAL_CP_PHYSICAL
+        if owner_layout is Glm52MlpRowLayout.OWNER_CP_PHYSICAL
+        else Glm52MlpRowLayout.GLOBAL_LOGICAL
+    )
+    set_glm52_mlp_row_state(
+        forward_batch,
+        global_layout,
+        global_rows.shape[0],
+    )
+    return global_rows
 
 
 def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
@@ -229,8 +252,15 @@ def align_glm52_moe_positions(
 ) -> CanonicalMoEPositions:
     """Align positions to the same DP-major/CP-minor FULL row layout."""
 
+    row_state = get_glm52_mlp_row_state(
+        forward_batch,
+        expected_rows=full_hidden_states.shape[0],
+    )
     cached = getattr(forward_batch, "_glm52_owned_moe_positions", None)
-    if cached is not None:
+    cached_row_state = getattr(
+        forward_batch, "_glm52_owned_moe_position_row_state", None
+    )
+    if cached is not None and cached_row_state == row_state:
         if cached.values.numel() != full_hidden_states.shape[0]:
             raise RuntimeError(
                 "Cached GLM-5.2 positions do not match the gathered MLP rows"
@@ -241,29 +271,32 @@ def align_glm52_moe_positions(
     segment_lengths = list(get_dp_global_num_tokens() or [])
     prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
     cp_v2_metadata = getattr(forward_batch, "attn_cp_metadata", None)
-    if prefill_cp and cp_v2_metadata is not None and ownership.dp_size == 1:
-        # DP1 canonical-v3b keeps the equal padded CP buckets consumed by the
-        # source-sharded MoE transport.  CP-v2's DP token counts are logical
-        # (ragged), so they cannot describe this physical FULL-row capacity.
-        segment_lengths = [full_hidden_states.shape[0]]
-    elif not segment_lengths and ownership.dp_size == 1:
-        segment_lengths = [full_hidden_states.shape[0]]
-    block = ownership.dp_block_slice(segment_lengths)
-    block_rows = block.stop - block.start
     local_positions = positions.reshape(-1).to(torch.int64)
-    if prefill_cp and cp_v2_metadata is not None and ownership.dp_size > 1:
-        local_valid = (local_positions >= 0).to(torch.int32)
-        dp_positions = _gather_glm52_cp_logical_rows(local_positions, forward_batch)
-        dp_valid = _gather_glm52_cp_logical_rows(local_valid, forward_batch)
-        if dp_positions.numel() != block_rows or dp_valid.numel() != block_rows:
+
+    global_layout = row_state.layout in {
+        Glm52MlpRowLayout.GLOBAL_LOGICAL,
+        Glm52MlpRowLayout.GLOBAL_CP_PHYSICAL,
+    }
+    if global_layout:
+        try:
+            block = ownership.dp_block_slice(segment_lengths)
+        except ValueError as error:
             raise RuntimeError(
-                "GLM-5.2 CP-v2 logical positions do not match the DP row layout: "
-                f"positions={dp_positions.numel()}, valid={dp_valid.numel()}, "
-                f"expected={block_rows}"
+                "GLM-5.2 global MLP rows require one segment per DP owner"
+            ) from error
+        block_rows = block.stop - block.start
+    else:
+        block_rows = full_hidden_states.shape[0]
+
+    physical_layout = row_state.layout in {
+        Glm52MlpRowLayout.OWNER_CP_PHYSICAL,
+        Glm52MlpRowLayout.GLOBAL_CP_PHYSICAL,
+    }
+    if physical_layout:
+        if not prefill_cp:
+            raise RuntimeError(
+                "GLM-5.2 physical CP rows require an active prefill-CP gather"
             )
-    elif prefill_cp:
-        # Legacy CP exposes a rank-major physical layout without CP-v2
-        # metadata. Preserve its fixed-width gather contract.
         if block_rows % ownership.cp_size:
             raise RuntimeError("GLM-5.2 DP row capacity must divide across CP owners")
         local_capacity = block_rows // ownership.cp_size
@@ -280,7 +313,7 @@ def align_glm52_moe_positions(
                 or len(physical_counts) != ownership.cp_size
             ):
                 raise RuntimeError(
-                    "GLM-5.2 DP1 CP-v2 positions require complete per-rank row metadata"
+                    "GLM-5.2 physical CP-v2 positions require complete per-rank row metadata"
                 )
             logical_counts = [int(count) for count in logical_counts]
             physical_counts = [int(count) for count in physical_counts]
@@ -296,7 +329,7 @@ def align_glm52_moe_positions(
                 )
             ):
                 raise RuntimeError(
-                    "GLM-5.2 DP1 CP-v2 row metadata does not describe the physical FULL-row layout"
+                    "GLM-5.2 CP-v2 metadata does not describe the physical FULL-row layout"
                 )
             local_logical_rows = logical_counts[ownership.cp_rank]
             local_physical_rows = physical_counts[ownership.cp_rank]
@@ -305,7 +338,7 @@ def align_glm52_moe_positions(
                 or local_positions.numel() != local_physical_rows
             ):
                 raise RuntimeError(
-                    "GLM-5.2 DP1 CP-v2 position metadata does not match the physical CP bucket"
+                    "GLM-5.2 CP-v2 position metadata does not match the physical CP bucket"
                 )
         padded_positions = local_positions.new_full((local_capacity,), -1)
         padded_positions[:local_logical_rows].copy_(
@@ -322,18 +355,35 @@ def align_glm52_moe_positions(
         attn_cp_all_gather_into_tensor(dp_positions, padded_positions)
         attn_cp_all_gather_into_tensor(dp_valid, padded_valid)
     else:
-        if local_positions.numel() > block_rows:
-            raise RuntimeError("GLM-5.2 local positions exceed the DP source capacity")
-        dp_positions = local_positions.new_full((block_rows,), -1)
-        dp_positions[: local_positions.numel()].copy_(local_positions)
-        dp_valid = torch.zeros(
-            (block_rows,), dtype=torch.int32, device=local_positions.device
-        )
-        dp_valid[: local_positions.numel()].copy_(
-            (local_positions >= 0).to(torch.int32)
-        )
+        gathered_logical_layout = row_state.layout in {
+            Glm52MlpRowLayout.OWNER_LOGICAL,
+            Glm52MlpRowLayout.GLOBAL_LOGICAL,
+        }
+        if gathered_logical_layout and prefill_cp and cp_v2_metadata is not None:
+            local_valid = (local_positions >= 0).to(torch.int32)
+            dp_positions = _gather_glm52_cp_logical_rows(local_positions, forward_batch)
+            dp_valid = _gather_glm52_cp_logical_rows(local_valid, forward_batch)
+            if dp_positions.numel() != block_rows or dp_valid.numel() != block_rows:
+                raise RuntimeError(
+                    "GLM-5.2 CP-v2 logical positions do not match the DP row layout: "
+                    f"positions={dp_positions.numel()}, valid={dp_valid.numel()}, "
+                    f"expected={block_rows}"
+                )
+        else:
+            if local_positions.numel() > block_rows:
+                raise RuntimeError(
+                    "GLM-5.2 local positions exceed the DP source capacity"
+                )
+            dp_positions = local_positions.new_full((block_rows,), -1)
+            dp_positions[: local_positions.numel()].copy_(local_positions)
+            dp_valid = torch.zeros(
+                (block_rows,), dtype=torch.int32, device=local_positions.device
+            )
+            dp_valid[: local_positions.numel()].copy_(
+                (local_positions >= 0).to(torch.int32)
+            )
 
-    if ownership.dp_size > 1:
+    if global_layout:
         full_positions = local_positions.new_empty((sum(segment_lengths),))
         full_valid = dp_valid.new_empty((sum(segment_lengths),))
         _gather_dp_owned_rows(dp_positions, output=full_positions, ownership=ownership)
@@ -346,6 +396,7 @@ def align_glm52_moe_positions(
         )
     aligned = CanonicalMoEPositions(full_positions, full_valid.to(torch.bool))
     forward_batch._glm52_owned_moe_positions = aligned
+    forward_batch._glm52_owned_moe_position_row_state = row_state
     return aligned
 
 

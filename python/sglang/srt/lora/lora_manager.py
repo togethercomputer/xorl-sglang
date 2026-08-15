@@ -276,6 +276,23 @@ class LoRAManager:
             self.lora_backend.init_context_parallel_cuda_graph_batch_info(
                 num_rows=self.dp_size
             )
+        elif (
+            getattr(self.base_hf_config, "_glm52_exact_mode", False)
+            and self.dp_size > 1
+        ):
+            try:
+                LogicalRowOwnership(
+                    dp_size=self.dp_size,
+                    cp_size=self.attn_cp_size,
+                    dp_rank=0,
+                    cp_rank=0,
+                    contributor_count=self.tp_size,
+                )
+            except ValueError as error:
+                raise RuntimeError(str(error)) from error
+            self.lora_backend.init_context_parallel_cuda_graph_batch_info(
+                num_rows=(max_bs_in_cuda_graph * num_tokens_per_req * self.dp_size)
+            )
 
         # ===== TO BE REFACTORED ====
         # Pre-create the experimental LoRA two-stream side stream now (gated) so the
@@ -926,7 +943,12 @@ class LoRAManager:
         )
         self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
 
-    def prepare_glm52_exact_dp_lora_batch(self, forward_batch: ForwardBatch) -> None:
+    def prepare_glm52_exact_dp_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        dp_row_counts: Optional[List[int]] = None,
+    ) -> None:
         """Build per-request LoRA metadata for DP/CP-gathered logical rows."""
 
         if not getattr(self.base_hf_config, "_glm52_exact_mode", False):
@@ -945,19 +967,31 @@ class LoRAManager:
             raise RuntimeError(
                 "Gather-aware GLM-5.2 LoRA requires EP to cover every canonical contributor."
             )
-        if get_is_capture_mode():
-            raise RuntimeError(
-                "Gather-aware GLM-5.2 active LoRA admits eager execution only."
-            )
 
         local_segments = _glm52_local_request_segments(forward_batch)
         physical_segments = parallel.tp_group.all_gather_object(local_segments)
-        global_num_tokens = list(forward_batch.global_num_tokens_cpu or [])
+        global_num_tokens = list(
+            dp_row_counts
+            if dp_row_counts is not None
+            else (forward_batch.global_num_tokens_cpu or [])
+        )
         global_segments = _glm52_flatten_dp_request_segments(
             ownership, physical_segments, global_num_tokens
         )
-        global_uids = [uid for uid, _ in global_segments]
-        global_request_lens = [rows for _, rows in global_segments]
+        uses_decode_cuda_graph = (
+            hasattr(self, "max_bs_in_cuda_graph")
+            and forward_batch.batch_size <= self.max_bs_in_cuda_graph
+            and forward_batch.forward_mode.is_cuda_graph()
+        )
+        if uses_decode_cuda_graph:
+            # Graph kernels capture their segment count and grid geometry. Use
+            # one segment per physical row so every captured DP bucket has a
+            # fixed layout; owner padding remains on the base-model slot.
+            global_uids = [uid for uid, rows in global_segments for _ in range(rows)]
+            global_request_lens = [1] * len(global_uids)
+        else:
+            global_uids = [uid for uid, _ in global_segments]
+            global_request_lens = [rows for _, rows in global_segments]
 
         active_uids = {uid for uid in global_uids if uid is not None}
         active_adapter_limit = self.max_loras_per_batch - 1
@@ -985,9 +1019,6 @@ class LoRAManager:
             )
         for uid in active_uids:
             self._validate_glm52_exact_uid(uid)
-        if not active_uids:
-            self.lora_backend.context_parallel_mlp_batch_info = None
-            return
 
         weight_indices = []
         lora_ranks = [0] * self.max_loras_per_batch
@@ -1000,35 +1031,78 @@ class LoRAManager:
                 lora_ranks[slot] = adapter.config.r
                 scalings[slot] = adapter.scaling
 
+        has_active_lora = any(rank > 0 for rank in lora_ranks)
         device = self.device
-        segment_lens = torch.tensor(
-            global_request_lens, dtype=torch.int32, device=device
-        )
-        segment_indptr = torch.zeros(
-            (len(global_request_lens) + 1,), dtype=torch.int32, device=device
-        )
-        segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
         total_tokens = sum(global_request_lens)
-        global_batch_info = LoRABatchInfo(
-            use_cuda_graph=False,
-            bs=len(global_request_lens),
-            num_segments=len(global_request_lens),
-            seg_indptr=segment_indptr,
-            weight_indices=torch.tensor(
+        if uses_decode_cuda_graph:
+            global_batch_info = self.lora_backend.context_parallel_cuda_graph_batch_info
+            if global_batch_info is None:
+                raise RuntimeError(
+                    "Gathered GLM-5.2 decode graph metadata was not initialized."
+                )
+            capacity = global_batch_info.weight_indices.numel()
+            if (
+                total_tokens > capacity
+                or global_batch_info.seg_lens.numel() != capacity
+                or global_batch_info.seg_indptr.numel() != capacity + 1
+            ):
+                raise RuntimeError(
+                    "Gathered GLM-5.2 decode graph metadata has insufficient "
+                    "physical row capacity: "
+                    f"metadata_rows={capacity}, physical_rows={total_tokens}."
+                )
+            base_slot = self.memory_pool.get_buffer_id(None)
+            global_batch_info.seg_lens.zero_()
+            global_batch_info.seg_lens[:total_tokens].fill_(1)
+            global_batch_info.seg_indptr[0].zero_()
+            torch.cumsum(
+                global_batch_info.seg_lens,
+                dim=0,
+                out=global_batch_info.seg_indptr[1:],
+            )
+            global_batch_info.weight_indices.fill_(base_slot)
+            global_batch_info.weight_indices[:total_tokens].copy_(
+                torch.tensor(weight_indices, dtype=torch.int32, device=device)
+            )
+            global_batch_info.lora_ranks.copy_(
+                torch.tensor(lora_ranks, dtype=torch.int32, device=device)
+            )
+            global_batch_info.scalings.copy_(
+                torch.tensor(scalings, dtype=torch.float32, device=device)
+            )
+            global_batch_info.bs = total_tokens
+            global_batch_info.num_segments = total_tokens
+            global_batch_info.max_len = 1
+            global_batch_info.expected_tokens = total_tokens
+            global_batch_info.has_active_lora = has_active_lora
+            segment_lens = global_batch_info.seg_lens[:total_tokens]
+        else:
+            segment_lens = torch.tensor(
+                global_request_lens, dtype=torch.int32, device=device
+            )
+            segment_indptr = torch.zeros(
+                (len(global_request_lens) + 1,), dtype=torch.int32, device=device
+            )
+            segment_indptr[1:] = torch.cumsum(segment_lens, dim=0)
+            weight_indices_tensor = torch.tensor(
                 weight_indices, dtype=torch.int32, device=device
-            ),
-            lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=device),
-            scalings=torch.tensor(scalings, dtype=torch.float32, device=device),
-            max_len=max(global_request_lens, default=0),
-            seg_lens=segment_lens,
-            permutation=None,
-            expected_tokens=total_tokens,
-            has_active_lora=True,
-            req_seg_indptr=segment_indptr,
-            req_weight_indices=torch.tensor(
-                weight_indices, dtype=torch.int32, device=device
-            ),
-        )
+            )
+            global_batch_info = LoRABatchInfo(
+                use_cuda_graph=False,
+                bs=len(global_request_lens),
+                num_segments=len(global_request_lens),
+                seg_indptr=segment_indptr,
+                weight_indices=weight_indices_tensor,
+                lora_ranks=torch.tensor(lora_ranks, dtype=torch.int64, device=device),
+                scalings=torch.tensor(scalings, dtype=torch.float32, device=device),
+                max_len=max(global_request_lens, default=0),
+                seg_lens=segment_lens,
+                permutation=None,
+                expected_tokens=total_tokens,
+                has_active_lora=has_active_lora,
+                req_seg_indptr=segment_indptr,
+                req_weight_indices=weight_indices_tensor,
+            )
 
         physical_batch = copy(forward_batch)
         physical_batch.batch_size = len(global_request_lens)
@@ -1954,7 +2028,9 @@ def init_lora_cuda_graph_moe_buffers(
     from sglang.srt.lora.layers import FusedMoEWithLoRA
 
     max_bs = server_args.cuda_graph_config.decode.max_bs
-    if server_args.dsv4_flash_exact_mode:
+    if getattr(server_args, "dsv4_flash_exact_mode", False) or (
+        getattr(server_args, "glm52_exact_mode", False) and server_args.dp_size > 1
+    ):
         # Sparse MLPs consume the rank-major DP gather, not the local attention
         # rows. Allocate every MoE workspace for all physical DP rows.
         max_bs *= server_args.dp_size

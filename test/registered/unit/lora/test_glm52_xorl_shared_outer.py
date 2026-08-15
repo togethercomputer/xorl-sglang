@@ -12,7 +12,10 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from sglang.srt.layers.communicator import ScatterMode
+from sglang.srt.layers.glm52_positions import (
+    Glm52MlpRowLayout,
+    set_glm52_mlp_row_state,
+)
 from sglang.srt.lora import lora_moe_runners
 from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
 from sglang.srt.lora.glm52 import (
@@ -218,6 +221,207 @@ def test_mixed_dp_cp_lora_metadata_preserves_ragged_requests_per_owner(
         for uid, rows in expected_segments
         for _ in range(rows)
     ]
+
+
+def test_gathered_mlp_context_rejects_missing_metadata() -> None:
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+
+    backend = object.__new__(BaseLoRABackend)
+    backend.batch_info = SimpleNamespace(expected_tokens=2)
+    backend.context_parallel_mlp_batch_info = None
+    backend.sgemm_batch_info = None
+
+    with pytest.raises(RuntimeError, match="metadata is missing"):
+        with backend.use_gathered_mlp_batch_info(4):
+            pass
+
+
+@pytest.mark.parametrize(("dp_size", "cp_size"), [(2, 8), (4, 4), (8, 2), (16, 1)])
+def test_mixed_dp_glm_decode_graph_allocates_all_gathered_rows(
+    monkeypatch, dp_size, cp_size
+) -> None:
+    calls = []
+    backend = SimpleNamespace(
+        init_cuda_graph_batch_info=lambda **kwargs: None,
+        init_context_parallel_cuda_graph_batch_info=lambda num_rows: calls.append(
+            num_rows
+        ),
+    )
+    manager = object.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_glm52_exact_mode=True)
+    manager.dp_size = dp_size
+    manager.attn_cp_size = cp_size
+    manager.tp_size = 16
+    manager.lora_backend = backend
+
+    monkeypatch.setattr(
+        "sglang.srt.lora.lora_manager._SGLANG_EXPERIMENTAL_LORA_OPTI", False
+    )
+    manager.init_cuda_graph_batch_info(max_bs_in_cuda_graph=27, num_tokens_per_req=2)
+
+    assert calls == [27 * 2 * dp_size]
+
+
+@pytest.mark.parametrize("dp_size", [2, 4, 8, 16])
+def test_mixed_dp_glm_decode_graph_moe_buffers_cover_gathered_rows(
+    monkeypatch, dp_size
+) -> None:
+    import sglang.srt.lora.layers as lora_layers
+    from sglang.srt.lora.lora_manager import init_lora_cuda_graph_moe_buffers
+
+    class _FakeMoELoRA:
+        pass
+
+    fake_layer = _FakeMoELoRA()
+    calls = []
+    manager = SimpleNamespace(
+        init_cuda_graph_moe_buffers=lambda *args: calls.append(args)
+    )
+    server_args = SimpleNamespace(
+        cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(max_bs=27)),
+        dsv4_flash_exact_mode=False,
+        glm52_exact_mode=True,
+        dp_size=dp_size,
+        max_loras_per_batch=3,
+    )
+    monkeypatch.setattr(lora_layers, "FusedMoEWithLoRA", _FakeMoELoRA)
+
+    init_lora_cuda_graph_moe_buffers(
+        server_args=server_args,
+        model=SimpleNamespace(modules=lambda: [object(), fake_layer]),
+        lora_manager=manager,
+        dtype=torch.bfloat16,
+    )
+
+    assert calls == [(27 * dp_size, 3, torch.bfloat16, fake_layer)]
+
+
+@pytest.mark.parametrize(("dp_size", "cp_size"), [(2, 8), (4, 4)])
+def test_mixed_dp_glm_decode_graph_refreshes_pointer_stable_owner_rows(
+    monkeypatch, dp_size, cp_size
+) -> None:
+    import sglang.srt.lora.lora_manager as lora_manager_module
+
+    class _MemoryPool:
+        uid_to_buffer_id = {None: 0, "adapter-a": 1, "adapter-b": 2}
+
+        @staticmethod
+        def get_buffer_id(uid):
+            return _MemoryPool.uid_to_buffer_id[uid]
+
+    adapters = {
+        uid: SimpleNamespace(
+            config=SimpleNamespace(r=16),
+            scaling=2.0,
+            _glm52_exact_adapter_certified=True,
+        )
+        for uid in ("adapter-a", "adapter-b")
+    }
+    max_local_rows = 4
+    max_gathered_rows = max_local_rows * dp_size
+    backend = object.__new__(TritonLoRABackend)
+    backend.device = torch.device("cpu")
+    backend.max_loras_per_batch = 3
+    backend._is_moe_lora = True
+    backend.context_parallel_mlp_batch_info = None
+    backend.init_context_parallel_cuda_graph_batch_info(max_gathered_rows)
+    backend.moe_cg_buffers = {
+        "adapter_enabled": torch.zeros(3, dtype=torch.int32),
+        "token_lora_mapping": torch.full((max_gathered_rows,), -1, dtype=torch.int32),
+    }
+
+    manager = object.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_glm52_exact_mode=True)
+    manager.tp_size = 16
+    manager.dp_size = dp_size
+    manager.ep_size = 16
+    manager.attn_cp_size = cp_size
+    manager.max_loras_per_batch = 3
+    manager.max_bs_in_cuda_graph = max_local_rows
+    manager.device = torch.device("cpu")
+    manager.lora_backend = backend
+    manager.memory_pool = _MemoryPool()
+    manager.loras = adapters
+    manager.lora_refs = {uid: object() for uid in adapters}
+    manager.fetch_new_loras = lambda _: None
+
+    owner_uids = [["adapter-a", None]] + [
+        (["adapter-b"] if rank == 1 else [None]) for rank in range(1, dp_size)
+    ]
+
+    class _Group:
+        @staticmethod
+        def all_gather_object(local_segments):
+            assert local_segments == tuple((uid, 1) for uid in owner_uids[0])
+            return [
+                tuple((uid, 1) for uid in owner_uids[physical_rank // cp_size])
+                for physical_rank in range(16)
+            ]
+
+    monkeypatch.setattr(
+        lora_manager_module,
+        "get_parallel",
+        lambda: SimpleNamespace(
+            tp_group=_Group(),
+            attn_dp_rank=0,
+            attn_cp_rank=0,
+        ),
+    )
+    batch = SimpleNamespace(
+        batch_size=len(owner_uids[0]),
+        lora_ids=list(owner_uids[0]),
+        global_num_tokens_cpu=[len(uids) for uids in owner_uids],
+        is_extend_in_batch=False,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    fixed = backend.context_parallel_cuda_graph_batch_info
+    fixed_ptrs = {
+        name: getattr(fixed, name).data_ptr()
+        for name in (
+            "seg_lens",
+            "seg_indptr",
+            "weight_indices",
+            "lora_ranks",
+            "scalings",
+        )
+    }
+    manager.prepare_glm52_exact_dp_lora_batch(
+        batch, dp_row_counts=[max_local_rows] * dp_size
+    )
+
+    expected_uids = [
+        uid
+        for uids in owner_uids
+        for uid in [*uids, *([None] * (max_local_rows - len(uids)))]
+    ]
+    assert backend.context_parallel_mlp_batch_info is fixed
+    assert fixed.expected_tokens == fixed.bs == max_gathered_rows
+    assert fixed.seg_lens.tolist() == [1] * max_gathered_rows
+    assert fixed.seg_indptr.tolist() == list(range(max_gathered_rows + 1))
+    assert fixed.weight_indices.tolist() == [
+        _MemoryPool.uid_to_buffer_id[uid] for uid in expected_uids
+    ]
+    assert fixed.moe_lora_info.token_lora_mapping.tolist() == [
+        _MemoryPool.uid_to_buffer_id[uid] for uid in expected_uids
+    ]
+
+    owner_uids[0] = [None]
+    owner_uids[-1] = ["adapter-a", "adapter-b"]
+    batch.batch_size = len(owner_uids[0])
+    batch.lora_ids = list(owner_uids[0])
+    manager.prepare_glm52_exact_dp_lora_batch(
+        batch, dp_row_counts=[max_local_rows] * dp_size
+    )
+    expected_uids = [
+        uid
+        for uids in owner_uids
+        for uid in [*uids, *([None] * (max_local_rows - len(uids)))]
+    ]
+    assert fixed.weight_indices.tolist() == [
+        _MemoryPool.uid_to_buffer_id[uid] for uid in expected_uids
+    ]
+    assert fixed_ptrs == {name: getattr(fixed, name).data_ptr() for name in fixed_ptrs}
 
 
 def test_mixed_dp_cp_lora_rejects_inconsistent_cp_request_replicas() -> None:
@@ -511,9 +715,19 @@ def test_triton_lora_selects_cp_gathered_metadata_only_for_gathered_rows():
         assert backend._sgemm_info(num_tokens=4096) is gathered_batch_info
 
 
-@pytest.mark.parametrize("gathered_mode", [ScatterMode.FULL, ScatterMode.MOE_FULL])
-def test_glm_decoder_routes_mlp_metadata_by_post_prepare_layout(gathered_mode):
-    local_batch_info = SimpleNamespace(expected_tokens=None)
+@pytest.mark.parametrize(
+    "gathered_layout",
+    [
+        Glm52MlpRowLayout.OWNER_LOGICAL,
+        Glm52MlpRowLayout.OWNER_CP_PHYSICAL,
+        Glm52MlpRowLayout.GLOBAL_LOGICAL,
+        Glm52MlpRowLayout.GLOBAL_CP_PHYSICAL,
+    ],
+)
+def test_glm_decoder_routes_mlp_metadata_by_runtime_row_layout(gathered_layout):
+    # Equal row counts deliberately make size-only selection ambiguous. The
+    # runtime tag must still distinguish local order from gathered order.
+    local_batch_info = SimpleNamespace(expected_tokens=512)
     gathered_batch_info = SimpleNamespace(expected_tokens=512)
     backend = object.__new__(TritonLoRABackend)
     backend.batch_info = local_batch_info
@@ -521,13 +735,20 @@ def test_glm_decoder_routes_mlp_metadata_by_post_prepare_layout(gathered_mode):
     backend.sgemm_batch_info = None
     dense_layer = SimpleNamespace(
         glm52_xorl_bi_contract=True,
-        layer_scatter_modes=SimpleNamespace(mlp_mode=ScatterMode.SCATTERED),
         mlp=SimpleNamespace(
             gate_up_proj=SimpleNamespace(lora_backend=backend),
         ),
     )
+    forward_batch = SimpleNamespace()
 
-    with DeepseekV2DecoderLayer._glm52_mlp_lora_context(dense_layer, 32):
+    set_glm52_mlp_row_state(
+        forward_batch,
+        Glm52MlpRowLayout.LOCAL_LOGICAL,
+        512,
+    )
+    with DeepseekV2DecoderLayer._glm52_mlp_lora_context(
+        dense_layer, forward_batch, 512
+    ):
         assert backend.batch_info is local_batch_info
 
     class FakeMoE:
@@ -536,21 +757,32 @@ def test_glm_decoder_routes_mlp_metadata_by_post_prepare_layout(gathered_mode):
 
     sparse_layer = SimpleNamespace(
         glm52_xorl_bi_contract=True,
-        layer_scatter_modes=SimpleNamespace(mlp_mode=gathered_mode),
         mlp=FakeMoE(),
     )
     with patch("sglang.srt.models.deepseek_v2.DeepseekV2MoE", FakeMoE):
-        with DeepseekV2DecoderLayer._glm52_mlp_lora_context(sparse_layer, 512):
+        set_glm52_mlp_row_state(forward_batch, gathered_layout, 512)
+        with DeepseekV2DecoderLayer._glm52_mlp_lora_context(
+            sparse_layer, forward_batch, 512
+        ):
             assert backend.batch_info is gathered_batch_info
 
         assert backend.batch_info is local_batch_info
+        set_glm52_mlp_row_state(forward_batch, gathered_layout, 32)
         with pytest.raises(RuntimeError, match="metadata_rows=512, activation_rows=32"):
-            with DeepseekV2DecoderLayer._glm52_mlp_lora_context(sparse_layer, 32):
+            with DeepseekV2DecoderLayer._glm52_mlp_lora_context(
+                sparse_layer, forward_batch, 32
+            ):
                 pass
 
-    sparse_layer.layer_scatter_modes.mlp_mode = ScatterMode.TP_ATTN_FULL
-    with pytest.raises(RuntimeError, match="no certified metadata routing"):
-        with DeepseekV2DecoderLayer._glm52_mlp_lora_context(sparse_layer, 32):
+    set_glm52_mlp_row_state(
+        forward_batch,
+        Glm52MlpRowLayout.LOCAL_LOGICAL,
+        32,
+    )
+    with pytest.raises(RuntimeError, match="metadata_rows=512, activation_rows=32"):
+        with DeepseekV2DecoderLayer._glm52_mlp_lora_context(
+            dense_layer, forward_batch, 32
+        ):
             pass
 
 

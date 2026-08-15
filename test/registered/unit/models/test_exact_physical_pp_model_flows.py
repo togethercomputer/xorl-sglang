@@ -10,6 +10,11 @@ import torch
 from torch import nn
 
 from sglang.srt.distributed.canonical_moe import SamplerParallelPlan
+from sglang.srt.layers.communicator_dsa_cp import align_glm52_moe_positions
+from sglang.srt.layers.glm52_positions import (
+    Glm52MlpRowLayout,
+    set_glm52_mlp_row_state,
+)
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.models.deepseek_v2 import DeepseekV2Model
@@ -161,6 +166,44 @@ class _GlmBodyLayer(nn.Module):
         return hidden_states, residual, topk
 
 
+class _GlmRowCacheProbeLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.aligned_positions = []
+
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        residual,
+        zero_allocator,
+        gemm_output_zero_allocator,
+        llama_4_scaling,
+        *,
+        prev_topk_indices,
+        captured_last_layer_outputs,
+        next_full_attention_layer_id,
+    ):
+        del (
+            zero_allocator,
+            gemm_output_zero_allocator,
+            llama_4_scaling,
+            prev_topk_indices,
+            captured_last_layer_outputs,
+            next_full_attention_layer_id,
+        )
+        set_glm52_mlp_row_state(
+            forward_batch,
+            Glm52MlpRowLayout.LOCAL_LOGICAL,
+            hidden_states.shape[0],
+        )
+        self.aligned_positions.append(
+            align_glm52_moe_positions(positions, hidden_states, forward_batch)
+        )
+        return hidden_states, residual, None
+
+
 def _make_glm_stage(rank, world_size, layer_range):
     model = DeepseekV2Model.__new__(DeepseekV2Model)
     nn.Module.__init__(model)
@@ -191,6 +234,90 @@ def _make_glm_stage(rank, world_size, layer_range):
     )
     model.glm52_parallel_plan = replace(plan, stage_layer_range=layer_range)
     return model
+
+
+def _make_glm_row_cache_probe_model():
+    model = DeepseekV2Model.__new__(DeepseekV2Model)
+    nn.Module.__init__(model)
+    model.pp_group = _PPGroup(0, 1)
+    model.config = SimpleNamespace(num_hidden_layers=2)
+    model.use_dsa = False
+    model.dsa_enable_prefill_cp = False
+    model.mla_enable_prefill_cp = False
+    model.cp_size = None
+    model.glm52_xorl_bi_contract = True
+    model.first_k_dense_replace = 0
+    model.start_layer, model.end_layer = 0, 2
+    model.layers = nn.ModuleList([_GlmRowCacheProbeLayer() for _ in range(2)])
+    model.embed_tokens = nn.Identity()
+    model.norm = nn.Identity()
+    model.layers_to_capture = []
+    model.next_full_attention_layer_id = {}
+    model.glm52_deferred_status_book = None
+    model.llama_4_scaling_config = None
+    return model
+
+
+def test_glm_moe_position_cache_is_per_model_forward():
+    """Warmup/capture-style repeated forwards must rebuild aligned positions."""
+
+    model = _make_glm_row_cache_probe_model()
+    forward_batch = _forward_batch()
+    hidden = torch.zeros((2, 4), dtype=torch.float32)
+    first_positions = torch.tensor([3, 4], dtype=torch.int64)
+    second_positions = torch.tensor([11, 12], dtype=torch.int64)
+    ownership = SimpleNamespace(dp_size=1, cp_size=1, dp_rank=0, cp_rank=0)
+
+    with (
+        patch(
+            "sglang.srt.models.deepseek_v2.check_cuda_graph_backend",
+            return_value=True,
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v2.dsa_use_prefill_cp",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.models.deepseek_v2.mla_use_prefill_cp",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.communicator_dsa_cp._glm52_row_ownership",
+            return_value=ownership,
+        ) as ownership_mock,
+        patch(
+            "sglang.srt.layers.communicator_dsa_cp.get_dp_global_num_tokens",
+            return_value=None,
+        ),
+        patch(
+            "sglang.srt.layers.communicator_dsa_cp.dsa_use_prefill_cp",
+            return_value=False,
+        ),
+        patch(
+            "sglang.srt.layers.communicator_dsa_cp.mla_use_prefill_cp",
+            return_value=False,
+        ),
+    ):
+        model(
+            torch.tensor([1, 2]),
+            first_positions,
+            forward_batch,
+            input_embeds=hidden,
+        )
+        model(
+            torch.tensor([1, 2]),
+            second_positions,
+            forward_batch,
+            input_embeds=hidden,
+        )
+
+    first_layer, second_layer = model.layers
+    assert ownership_mock.call_count == 2
+    assert first_layer.aligned_positions[0] is second_layer.aligned_positions[0]
+    assert first_layer.aligned_positions[1] is second_layer.aligned_positions[1]
+    assert first_layer.aligned_positions[0] is not first_layer.aligned_positions[1]
+    assert torch.equal(first_layer.aligned_positions[0].values, first_positions)
+    assert torch.equal(first_layer.aligned_positions[1].values, second_positions)
 
 
 def test_glm_exact_mixed_dp_cp_stage_plan_and_topk_proxy_match_uncut_body():

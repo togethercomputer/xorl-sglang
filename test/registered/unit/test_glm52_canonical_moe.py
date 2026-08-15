@@ -22,7 +22,12 @@ from sglang.srt.distributed.canonical_moe import (
     canonicalize_glm52_local_partial,
     canonicalize_glm52_local_partial_v3,
 )
-from sglang.srt.layers.glm52_positions import align_glm52_moe_positions
+from sglang.srt.layers.glm52_positions import (
+    Glm52MlpRowLayout,
+    align_glm52_moe_positions,
+    get_glm52_mlp_row_state,
+    set_glm52_mlp_row_state,
+)
 from sglang.srt.models.glm52_index_share import (
     CanonicalLogicalIndices,
     Glm52IndexShareManager,
@@ -120,6 +125,77 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             self.assertTrue(torch.equal(gathered[:3], remote[:3]))
             self.assertTrue(torch.equal(gathered[3:], local))
 
+    def test_generic_dp_gather_records_global_logical_layout(self):
+        from sglang.srt.layers.communicator import (
+            CommunicateWithAllReduceAndLayerNormFn,
+            ScatterMode,
+        )
+
+        forward_batch = SimpleNamespace()
+        local_hidden = torch.arange(4, dtype=torch.bfloat16).reshape(2, 2)
+        residual = torch.zeros_like(local_hidden)
+        global_hidden = torch.empty((8, 2), dtype=torch.bfloat16)
+        set_glm52_mlp_row_state(
+            forward_batch,
+            Glm52MlpRowLayout.LOCAL_LOGICAL,
+            local_hidden.shape[0],
+        )
+
+        def fake_dp_gather(output, local, _forward_batch):
+            self.assertIs(output, global_hidden)
+            self.assertTrue(torch.equal(local, local_hidden))
+            output.copy_(local.repeat(4, 1))
+
+        context = SimpleNamespace(
+            attn_dp_size=4,
+            attn_tp_size=1,
+            attn_tp_rank=0,
+            force_layernorm_before_dp_gather=True,
+        )
+        with (
+            patch(
+                "sglang.srt.layers.communicator.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+            patch(
+                "sglang.srt.layers.communicator.get_tp_group",
+                return_value=object(),
+            ),
+            patch(
+                "sglang.srt.layers.communicator.get_global_dp_buffer",
+                return_value=global_hidden,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.dp_gather_replicate",
+                side_effect=fake_dp_gather,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.is_allocation_symmetric",
+                return_value=False,
+            ),
+        ):
+            gathered, returned_residual = (
+                CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
+                    hidden_states=local_hidden,
+                    residual=residual,
+                    forward_batch=forward_batch,
+                    layernorm=lambda hidden, current_residual: (
+                        hidden,
+                        current_residual,
+                    ),
+                    context=context,
+                    residual_input_mode=ScatterMode.TP_ATTN_FULL,
+                )
+            )
+
+        self.assertIs(gathered, global_hidden)
+        self.assertIs(returned_residual, residual)
+        row_state = get_glm52_mlp_row_state(
+            forward_batch,
+            expected_rows=global_hidden.shape[0],
+        )
+        self.assertIs(row_state.layout, Glm52MlpRowLayout.GLOBAL_LOGICAL)
+
     def test_dp_owned_positions_follow_rank_major_gather(self):
         from sglang.srt.layers.communicator_dsa_cp import (
             align_glm52_moe_positions as align_runtime_positions,
@@ -134,6 +210,12 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                 output.copy_(torch.tensor([1, 1, 1, 1, 1, 0], dtype=output.dtype))
             return output
 
+        forward_batch = SimpleNamespace()
+        set_glm52_mlp_row_state(
+            forward_batch,
+            Glm52MlpRowLayout.GLOBAL_LOGICAL,
+            6,
+        )
         with patch.multiple(
             "sglang.srt.layers.communicator_dsa_cp",
             dsa_use_prefill_cp=lambda *_args: False,
@@ -151,7 +233,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             aligned = align_runtime_positions(
                 torch.tensor([2, 3]),
                 torch.empty((6, 4)),
-                SimpleNamespace(),
+                forward_batch,
             )
 
         self.assertTrue(torch.equal(aligned.values, torch.tensor([0, 2, 3, 5, 6, -1])))
@@ -192,6 +274,12 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             )
             return output
 
+        forward_batch = SimpleNamespace()
+        set_glm52_mlp_row_state(
+            forward_batch,
+            Glm52MlpRowLayout.GLOBAL_CP_PHYSICAL,
+            16,
+        )
         with patch.multiple(
             "sglang.srt.layers.communicator_dsa_cp",
             dsa_use_prefill_cp=lambda *_args: True,
@@ -210,7 +298,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             aligned = align_runtime_positions(
                 torch.tensor([9]),
                 torch.empty((16, 4)),
-                SimpleNamespace(),
+                forward_batch,
             )
 
         self.assertTrue(torch.equal(aligned.values, expected_positions))
@@ -221,11 +309,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         from sglang.srt.layers.communicator_dsa_cp import (
             DSACPLayerCommunicator,
             DSAMLPOutputLayout,
-        )
-        from sglang.srt.layers.communicator_dsa_cp import (
             align_glm52_moe_positions as align_runtime_positions,
-        )
-        from sglang.srt.layers.communicator_dsa_cp import (
             gather_glm52_mlp_rows,
         )
         from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
@@ -371,6 +455,14 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                         hidden_shards[cp_rank], forward_batch
                     )
                     self.assertTrue(torch.equal(gathered, global_hidden))
+                    row_state = get_glm52_mlp_row_state(
+                        forward_batch,
+                        expected_rows=global_rows,
+                    )
+                    self.assertIs(
+                        row_state.layout,
+                        Glm52MlpRowLayout.GLOBAL_LOGICAL,
+                    )
 
                     aligned = align_runtime_positions(
                         position_shards[cp_rank], gathered, forward_batch
@@ -497,6 +589,14 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         ):
             gathered = gather_glm52_mlp_rows(physical_shards[cp_rank], forward_batch)
             self.assertTrue(torch.equal(gathered, expected_rank_major))
+            row_state = get_glm52_mlp_row_state(
+                forward_batch,
+                expected_rows=expected_rank_major.shape[0],
+            )
+            self.assertIs(
+                row_state.layout,
+                Glm52MlpRowLayout.OWNER_CP_PHYSICAL,
+            )
 
             aligned = align_runtime_positions(
                 position_shards[cp_rank], gathered, forward_batch
@@ -525,6 +625,91 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
 
         self.assertTrue(torch.equal(local, consumer_shard))
         self.assertIs(returned_residual, residual)
+
+    def test_equal_capacity_physical_layout_stays_rank_major(self):
+        from sglang.srt.layers.communicator_dsa_cp import (
+            align_glm52_moe_positions as align_runtime_positions,
+            gather_glm52_mlp_rows,
+        )
+
+        cp_size = 4
+        cp_rank = 2
+        logical_positions = torch.arange(8, dtype=torch.int64)
+        position_shards = [
+            logical_positions[rank::cp_size].contiguous() for rank in range(cp_size)
+        ]
+        hidden_shards = [
+            shard.to(torch.bfloat16).unsqueeze(1) for shard in position_shards
+        ]
+        expected_rank_major = torch.cat(position_shards)
+        self.assertEqual(expected_rank_major.numel(), logical_positions.numel())
+        self.assertFalse(torch.equal(expected_rank_major, logical_positions))
+
+        metadata = SimpleNamespace(
+            total_seq_lens=logical_positions.numel(),
+            per_rank_logical_token=[2] * cp_size,
+            per_rank_actual_token=[2] * cp_size,
+        )
+        forward_batch = SimpleNamespace(attn_cp_metadata=metadata)
+        parallel = SimpleNamespace(
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_cp_size=cp_size,
+            attn_cp_rank=cp_rank,
+            attn_tp_size=1,
+            tp_size=cp_size,
+            attn_cp_group=object(),
+        )
+        gathered_hidden = torch.empty((8, 1), dtype=torch.bfloat16)
+
+        def fake_cp_all_gather(output, local):
+            if local.dtype is torch.bfloat16:
+                shards = hidden_shards
+            elif local.dtype is torch.int64:
+                shards = position_shards
+            else:
+                self.assertEqual(local.dtype, torch.int32)
+                shards = [torch.ones(2, dtype=torch.int32)] * cp_size
+            self.assertTrue(torch.equal(local, shards[cp_rank]))
+            output.copy_(torch.cat(shards))
+
+        with (
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.get_local_dp_buffer",
+                return_value=gathered_hidden,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.attn_cp_all_gather_into_tensor",
+                side_effect=fake_cp_all_gather,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.dsa_use_prefill_cp",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.mla_use_prefill_cp",
+                return_value=False,
+            ),
+        ):
+            gathered = gather_glm52_mlp_rows(hidden_shards[cp_rank], forward_batch)
+            row_state = get_glm52_mlp_row_state(
+                forward_batch,
+                expected_rows=logical_positions.numel(),
+            )
+            self.assertIs(
+                row_state.layout,
+                Glm52MlpRowLayout.OWNER_CP_PHYSICAL,
+            )
+            aligned = align_runtime_positions(
+                position_shards[cp_rank], gathered, forward_batch
+            )
+
+        self.assertTrue(torch.equal(aligned.values, expected_rank_major))
+        self.assertTrue(torch.all(aligned.valid_mask))
 
     def test_cp_v2_logical_gather_rejects_invalid_strategy_row_count(self):
         from sglang.srt.layers.communicator_dsa_cp import (
