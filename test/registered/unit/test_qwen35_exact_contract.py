@@ -10,7 +10,7 @@ import torch
 from sglang.kernels.ops.attention.fla import qwen35_gdn_exact as exact
 from sglang.srt.distributed.canonical_moe import (
     SamplerParallelPlan,
-    canonical_moe_fold_fp32_v2,
+    canonical_moe_fold_fp64_v3,
 )
 from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.server_args import ServerArgs
@@ -361,7 +361,7 @@ def test_qwen35_moe_odd_contributor_plan_uses_deterministic_eager_fold(
         [[4096.0, ordinal + 1.0] for ordinal in range(contributors)],
         dtype=torch.bfloat16,
     )
-    level = list(partials.float().unbind(0))
+    level = list(partials.double().unbind(0))
     while len(level) > 1:
         paired = [
             level[index] + level[index + 1] for index in range(0, len(level) - 1, 2)
@@ -369,7 +369,7 @@ def test_qwen35_moe_odd_contributor_plan_uses_deterministic_eager_fold(
         if len(level) % 2:
             paired.append(level[-1])
         level = paired
-    assert torch.equal(canonical_moe_fold_fp32_v2(partials), level[0].bfloat16())
+    assert torch.equal(canonical_moe_fold_fp64_v3(partials), level[0].bfloat16())
 
 
 def test_qwen35_moe_rejects_architecture_alias_with_unqualified_geometry():
@@ -529,7 +529,7 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         rendered = startup_args[0] % startup_args[1:]
         assert "decode, cached-row incremental" in rendered
         assert "rmsnorm_family=v2" in rendered
-        assert "moe_fold=canonical_moe_fold_fp32_v2" in rendered
+        assert "moe_fold=canonical_moe_fold_fp64_v3" in rendered
         force_family.assert_not_called()
 
 

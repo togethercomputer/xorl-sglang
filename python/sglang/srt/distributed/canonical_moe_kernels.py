@@ -8,13 +8,13 @@ import triton.language as tl
 
 
 @triton.jit
-def _fp32_add_rn(left, right):
-    """Pin one non-reassociable IEEE FP32 add at a declared tree node."""
+def _fp64_add_rn(left, right):
+    """Pin one non-reassociable IEEE FP64 add at a declared tree node."""
     return tl.inline_asm_elementwise(
-        asm="add.rn.f32 $0, $1, $2;",
-        constraints="=f,f,f",
+        asm="add.rn.f64 $0, $1, $2;",
+        constraints="=d,d,d",
         args=(left, right),
-        dtype=tl.float32,
+        dtype=tl.float64,
         is_pure=True,
         pack=1,
     )
@@ -50,11 +50,11 @@ def _load_logical_contributor(
         mask=offsets < n_elements,
         other=0.0,
     )
-    return value.to(tl.float32)
+    return value.to(tl.float64)
 
 
 @triton.jit
-def _fused_balanced_adjacent_fp32_tree_kernel(
+def _fused_balanced_adjacent_fp64_tree_kernel(
     partials_ptr,
     logical_to_group_ptr,
     output_ptr,
@@ -84,7 +84,7 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
             LOGICAL=1,
             IDENTITY_ORDER=IDENTITY_ORDER,
         )
-        level_01 = _fp32_add_rn(p0, p1)
+        level_01 = _fp64_add_rn(p0, p1)
         if CONTRIBUTORS == 2:
             result = level_01
         else:
@@ -97,7 +97,7 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                 IDENTITY_ORDER=IDENTITY_ORDER,
             )
             if CONTRIBUTORS == 3:
-                result = _fp32_add_rn(level_01, p2)
+                result = _fp64_add_rn(level_01, p2)
             else:
                 p3 = _load_logical_contributor(
                     partials_ptr,
@@ -107,8 +107,8 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                     LOGICAL=3,
                     IDENTITY_ORDER=IDENTITY_ORDER,
                 )
-                level_23 = _fp32_add_rn(p2, p3)
-                level_03 = _fp32_add_rn(level_01, level_23)
+                level_23 = _fp64_add_rn(p2, p3)
+                level_03 = _fp64_add_rn(level_01, level_23)
                 if CONTRIBUTORS == 4:
                     result = level_03
                 else:
@@ -121,7 +121,7 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                         IDENTITY_ORDER=IDENTITY_ORDER,
                     )
                     if CONTRIBUTORS == 5:
-                        result = _fp32_add_rn(level_03, p4)
+                        result = _fp64_add_rn(level_03, p4)
                     else:
                         p5 = _load_logical_contributor(
                             partials_ptr,
@@ -131,9 +131,9 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                             LOGICAL=5,
                             IDENTITY_ORDER=IDENTITY_ORDER,
                         )
-                        level_45 = _fp32_add_rn(p4, p5)
+                        level_45 = _fp64_add_rn(p4, p5)
                         if CONTRIBUTORS == 6:
-                            result = _fp32_add_rn(level_03, level_45)
+                            result = _fp64_add_rn(level_03, level_45)
                         else:
                             p6 = _load_logical_contributor(
                                 partials_ptr,
@@ -144,8 +144,8 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                 IDENTITY_ORDER=IDENTITY_ORDER,
                             )
                             if CONTRIBUTORS == 7:
-                                result = _fp32_add_rn(
-                                    level_03, _fp32_add_rn(level_45, p6)
+                                result = _fp64_add_rn(
+                                    level_03, _fp64_add_rn(level_45, p6)
                                 )
                             else:
                                 p7 = _load_logical_contributor(
@@ -156,9 +156,9 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                     LOGICAL=7,
                                     IDENTITY_ORDER=IDENTITY_ORDER,
                                 )
-                                level_67 = _fp32_add_rn(p6, p7)
-                                level_47 = _fp32_add_rn(level_45, level_67)
-                                level_07 = _fp32_add_rn(level_03, level_47)
+                                level_67 = _fp64_add_rn(p6, p7)
+                                level_47 = _fp64_add_rn(level_45, level_67)
+                                level_07 = _fp64_add_rn(level_03, level_47)
                                 if CONTRIBUTORS == 8:
                                     result = level_07
                                 else:
@@ -171,7 +171,7 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                         IDENTITY_ORDER=IDENTITY_ORDER,
                                     )
                                     if CONTRIBUTORS == 9:
-                                        result = _fp32_add_rn(level_07, p8)
+                                        result = _fp64_add_rn(level_07, p8)
                                     else:
                                         p9 = _load_logical_contributor(
                                             partials_ptr,
@@ -181,9 +181,9 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                             LOGICAL=9,
                                             IDENTITY_ORDER=IDENTITY_ORDER,
                                         )
-                                        level_89 = _fp32_add_rn(p8, p9)
+                                        level_89 = _fp64_add_rn(p8, p9)
                                         if CONTRIBUTORS == 10:
-                                            result = _fp32_add_rn(level_07, level_89)
+                                            result = _fp64_add_rn(level_07, level_89)
                                         else:
                                             p10 = _load_logical_contributor(
                                                 partials_ptr,
@@ -194,9 +194,9 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                                 IDENTITY_ORDER=IDENTITY_ORDER,
                                             )
                                             if CONTRIBUTORS == 11:
-                                                result = _fp32_add_rn(
+                                                result = _fp64_add_rn(
                                                     level_07,
-                                                    _fp32_add_rn(level_89, p10),
+                                                    _fp64_add_rn(level_89, p10),
                                                 )
                                             else:
                                                 p11 = _load_logical_contributor(
@@ -207,12 +207,12 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                                     LOGICAL=11,
                                                     IDENTITY_ORDER=IDENTITY_ORDER,
                                                 )
-                                                level_1011 = _fp32_add_rn(p10, p11)
-                                                level_811 = _fp32_add_rn(
+                                                level_1011 = _fp64_add_rn(p10, p11)
+                                                level_811 = _fp64_add_rn(
                                                     level_89, level_1011
                                                 )
                                                 if CONTRIBUTORS == 12:
-                                                    result = _fp32_add_rn(
+                                                    result = _fp64_add_rn(
                                                         level_07, level_811
                                                     )
                                                 else:
@@ -225,9 +225,9 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                                         IDENTITY_ORDER=IDENTITY_ORDER,
                                                     )
                                                     if CONTRIBUTORS == 13:
-                                                        result = _fp32_add_rn(
+                                                        result = _fp64_add_rn(
                                                             level_07,
-                                                            _fp32_add_rn(
+                                                            _fp64_add_rn(
                                                                 level_811, p12
                                                             ),
                                                         )
@@ -240,13 +240,13 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                                             LOGICAL=13,
                                                             IDENTITY_ORDER=IDENTITY_ORDER,
                                                         )
-                                                        level_1213 = _fp32_add_rn(
+                                                        level_1213 = _fp64_add_rn(
                                                             p12, p13
                                                         )
                                                         if CONTRIBUTORS == 14:
-                                                            result = _fp32_add_rn(
+                                                            result = _fp64_add_rn(
                                                                 level_07,
-                                                                _fp32_add_rn(
+                                                                _fp64_add_rn(
                                                                     level_811,
                                                                     level_1213,
                                                                 ),
@@ -261,11 +261,11 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                                                 IDENTITY_ORDER=IDENTITY_ORDER,
                                                             )
                                                             if CONTRIBUTORS == 15:
-                                                                result = _fp32_add_rn(
+                                                                result = _fp64_add_rn(
                                                                     level_07,
-                                                                    _fp32_add_rn(
+                                                                    _fp64_add_rn(
                                                                         level_811,
-                                                                        _fp32_add_rn(
+                                                                        _fp64_add_rn(
                                                                             level_1213,
                                                                             p14,
                                                                         ),
@@ -281,23 +281,23 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
                                                                     IDENTITY_ORDER=IDENTITY_ORDER,
                                                                 )
                                                                 level_1415 = (
-                                                                    _fp32_add_rn(
+                                                                    _fp64_add_rn(
                                                                         p14, p15
                                                                     )
                                                                 )
                                                                 level_1215 = (
-                                                                    _fp32_add_rn(
+                                                                    _fp64_add_rn(
                                                                         level_1213,
                                                                         level_1415,
                                                                     )
                                                                 )
                                                                 level_815 = (
-                                                                    _fp32_add_rn(
+                                                                    _fp64_add_rn(
                                                                         level_811,
                                                                         level_1215,
                                                                     )
                                                                 )
-                                                                result = _fp32_add_rn(
+                                                                result = _fp64_add_rn(
                                                                     level_07,
                                                                     level_815,
                                                                 )
@@ -305,23 +305,23 @@ def _fused_balanced_adjacent_fp32_tree_kernel(
     tl.store(output_ptr + offsets, result, mask=offsets < n_elements)
 
 
-def fused_balanced_adjacent_fp32_tree(
+def fused_balanced_adjacent_fp64_tree(
     partials: torch.Tensor,
     logical_to_group: torch.Tensor,
     *,
     identity_order: bool,
     output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Evaluate a 1..16-way FP32 adjacent tree and cast once to output."""
+    """Evaluate a 1..16-way FP64 adjacent tree and cast once to output."""
     if not partials.is_cuda:
-        raise ValueError("The fused canonical FP32 tree requires a CUDA tensor")
+        raise ValueError("The fused canonical FP64 tree requires a CUDA tensor")
     if partials.dtype not in {torch.bfloat16, torch.float16}:
-        raise TypeError("The fused canonical FP32 tree requires BF16 or FP16 partials")
+        raise TypeError("The fused canonical FP64 tree requires BF16 or FP16 partials")
     if not partials.is_contiguous():
-        raise ValueError("The fused canonical FP32 tree requires contiguous partials")
+        raise ValueError("The fused canonical FP64 tree requires contiguous partials")
     contributors = partials.shape[0]
     if not 1 <= contributors <= 16:
-        raise ValueError("The fused canonical FP32 tree requires 1..16 contributors")
+        raise ValueError("The fused canonical FP64 tree requires 1..16 contributors")
     if logical_to_group.shape != (contributors,):
         raise ValueError("logical_to_group must contain one entry per contributor")
     if logical_to_group.device != partials.device:
@@ -336,16 +336,16 @@ def fused_balanced_adjacent_fp32_tree(
         output = torch.empty(output_shape, dtype=partials.dtype, device=partials.device)
     if output.shape != output_shape or output.dtype is not partials.dtype:
         raise ValueError(
-            "Fused canonical FP32 tree output metadata does not match partials"
+            "Fused canonical FP64 tree output metadata does not match partials"
         )
     if output.device != partials.device or not output.is_contiguous():
         raise ValueError(
-            "Fused canonical FP32 tree output must be contiguous on the input device"
+            "Fused canonical FP64 tree output must be contiguous on the input device"
         )
 
     n_elements = output.numel()
     block_size = 128
-    _fused_balanced_adjacent_fp32_tree_kernel[(triton.cdiv(n_elements, block_size),)](
+    _fused_balanced_adjacent_fp64_tree_kernel[(triton.cdiv(n_elements, block_size),)](
         partials,
         logical_to_group,
         output,
@@ -423,6 +423,6 @@ def fused_canonical_moe_leaf_fp32(
 
 
 __all__ = [
-    "fused_balanced_adjacent_fp32_tree",
+    "fused_balanced_adjacent_fp64_tree",
     "fused_canonical_moe_leaf_fp32",
 ]
