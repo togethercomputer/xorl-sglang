@@ -130,8 +130,8 @@ impl<E: Display> Stream for BreakerTrackedStream<E> {
 impl<E> Drop for BreakerTrackedStream<E> {
     fn drop(&mut self) {
         match self.terminal {
-            Terminal::Completed => self.worker.circuit_breaker().record_success(),
-            Terminal::Errored => self.worker.circuit_breaker().record_failure(),
+            Terminal::Completed => self.worker.record_outcome(true),
+            Terminal::Errored => self.worker.record_outcome(false),
             // Client disconnected before we knew the worker's verdict.
             // Leaving the breaker untouched is the correct default — we
             // got a 200 header and some bytes; nothing said the worker
