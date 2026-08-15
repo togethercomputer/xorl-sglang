@@ -24,7 +24,7 @@ without needing a per-backend LoRA runner subclass.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
@@ -480,26 +480,6 @@ def _add_lora_down_delta(
             fully_sharded=lora_info.fully_sharded,
             offset=offset,
         )
-
-
-def slice_moe_lora_info(
-    lora_info: LoRAInfo | None, start: int, stop: int
-) -> LoRAInfo | None:
-    """Per-token slice of a LoRAInfo for the DSV4 exact chunked Marlin launches.
-
-    ``token_lora_mapping`` is per token and slices directly; ``seg_indptr``
-    shifts into chunk coordinates with out-of-chunk requests clamped to
-    zero-length segments (``req_to_lora`` alignment is preserved). Adapter
-    weight tables are per adapter and carried through unchanged.
-    """
-    if lora_info is None:
-        return None
-    length = stop - start
-    return replace(
-        lora_info,
-        seg_indptr=(lora_info.seg_indptr - start).clamp(0, length),
-        token_lora_mapping=lora_info.token_lora_mapping[start:stop],
-    )
 
 
 def build_lora_hooks(

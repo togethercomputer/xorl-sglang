@@ -56,9 +56,9 @@ class MoeRunnerConfig:
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
-    # Admit DSV4's qualified block-64/ten-token Marlin launch program. This
-    # must be explicit so official-geometry models outside the exact lane keep
-    # the stock Marlin launch heuristic.
+    # Admit DSV4's block-64 Marlin row program. This must be explicit so
+    # official-geometry models outside the exact lane keep the stock row-block
+    # heuristic. MXFP4 singleton decomposition is backend-wide and independent.
     dsv4_exact_mode: bool = False
     # Whether gate/up weights are stored interleaved (vs split). Only the
     # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,

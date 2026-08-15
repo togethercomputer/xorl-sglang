@@ -119,9 +119,6 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
-DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS = 10  # floor(pinned row block 64 / topk 6)
-
-
 def is_dsv4_exact_pinned_marlin_geometry(
     *,
     dsv4_exact_mode: bool,
@@ -133,8 +130,7 @@ def is_dsv4_exact_pinned_marlin_geometry(
     topk: int,
     clamp_limit: Optional[float],
 ) -> bool:
-    """The admitted DSV4-Flash exact Marlin geometry (row block pinned to 64,
-    token batches chunked so no expert spans more than one row block)."""
+    """The admitted DSV4-Flash exact Marlin geometry."""
     return (
         dsv4_exact_mode
         and is_mxfp4_marlin
@@ -162,17 +158,9 @@ def select_marlin_moe_block_size_m(
     """Select Marlin's row block, pinning the admitted DSV4 exact geometry.
 
     The generic density heuristic selects blocks 8-32 at admitted DSV4 widths.
-    On SM90, repeated hot routes can then assign one expert to multiple Marlin
-    row blocks, whose partial completion order is not byte-stable.  A
-    shape-matched M=48 discriminator proves blocks 8/16/32 diverge while 48/64
-    are stable and produce the same bytes.  Pin 64 to keep one block per expert
-    through the retained four- and 64-decision lane; unrelated Marlin models
-    retain their established choice.  Pinning the block is NOT sufficient on
-    its own: a hot expert with more than 64 routed rows spans several blocks
-    again (measured 31% repeat-flip rate at a real 74-token layer-40 routing),
-    so the exact geometry additionally chunks token batches to
-    ``DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS`` so every expert stays within one
-    row block per launch.
+    Pin 64 so a token's routes use one row block per expert. MXFP4 Marlin's
+    separate singleton decomposition fixes the batch-dependent K-stripe
+    partition; this pin retains the DSV4 row-block program.
     """
 
     block_size_m = 8
@@ -313,28 +301,14 @@ def fused_marlin_moe(
 
     if global_num_experts == -1:
         global_num_experts = E
-    if (
-        is_dsv4_exact_pinned_marlin_geometry(
-            dsv4_exact_mode=dsv4_exact_mode,
-            is_mxfp4_marlin=is_mxfp4_marlin,
-            global_experts=global_num_experts,
-            local_experts=E,
-            hidden_size=K,
-            intermediate_size=N,
-            topk=topk,
-            clamp_limit=clamp_limit,
-        )
-        and M > DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS
-    ):
-        # Chunk so no expert can exceed one 64-row Marlin block per launch:
-        # multi-block experts reduce across blocks in completion order, which
-        # is not byte-stable. Chunked launches are the DSV4 exact byte
-        # program; the trainer reaches this same primitive and chunks
-        # identically. Row outputs are per-token, so concatenation is exact.
-        chunk = DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS
+    if is_mxfp4_marlin and M > 1:
+        # Marlin partitions each expert's K reduction using the total number of
+        # local expert blocks in the launch. Use the same one-token program for
+        # batched and singleton execution so unrelated routes cannot change
+        # that reduction tree.
         chunked_out = torch.empty_like(hidden_states)
-        for chunk_start in range(0, M, chunk):
-            chunk_stop = min(chunk_start + chunk, M)
+        for chunk_start in range(M):
+            chunk_stop = chunk_start + 1
             chunked_out[chunk_start:chunk_stop] = fused_marlin_moe(
                 hidden_states[chunk_start:chunk_stop],
                 w1,

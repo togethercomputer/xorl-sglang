@@ -143,12 +143,6 @@ class MoeRunner:
     def run(
         self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info=None
     ) -> CombineInput:
-        chunked = self._maybe_run_dsv4_exact_marlin_chunks(
-            dispatch_output, quant_info, lora_info
-        )
-        if chunked is not None:
-            return chunked
-
         if self.fused_func is not None and not self.lora_enabled:
             return self.fused_func(dispatch_output, quant_info, self.config)
 
@@ -213,101 +207,6 @@ class MoeRunner:
         )
 
         return combine_input
-
-    def _maybe_run_dsv4_exact_marlin_chunks(
-        self, dispatch_output: DispatchOutput, quant_info: MoeQuantInfo, lora_info
-    ) -> Optional[CombineInput]:
-        """DSV4 exact byte program: chunk Marlin token batches.
-
-        A hot expert with more routed rows than one 64-row Marlin block spans
-        several blocks, whose cross-block reduction order is not byte-stable
-        (see ``is_dsv4_exact_pinned_marlin_geometry``). Chunking so every
-        expert stays within one block per launch is part of the DSV4 exact
-        byte contract; the trainer chunks identically inside
-        ``fused_marlin_moe``. Returns ``None`` for every other model or
-        geometry, leaving the stock path untouched.
-        """
-        if not self.config.dsv4_exact_mode:
-            return None
-
-        import torch
-
-        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-            DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS,
-            is_dsv4_exact_pinned_marlin_geometry,
-        )
-        from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-        from sglang.srt.layers.moe.token_dispatcher.standard import (
-            StandardCombineInput,
-            StandardDispatchOutput,
-        )
-        from sglang.srt.model_executor.runner import get_is_capture_mode
-
-        if not isinstance(quant_info, MarlinMoeQuantInfo):
-            return None
-        if not isinstance(dispatch_output, StandardDispatchOutput):
-            return None
-        hidden_states = dispatch_output.hidden_states
-        num_tokens = hidden_states.shape[0]
-        if num_tokens <= DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS:
-            return None
-        if get_is_capture_mode():
-            return None
-        topk_output = dispatch_output.topk_output
-        local_experts = quant_info.w13_qweight.shape[0]
-        hidden_size = hidden_states.shape[1]
-        intermediate_size = quant_info.w2_qweight.shape[1] * 16
-        is_mxfp4_marlin = (
-            quant_info.weight_bits == 4
-            and quant_info.w13_qzeros is None
-            and quant_info.w2_qzeros is None
-            and quant_info.w13_scales.dtype == torch.float8_e8m0fnu
-            and quant_info.w2_scales.dtype == torch.float8_e8m0fnu
-        )
-        global_experts = (
-            quant_info.global_num_experts
-            if quant_info.global_num_experts != -1
-            else local_experts
-        )
-        if not is_dsv4_exact_pinned_marlin_geometry(
-            dsv4_exact_mode=self.config.dsv4_exact_mode,
-            is_mxfp4_marlin=is_mxfp4_marlin,
-            global_experts=global_experts,
-            local_experts=local_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            topk=topk_output.topk_ids.shape[1],
-            clamp_limit=self.config.swiglu_limit,
-        ):
-            return None
-
-        from sglang.srt.lora.lora_moe_runners import slice_moe_lora_info
-
-        chunk = DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS
-        outputs = []
-        for start in range(0, num_tokens, chunk):
-            stop = min(start + chunk, num_tokens)
-            sliced_dispatch = dispatch_output._replace(
-                hidden_states=hidden_states[start:stop],
-                hidden_states_scale=(
-                    dispatch_output.hidden_states_scale[start:stop]
-                    if dispatch_output.hidden_states_scale is not None
-                    else None
-                ),
-                topk_output=topk_output._replace(
-                    topk_weights=topk_output.topk_weights[start:stop],
-                    topk_ids=topk_output.topk_ids[start:stop],
-                    router_logits=topk_output.router_logits[start:stop],
-                ),
-            )
-            outputs.append(
-                self.run(
-                    sliced_dispatch,
-                    quant_info,
-                    lora_info=slice_moe_lora_info(lora_info, start, stop),
-                ).hidden_states
-            )
-        return StandardCombineInput(hidden_states=torch.cat(outputs, dim=0))
 
     def set_overlap_args(
         self, down_gemm_overlap_args: DownGemmOverlapArgs, meta_overlap_args: dict

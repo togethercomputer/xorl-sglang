@@ -1141,7 +1141,6 @@ def test_small_batch_moe_lora_alignment_skips_ep_sentinels() -> None:
 
 def test_dsv4_exact_marlin_geometry_is_narrow_and_fail_closed() -> None:
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
-        DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS,
         is_dsv4_exact_pinned_marlin_geometry,
     )
 
@@ -1155,7 +1154,6 @@ def test_dsv4_exact_marlin_geometry_is_narrow_and_fail_closed() -> None:
         "topk": 6,
         "clamp_limit": 10.0,
     }
-    assert DSV4_EXACT_MARLIN_MAX_CHUNK_TOKENS == 10
     assert is_dsv4_exact_pinned_marlin_geometry(**admitted)
     assert not is_dsv4_exact_pinned_marlin_geometry(
         **{**admitted, "dsv4_exact_mode": False}
@@ -1189,34 +1187,6 @@ def test_exact_resolved_contract_rejects_alternate_dp_combine(
     setting = getattr(envs, setting_name)
     with setting.override(True), pytest.raises(ValueError, match=setting_name):
         args._validate_dsv4_flash_exact_resolved_contract()
-
-
-def test_chunked_moe_lora_info_rebases_segments_and_slices_tokens() -> None:
-    from sglang.srt.lora.lora_moe_runners import LoRAInfo, slice_moe_lora_info
-
-    weights = torch.zeros(1, 1, 1, 1)
-    info = LoRAInfo(
-        gate_up_lora_a_weights=weights,
-        gate_up_lora_b_weights=weights,
-        down_lora_a_weights=weights,
-        down_lora_b_weights=weights,
-        seg_indptr=torch.tensor([0, 3, 8, 12], dtype=torch.int32),
-        req_to_lora=torch.tensor([0, 1, 0], dtype=torch.int32),
-        lora_ranks=torch.tensor([1, 1], dtype=torch.int32),
-        adapter_enabled=torch.tensor([True, True]),
-        token_lora_mapping=torch.tensor([0] * 3 + [1] * 5 + [0] * 4),
-        max_lora_rank=1,
-        num_experts=1,
-    )
-
-    sliced = slice_moe_lora_info(info, 4, 10)
-
-    assert sliced is not None
-    assert sliced.seg_indptr.tolist() == [0, 0, 4, 6]
-    assert sliced.req_to_lora is info.req_to_lora
-    assert sliced.token_lora_mapping.tolist() == [1, 1, 1, 1, 0, 0]
-    assert sliced.gate_up_lora_a_weights is weights
-    assert slice_moe_lora_info(None, 0, 1) is None
 
 
 def test_exact_batch_checks_decode_graph_metadata_shape_not_topology() -> None:

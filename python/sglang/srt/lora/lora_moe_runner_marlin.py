@@ -39,6 +39,131 @@ if _is_cuda:
     from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
 
 
+MarlinAlignment = tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _build_marlin_alignments(
+    *,
+    topk_ids: torch.Tensor,
+    block_size_m: int,
+    num_experts: int,
+    singleton: bool,
+) -> list[MarlinAlignment]:
+    token_ranges = (
+        [(token, token + 1) for token in range(topk_ids.shape[0])]
+        if singleton
+        else [(0, topk_ids.shape[0])]
+    )
+    return [
+        (
+            start,
+            stop,
+            *moe_align_block_size(
+                topk_ids[start:stop],
+                block_size_m,
+                num_experts,
+            ),
+        )
+        for start, stop in token_ranges
+    ]
+
+
+def _run_marlin_gate_up_base(
+    *,
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    quant_info: MarlinMoeQuantInfo,
+    topk_weights: torch.Tensor,
+    alignments: list[MarlinAlignment],
+    workspace: torch.Tensor,
+    block_size_m: int,
+    topk: int,
+    intermediate_size: int,
+    hidden_size: int,
+    scalar_type,
+    use_atomic_add: bool,
+) -> None:
+    for start, stop, sorted_token_ids, expert_ids, num_tokens_post_padded in alignments:
+        route_start = start * topk
+        route_stop = stop * topk
+        moe_wna16_marlin_gemm(
+            hidden_states[start:stop],
+            output[route_start:route_stop],
+            quant_info.w13_qweight,
+            quant_info.w13_bias,
+            quant_info.w13_scales,
+            quant_info.w13_global_scale,
+            quant_info.w13_qzeros,
+            quant_info.w13_g_idx,
+            quant_info.w13_g_idx_sort_indices,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights[start:stop],
+            moe_block_size=block_size_m,
+            top_k=topk,
+            mul_topk_weights=False,
+            is_ep=quant_info.expert_map is not None,
+            b_q_type=scalar_type,
+            size_m=stop - start,
+            size_n=2 * intermediate_size,
+            size_k=hidden_size,
+            is_k_full=quant_info.is_k_full,
+            use_atomic_add=use_atomic_add,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )
+
+
+def _run_marlin_down_base(
+    *,
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    quant_info: MarlinMoeQuantInfo,
+    topk_weights: torch.Tensor,
+    alignments: list[MarlinAlignment],
+    workspace: torch.Tensor,
+    block_size_m: int,
+    topk: int,
+    intermediate_size: int,
+    hidden_size: int,
+    scalar_type,
+    use_atomic_add: bool,
+) -> None:
+    for start, stop, sorted_token_ids, expert_ids, num_tokens_post_padded in alignments:
+        route_start = start * topk
+        route_stop = stop * topk
+        moe_wna16_marlin_gemm(
+            hidden_states[route_start:route_stop],
+            output[route_start:route_stop],
+            quant_info.w2_qweight,
+            quant_info.w2_bias,
+            quant_info.w2_scales,
+            quant_info.w2_global_scale,
+            quant_info.w2_qzeros,
+            quant_info.w2_g_idx,
+            quant_info.w2_g_idx_sort_indices,
+            workspace,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            topk_weights[start:stop],
+            moe_block_size=block_size_m,
+            top_k=1,
+            mul_topk_weights=True,
+            is_ep=quant_info.expert_map is not None,
+            b_q_type=scalar_type,
+            size_m=(stop - start) * topk,
+            size_n=hidden_size,
+            size_k=intermediate_size,
+            is_k_full=quant_info.is_k_full,
+            use_atomic_add=use_atomic_add,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )
+
+
 class MarlinLoraRunnerCore:
     """
     MoE runner using Marlin kernels for base projections, with hooks for LoRA.
@@ -93,10 +218,11 @@ class MarlinLoraRunnerCore:
             hidden_states.dtype == torch.float16
             or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
         ) and not is_mxfp4_marlin
+        singleton_base = is_mxfp4_marlin and M > 1
 
         block_size_m = select_marlin_moe_block_size_m(
             dsv4_exact_mode=runner_config.dsv4_exact_mode,
-            num_tokens=M,
+            num_tokens=1 if singleton_base else M,
             topk=topk,
             local_experts=E,
             global_experts=(
@@ -115,8 +241,15 @@ class MarlinLoraRunnerCore:
         align_num_experts = (
             quant_info.global_num_experts if quant_info.expert_map is not None else E
         )
-        sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, align_num_experts
+        # MXFP4 Marlin changes each expert's K-stripe partition when unrelated
+        # routes add local expert blocks to the same launch. Keep only the
+        # frozen base GEMMs on a one-logical-token program; the LoRA hooks stay
+        # batched so their alignment and parameter program execute once.
+        alignments = _build_marlin_alignments(
+            topk_ids=topk_ids,
+            block_size_m=block_size_m,
+            num_experts=align_num_experts,
+            singleton=singleton_base,
         )
 
         # Per-call workspace like fused_experts_none_to_marlin: a shared buffer aliases
@@ -155,33 +288,19 @@ class MarlinLoraRunnerCore:
             M * topk, 2 * N
         )
         intermediate_cache3 = intermediate_cache13[: M * topk * K].view(M * topk, K)
-        intermediate_cache1 = moe_wna16_marlin_gemm(
-            hidden_states,
-            intermediate_cache1,
-            quant_info.w13_qweight,
-            quant_info.w13_bias,
-            quant_info.w13_scales,
-            quant_info.w13_global_scale,
-            quant_info.w13_qzeros,
-            quant_info.w13_g_idx,
-            quant_info.w13_g_idx_sort_indices,
-            workspace,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            topk_weights,
-            moe_block_size=block_size_m,
-            top_k=topk,
-            mul_topk_weights=False,
-            is_ep=quant_info.expert_map is not None,
-            b_q_type=scalar_type1,
-            size_m=M,
-            size_n=2 * N,
-            size_k=K,
-            is_k_full=quant_info.is_k_full,
+        _run_marlin_gate_up_base(
+            hidden_states=hidden_states,
+            output=intermediate_cache1,
+            quant_info=quant_info,
+            topk_weights=topk_weights,
+            alignments=alignments,
+            workspace=workspace,
+            block_size_m=block_size_m,
+            topk=topk,
+            intermediate_size=N,
+            hidden_size=K,
+            scalar_type=scalar_type1,
             use_atomic_add=use_atomic_add,
-            use_fp32_reduce=True,
-            is_zp_float=False,
         )
         # Hook: after gate_up
         if hooks.after_gate_up:
@@ -202,33 +321,19 @@ class MarlinLoraRunnerCore:
         else:
             silu_and_mul(gate_up, intermediate_cache2)
         # Stage 3: Down (Marlin)
-        intermediate_cache3 = moe_wna16_marlin_gemm(
-            intermediate_cache2,
-            intermediate_cache3,
-            quant_info.w2_qweight,
-            quant_info.w2_bias,
-            quant_info.w2_scales,
-            quant_info.w2_global_scale,
-            quant_info.w2_qzeros,
-            quant_info.w2_g_idx,
-            quant_info.w2_g_idx_sort_indices,
-            workspace,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            topk_weights,
-            moe_block_size=block_size_m,
-            top_k=1,
-            mul_topk_weights=True,
-            is_ep=quant_info.expert_map is not None,
-            b_q_type=scalar_type2,
-            size_m=M * topk,
-            size_n=K,
-            size_k=N,
-            is_k_full=quant_info.is_k_full,
+        _run_marlin_down_base(
+            hidden_states=intermediate_cache2,
+            output=intermediate_cache3,
+            quant_info=quant_info,
+            topk_weights=topk_weights,
+            alignments=alignments,
+            workspace=workspace,
+            block_size_m=block_size_m,
+            topk=topk,
+            intermediate_size=N,
+            hidden_size=K,
+            scalar_type=scalar_type2,
             use_atomic_add=use_atomic_add,
-            use_fp32_reduce=True,
-            is_zp_float=False,
         )
         intermediate_cache3 = intermediate_cache3.view(M, topk, K)
 
