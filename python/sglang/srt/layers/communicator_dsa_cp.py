@@ -239,13 +239,18 @@ def align_glm52_moe_positions(
 
     ownership = _glm52_row_ownership()
     segment_lengths = list(get_dp_global_num_tokens() or [])
-    if not segment_lengths and ownership.dp_size == 1:
+    prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
+    cp_v2_metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if prefill_cp and cp_v2_metadata is not None and ownership.dp_size == 1:
+        # DP1 canonical-v3b keeps the equal padded CP buckets consumed by the
+        # source-sharded MoE transport.  CP-v2's DP token counts are logical
+        # (ragged), so they cannot describe this physical FULL-row capacity.
+        segment_lengths = [full_hidden_states.shape[0]]
+    elif not segment_lengths and ownership.dp_size == 1:
         segment_lengths = [full_hidden_states.shape[0]]
     block = ownership.dp_block_slice(segment_lengths)
     block_rows = block.stop - block.start
-    prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
     local_positions = positions.reshape(-1).to(torch.int64)
-    cp_v2_metadata = getattr(forward_batch, "attn_cp_metadata", None)
     if prefill_cp and cp_v2_metadata is not None and ownership.dp_size > 1:
         local_valid = (local_positions >= 0).to(torch.int32)
         dp_positions = _gather_glm52_cp_logical_rows(local_positions, forward_batch)
@@ -264,13 +269,53 @@ def align_glm52_moe_positions(
         local_capacity = block_rows // ownership.cp_size
         if local_positions.numel() > local_capacity:
             raise RuntimeError("GLM-5.2 local positions exceed the CP source capacity")
+        local_logical_rows = local_positions.numel()
+        if cp_v2_metadata is not None:
+            logical_counts = getattr(cp_v2_metadata, "per_rank_logical_token", None)
+            physical_counts = getattr(cp_v2_metadata, "per_rank_actual_token", None)
+            if (
+                logical_counts is None
+                or physical_counts is None
+                or len(logical_counts) != ownership.cp_size
+                or len(physical_counts) != ownership.cp_size
+            ):
+                raise RuntimeError(
+                    "GLM-5.2 DP1 CP-v2 positions require complete per-rank row metadata"
+                )
+            logical_counts = [int(count) for count in logical_counts]
+            physical_counts = [int(count) for count in physical_counts]
+            total_logical_rows = getattr(cp_v2_metadata, "total_seq_lens", None)
+            if (
+                total_logical_rows is None
+                or sum(logical_counts) != int(total_logical_rows)
+                or sum(physical_counts) != block_rows
+                or any(count != local_capacity for count in physical_counts)
+                or any(
+                    logical < 0 or logical > physical
+                    for logical, physical in zip(logical_counts, physical_counts)
+                )
+            ):
+                raise RuntimeError(
+                    "GLM-5.2 DP1 CP-v2 row metadata does not describe the physical FULL-row layout"
+                )
+            local_logical_rows = logical_counts[ownership.cp_rank]
+            local_physical_rows = physical_counts[ownership.cp_rank]
+            if (
+                local_physical_rows != local_capacity
+                or local_positions.numel() != local_physical_rows
+            ):
+                raise RuntimeError(
+                    "GLM-5.2 DP1 CP-v2 position metadata does not match the physical CP bucket"
+                )
         padded_positions = local_positions.new_full((local_capacity,), -1)
-        padded_positions[: local_positions.numel()].copy_(local_positions)
+        padded_positions[:local_logical_rows].copy_(
+            local_positions[:local_logical_rows]
+        )
         padded_valid = torch.zeros(
             (local_capacity,), dtype=torch.int32, device=local_positions.device
         )
-        padded_valid[: local_positions.numel()].copy_(
-            (local_positions >= 0).to(torch.int32)
+        padded_valid[:local_logical_rows].copy_(
+            (local_positions[:local_logical_rows] >= 0).to(torch.int32)
         )
         dp_positions = local_positions.new_empty((block_rows,))
         dp_valid = padded_valid.new_empty((block_rows,))

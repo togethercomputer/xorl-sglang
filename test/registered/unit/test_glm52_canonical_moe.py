@@ -396,6 +396,11 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         from sglang.srt.layers.communicator_dsa_cp import (
             DSACPLayerCommunicator,
             DSAMLPOutputLayout,
+        )
+        from sglang.srt.layers.communicator_dsa_cp import (
+            align_glm52_moe_positions as align_runtime_positions,
+        )
+        from sglang.srt.layers.communicator_dsa_cp import (
             gather_glm52_mlp_rows,
         )
 
@@ -416,6 +421,21 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             physical_shards.append(padded)
         expected_rank_major = torch.cat(physical_shards)
         gathered_buffer = torch.empty_like(expected_rank_major)
+        position_shards = []
+        aligned_position_shards = []
+        valid_shards = []
+        logical_positions = torch.arange(logical_rows, dtype=torch.int64)
+        for rank in range(cp_size):
+            shard = logical_positions[rank::cp_size]
+            physical = torch.zeros((physical_rows,), dtype=torch.int64)
+            physical[: shard.shape[0]].copy_(shard)
+            position_shards.append(physical)
+            aligned = torch.full((physical_rows,), -1, dtype=torch.int64)
+            aligned[: shard.shape[0]].copy_(shard)
+            aligned_position_shards.append(aligned)
+            valid = torch.zeros((physical_rows,), dtype=torch.int32)
+            valid[: shard.shape[0]].fill_(1)
+            valid_shards.append(valid)
         metadata = SimpleNamespace(
             total_seq_lens=logical_rows,
             per_rank_logical_token=per_rank_logical,
@@ -433,8 +453,15 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         )
 
         def fake_cp_all_gather(output, local):
-            self.assertTrue(torch.equal(local, physical_shards[cp_rank]))
-            output.copy_(expected_rank_major)
+            if local.dtype is torch.bfloat16:
+                shards = physical_shards
+            elif local.dtype is torch.int64:
+                shards = aligned_position_shards
+            else:
+                self.assertEqual(local.dtype, torch.int32)
+                shards = valid_shards
+            self.assertTrue(torch.equal(local, shards[cp_rank]))
+            output.copy_(torch.cat(shards))
 
         with (
             patch(
@@ -444,6 +471,10 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
             patch(
                 "sglang.srt.layers.communicator_dsa_cp.get_local_dp_buffer",
                 return_value=gathered_buffer,
+            ),
+            patch(
+                "sglang.srt.layers.communicator_dsa_cp.get_dp_global_num_tokens",
+                return_value=[logical_rows],
             ),
             patch(
                 "sglang.srt.layers.communicator_dsa_cp.attn_cp_all_gather_into_tensor",
@@ -466,6 +497,19 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         ):
             gathered = gather_glm52_mlp_rows(physical_shards[cp_rank], forward_batch)
             self.assertTrue(torch.equal(gathered, expected_rank_major))
+
+            aligned = align_runtime_positions(
+                position_shards[cp_rank], gathered, forward_batch
+            )
+            self.assertTrue(
+                torch.equal(aligned.values, torch.cat(aligned_position_shards))
+            )
+            self.assertTrue(
+                torch.equal(
+                    aligned.valid_mask,
+                    torch.cat(valid_shards).to(torch.bool),
+                )
+            )
 
             communicator = object.__new__(DSACPLayerCommunicator)
             communicator.mlp_output_layout = DSAMLPOutputLayout.COMPLETE
