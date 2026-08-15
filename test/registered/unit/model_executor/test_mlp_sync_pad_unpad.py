@@ -104,6 +104,34 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "raw per-rank request counts"):
             DecodeCudaGraphRunner._max_dp_batch_size(fb)
 
+    def test_decode_graph_ignores_lora_ids_without_lora_manager(self):
+        """Merged-weight sync may retain request LoRA IDs with serving LoRA off."""
+
+        class ReachedBufferFill(RuntimeError):
+            pass
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = False
+        runner.deepep_adapter = MagicMock()
+        runner._validate_capture_hidden_mode = MagicMock()
+        runner.captured_req_width = 1
+        runner.require_mlp_tp_gather = False
+        runner.capture_bs = [1]
+        runner._pad_to_bucket = MagicMock(return_value=1)
+        runner._capture_graph_size = MagicMock(return_value=1)
+        runner.model_runner = SimpleNamespace()
+        runner.buffers = SimpleNamespace()
+        runner.buffer_registry = MagicMock()
+        runner.buffer_registry.fill_from.side_effect = ReachedBufferFill
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            lora_ids=[None],
+            needs_forward_metadata_init=lambda: True,
+        )
+
+        with self.assertRaises(ReachedBufferFill):
+            runner.load_batch(forward_batch)
+
     def test_decode_post_forward_unpads_per_request_tensors(self):
         fb = ForwardBatch(
             forward_mode=ForwardMode.DECODE,

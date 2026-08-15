@@ -1171,8 +1171,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs=bs, num_tokens=padded_num_tokens
             )
 
-        if forward_batch.lora_ids is not None:
-            self.model_runner.lora_manager.prepare_glm52_exact_dp_lora_batch(
+        lora_manager = getattr(self.model_runner, "lora_manager", None)
+        if lora_manager is not None and forward_batch.lora_ids is not None:
+            lora_manager.prepare_glm52_exact_dp_lora_batch(
                 forward_batch,
                 dp_row_counts=[padded_num_tokens] * self.dp_size,
             )
