@@ -18,12 +18,11 @@ import logging
 import os
 import signal
 from collections import OrderedDict, defaultdict
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import psutil
 import pybase64
 import setproctitle
-import torch
 import zmq
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -410,8 +409,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
     @staticmethod
     def _b64_encode_per_request(
-        data_list: Optional[List[Optional[torch.Tensor]]],
-    ) -> Optional[List[Optional[str]]]:
+        data_list: Optional[List[Optional[Any]]],
+    ) -> Optional[List[Optional[Any]]]:
         """Encode a per-request list of tensors as base64 strings, off the
         tokenizer hot path. Returns None when the input is None; per-item None
         stays None.
@@ -420,9 +419,13 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             return None
         return [
             (
-                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
-                if item is not None
-                else None
+                item
+                if isinstance(item, dict)
+                else (
+                    pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
+                    if item is not None
+                    else None
+                )
             )
             for item in data_list
         ]
@@ -435,6 +438,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             else []
         )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        expert_logits = self._b64_encode_per_request(recv_obj.expert_logits)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -476,6 +480,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_sampling_logprobs=recv_obj.output_token_sampling_logprobs,
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
+            expert_logits=expert_logits,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,

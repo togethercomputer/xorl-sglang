@@ -1,4 +1,4 @@
-"""An order pin must not be silently ignored by the DeepEP early return."""
+"""The canonical fold must not be silently ignored by the DeepEP early return."""
 
 import ast
 import pathlib
@@ -8,17 +8,17 @@ from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
-class TestOrderedAllReduceDeepEPRefuses(unittest.TestCase):
+class TestCanonicalMoeFoldDeepEPRefuses(unittest.TestCase):
     def _check(self, *, pinned: bool):
         from sglang.srt.models import qwen2_moe
 
         with patch.object(
-            qwen2_moe, "_ordered_moe_all_reduce_enabled", return_value=pinned
+            qwen2_moe, "_canonical_moe_fold_enabled", return_value=pinned
         ):
-            qwen2_moe._require_no_ordered_all_reduce_under_deepep()
+            qwen2_moe._require_no_canonical_moe_fold_under_deepep()
 
     def test_pin_under_deepep_refuses(self):
         with self.assertRaises(NotImplementedError) as ctx:
@@ -30,7 +30,7 @@ class TestOrderedAllReduceDeepEPRefuses(unittest.TestCase):
     def test_unpinned_deepep_is_untouched(self):
         self._check(pinned=False)
 
-    def test_qwen35_exact_mode_enables_the_ordered_collective(self):
+    def test_qwen35_exact_mode_enables_the_canonical_fold(self):
         from sglang.srt.models import qwen2_moe
 
         with patch.object(
@@ -38,7 +38,7 @@ class TestOrderedAllReduceDeepEPRefuses(unittest.TestCase):
             "get_global_server_args",
             return_value=SimpleNamespace(qwen35_gdn_exact_mode=True),
         ):
-            self.assertTrue(qwen2_moe._ordered_moe_all_reduce_enabled())
+            self.assertTrue(qwen2_moe._canonical_moe_fold_enabled())
 
     def test_qwen35_exact_mode_enables_the_batch_invariant_router(self):
         from sglang.srt.models import qwen2_moe
@@ -61,7 +61,7 @@ class TestOrderedAllReduceDeepEPRefuses(unittest.TestCase):
                 qwen35_gdn_exact_mode=False,
             ),
         ):
-            self.assertFalse(qwen2_moe._ordered_moe_all_reduce_enabled())
+            self.assertFalse(qwen2_moe._canonical_moe_fold_enabled())
 
     def test_guard_runs_before_the_deepep_forward(self):
         from sglang.srt.models import qwen2_moe
@@ -78,7 +78,7 @@ class TestOrderedAllReduceDeepEPRefuses(unittest.TestCase):
             if (
                 isinstance(call, ast.Call)
                 and isinstance(call.func, ast.Name)
-                and call.func.id == "_require_no_ordered_all_reduce_under_deepep"
+                and call.func.id == "_require_no_canonical_moe_fold_under_deepep"
             ):
                 found = True
         self.assertTrue(found, "the DeepEP early return does not call the pin guard")
@@ -101,18 +101,20 @@ class TestOrderedAllReduceDeepEPRefuses(unittest.TestCase):
         self.assertIn("_bi_router_logits", calls)
         self.assertIn("_bi_topk_output", calls)
 
-    def test_ordered_reduce_uses_the_graph_safe_group_gather(self):
+    def test_canonical_reduce_uses_the_graph_safe_group_gather(self):
         from sglang.srt.distributed import communication_op
 
         tree = ast.parse(pathlib.Path(communication_op.__file__).read_text())
-        ordered_reduce = next(
+        canonical_reduce = next(
             node
             for node in tree.body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "tensor_model_parallel_ordered_all_reduce"
+            and node.name == "tensor_model_parallel_canonical_moe_all_reduce"
         )
         calls = [
-            node.func for node in ast.walk(ordered_reduce) if isinstance(node, ast.Call)
+            node.func
+            for node in ast.walk(canonical_reduce)
+            if isinstance(node, ast.Call)
         ]
         group_gathers = [
             call

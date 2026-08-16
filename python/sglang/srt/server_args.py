@@ -310,8 +310,7 @@ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority"]
 RETRACTION_POLICY_CHOICES = ["length", "priority"]
 
 XORL_RL_TARGET = "xorl"
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "xorl-batch-invariant", XORL_RL_TARGET]
-BATCH_INVARIANT_RL_TARGETS = frozenset({"fsdp", "xorl-batch-invariant"})
+RL_ON_POLICY_TARGET_CHOICES = [XORL_RL_TARGET]
 
 LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
@@ -429,20 +428,32 @@ def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
 
 
-def add_rl_on_policy_target_choices(choices):
-    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
-
-
-def is_batch_invariant_rl_target(target: Optional[str]) -> bool:
-    return target in BATCH_INVARIANT_RL_TARGETS
-
-
 def is_glm52_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "glm52_exact_mode", False))
 
 
+def is_dsv4_flash_exact_mode(server_args: ServerArgs) -> bool:
+    return bool(getattr(server_args, "dsv4_flash_exact_mode", False))
+
+
 def is_qwen35_gdn_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "qwen35_gdn_exact_mode", False))
+
+
+def is_qwen3_dense_exact_mode(server_args: ServerArgs) -> bool:
+    return bool(getattr(server_args, "qwen3_dense_exact_mode", False))
+
+
+def is_xorl_exact_mode(server_args: ServerArgs) -> bool:
+    """Return whether a resolved architecture-owned XORL contract is active."""
+    return any(
+        (
+            is_glm52_exact_mode(server_args),
+            is_dsv4_flash_exact_mode(server_args),
+            is_qwen35_gdn_exact_mode(server_args),
+            is_qwen3_dense_exact_mode(server_args),
+        )
+    )
 
 
 def is_qwen35_rope_class_b(server_args: ServerArgs) -> bool:
@@ -463,12 +474,211 @@ def _validate_exact_model_geometry(
     mismatches = []
     for name, expected_value in expected.items():
         actual_value = getattr(config, name, None)
+        if name == "rope_theta" and actual_value is None:
+            rope_parameters = getattr(config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                actual_value = rope_parameters.get("rope_theta")
         if actual_value != expected_value:
             mismatches.append(f"{name}={actual_value!r} (expected {expected_value!r})")
     if mismatches:
         raise ValueError(
             f"The exact {contract_name} XORL contract only admits the qualified "
             f"model geometry; mismatched fields: {', '.join(mismatches)}"
+        )
+
+
+def _validate_exact_qwen3_dense_capabilities(hf_config) -> None:
+    config = _text_model_config(hf_config)
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "use_sliding_window": False,
+        "attention_dropout": 0.0,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+        unsupported_keys = set(rope_scaling) - {"rope_type", "type", "rope_theta"}
+        if rope_type not in (None, "default") or unsupported_keys:
+            mismatches.append(
+                f"rope_scaling={rope_scaling!r} (only default RoPE is supported)"
+            )
+    elif rope_scaling:
+        mismatches.append(
+            f"rope_scaling={rope_scaling!r} (only default RoPE is supported)"
+        )
+
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get("rope_theta")
+    if (
+        not isinstance(rope_theta, (int, float))
+        or isinstance(rope_theta, bool)
+        or rope_theta <= 0
+    ):
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if (
+        not isinstance(rms_norm_eps, (int, float))
+        or isinstance(rms_norm_eps, bool)
+        or rms_norm_eps <= 0
+    ):
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    if mismatches:
+        raise ValueError(
+            "The exact dense Qwen3 XORL contract does not support this "
+            f"architecture configuration: {', '.join(mismatches)}"
+        )
+
+
+def _validate_exact_qwen35_dense_capabilities(hf_config) -> None:
+    config = _text_model_config(hf_config)
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+        "linear_num_value_heads",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 256,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+    if getattr(config, "use_sliding_window", False):
+        mismatches.append("use_sliding_window=True (requires False)")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if (
+        not isinstance(rms_norm_eps, (int, float))
+        or isinstance(rms_norm_eps, bool)
+        or rms_norm_eps <= 0
+    ):
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
+
+    rope_parameters = getattr(config, "rope_parameters", None)
+    rope_theta = getattr(config, "rope_theta", None)
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+    if isinstance(rope_parameters, dict):
+        if rope_theta is None:
+            rope_theta = rope_parameters.get("rope_theta")
+        if partial_rotary_factor is None:
+            partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
+    if (
+        not isinstance(rope_theta, (int, float))
+        or isinstance(rope_theta, bool)
+        or rope_theta <= 0
+    ):
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+    if partial_rotary_factor != 0.25:
+        mismatches.append(
+            f"partial_rotary_factor={partial_rotary_factor!r} (requires 0.25)"
+        )
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    linear_num_value_heads = getattr(config, "linear_num_value_heads", None)
+    if (
+        isinstance(linear_num_value_heads, int)
+        and linear_num_value_heads > 0
+        and linear_num_value_heads % 16 != 0
+    ):
+        mismatches.append(
+            f"linear_num_value_heads={linear_num_value_heads!r} "
+            "(requires a multiple of 16)"
+        )
+
+    num_hidden_layers = getattr(config, "num_hidden_layers", None)
+    layer_types = getattr(config, "layer_types", None)
+    if (
+        isinstance(num_hidden_layers, int)
+        and num_hidden_layers > 0
+        and layer_types is not None
+    ):
+        expected_layer_types = tuple(
+            "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
+            for layer_idx in range(num_hidden_layers)
+        )
+        if tuple(layer_types) != expected_layer_types:
+            mismatches.append("layer_types does not match full_attention_interval=4")
+
+    if mismatches:
+        raise ValueError(
+            "The exact dense Qwen3.5 XORL contract does not support this "
+            f"architecture configuration: {', '.join(mismatches)}"
         )
 
 
@@ -560,6 +770,37 @@ def _validate_glm52_exact_quantization_config(hf_config) -> None:
         )
 
 
+def _validate_dsv4_flash_exact_quantization_config(hf_config) -> None:
+    """Validate the FP8 formats consumed by the exact DSV4 arithmetic path."""
+
+    config = _text_model_config(hf_config)
+    quantization_config = getattr(config, "quantization_config", None)
+    if not isinstance(quantization_config, dict):
+        raise ValueError(
+            "The DSV4 exact arithmetic path requires a dynamic block-FP8 "
+            "quantization config."
+        )
+    expected = {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "fmt": "e4m3",
+        "scale_fmt": "ue8m0",
+        "weight_block_size": [128, 128],
+    }
+    mismatches = [
+        f"quantization_config.{name}={quantization_config.get(name)!r} "
+        f"(expected {value!r})"
+        for name, value in expected.items()
+        if quantization_config.get(name) != value
+    ]
+    if mismatches:
+        raise ValueError(
+            "The DSV4 exact arithmetic path requires dynamic E4M3 weights, "
+            "UE8M0 scales, and 128x128 blocks; mismatched fields: "
+            + ", ".join(mismatches)
+        )
+
+
 def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | None:
     if is_glm52_exact_mode(server_args):
         from sglang.srt.layers.xorl_batch_invariant import XORL_GLM52_REQUIRED_BI_OPS
@@ -571,6 +812,10 @@ def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | Non
         )
 
         return QWEN35_REQUIRED_BI_OPS
+    if is_qwen3_dense_exact_mode(server_args):
+        # Dense Qwen3 owns its norm, activation, lm-head, and probability
+        # reductions. Only trunk matrix products use the generic BI interpose.
+        return ("addmm", "bmm", "mm")
     return None
 
 
@@ -3401,7 +3646,7 @@ class ServerArgs:
     rl_on_policy_target: A[
         Optional[str],
         Arg(
-            help="The training system that SGLang needs to match for true on-policy.",
+            help="Enable the current exact XoRL on-policy contract.",
             choices=RL_ON_POLICY_TARGET_CHOICES,
         ),
         NS("exec.deterministic"),
@@ -3409,6 +3654,9 @@ class ServerArgs:
     # Architecture-owned runtime selections. These are resolved from the
     # model geometry and XORL target and are intentionally not CLI flags.
     glm52_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
+    )
+    dsv4_flash_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
         init=False, default=False, repr=False
     )
     qwen35_gdn_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
@@ -3422,6 +3670,15 @@ class ServerArgs:
     )
     qwen35_rmsnorm_family: A[Literal["v1", "v2"], NS("exec.deterministic")] = (
         dataclasses.field(init=False, default="v1", repr=False)
+    )
+    qwen3_dense_exact_mode: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
+    )
+    # Capability bit set by an exact model resolver only when the model owns a
+    # stage-local PP proxy contract for every bit-relevant boundary.  Admission
+    # code consumes this capability rather than maintaining a family allowlist.
+    exact_physical_pp_capable: A[bool, NS("exec.deterministic")] = dataclasses.field(
+        init=False, default=False, repr=False
     )
 
     # -------------------------------------------------------------------------
@@ -3532,6 +3789,21 @@ class ServerArgs:
         "Enable returning routed experts of each layer with responses.",
         NS("exec.features"),
     ] = False
+    enable_return_expert_logits: A[
+        bool,
+        "Enable returning float32 selected-router weights of each layer with responses.",
+        NS("exec.features"),
+    ] = False
+    routed_experts_side_channel_dir: A[
+        Optional[str],
+        "Publish routed-experts tensors asynchronously into packed files in this shared directory and return descriptors instead of base64 bodies.",
+        NS("exec.features"),
+    ] = None
+    routed_experts_side_channel_workers: A[
+        int,
+        "Number of asynchronous routed-experts side-channel publisher threads.",
+        NS("exec.features"),
+    ] = 2
     enable_return_indexer_topk: A[
         bool,
         "Enable returning indexer topk indices of layers with indexer with responses.",
@@ -3629,6 +3901,7 @@ class ServerArgs:
         self._resolved_overrides = []
 
         self._handle_return_hidden_states_mode()
+        self._validate_rl_on_policy_target()
         if self.model_path.lower() in ["none", "dummy"]:
             return
 
@@ -3795,6 +4068,7 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._validate_dsv4_flash_exact_resolved_contract()
         self._validate_glm52_exact_resolved_contract()
 
     def _handle_return_hidden_states_mode(self):
@@ -5196,6 +5470,149 @@ class ServerArgs:
 
         validate_hisparse_kv_cache_dtype(self)
 
+    def _declare_exact_physical_pp_capability(self, *configs) -> None:
+        """Publish the model-owned physical-PP proxy capability.
+
+        This is deliberately a mechanism declaration, not a model-family
+        admission table.  Exact resolvers set it only after selecting a model
+        implementation whose body state, ownership metadata, and terminal head
+        are stage-local under physical pipeline parallelism.
+        """
+
+        self.exact_physical_pp_capable = True
+        for config in configs:
+            config._exact_physical_pp_capable = True
+
+    def _resolve_dsv4_flash_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+    ) -> None:
+        self.dsv4_flash_exact_mode = (
+            self.rl_on_policy_target == XORL_RL_TARGET
+            and model_arch == "DeepseekV4ForCausalLM"
+        )
+        config = _text_model_config(hf_config)
+        hf_config._dsv4_flash_exact_mode = self.dsv4_flash_exact_mode
+        config._dsv4_flash_exact_mode = self.dsv4_flash_exact_mode
+        if not self.dsv4_flash_exact_mode:
+            return
+
+        self._declare_exact_physical_pp_capability(hf_config, config)
+
+        _validate_dsv4_flash_exact_quantization_config(config)
+
+        # The model-owned exact path has eight fixed logical MoE leaves.  Each
+        # leaf is one complete EP expert slice plus one eighth of the shared
+        # expert; the trainer folds the same eight leaves.  A smaller EP with
+        # MoE-TP subshards would run, but would introduce different BF16 tree
+        # nodes before the canonical fold.
+        if self.tp_size != 8:
+            raise ValueError(
+                "Exact DSV4 requires a stage-local TP8 owner/contributor plane"
+            )
+        if self.ep_size == 1:
+            self.ep_size = 8
+        if self.ep_size != 8 or self.moe_dp_size != 1:
+            raise ValueError(
+                "Exact DSV4 requires EP8 with MoE-DP1 so serving and trainer "
+                "fold the same eight expert/shared leaves"
+            )
+        if self.dp_size <= 0 or 8 % self.dp_size:
+            raise ValueError(
+                "Exact DSV4 attention DP must be a positive divisor of the "
+                "eight-rank owner plane"
+            )
+        dsv4_cp_size = 8 // self.dp_size
+
+        # Geometry, ownership, adapter inventory, and graph-buffer constraints
+        # are checked by the runtime mechanisms that consume them. ServerArgs
+        # selects the exact arithmetic implementation without certifying one
+        # model checkpoint or distributed topology.
+        exact_arithmetic = {
+            "dtype": (self.dtype, ("auto", "bf16", "bfloat16")),
+            "quantization": (self.quantization, (None, "fp8")),
+            "kv_cache_dtype": (
+                self.kv_cache_dtype,
+                ("auto", "fp8_e4m3"),
+            ),
+            "attention_backend": (self.attention_backend, (None, "dsv4")),
+            "prefill_attention_backend": (
+                self.prefill_attention_backend,
+                (None, "dsv4"),
+            ),
+            "decode_attention_backend": (
+                self.decode_attention_backend,
+                (None, "dsv4"),
+            ),
+            "page_size": (self.page_size, (None, 256)),
+            "moe_a2a_backend": (self.moe_a2a_backend, ("none",)),
+            "moe_runner_backend": (
+                self.moe_runner_backend,
+                ("auto", "marlin"),
+            ),
+            "flashinfer_mxfp4_moe_precision": (
+                self.flashinfer_mxfp4_moe_precision,
+                ("default",),
+            ),
+            "fp8_gemm_runner_backend": (
+                self.fp8_gemm_runner_backend,
+                ("auto", "triton"),
+            ),
+            "ep_num_redundant_experts": (
+                self.ep_num_redundant_experts,
+                (0,),
+            ),
+            "ep_dispatch_algorithm": (self.ep_dispatch_algorithm, (None,)),
+            "init_expert_location": (self.init_expert_location, ("trivial",)),
+            "enable_eplb": (self.enable_eplb, (False,)),
+            "enable_hisparse": (self.enable_hisparse, (False,)),
+            "enable_deepseek_v4_fp4_indexer": (
+                self.enable_deepseek_v4_fp4_indexer,
+                (False,),
+            ),
+            "sampling_backend": (self.sampling_backend, (None, "pytorch")),
+            "sampling_defaults": (self.sampling_defaults, ("model", "openai")),
+            "model_impl": (self.model_impl, ("auto", "sglang")),
+            "device": (self.device, (None, "cuda")),
+        }
+        incompatible = [
+            f"{name}={value!r}"
+            for name, (value, allowed) in exact_arithmetic.items()
+            if value not in allowed
+        ]
+        if incompatible:
+            raise ValueError(
+                "The DSV4-Flash exact arithmetic implementation requires: "
+                f"{', '.join(incompatible)}"
+            )
+
+        self.dtype = "bfloat16"
+        self.quantization = "fp8"
+        self.kv_cache_dtype = "fp8_e4m3"
+        self.attention_backend = "dsv4"
+        self.prefill_attention_backend = None
+        self.decode_attention_backend = None
+        self.page_size = 256
+        self.sampling_backend = "pytorch"
+        self.sampling_defaults = "openai"
+        self.model_impl = "sglang"
+        self.device = "cuda"
+        self.moe_runner_backend = "marlin"
+        self.flashinfer_mxfp4_moe_precision = "default"
+        self.fp8_gemm_runner_backend = "triton"
+        self.enable_deterministic_inference = True
+        self.disable_shared_experts_fusion = True
+        self.disable_custom_all_reduce = True
+        self.enable_dp_attention = True
+        self.attn_cp_size = dsv4_cp_size
+        self.enable_prefill_cp = dsv4_cp_size > 1
+        self.enable_prefill_context_parallel = False
+        self.enable_dsa_prefill_context_parallel = dsv4_cp_size > 1
+        self.cp_strategy = "interleave" if dsv4_cp_size > 1 else None
+        self.dsa_prefill_cp_mode = "round-robin-split"
+
     def _validate_glm52_exact_contract(self) -> None:
         if not self.glm52_exact_mode:
             return
@@ -5226,78 +5643,30 @@ class ServerArgs:
         if not self.glm52_exact_mode:
             return
 
-        _validate_exact_model_geometry(
-            hf_config,
-            contract_name="GLM-5.2",
-            expected={
-                "hidden_size": 6144,
-                "intermediate_size": 12288,
-                "moe_intermediate_size": 2048,
-                "moe_layer_freq": 1,
-                "num_hidden_layers": 78,
-                "vocab_size": 154880,
-                "num_attention_heads": 64,
-                "num_key_value_heads": 64,
-                "first_k_dense_replace": 3,
-                "mlp_layer_types": ["dense"] * 3 + ["sparse"] * 75,
-                "n_routed_experts": 256,
-                "n_shared_experts": 1,
-                "num_experts_per_tok": 8,
-                "index_topk": 2048,
-                "index_topk_freq": 4,
-                "index_skip_topk_offset": 3,
-                "index_topk_pattern": None,
-                "index_head_dim": 128,
-                "index_n_heads": 32,
-                "q_lora_rank": 2048,
-                "kv_lora_rank": 512,
-                "qk_nope_head_dim": 192,
-                "qk_rope_head_dim": 64,
-                "v_head_dim": 256,
-                "indexer_rope_interleave": True,
-                "rope_interleave": True,
-                "rms_norm_eps": 1e-5,
-                "max_position_embeddings": 1_048_576,
-                "hidden_act": "silu",
-                "norm_topk_prob": True,
-                "n_group": 1,
-                "topk_group": 1,
-                "scoring_func": "sigmoid",
-                "routed_scaling_factor": 2.5,
-                "topk_method": "noaux_tc",
-                "tie_word_embeddings": False,
-                "swiglu_limit": None,
-                "llama_4_scaling": None,
-                "indexer_types": [
-                    "full" if layer < 3 or layer % 4 == 2 else "shared"
-                    for layer in range(78)
-                ],
-            },
+        self._declare_exact_physical_pp_capability(
+            hf_config, _text_model_config(hf_config)
         )
+
         config = _text_model_config(hf_config)
-        rope_parameters = getattr(config, "rope_parameters", None)
-        allowed_rope_keys = {"rope_theta", "rope_type", "type"}
-        if (
-            not isinstance(rope_parameters, dict)
-            or rope_parameters.get("rope_theta") != 8_000_000
-            or rope_parameters.get("rope_type", rope_parameters.get("type"))
-            != "default"
-            or rope_parameters.get("type", rope_parameters.get("rope_type"))
-            != "default"
-            or not set(rope_parameters).issubset(allowed_rope_keys)
-        ):
+        # These are mechanism constraints, not a checkpoint fingerprint. The
+        # exact PAGED selector has a fixed 2048-wide output. The canonical MoE
+        # owner also consumes the FP32 correction bias created by noaux_tc;
+        # hash layers deliberately omit that parameter. All other dimensions,
+        # layer schedules, RoPE metadata, and index-sharing schedules are read
+        # from the model and validated by the kernels that consume them.
+        if getattr(config, "index_topk", None) != 2048:
             raise ValueError(
-                "The exact GLM-5.2 XORL contract only admits the qualified "
-                "model geometry; mismatched fields: "
-                f"rope_parameters={rope_parameters!r}"
+                "The exact GLM-5.2 PAGED selector requires index_topk=2048"
             )
-        if getattr(config, "cli_factor", 1) != 1:
+        if getattr(config, "topk_method", None) != "noaux_tc":
             raise ValueError(
-                "The exact GLM-5.2 XORL contract requires cli_factor=1"
+                "The exact GLM-5.2 canonical router requires topk_method=noaux_tc "
+                "to expose its FP32 correction bias"
             )
         if getattr(config, "num_hash_layers", 0) not in (None, 0):
             raise ValueError(
-                "The exact GLM-5.2 XORL contract requires num_hash_layers=0"
+                "The exact GLM-5.2 canonical router requires num_hash_layers=0 "
+                "because hash layers do not expose its FP32 correction bias"
             )
         _validate_glm52_exact_quantization_config(hf_config)
         if self.dtype not in ("auto", "bf16", "bfloat16"):
@@ -5330,7 +5699,26 @@ class ServerArgs:
             # Dynamic POST loading needs the fixed complete memory-pool layout
             # even when no adapter is present at server startup.
             self.lora_target_modules = set(GLM52_REQUIRED_TARGET_MODULES)
-        exact_program = {
+        requested_max_lora_rank = self.max_lora_rank
+        if self.tp_size <= 0 or self.dp_size <= 0 or self.tp_size % self.dp_size:
+            raise ValueError(
+                "Exact GLM-5.2 requires DP to be a positive divisor of the "
+                "stage-local contributor group"
+            )
+        glm52_dp_owned = self.dp_size > 1
+        glm52_cp_size = self.tp_size // self.dp_size
+        # ``ep_size=1`` is the generic CLI default.  The exact GLM program's
+        # logical leaves are complete EP expert/shared shards, so select the
+        # stage-local contributor count unless the launch already did so.
+        if self.ep_size == 1 and self.tp_size > 1:
+            self.ep_size = self.tp_size
+        if self.ep_size != self.tp_size:
+            raise ValueError(
+                "Exact GLM-5.2 requires EP to equal the stage-local TP "
+                "contributor count so serving and trainer fold identical "
+                f"logical leaves; got TP{self.tp_size}/EP{self.ep_size}"
+            )
+        exact_mechanisms = {
             "moe_runner_backend": (self.moe_runner_backend, ("auto", "triton")),
             "fp8_gemm_runner_backend": (
                 self.fp8_gemm_runner_backend,
@@ -5343,10 +5731,8 @@ class ServerArgs:
             "dsa_topk_backend": (self.dsa_topk_backend, ("sgl-kernel",)),
             "moe_dense_tp_size": (self.moe_dense_tp_size, (None, 1)),
             "moe_a2a_backend": (self.moe_a2a_backend, ("none",)),
-            "ep_num_redundant_experts": (
-                self.ep_num_redundant_experts,
-                (0,),
-            ),
+            "moe_dp_size": (self.moe_dp_size, (1,)),
+            "ep_num_redundant_experts": (self.ep_num_redundant_experts, (0,)),
             "ep_dispatch_algorithm": (self.ep_dispatch_algorithm, (None,)),
             "init_expert_location": (self.init_expert_location, ("trivial",)),
             "enable_eplb": (self.enable_eplb, (False,)),
@@ -5363,33 +5749,14 @@ class ServerArgs:
             "disaggregation_mode": (self.disaggregation_mode, ("null",)),
             "sampling_backend": (self.sampling_backend, (None, "pytorch")),
             "sampling_defaults": (self.sampling_defaults, ("model", "openai")),
-            "chunked_prefill_size": (
-                self.chunked_prefill_size,
-                (None, -1, 8192),
-            ),
-            "max_prefill_tokens": (self.max_prefill_tokens, (8192, 16384)),
-            "prefill_max_requests": (self.prefill_max_requests, (None, 1)),
-            "max_total_tokens": (self.max_total_tokens, (None, 8192)),
-            "max_running_requests": (self.max_running_requests, (None, 16)),
             "model_impl": (self.model_impl, ("auto", "sglang")),
             "device": (self.device, (None, "cuda")),
             "is_embedding": (self.is_embedding, (False,)),
-            "debug_cuda_graph": (self.debug_cuda_graph, (False,)),
-            "enable_torch_compile": (self.enable_torch_compile, (False,)),
-            "enable_two_batch_overlap": (
-                self.enable_two_batch_overlap,
-                (False,),
-            ),
+            "enable_two_batch_overlap": (self.enable_two_batch_overlap, (False,)),
             "enable_single_batch_overlap": (
                 self.enable_single_batch_overlap,
                 (False,),
             ),
-            "debug_tensor_dump_output_folder": (
-                self.debug_tensor_dump_output_folder,
-                (None,),
-            ),
-            "msprobe_dump_config": (self.msprobe_dump_config, (None,)),
-            "max_lora_rank": (self.max_lora_rank, (None, 1)),
             "lora_backend": (self.lora_backend, ("csgmv", "triton")),
             "experts_shared_outer_loras": (
                 self.experts_shared_outer_loras,
@@ -5400,70 +5767,27 @@ class ServerArgs:
                 (None, False),
             ),
             "lora_use_virtual_experts": (self.lora_use_virtual_experts, (False,)),
-            "nnodes": (self.nnodes, (2,)),
-            "tp_size": (self.tp_size, (16,)),
-            "ep_size": (self.ep_size, (1, 16)),
-            "pp_size": (self.pp_size, (1,)),
-            "dp_size": (self.dp_size, (1,)),
             "dcp_size": (self.dcp_size, (1,)),
             "enable_cp_decode_attn_tp": (self.enable_cp_decode_attn_tp, (False,)),
-            "enable_dp_lm_head": (self.enable_dp_lm_head, (False,)),
-            "moe_dp_size": (self.moe_dp_size, (1,)),
-            "attn_cp_size": (self.attn_cp_size, (1, 16)),
-            "dsa_prefill_cp_mode": (
-                self.dsa_prefill_cp_mode,
-                ("round-robin-split",),
-            ),
         }
         incompatible = [
             f"{name}={value!r}"
-            for name, (value, allowed) in exact_program.items()
+            for name, (value, allowed) in exact_mechanisms.items()
             if value not in allowed
         ]
-        if self.disable_cuda_graph:
-            incompatible.append("disable_cuda_graph=True")
-        if self.cuda_graph_bs_decode not in (None, [16]):
-            incompatible.append(f"cuda_graph_bs_decode={self.cuda_graph_bs_decode!r}")
-        if self.cuda_graph_max_bs_decode not in (None, 16):
-            incompatible.append(
-                f"cuda_graph_max_bs_decode={self.cuda_graph_max_bs_decode!r}"
-            )
-        if self.disable_cuda_graph_padding:
-            incompatible.append("disable_cuda_graph_padding=True")
-        if (
-            getattr(self, "_mem_fraction_static_user_supplied", False)
-            and self.mem_fraction_static != 0.82
+        if requested_max_lora_rank is not None and (
+            isinstance(requested_max_lora_rank, bool)
+            or not isinstance(requested_max_lora_rank, int)
+            or requested_max_lora_rank <= 0
         ):
-            incompatible.append(f"mem_fraction_static={self.mem_fraction_static!r}")
-        if isinstance(self.cuda_graph_config, CudaGraphConfig):
-            locked = getattr(self, "_cuda_graph_config_locked", set())
-            graph_program = {
-                (Phase.DECODE, "backend"): (
-                    self.cuda_graph_config.decode.backend,
-                    (Backend.FULL,),
-                ),
-                (Phase.DECODE, "bs"): (
-                    self.cuda_graph_config.decode.bs,
-                    ([16],),
-                ),
-                (Phase.DECODE, "max_bs"): (
-                    self.cuda_graph_config.decode.max_bs,
-                    (16,),
-                ),
-                (Phase.PREFILL, "backend"): (
-                    self.cuda_graph_config.prefill.backend,
-                    (Backend.DISABLED,),
-                ),
-            }
-            incompatible.extend(
-                f"cuda_graph_config[{phase}].{name}={value!r}"
-                for (phase, name), (value, allowed) in graph_program.items()
-                if (phase, name) in locked and value not in allowed
+            incompatible.append(
+                f"max_lora_rank={requested_max_lora_rank!r} "
+                "(expected a positive integer)"
             )
         if incompatible:
             raise ValueError(
-                "The exact GLM-5.2 XORL contract rejects incompatible runtime "
-                f"settings: {', '.join(incompatible)}"
+                "The exact GLM-5.2 arithmetic mechanisms reject: "
+                f"{', '.join(incompatible)}"
             )
         self.dtype = "bfloat16"
         self.quantization = "fp8"
@@ -5477,15 +5801,8 @@ class ServerArgs:
         self.dsa_topk_backend = "sgl-kernel"
         self.sampling_backend = "pytorch"
         self.sampling_defaults = "openai"
-        self.chunked_prefill_size = -1
-        self.max_prefill_tokens = 8192
-        self.prefill_max_requests = 1
-        self.max_total_tokens = 8192
-        self.max_running_requests = 16
-        self.mem_fraction_static = 0.82
         self.model_impl = "sglang"
         self.device = "cuda"
-        self.max_lora_rank = 1
         self.lora_backend = "triton"
         self.experts_shared_outer_loras = True
         self.enable_lora_overlap_loading = False
@@ -5493,40 +5810,142 @@ class ServerArgs:
         self.lora_strict_loading = True
         self.dcp_size = 1
         self.enable_cp_decode_attn_tp = False
+        self.enable_dp_lm_head = glm52_dp_owned
+        self.enable_dp_attention = True
         self.moe_runner_backend = "triton"
         self.fp8_gemm_runner_backend = "triton"
         self.moe_dense_tp_size = 1
-        self.ep_size = 16
-        self.attn_cp_size = 16
-        self.enable_prefill_cp = True
+        self.attn_cp_size = glm52_cp_size
+        self.enable_prefill_cp = glm52_cp_size > 1
         self.enable_prefill_context_parallel = False
-        self.cp_strategy = "interleave"
-        self.enable_dsa_prefill_context_parallel = True
+        self.cp_strategy = "interleave" if glm52_cp_size > 1 else None
+        self.enable_dsa_prefill_context_parallel = glm52_cp_size > 1
         self.dsa_prefill_cp_mode = "round-robin-split"
         self.enable_deterministic_inference = True
         self.disable_shared_experts_fusion = True
         self.disable_custom_all_reduce = True
         self.disable_overlap_schedule = True
         self.disable_piecewise_cuda_graph = True
-        self.disable_radix_cache = True
-        self.cuda_graph_bs_decode = [16]
-        self.cuda_graph_max_bs_decode = 16
-        if isinstance(self.cuda_graph_config, CudaGraphConfig):
-            self.cuda_graph_config.decode.backend = Backend.FULL
-            self.cuda_graph_config.decode.bs = [16]
-            self.cuda_graph_config.decode.max_bs = 16
-            self.cuda_graph_config.prefill.backend = Backend.DISABLED
-            self._cuda_graph_config_locked.add((Phase.DECODE, "backend"))
-            self._cuda_graph_config_locked.add((Phase.DECODE, "bs"))
-            self._cuda_graph_config_locked.add((Phase.DECODE, "max_bs"))
-            self._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
+        # Radix is a runtime option.  When enabled, validate only the concrete
+        # cache mechanics that the exact path does not implement yet.
+        if envs.SGLANG_ENABLE_GLM52_EXACT_RADIX.get() and self.disable_radix_cache:
+            raise ValueError(
+                "SGLANG_ENABLE_GLM52_EXACT_RADIX conflicts with "
+                "--disable-radix-cache; drop one of the two."
+            )
+        if not self.disable_radix_cache:
+            incompatible_cache = [
+                name
+                for name, value in (
+                    ("enable_hierarchical_cache", self.enable_hierarchical_cache),
+                    ("enable_lmcache", self.enable_lmcache),
+                    ("enable_flexkv", self.enable_flexkv),
+                    ("hicache_storage_backend", self.hicache_storage_backend),
+                )
+                if value
+            ]
+            if incompatible_cache:
+                raise ValueError(
+                    "The GLM-5.2 exact radix path admits only the "
+                    "in-device radix tree; incompatible cache settings: "
+                    f"{', '.join(incompatible_cache)}."
+                )
+            logger.info(
+                "GLM-5.2 exact radix prefix reuse is enabled; RL weight updates "
+                "invalidate the prefix tree before subsequent requests, and "
+                "the generic request key namespaces entries by LoRA ID."
+            )
+
+    def _validate_dsv4_flash_exact_resolved_contract(self) -> None:
+        """Reject late drift in the selected DSV4 arithmetic implementation."""
+
+        if not self.dsv4_flash_exact_mode:
+            return
+        dsv4_cp_size = (
+            8 // self.dp_size if self.dp_size > 0 and 8 % self.dp_size == 0 else None
+        )
+        expected = {
+            "dtype": "bfloat16",
+            "quantization": "fp8",
+            "kv_cache_dtype": "fp8_e4m3",
+            "attention_backend": "dsv4",
+            "page_size": 256,
+            "moe_a2a_backend": "none",
+            "moe_runner_backend": "marlin",
+            "flashinfer_mxfp4_moe_precision": "default",
+            "fp8_gemm_runner_backend": "triton",
+            "ep_num_redundant_experts": 0,
+            "ep_dispatch_algorithm": None,
+            "init_expert_location": "trivial",
+            "enable_eplb": False,
+            "enable_hisparse": False,
+            "enable_deepseek_v4_fp4_indexer": False,
+            "sampling_backend": "pytorch",
+            "sampling_defaults": "openai",
+            "model_impl": "sglang",
+            "device": "cuda",
+            "enable_deterministic_inference": True,
+            "disable_shared_experts_fusion": True,
+            "disable_custom_all_reduce": True,
+            "tp_size": 8,
+            "ep_size": 8,
+            "moe_dp_size": 1,
+            "attn_cp_size": dsv4_cp_size,
+            "enable_dp_attention": True,
+            "enable_prefill_cp": dsv4_cp_size is not None and dsv4_cp_size > 1,
+            "enable_prefill_context_parallel": False,
+            "enable_dsa_prefill_context_parallel": (
+                dsv4_cp_size is not None and dsv4_cp_size > 1
+            ),
+            "cp_strategy": (
+                "interleave" if dsv4_cp_size is not None and dsv4_cp_size > 1 else None
+            ),
+            "dsa_prefill_cp_mode": "round-robin-split",
+        }
+        mismatches = [
+            f"{name}={getattr(self, name, None)!r} (expected {value!r})"
+            for name, value in expected.items()
+            if getattr(self, name, None) != value
+        ]
+        if envs.SGLANG_OPT_FUSE_WQA_WKV.get():
+            mismatches.append("SGLANG_OPT_FUSE_WQA_WKV is enabled")
+        exact_disabled_envs = (
+            envs.SGLANG_SIMULATE_UNIFORM_EXPERTS,
+            envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS,
+            envs.SGLANG_OPT_MOE_QUANT_ONCE,
+            envs.SGLANG_SHARED_EXPERT_TP1,
+            envs.SGLANG_DP_USE_GATHERV,
+            envs.SGLANG_DP_USE_REDUCE_SCATTER,
+        )
+        mismatches.extend(
+            f"{setting.name} is enabled"
+            for setting in exact_disabled_envs
+            if setting.get()
+        )
+        if mismatches:
+            raise ValueError(
+                "The DSV4-Flash exact arithmetic implementation drifted after "
+                "runtime "
+                f"resolution: {', '.join(mismatches)}"
+            )
 
     def _validate_glm52_exact_resolved_contract(self) -> None:
-        """Fail if a late resolution pass changed the certified GLM program."""
+        """Fail if a late pass changed a bit-relevant GLM mechanism."""
 
         if not self.glm52_exact_mode:
             return
 
+        if self.dp_size <= 0 or self.tp_size % self.dp_size:
+            raise ValueError(
+                "Exact GLM-5.2 requires dp_size to be a positive divisor of tp_size"
+            )
+        if self.ep_size != self.tp_size:
+            raise ValueError(
+                "Exact GLM-5.2 requires ep_size to equal tp_size so serving "
+                "and trainer fold identical logical leaves"
+            )
+        glm52_dp_owned = self.dp_size > 1
+        glm52_cp_size = self.tp_size // self.dp_size
         expected = {
             "dtype": "bfloat16",
             "quantization": "fp8",
@@ -5540,23 +5959,19 @@ class ServerArgs:
             "dsa_paged_mqa_logits_backend": "deepgemm",
             "dsa_topk_backend": "sgl-kernel",
             "page_size": 64,
-            "nnodes": 2,
-            "tp_size": 16,
-            "ep_size": 16,
-            "pp_size": 1,
-            "dp_size": 1,
+            "ep_size": self.ep_size,
             "moe_dp_size": 1,
-            "attn_cp_size": 16,
+            "attn_cp_size": glm52_cp_size,
             "moe_dense_tp_size": 1,
             "moe_a2a_backend": "none",
             "ep_num_redundant_experts": 0,
             "ep_dispatch_algorithm": None,
             "init_expert_location": "trivial",
             "enable_eplb": False,
-            "enable_prefill_cp": True,
+            "enable_prefill_cp": glm52_cp_size > 1,
             "enable_prefill_context_parallel": False,
-            "enable_dsa_prefill_context_parallel": True,
-            "cp_strategy": "interleave",
+            "enable_dsa_prefill_context_parallel": glm52_cp_size > 1,
+            "cp_strategy": "interleave" if glm52_cp_size > 1 else None,
             "dsa_prefill_cp_mode": "round-robin-split",
             "enable_dp_attention": True,
             "enable_hisparse": False,
@@ -5565,27 +5980,15 @@ class ServerArgs:
             "disable_custom_all_reduce": True,
             "disable_overlap_schedule": True,
             "disable_piecewise_cuda_graph": True,
-            "disable_radix_cache": True,
-            "disable_cuda_graph": False,
-            "disable_cuda_graph_padding": False,
             "sampling_backend": "pytorch",
             "sampling_defaults": "openai",
-            "chunked_prefill_size": -1,
-            "max_prefill_tokens": 8192,
-            "prefill_max_requests": 1,
-            "max_total_tokens": 8192,
-            "max_running_requests": 16,
-            "mem_fraction_static": 0.82,
             "model_impl": "sglang",
             "device": "cuda",
             "is_embedding": False,
-            "debug_cuda_graph": False,
-            "enable_torch_compile": False,
             "enable_two_batch_overlap": False,
             "enable_single_batch_overlap": False,
             "debug_tensor_dump_output_folder": None,
             "msprobe_dump_config": None,
-            "max_lora_rank": 1,
             "lora_backend": "triton",
             "experts_shared_outer_loras": True,
             "enable_lora_overlap_loading": False,
@@ -5593,31 +5996,20 @@ class ServerArgs:
             "lora_strict_loading": True,
             "dcp_size": 1,
             "enable_cp_decode_attn_tp": False,
-            "enable_dp_lm_head": False,
+            "enable_dp_lm_head": glm52_dp_owned,
         }
         mismatches = [
             f"{name}={getattr(self, name, None)!r} (expected {value!r})"
             for name, value in expected.items()
             if getattr(self, name, None) != value
         ]
-        if self.node_rank not in (0, 1):
-            mismatches.append(f"node_rank={self.node_rank!r} (expected 0 or 1)")
-        if not isinstance(self.cuda_graph_config, CudaGraphConfig):
-            mismatches.append("cuda_graph_config is not resolved")
-        else:
-            graph_expected = {
-                "decode.backend": (self.cuda_graph_config.decode.backend, Backend.FULL),
-                "decode.bs": (self.cuda_graph_config.decode.bs, [16]),
-                "decode.max_bs": (self.cuda_graph_config.decode.max_bs, 16),
-                "prefill.backend": (
-                    self.cuda_graph_config.prefill.backend,
-                    Backend.DISABLED,
-                ),
-            }
-            mismatches.extend(
-                f"cuda_graph_config.{name}={value!r} (expected {wanted!r})"
-                for name, (value, wanted) in graph_expected.items()
-                if value != wanted
+        if self.max_lora_rank is not None and (
+            isinstance(self.max_lora_rank, bool)
+            or not isinstance(self.max_lora_rank, int)
+            or self.max_lora_rank <= 0
+        ):
+            mismatches.append(
+                f"max_lora_rank={self.max_lora_rank!r} " "(expected a positive integer)"
             )
         if (
             self.speculative_algorithm is not None
@@ -5625,7 +6017,7 @@ class ServerArgs:
             or self.enable_multi_layer_eagle
         ):
             mismatches.append("speculative or draft decoding is enabled")
-        if not envs.SGLANG_ENABLE_CP_V2.get():
+        if glm52_cp_size > 1 and not envs.SGLANG_ENABLE_CP_V2.get():
             mismatches.append("SGLANG_ENABLE_CP_V2 is not enabled")
         if envs.SGLANG_DISABLE_DSA_INDEXER_FUSION.get():
             mismatches.append("SGLANG_DISABLE_DSA_INDEXER_FUSION is enabled")
@@ -5637,6 +6029,11 @@ class ServerArgs:
             envs.SGLANG_OPT_MOE_QUANT_ONCE,
             envs.SGLANG_SHARED_EXPERT_TP1,
         )
+        if glm52_dp_owned:
+            exact_disabled_envs += (
+                envs.SGLANG_DP_USE_GATHERV,
+                envs.SGLANG_DP_USE_REDUCE_SCATTER,
+            )
         mismatches.extend(
             f"{setting.name} is enabled"
             for setting in exact_disabled_envs
@@ -5644,7 +6041,7 @@ class ServerArgs:
         )
         if mismatches:
             raise ValueError(
-                "The exact GLM-5.2 XORL contract drifted after runtime "
+                "The exact GLM-5.2 mechanisms drifted after runtime "
                 f"resolution: {', '.join(mismatches)}"
             )
 
@@ -5652,30 +6049,28 @@ class ServerArgs:
         if not self.qwen35_gdn_exact_mode:
             return
         config = _text_model_config(hf_config)
-        expected = {
-            "hidden_size": 2048 if self.qwen35_gdn_exact_is_moe else 1024,
-            "num_hidden_layers": 40 if self.qwen35_gdn_exact_is_moe else 24,
-            "num_attention_heads": 16 if self.qwen35_gdn_exact_is_moe else 8,
-            "num_key_value_heads": 2,
-            "vocab_size": 248320,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 32 if self.qwen35_gdn_exact_is_moe else 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "full_attention_interval": 4,
-        }
         if self.qwen35_gdn_exact_is_moe:
-            expected.update(num_experts=256, num_experts_per_tok=8)
-        _validate_exact_model_geometry(
-            config,
-            contract_name=(
-                "Qwen3.6-35B-A3B"
-                if self.qwen35_gdn_exact_is_moe
-                else "Qwen3.5-0.8B"
-            ),
-            expected=expected,
-        )
+            _validate_exact_model_geometry(
+                config,
+                contract_name="Qwen3.6-35B-A3B",
+                expected={
+                    "hidden_size": 2048,
+                    "num_hidden_layers": 40,
+                    "num_attention_heads": 16,
+                    "num_key_value_heads": 2,
+                    "vocab_size": 248320,
+                    "linear_num_key_heads": 16,
+                    "linear_num_value_heads": 32,
+                    "linear_key_head_dim": 128,
+                    "linear_value_head_dim": 128,
+                    "linear_conv_kernel_dim": 4,
+                    "full_attention_interval": 4,
+                    "num_experts": 256,
+                    "num_experts_per_tok": 8,
+                },
+            )
+        else:
+            _validate_exact_qwen35_dense_capabilities(config)
         if (
             self.speculative_algorithm is not None
             or self.speculative_draft_model_path is not None
@@ -5719,6 +6114,8 @@ class ServerArgs:
         if not self.qwen35_gdn_exact_mode:
             return
 
+        self._declare_exact_physical_pp_capability(hf_config, text_config)
+
         if self.dtype not in ("auto", "bf16", "bfloat16"):
             raise ValueError(
                 "The exact Qwen3.5-family XORL contract requires BF16 dtype"
@@ -5756,142 +6153,131 @@ class ServerArgs:
         self.sampling_defaults = "openai"
         self.disable_custom_all_reduce = True
         self.disable_piecewise_cuda_graph = True
-        if self.qwen35_gdn_exact_is_moe:
-            if self.tp_size != 8:
+        if not self.disable_radix_cache:
+            # The exact GDN decoder owns additional per-slot state that the
+            # generic Mamba checkpoint pool does not store: the fp32 state at
+            # the current 64-token chunk boundary and the live partial-chunk
+            # qkv/gating rows.  The extra-buffer cache is nevertheless safe:
+            # it exposes only aligned recurrent-state checkpoints and
+            # re-prefills the suffix, which lets _bi_gdn_decode_seed rebuild
+            # those private buffers.  no_buffer can expose an arbitrary token
+            # boundary and therefore cannot restore the exact decoder state.
+            if self.mamba_radix_cache_strategy == "auto":
+                self.mamba_radix_cache_strategy = "extra_buffer"
+            elif self.mamba_radix_cache_strategy not in (
+                "extra_buffer",
+                "extra_buffer_lazy",
+            ):
                 raise ValueError(
-                    "The exact Qwen3.5-family MoE XORL contract is certified "
-                    f"at TP8/DP8/EP8/PP1; got tp_size={self.tp_size}"
+                    "Exact Qwen3.5-family radix reuse requires an aligned "
+                    "Mamba checkpoint strategy; use --mamba-radix-cache-strategy "
+                    "extra_buffer (or extra_buffer_lazy), or disable radix cache"
                 )
-            if self.pp_size != 1:
+            if self.mamba_track_interval % 64 != 0:
                 raise ValueError(
-                    "The exact Qwen3.5-family MoE XORL contract is certified "
-                    f"at PP1; got pp_size={self.pp_size}"
+                    "Exact Qwen3.5-family radix checkpoints must align with the "
+                    "64-token GDN chunk boundary; got "
+                    f"--mamba-track-interval={self.mamba_track_interval}"
+                )
+            if self.enable_int8_mamba_checkpoint:
+                raise ValueError(
+                    "Exact Qwen3.5-family radix reuse requires lossless recurrent "
+                    "state checkpoints; --enable-int8-mamba-checkpoint is not "
+                    "supported"
+                )
+        if self.qwen35_gdn_exact_is_moe:
+            if self.ep_size == 1:
+                self.ep_size = self.tp_size
+            if self.ep_size != self.tp_size:
+                raise ValueError(
+                    "Exact Qwen3.5-family MoE requires EP to equal stage-local "
+                    "TP so serving and trainer fold identical expert/shared leaves"
                 )
             if self.dp_size == 1:
-                self.dp_size = 8
-            elif self.dp_size != 8:
+                self.dp_size = self.tp_size
+            if self.dp_size != self.tp_size:
                 raise ValueError(
-                    "The exact Qwen3.5-family MoE XORL contract is certified "
-                    f"at DP8; got dp_size={self.dp_size}"
-                )
-            if self.ep_size == 1:
-                self.ep_size = 8
-            elif self.ep_size != 8:
-                raise ValueError(
-                    "The exact Qwen3.5-family MoE XORL contract requires EP8; "
-                    f"got ep_size={self.ep_size}"
+                    "Exact Qwen3.5-family MoE requires DP to equal stage-local "
+                    "TP so the dense GDN/head program remains TP1 on each owner"
                 )
             if self.moe_a2a_backend != "none":
                 raise ValueError(
                     "The exact Qwen3.5-family MoE XORL contract requires "
                     "--moe-a2a-backend none"
                 )
-            self.enable_dp_attention = True
-            self.enable_dp_lm_head = True
+            # These are ownership selections, not topology certification.  A
+            # DP-owned launch needs request-local attention and a DP-owned head;
+            # DP1 retains the ordinary replicated path.
+            if self.dp_size > 1:
+                self.enable_dp_attention = True
+                self.enable_dp_lm_head = True
             self.enable_fp32_router = True
-            if self.disable_cuda_graph:
-                raise ValueError(
-                    "The exact Qwen3.6 MoE XORL contract requires its CUDA graph bucket [32]"
-                )
-            # The exact decode cache currently stores the fp32 state at each
-            # 64-token GDN boundary plus the live partial-chunk rows.  SGLang's
-            # generic radix cache can restore an arbitrary token prefix (for
-            # example, the 81-token shared Wordle prompt) without restoring
-            # those partial rows.  That is not enough state to seed an exact
-            # rescan.  Keep prefix reuse out of the admitted program until the
-            # radix tree persists the matching GDN checkpoint metadata.
-            self.disable_radix_cache = True
-            exact_decode_graph_bs = list(range(1, 33))
-            if self.cuda_graph_bs_decode is not None and self.cuda_graph_bs_decode not in (
-                [32],
-                exact_decode_graph_bs,
-            ):
-                raise ValueError(
-                    "The exact Qwen3.6 MoE XORL contract requires decode CUDA "
-                    "graph buckets through 32; got "
-                    f"{self.cuda_graph_bs_decode}"
-                )
-            # Padding is disabled below to preserve the literal-zero serving
-            # program.  Capture every exact local batch shape through the
-            # approved graph-32 maximum so draining and multi-turn Wordle
-            # batches do not fall back to eager merely because their active
-            # request count is below 32.
-            self.cuda_graph_bs_decode = exact_decode_graph_bs
-            self.cuda_graph_max_bs_decode = 32
-            self.disable_prefill_cuda_graph = True
-            # Model-specific contracts resolve after _handle_cuda_graph_config,
-            # so setting only the legacy flag here is too late to change the
-            # already-materialized per-phase backend.
-            if isinstance(self.cuda_graph_config, CudaGraphConfig):
-                self.cuda_graph_config.decode.bs = exact_decode_graph_bs
-                self.cuda_graph_config.decode.max_bs = 32
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
-                self._cuda_graph_config_locked.add((Phase.DECODE, "bs"))
-                self._cuda_graph_config_locked.add((Phase.DECODE, "max_bs"))
-                self._cuda_graph_config_locked.add((Phase.PREFILL, "backend"))
-            # The production Wordle literal-zero receipt used the conservative
-            # no-overlap/no-padding scheduler contract.  A live GRPO gate on
-            # the newer overlap + padded-graph program measured nonzero K3
-            # even after the Wave-3 GDN mechanisms were disabled.  Preserve
-            # graph-32 for full local batches, but run ragged/draining batches
-            # eagerly rather than padding them into a graph shape that has not
-            # passed the trainer-versus-sampler denominator.
-            self.disable_overlap_schedule = True
-            self.disable_cuda_graph_padding = True
-            self.max_queued_requests = 512
-            # Chunked prefill can hand the exact GDN backend a continuation at
-            # an arbitrary prompt offset (81 for the production Wordle
-            # prompt).  The exact cache only has a complete seed at the start
-            # of a request or at a persisted 64-token boundary.  Until chunk
-            # handoff carries the matching partial-row state, prefill each
-            # prompt in one forward from prefix zero.
-            self.chunked_prefill_size = -1
-            self.max_prefill_tokens = 32768
-            mem_fraction_explicit = getattr(
-                self,
-                "_mem_fraction_static_user_supplied",
-                self.mem_fraction_static is not None,
+            # Graph buckets, padding, cache capacity, chunking, and radix reuse
+            # are runtime options.  Exact GDN validates the concrete state
+            # checkpoint mechanics it consumes instead of pinning one campaign
+            # launch envelope here.
+        elif (self.tp_size, self.dp_size, self.ep_size) != (1, 1, 1):
+            raise ValueError(
+                "Exact dense Qwen3.5 requires stage-local TP1/DP1/EP1; physical "
+                "pipeline parallelism may still split layers across stages"
             )
-            if mem_fraction_explicit and self.mem_fraction_static != 0.40:
-                raise ValueError(
-                    "The exact Qwen3.6 MoE XORL contract requires "
-                    "--mem-fraction-static 0.40; got "
-                    f"{self.mem_fraction_static}"
-                )
-            self.mem_fraction_static = 0.40
-            if self.max_running_requests is None:
-                self.max_running_requests = 256
-            elif self.max_running_requests != 256:
-                raise ValueError(
-                    "The exact Qwen3.6 MoE XORL contract requires "
-                    "--max-running-requests 256; got "
-                    f"{self.max_running_requests}"
-                )
-            if self.max_mamba_cache_size is None:
-                # This is a global DP8 value. The pool shards it to 160 state
-                # slots per rank; Qwen3.6's extra-buffer strategy consumes five
-                # slots per request, leaving exactly 32 effective requests.
-                self.max_mamba_cache_size = 1280
-            elif self.max_mamba_cache_size != 1280:
-                raise ValueError(
-                    "The exact Qwen3.6 MoE XORL contract requires "
-                    "--max-mamba-cache-size 1280; got "
-                    f"{self.max_mamba_cache_size}"
-                )
-        else:
-            dense_topology = (self.tp_size, self.dp_size, self.ep_size, self.pp_size)
-            if dense_topology != (1, 1, 1, 1):
-                raise ValueError(
-                    "The exact dense Qwen3.5-family XORL contract is certified "
-                    "at TP1/DP1/EP1/PP1; got "
-                    f"TP{self.tp_size}/DP{self.dp_size}/EP{self.ep_size}/PP{self.pp_size}"
-                )
-            if self.cuda_graph_bs_decode is not None:
-                raise ValueError(
-                    "The exact dense Qwen3.5 XORL contract is certified in eager mode"
-                )
-            self.disable_cuda_graph = True
-            self.disable_radix_cache = True
+
+    def _resolve_qwen3_dense_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+    ) -> None:
+        self.qwen3_dense_exact_mode = (
+            self.rl_on_policy_target == XORL_RL_TARGET
+            and model_arch == "Qwen3ForCausalLM"
+        )
+        hf_config._qwen3_dense_exact_mode = self.qwen3_dense_exact_mode
+        if not self.qwen3_dense_exact_mode:
+            return
+
+        self._declare_exact_physical_pp_capability(
+            hf_config, _text_model_config(hf_config)
+        )
+
+        _validate_exact_qwen3_dense_capabilities(hf_config)
+        if self.dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError("The exact dense Qwen3 XORL contract requires BF16 dtype")
+        if self.quantization is not None:
+            raise ValueError(
+                "The exact dense Qwen3 XORL contract requires unquantized weights"
+            )
+        if self.attention_backend not in (None, "fa4"):
+            raise ValueError(
+                "The exact dense Qwen3 XORL contract requires the FA4 backend"
+            )
+        if (self.tp_size, self.dp_size, self.ep_size) != (1, 1, 1):
+            raise ValueError(
+                "Exact dense Qwen3 requires stage-local TP1/DP1/EP1; physical "
+                "pipeline parallelism may still split layers across stages"
+            )
+        if (
+            self.speculative_algorithm is not None
+            or self.speculative_draft_model_path is not None
+            or self.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "The exact dense Qwen3 XORL contract does not support speculative "
+                "or draft decoding"
+            )
+
+        self.dtype = "bfloat16"
+        self.attention_backend = "fa4"
+        self.enable_fp32_lm_head = False
+        self.enable_fp32_router = False
+        self.enable_deterministic_inference = True
+        self.sampling_backend = "pytorch"
+        self.sampling_defaults = "openai"
+        self.disable_custom_all_reduce = True
+        logger.info(
+            "Dense Qwen3 exact numerics: Class-B RoPE, RMSNorm families-v2, "
+            "shape-aware exact SwiGLU, and the families-v2 BF16 lm-head"
+        )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
@@ -5909,12 +6295,17 @@ class ServerArgs:
 
         hf_config = self.get_model_config().hf_config
         model_arch = hf_config.architectures[0]
+        self._resolve_dsv4_flash_exact_contract(
+            hf_config,
+            model_arch=model_arch,
+        )
         self._resolve_glm52_exact_contract(
             hf_config,
             model_arch=model_arch,
             is_dsa_model=is_deepseek_dsa(hf_config),
         )
         self._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=model_arch)
+        self._resolve_qwen3_dense_exact_contract(hf_config, model_arch=model_arch)
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
@@ -7199,6 +7590,11 @@ class ServerArgs:
 
         view = self._resolved()
         if view.attn_cp_size > 1:
+            if self.pp_size > 1 and not self.exact_physical_pp_capable:
+                raise ValueError(
+                    "This model has not declared the physical pipeline proxy "
+                    "contract required to compose context parallelism with PP"
+                )
             # The tp_size is the world size, not the real tensor parallel size
             assert (
                 self.tp_size % view.attn_cp_size == 0
@@ -7219,7 +7615,11 @@ class ServerArgs:
             assert (
                 view.ep_size * self.moe_dp_size <= self.tp_size
             ), "ep_size * moe_dp_size must be less than or equal to tp_size"
-            assert self.pp_size == 1, "PP is not supported with context parallelism"
+            if self.pp_size > 1 and not self.exact_physical_pp_capable:
+                raise ValueError(
+                    "This model has not declared the physical pipeline proxy "
+                    "contract required to compose context parallelism with PP"
+                )
 
             if view.ep_size > 1:
                 assert (
@@ -8652,6 +9052,14 @@ class ServerArgs:
         if not (0 < self._resolved().swa_full_tokens_ratio <= 1.0):
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
+    def _validate_rl_on_policy_target(self) -> None:
+        if self.rl_on_policy_target not in (None, XORL_RL_TARGET):
+            raise ValueError(
+                "--rl-on-policy-target only supports the current exact XORL "
+                f"contract ({XORL_RL_TARGET!r}); got "
+                f"{self.rl_on_policy_target!r}"
+            )
+
     def _handle_deterministic_inference(self):
         if self.rl_on_policy_target is not None:
             logger.warning(
@@ -8715,6 +9123,12 @@ class ServerArgs:
             is_glm_dsa_backend = (
                 model_arch == "GlmMoeDsaForCausalLM" and attention_backend == "dsa"
             )
+            is_exact_dsv4_backend = (
+                model_arch == "DeepseekV4ForCausalLM"
+                and attention_backend == "dsv4"
+                and self.rl_on_policy_target == XORL_RL_TARGET
+                and self.dsv4_flash_exact_mode
+            )
             if is_deepseek_model:
                 if (
                     attention_backend
@@ -8733,9 +9147,9 @@ class ServerArgs:
                     )
 
             if (
-                attention_backend
-                not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
+                attention_backend not in RADIX_SUPPORTED_DETERMINISTIC_ATTENTION_BACKEND
                 and not is_glm_dsa_backend
+                and not is_exact_dsv4_backend
             ):
                 # Currently, only certain backends support radix cache. Support for other backends is in progress
                 self.disable_radix_cache = True

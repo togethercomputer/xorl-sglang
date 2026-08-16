@@ -36,6 +36,7 @@ from sglang.srt.managers.tokenizer_manager import (
     TokenizerManager,
     _build_flat_input_top_logprobs_fields,
     _build_flat_input_top_logprobs_fields_from_arrays,
+    _build_raw_token_logprobs_b64_fields,
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -127,6 +128,61 @@ class TestFlatRawTopLogprobsValidation(CustomTestCase):
         req.normalize_batch_and_arguments()
         for i in range(2):
             self.assertTrue(req[i].return_flat_raw_top_logprobs_b64)
+
+    def test_raw_selected_token_flag_propagates_to_batch_items(self):
+        req = GenerateReqInput(
+            text=["a", "b"],
+            return_logprob=True,
+            return_raw_token_logprobs_b64=True,
+        )
+        req.normalize_batch_and_arguments()
+        for i in range(2):
+            self.assertTrue(req[i].return_raw_token_logprobs_b64)
+
+    def test_raw_selected_token_flag_requires_return_logprob(self):
+        req = GenerateReqInput(text="hello", return_raw_token_logprobs_b64=True)
+        with self.assertRaisesRegex(ValueError, "return_logprob=true"):
+            req.normalize_batch_and_arguments()
+
+
+class TestRawSelectedTokenLogprobs(CustomTestCase):
+    def test_b64_is_literal_little_endian_float32(self):
+        fields = _build_raw_token_logprobs_b64_fields([None, -0.5, -0.25], [-0.125])
+        input_values = np.frombuffer(
+            base64.b64decode(fields["input_token_logprobs_raw_b64"]),
+            dtype="<f4",
+        )
+        output_values = np.frombuffer(
+            base64.b64decode(fields["output_token_logprobs_raw_b64"]),
+            dtype="<f4",
+        )
+        self.assertTrue(np.isnan(input_values[0]))
+        np.testing.assert_array_equal(
+            input_values[1:], np.asarray([-0.5, -0.25], dtype="<f4")
+        )
+        np.testing.assert_array_equal(output_values, np.asarray([-0.125], dtype="<f4"))
+        self.assertEqual(fields["input_token_logprobs_raw_length"], 3)
+        self.assertEqual(fields["output_token_logprobs_raw_length"], 1)
+        self.assertEqual(fields["token_logprobs_raw_b64_dtype"], "float32_le")
+
+    def test_response_metadata_uses_live_raw_buffers(self):
+        state = _make_state(
+            return_logprob=True,
+            return_raw_token_logprobs_b64=True,
+        )
+        state.input_token_logprobs_val = [None, -0.5]
+        state.input_token_logprobs_idx = [None, 11]
+        state.output_token_logprobs_val = [-0.25]
+        state.output_token_logprobs_idx = [22]
+        meta = _add_logprob_meta_info(state, top_logprobs_num=0)
+        self.assertEqual(
+            base64.b64decode(meta["input_token_logprobs_raw_b64"]),
+            np.asarray([np.nan, -0.5], dtype="<f4").tobytes(),
+        )
+        self.assertEqual(
+            base64.b64decode(meta["output_token_logprobs_raw_b64"]),
+            np.asarray([-0.25], dtype="<f4").tobytes(),
+        )
 
 
 class TestFlatAssembly(CustomTestCase):

@@ -90,9 +90,9 @@ def _rms_norm_v2_kernel(
     x * inv_rms * w (left-to-right, fp32 weight-mul) -> single cast at store.
     Tree is a function of n_cols alone => batch-invariant by construction.
 
-    This fused one-launch form serves nearly every shipped shape, where launch
-    count dominates and the monolithic wide tree has the best ILP; shapes with
-    few rows over many tiles dispatch to the bit-identical split realization
+    For the residual specialization, this fused one-launch form serves nearly
+    every shipped shape. Few rows over many tiles, and the compiler-spilling
+    no-residual specialization, dispatch to the bit-identical split realization
     below (see ``_v2_norm_use_split``), which factorizes the same tree into
     per-TILE trees + a partials tree (adjacent pairing preserves contiguity at
     every level => identical bits; cross-structure gates + frozen goldens).
@@ -129,7 +129,9 @@ def _rms_norm_v2_kernel(
         if HAS_RESIDUAL:
             s = tl.load(
                 res_out_ptr + row * stride_res_out + cols, mask=mask, other=0.0
-            ).to(tl.float32)  # the rounded sum: bit-identical to what was squared
+            ).to(
+                tl.float32
+            )  # the rounded sum: bit-identical to what was squared
         else:
             s = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(
                 tl.float32
@@ -218,7 +220,12 @@ def rms_norm_v2(
     if residual is not None:
         assert residual.shape == x.shape and residual.stride(1) == 1
         assert residual.dtype == torch.bfloat16
-    if _v2_norm_use_split(rows, triton.cdiv(H, V2_NORM_TILE)):
+    if _v2_norm_use_split(
+        rows,
+        triton.cdiv(H, V2_NORM_TILE),
+        has_residual=residual is not None,
+        is_hopper=torch.cuda.get_device_capability(x.device) == (9, 0),
+    ):
         return _rms_norm_v2_split(x, weight, eps, residual, zero_centered)
     return _rms_norm_v2_fused(x, weight, eps, residual, zero_centered)
 
@@ -606,9 +613,9 @@ def _head_v2_merge(m_buf, l_buf, sel):
 
 def _head_v2_check_inputs(hidden, weight, token_ids, temperature):
     assert hidden.ndim == 2 and weight.ndim == 2 and hidden.shape[1] == weight.shape[1]
-    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-        "the head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
-    )
+    assert (
+        hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    ), "the head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
     assert hidden.is_cuda
     hidden = hidden.contiguous()
     M = hidden.shape[0]
@@ -675,6 +682,96 @@ def head_v2_full_logits_with_lse(
     _head_v2_launch(hidden, weight.t(), logits, m_buf, l_buf, None, None, temperature)
     lse, _ = _head_v2_merge(m_buf, l_buf, None)
     return logits, lse
+
+
+@triton.jit
+def _exact_temperature_scale_fp32_kernel(
+    logits_ptr,
+    temperature_ptr,
+    output_ptr,
+    n_cols,
+    logits_row_stride,
+    output_row_stride,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = cols < n_cols
+    values = tl.load(
+        logits_ptr + row * logits_row_stride + cols,
+        mask=mask,
+        other=0.0,
+    )
+    inv_t = 1.0 / tl.load(temperature_ptr + row)
+    values = values * inv_t
+    tl.store(output_ptr + row * output_row_stride + cols, values, mask=mask)
+
+
+def exact_temperature_scale_fp32_logits(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the exact per-row temperature transform for sampling.
+
+    The Triton expression is the same FP32 ``x * (1 / T)`` used by the v1 and
+    v2 selected/LSE kernels. Sampling and selected-token scoring can therefore
+    consume one transformed tensor instead of sampling from a separately
+    rounded approximation and repairing the returned scalar afterward.
+    """
+
+    assert logits.ndim == 2 and logits.dtype == torch.float32
+    assert logits.stride(1) == 1, "logits rows must be unit-stride"
+    assert temperature.dtype == torch.float32
+    assert temperature.device == logits.device
+    assert temperature.is_contiguous()
+    temperature = temperature.reshape(-1)
+    assert temperature.shape == (logits.shape[0],)
+    torch._assert_async(
+        (torch.isfinite(temperature) & (temperature > 0)).all(),
+        "temperature must contain finite values > 0",
+    )
+
+    output = torch.empty_like(logits)
+    if logits.numel() == 0:
+        return output
+    if logits.is_cuda:
+        block_n = 1024
+        _exact_temperature_scale_fp32_kernel[
+            (logits.shape[0], triton.cdiv(logits.shape[1], block_n))
+        ](
+            logits,
+            temperature,
+            output,
+            logits.shape[1],
+            logits.stride(0),
+            output.stride(0),
+            BLOCK_N=block_n,
+        )
+    else:
+        output.copy_(logits * (1.0 / temperature).unsqueeze(1))
+    return output
+
+
+def exact_temperature_scale_bf16_logits(
+    logits: torch.Tensor,
+    temperature: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply the DSV4-family BF16 divide/store temperature boundary."""
+
+    assert logits.ndim == 2 and logits.dtype == torch.bfloat16
+    assert logits.stride(1) == 1, "logits rows must be unit-stride"
+    if temperature is None:
+        return logits
+    assert temperature.dtype == torch.float32
+    assert temperature.device == logits.device
+    assert temperature.is_contiguous()
+    temperature = temperature.reshape(-1)
+    assert temperature.shape == (logits.shape[0],)
+    torch._assert_async(
+        (torch.isfinite(temperature) & (temperature > 0)).all(),
+        "temperature must contain finite values > 0",
+    )
+    return logits.bfloat16().div(temperature.unsqueeze(1)).bfloat16()
 
 
 @triton.jit
@@ -786,16 +883,27 @@ def head_v2_selected_logprob_from_logits(
 #
 # It pays three launches and an HBM round-trip for the partials, and buys
 # rows*n_tiles-way parallelism where the fused grid=(rows,) has only rows-way.
-# That trade only pays at few rows over many tiles; the fused form wins
-# everywhere else, prefill included (see _v2_norm_use_split for the measured
-# boundary).
+# For the residual specialization, that trade pays at few rows over many tiles.
+# The no-residual fused specialization currently spills on Hopper, so it always
+# uses the split form (see _v2_norm_use_split for the measured boundary).
 
 V2_NORM_SPLIT_MIN_TILES = 10  # fewest tiles at which the split realization ever wins
 
 
-def _v2_norm_use_split(rows: int, n_tiles: int) -> bool:
-    """Structure switch (perf-only, NOT bit-relevant): split wins at few rows over
-    many tiles, where the fused ``grid=(rows,)`` cannot fill the GPU.
+def _v2_norm_use_split(
+    rows: int,
+    n_tiles: int,
+    *,
+    has_residual: bool = True,
+    is_hopper: bool = False,
+) -> bool:
+    """Structure switch (perf-only, NOT bit-relevant).
+
+    The no-residual fused specialization spills on Hopper, while the split
+    realization is bit-identical and avoids that register-pressure cliff.
+    Other architectures and the residual specialization retain the measured
+    few-rows/many-tiles switch, where the fused ``grid=(rows,)`` cannot fill
+    the GPU.
 
     ``n_tiles`` must be the split kernel's 512-wide tile count, not the fused
     kernel's 4096-wide chunk count. Boundary measured on H100/132 SMs,
@@ -804,6 +912,8 @@ def _v2_norm_use_split(rows: int, n_tiles: int) -> bool:
     realizations compute the same tree, so a wrong choice here costs speed
     only; re-fit with families_v2/bench_norm_structure_switch.py.
     """
+    if is_hopper and not has_residual:
+        return True
     return n_tiles >= V2_NORM_SPLIT_MIN_TILES and rows <= n_tiles
 
 

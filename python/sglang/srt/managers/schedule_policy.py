@@ -1124,7 +1124,7 @@ class PrefillAdder:
                 self._swa_new_tokens(req),
                 swa_host_hit_length=req.swa_host_hit_length,
             )
-            if swa_needed >= self.rem_swa_tokens:
+            if swa_needed > self.rem_swa_tokens:
                 swa_cap = self._swa_chunk_cap(
                     self._swa_new_tokens(req), req.swa_host_hit_length
                 )
@@ -1154,7 +1154,7 @@ class PrefillAdder:
                     self._swa_new_tokens(req),
                     swa_host_hit_length=req.swa_host_hit_length,
                 )
-                if swa_needed >= self.rem_swa_tokens:
+                if swa_needed > self.rem_swa_tokens:
                     swa_cap = self._swa_chunk_cap(
                         self._swa_new_tokens(req), req.swa_host_hit_length
                     )

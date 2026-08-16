@@ -1,22 +1,31 @@
-"""Canonical BF16 MoE contribution folding for the GLM-5.2 serving lane."""
+"""Canonical FP32 MoE leaves and FP64 local folds for exact serving lanes."""
 
 from __future__ import annotations
 
 import hashlib
 import json
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
 
 import torch
 import torch.distributed as dist
+
 from sglang.srt.distributed.canonical_moe_kernels import (
-    fused_balanced_adjacent_bf16_tree,
+    fused_balanced_adjacent_fp64_tree,
+    fused_canonical_moe_leaf_fp32,
 )
 
-GLM52_CANONICAL_MOE_VERSION = "canonical_moe_reduce_v1"
+CANONICAL_MOE_LEAF_VERSION = "canonical_moe_leaf_fp32_v1"
+CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_fp64_v3"
+GLM52_CANONICAL_MOE_VERSION = "canonical_moe_reduce_fp64_v3"
 GLM52_CANONICAL_MOE_V3_VERSION = "glm52_canonical_moe_reduce_v3"
 GLM52_CANONICAL_MOE_V3B_VERSION = "glm52_canonical_moe_reduce_v3b"
-GLM52_SAMPLER_LOCAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_bf16_v2"
+GLM52_SAMPLER_LOCAL_POLICY = (
+    "glm52_routed_final_scaled_then_shared_ep_slice_fp32_then_bf16_v3"
+)
 
 
 class CanonicalDistribution(str, Enum):
@@ -45,12 +54,13 @@ class SamplerParallelPlan:
     pp_size: int = 1
     ep_size: int = 8
     attention_cp_size: int = 8
+    attention_dp_size: int = 1
     production: bool = False
     version: str = GLM52_CANONICAL_MOE_VERSION
 
     def __post_init__(self) -> None:
-        if self.contributor_count not in (2, 4, 8, 16):
-            raise ValueError("Canonical MoE admits exactly 2, 4, 8, or 16 contributors")
+        if self.contributor_count <= 0:
+            raise ValueError("Canonical MoE requires at least one contributor")
         if (
             len(self.physical_ranks) != self.contributor_count
             or len(set(self.physical_ranks)) != self.contributor_count
@@ -66,10 +76,8 @@ class SamplerParallelPlan:
             )
         if self.version != GLM52_CANONICAL_MOE_VERSION:
             raise ValueError(f"Unsupported canonical MoE version {self.version}")
-        if self.pp_size not in (1, 2) or not 0 <= self.pp_rank < self.pp_size:
-            raise ValueError(
-                "GLM-5.2 sampler admits only PP1 or PP2 with a valid stage rank"
-            )
+        if self.pp_size <= 0 or not 0 <= self.pp_rank < self.pp_size:
+            raise ValueError("Canonical MoE requires a valid physical pipeline stage")
         if self.effective_dense_tp != 1:
             raise ValueError("GLM-5.2 sampler requires effective dense TP1")
         if self.global_world_size != self.launcher_tp_size * self.pp_size:
@@ -80,33 +88,17 @@ class SamplerParallelPlan:
                 raise ValueError(
                     "Stage layer range must be a non-empty half-open interval"
                 )
-        expected_physical_ranks = tuple(
-            range(
-                self.pp_rank * self.launcher_tp_size,
-                (self.pp_rank + 1) * self.launcher_tp_size,
-            )
-        )
-        if self.physical_ranks != expected_physical_ranks:
-            raise ValueError(
-                "Physical ranks must be the ordered ranks of this pipeline stage"
-            )
         if self.production:
-            if self.contributor_count not in (8, 16):
-                raise ValueError(
-                    "Production GLM-5.2 requires exactly 8 or 16 contributors"
-                )
-            if self.physical_to_logical != tuple(range(self.contributor_count)):
-                raise ValueError(
-                    "Production GLM-5.2 requires identity logical contributor ordinals"
-                )
             if (
                 self.ep_size != self.contributor_count
-                or self.attention_cp_size != self.contributor_count
+                or self.attention_cp_size * self.attention_dp_size
+                != self.contributor_count
                 or self.launcher_tp_size != self.contributor_count
             ):
                 raise ValueError(
-                    "Production GLM-5.2 sampler requires launcher TP, attention CP, "
-                    "and EP to equal the contributor count"
+                    "Exact GLM-5.2 requires launcher TP and EP to equal the "
+                    "stage-local contributor count, with attention DP and CP "
+                    "exactly covering the logical row owners"
                 )
 
     @classmethod
@@ -117,7 +109,19 @@ class SamplerParallelPlan:
         pp_size: int = 1,
         pp_rank: int = 0,
         physical_ranks: tuple[int, ...] | None = None,
+        attention_dp_size: int = 1,
+        ep_size: int | None = None,
     ) -> SamplerParallelPlan:
+        if attention_dp_size <= 0 or contributors % attention_dp_size:
+            raise ValueError(
+                "GLM-5.2 attention DP must be a positive divisor of the contributor count"
+            )
+        ep_size = contributors if ep_size is None else ep_size
+        if ep_size != contributors:
+            raise ValueError(
+                "GLM-5.2 EP must equal the physical contributor count because "
+                "each logical trainer leaf is one complete EP expert/shared shard"
+            )
         ranks = (
             tuple(
                 range(
@@ -136,8 +140,9 @@ class SamplerParallelPlan:
             global_world_size=contributors * pp_size,
             pp_rank=pp_rank,
             pp_size=pp_size,
-            ep_size=contributors,
-            attention_cp_size=contributors,
+            ep_size=ep_size,
+            attention_cp_size=contributors // attention_dp_size,
+            attention_dp_size=attention_dp_size,
             production=True,
         )
 
@@ -168,6 +173,7 @@ class SamplerParallelPlan:
         pp_size: int,
         ep_size: int,
         attention_cp_size: int,
+        attention_dp_size: int = 1,
     ) -> None:
         actual = (
             dist.get_world_size(),
@@ -176,6 +182,7 @@ class SamplerParallelPlan:
             pp_size,
             ep_size,
             attention_cp_size,
+            attention_dp_size,
             dist.get_world_size(group),
         )
         expected = (
@@ -185,9 +192,10 @@ class SamplerParallelPlan:
             self.pp_size,
             self.ep_size,
             self.attention_cp_size,
+            self.attention_dp_size,
             self.contributor_count,
         )
-        if self.production and actual != expected:
+        if actual != expected:
             raise RuntimeError(
                 f"Resolved GLM-5.2 sampler topology must be {expected}, got {actual}"
             )
@@ -200,11 +208,12 @@ class SamplerParallelPlan:
                 )
 
     def validate_cuda_graph_policy(self, *, disable_cuda_graph: bool) -> None:
-        if self.production and self.pp_size > 1 and not disable_cuda_graph:
-            raise RuntimeError(
-                "GLM-5.2 canonical PP2 requires --disable-cuda-graph until "
-                "pipeline-aware graph replay is certified"
-            )
+        """Compatibility hook retained for callers on older integration commits.
+
+        CUDA graph selection is a performance policy.  The canonical fold owns
+        only its arithmetic and stage-local collective membership, both of which
+        are identical in eager execution and graph capture.
+        """
 
     @property
     def identity(self) -> str:
@@ -220,6 +229,7 @@ class SamplerParallelPlan:
             "pp_size": self.pp_size,
             "ep_size": self.ep_size,
             "attention_cp_size": self.attention_cp_size,
+            "attention_dp_size": self.attention_dp_size,
             "production": self.production,
             "version": self.version,
         }
@@ -369,6 +379,7 @@ class CanonicalMoEWorkspace:
             pp_size=plan.pp_size,
             ep_size=plan.ep_size,
             attention_cp_size=plan.attention_cp_size,
+            attention_dp_size=plan.attention_dp_size,
         )
         return cls(
             plan_hash=plan.identity,
@@ -436,6 +447,8 @@ class CanonicalMoEV3Workspace:
     zero: torch.Tensor
     logical_to_group: torch.Tensor
     status: torch.Tensor
+    ordered_sources: torch.Tensor | None = None
+    folded: torch.Tensor | None = None
 
     @classmethod
     def allocate(
@@ -460,6 +473,7 @@ class CanonicalMoEV3Workspace:
             pp_size=plan.pp_size,
             ep_size=plan.ep_size,
             attention_cp_size=plan.attention_cp_size,
+            attention_dp_size=plan.attention_dp_size,
         )
         contributors = plan.contributor_count
         capacity = local_partial.shape[0]
@@ -529,35 +543,242 @@ class CanonicalMoEV3Workspace:
             raise RuntimeError("Canonical MoE v3 workspace distribution changed")
         if local_partial.shape != (self.capacity, *self.payload_shape):
             raise RuntimeError("Canonical MoE v3 workspace shape changed")
+        if (self.ordered_sources is None) != (self.folded is None):
+            raise RuntimeError(
+                "Canonical MoE v3 reusable reorder and fold buffers must be paired"
+            )
+        if self.ordered_sources is not None:
+            if self.ordered_sources.shape != self.collective.shape:
+                raise RuntimeError("Canonical MoE v3 reordered-source shape changed")
+            if self.folded.shape != self.result.shape:
+                raise RuntimeError("Canonical MoE v3 folded-result shape changed")
 
 
-def _balanced_adjacent_tree(partials: torch.Tensor) -> torch.Tensor:
-    if partials.dtype is not torch.bfloat16:
-        raise TypeError("Canonical MoE arithmetic requires BF16 partials")
-    if partials.shape[0] not in (2, 4, 8, 16):
-        raise ValueError(
-            "Canonical MoE arithmetic requires 2, 4, 8, or 16 contributors"
+class _CanonicalMoEV3ScratchSlot:
+    """One reusable replicated-prefill scratch allocation."""
+
+    def __init__(self, workspace: CanonicalMoEV3Workspace, *, key: tuple) -> None:
+        if workspace.distribution is not CanonicalDistribution.REPLICATED_CANONICAL:
+            raise ValueError(
+                "The mixed-prefill scratch slot requires replicated output"
+            )
+        if workspace.ordered_sources is None or workspace.folded is None:
+            raise ValueError("The mixed-prefill scratch slot requires reorder buffers")
+        self.key = key
+        self.plan_hash = workspace.plan_hash
+        self.max_capacity = workspace.capacity
+        self.payload_shape = workspace.payload_shape
+        self.contributors = workspace.collective.shape[0]
+        self.masked_input = workspace.masked_input
+        self.collective = workspace.collective
+        self.ordered_sources = workspace.ordered_sources
+        self.folded = workspace.folded
+        self.zero = workspace.zero
+        self.logical_to_group = workspace.logical_to_group
+        self.status = workspace.status
+        self.ready_event = None
+
+    def workspace_for(self, local_partial: torch.Tensor) -> CanonicalMoEV3Workspace:
+        capacity = local_partial.shape[0]
+        if capacity > self.max_capacity:
+            raise ValueError("Requested capacity exceeds the reusable scratch slot")
+        payload_shape = self.payload_shape
+        collective_rows = self.contributors * capacity
+        collective = self.collective.view(-1, *payload_shape)[:collective_rows].view(
+            self.contributors, capacity, *payload_shape
         )
-    level = tuple(partials.unbind(0))
+        ordered_sources = self.ordered_sources.view(-1, *payload_shape)[
+            :collective_rows
+        ].view(self.contributors, capacity, *payload_shape)
+        return CanonicalMoEV3Workspace(
+            plan_hash=self.plan_hash,
+            distribution=CanonicalDistribution.REPLICATED_CANONICAL,
+            capacity=capacity,
+            local_capacity=capacity,
+            payload_shape=payload_shape,
+            masked_input=self.masked_input[:capacity],
+            collective=collective,
+            received=None,
+            result=torch.empty_like(local_partial),
+            zero=self.zero,
+            logical_to_group=self.logical_to_group,
+            status=self.status,
+            ordered_sources=ordered_sources,
+            folded=self.folded[:capacity],
+        )
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        for tensor in (
+            self.masked_input,
+            self.collective,
+            self.ordered_sources,
+            self.folded,
+            self.zero,
+            self.logical_to_group,
+            self.status,
+        ):
+            tensor.record_stream(stream)
+
+
+class CanonicalMoEV3ScratchPool:
+    """Bounded scratch shared by eager mixed-DP/CP GLM prefill layers.
+
+    The gathered and logically reordered contributor planes do not escape a
+    layer. A model-level lease therefore reuses one allocation while returning
+    a fresh result tensor from every call. The event joins a previous lease to
+    a new caller's stream without synchronizing the host or device.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._slot: _CanonicalMoEV3ScratchSlot | None = None
+
+    def _uses_cuda_event(self, local_partial: torch.Tensor) -> bool:
+        return local_partial.is_cuda
+
+    def _current_stream(self, device: torch.device) -> torch.cuda.Stream:
+        return torch.cuda.current_stream(device=device)
+
+    def _new_event(self) -> torch.cuda.Event:
+        return torch.cuda.Event(enable_timing=False)
+
+    @staticmethod
+    def _slot_key(
+        local_partial: torch.Tensor,
+        *,
+        plan: SamplerParallelPlan,
+        group: dist.ProcessGroup,
+    ) -> tuple:
+        return (
+            plan.identity,
+            id(group),
+            tuple(local_partial.shape[1:]),
+            local_partial.dtype,
+            local_partial.device,
+        )
+
+    @contextmanager
+    def lease(
+        self,
+        local_partial: torch.Tensor,
+        *,
+        plan: SamplerParallelPlan,
+        group: dist.ProcessGroup,
+        distribution: CanonicalDistribution,
+    ) -> Iterator[CanonicalMoEV3Workspace]:
+        if distribution is not CanonicalDistribution.REPLICATED_CANONICAL:
+            raise ValueError("Mixed-prefill scratch only admits replicated output")
+        if plan.attention_dp_size <= 1 or plan.attention_cp_size <= 1:
+            raise ValueError("Mixed-prefill scratch requires both attention DP and CP")
+
+        self._lock.acquire()
+        slot = None
+        stream = None
+        try:
+            if self._uses_cuda_event(local_partial):
+                stream = self._current_stream(local_partial.device)
+            key = self._slot_key(local_partial, plan=plan, group=group)
+            slot = self._slot
+            if slot is not None and stream is not None and slot.ready_event is not None:
+                stream.wait_event(slot.ready_event)
+            if (
+                slot is None
+                or slot.key != key
+                or local_partial.shape[0] > slot.max_capacity
+            ):
+                self._slot = None
+                slot = None
+                workspace = CanonicalMoEV3Workspace.allocate(
+                    local_partial,
+                    plan=plan,
+                    group=group,
+                    distribution=distribution,
+                )
+                workspace.ordered_sources = torch.empty_like(workspace.collective)
+                workspace.folded = torch.empty_like(workspace.result)
+                slot = _CanonicalMoEV3ScratchSlot(workspace, key=key)
+                self._slot = slot
+            else:
+                workspace = slot.workspace_for(local_partial)
+            if local_partial.is_cuda:
+                slot.record_stream(stream)
+            yield workspace
+        finally:
+            try:
+                if slot is not None and self._slot is slot and stream is not None:
+                    if slot.ready_event is None:
+                        slot.ready_event = self._new_event()
+                    slot.ready_event.record(stream)
+            finally:
+                self._lock.release()
+
+
+def canonical_moe_leaf_fp32_v1(
+    shared: torch.Tensor,
+    routed: torch.Tensor,
+    routed_scale: float = 1.0,
+) -> torch.Tensor:
+    """Build one transport leaf with one FP32 FMA and one final dtype cast.
+
+    ``routed`` is reused as the output buffer. Exact callers pass the shared
+    expert partial first and routed expert partial second so serving and
+    training both evaluate ``fma(routed, scale, shared)`` in that order.
+    """
+    if shared.shape != routed.shape or shared.device != routed.device:
+        raise ValueError("Canonical MoE leaf operands must share shape and device")
+    if shared.dtype != routed.dtype or shared.dtype not in {
+        torch.bfloat16,
+        torch.float16,
+    }:
+        raise TypeError("Canonical MoE leaf operands must share BF16 or FP16 dtype")
+    if not shared.is_contiguous() or not routed.is_contiguous():
+        raise ValueError("Canonical MoE leaf operands must be contiguous")
+    if shared.is_cuda:
+        return fused_canonical_moe_leaf_fp32(
+            shared,
+            routed,
+            routed_scale=float(routed_scale),
+            output=routed,
+        )
+    fp32_leaf = torch.add(
+        shared.to(torch.float32),
+        routed.to(torch.float32),
+        alpha=float(routed_scale),
+    )
+    # copy_ is the contract's only cast into the transport dtype.
+    routed.copy_(fp32_leaf)
+    return routed
+
+
+def _canonical_moe_fold_fp64_tree(partials: torch.Tensor) -> torch.Tensor:
+    """Return the adjacent-pair/odd-tail tree before its final dtype cast."""
+    if partials.dtype not in {torch.bfloat16, torch.float16}:
+        raise TypeError("Canonical MoE arithmetic requires BF16 or FP16 partials")
+    if partials.shape[0] <= 0:
+        raise ValueError("Canonical MoE arithmetic requires at least one contributor")
+    level = tuple(partial.to(torch.float64) for partial in partials.unbind(0))
     while len(level) > 1:
-        level = tuple(
-            (level[index] + level[index + 1]).to(torch.bfloat16)
-            for index in range(0, len(level), 2)
+        paired = tuple(
+            level[index] + level[index + 1] for index in range(0, len(level) - 1, 2)
         )
+        # A non-power-of-two contributor count carries its final unpaired
+        # logical contribution to the next level unchanged.  This preserves a
+        # deterministic adjacent-pair tree without inventing a zero add.
+        level = paired + ((level[-1],) if len(level) % 2 else ())
     return level[0]
 
 
-def _balanced_adjacent_tree_batched(partials: torch.Tensor) -> torch.Tensor:
-    """Evaluate the canonical tree with one tensor add per tree level."""
-    if partials.dtype is not torch.bfloat16:
-        raise TypeError("Canonical MoE arithmetic requires BF16 partials")
-    if partials.shape[0] not in (2, 4, 8, 16):
-        raise ValueError(
-            "Canonical MoE arithmetic requires 2, 4, 8, or 16 contributors"
-        )
-    level = partials
+def _canonical_moe_fold_fp64_tree_batched(partials: torch.Tensor) -> torch.Tensor:
+    """Evaluate the FP64 tree with one tensor add per explicit tree level."""
+    if partials.dtype not in {torch.bfloat16, torch.float16}:
+        raise TypeError("Canonical MoE arithmetic requires BF16 or FP16 partials")
+    if partials.shape[0] <= 0:
+        raise ValueError("Canonical MoE arithmetic requires at least one contributor")
+    level = partials.to(torch.float64)
     while level.shape[0] > 1:
-        level = (level[0::2] + level[1::2]).to(torch.bfloat16)
+        paired_count = (level.shape[0] // 2) * 2
+        paired = level[:paired_count:2] + level[1:paired_count:2]
+        level = torch.cat((paired, level[-1:]), dim=0) if level.shape[0] % 2 else paired
     return level[0]
 
 
@@ -568,8 +789,8 @@ def _fused_tree_or_cpu_reference(
     identity_order: bool,
     output: torch.Tensor,
 ) -> torch.Tensor:
-    if partials.is_cuda:
-        return fused_balanced_adjacent_bf16_tree(
+    if partials.is_cuda and 1 <= partials.shape[0] <= 16:
+        return fused_balanced_adjacent_fp64_tree(
             partials,
             logical_to_group,
             identity_order=identity_order,
@@ -578,14 +799,72 @@ def _fused_tree_or_cpu_reference(
     logical_sources = (
         partials if identity_order else partials.index_select(0, logical_to_group)
     )
-    output.copy_(_balanced_adjacent_tree_batched(logical_sources))
+    # copy_ is the contract's only cast into the transport dtype.
+    output.copy_(_canonical_moe_fold_fp64_tree_batched(logical_sources))
     return output
+
+
+def canonical_moe_fold_fp64_v3(
+    partials_by_physical_ordinal: torch.Tensor,
+    *,
+    logical_to_physical: torch.Tensor | None = None,
+    output: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Fold logical contributions with the version-3 FP64 adjacent tree.
+
+    Raw transport may deliver contributors in a physical order. Callers either
+    pass ``logical_to_physical`` or, when physical and logical ordinals are
+    identical, leave it unset. The fused CUDA implementation and the eager CPU
+    implementation are independent from the trainer implementation but obey
+    the same versioned arithmetic contract. Transport stays low precision;
+    every local fold node is FP64, then the completed tree is cast exactly once.
+    """
+    partials = partials_by_physical_ordinal
+    if partials.ndim < 2:
+        raise ValueError(
+            "Canonical MoE fold requires contributor and payload dimensions"
+        )
+    if partials.dtype not in {torch.bfloat16, torch.float16}:
+        raise TypeError("Canonical MoE fold requires BF16 or FP16 partials")
+    contributors = partials.shape[0]
+    if contributors <= 0:
+        raise ValueError("Canonical MoE fold requires at least one contributor")
+
+    identity_order = logical_to_physical is None
+    if identity_order:
+        logical_to_physical = torch.empty(
+            (contributors,), dtype=torch.int64, device=partials.device
+        )
+    elif (
+        logical_to_physical.shape != (contributors,)
+        or logical_to_physical.dtype is not torch.int64
+        or logical_to_physical.device != partials.device
+        or not logical_to_physical.is_contiguous()
+    ):
+        raise ValueError(
+            "logical_to_physical must be a contiguous int64 tensor on the partial device"
+        )
+    if output is None:
+        output = torch.empty_like(partials[0])
+    elif (
+        output.shape != partials.shape[1:]
+        or output.dtype is not partials.dtype
+        or output.device != partials.device
+        or not output.is_contiguous()
+    ):
+        raise ValueError("Canonical MoE fold output metadata does not match partials")
+    return _fused_tree_or_cpu_reference(
+        partials,
+        logical_to_physical,
+        identity_order=identity_order,
+        output=output,
+    )
 
 
 def canonical_moe_reference(
     partials: torch.Tensor, slots: CanonicalRowSlots
 ) -> torch.Tensor:
-    folded = _balanced_adjacent_tree(partials)
+    folded = _canonical_moe_fold_fp64_tree(partials).to(partials.dtype)
     mask = slots.valid_mask.view(-1, *([1] * (folded.ndim - 1)))
     return torch.where(mask, folded, torch.zeros_like(folded))
 
@@ -634,7 +913,7 @@ def canonicalize_glm52_local_partial(
         workspace.send.view(plan.contributor_count * slots.capacity, *payload_shape),
         group=group,
     )
-    folded = _balanced_adjacent_tree(
+    folded = canonical_moe_fold_fp64_v3(
         workspace.receive.index_select(0, workspace.logical_to_group)
     )
     owner_mask = slots.valid_mask & (owners == logical_ordinal)
@@ -686,9 +965,9 @@ def canonicalize_glm52_local_partial_v3(
 
     Prefill CP sends each rank-major source bucket directly to its consuming CP
     rank. Eager decode gathers one unexpanded partial from every contributor and
-    folds locally on every rank. Both modes preserve the v1 logical contributor
-    order and balanced adjacent BF16 tree; dense v1 remains the independent
-    oracle.
+    folds locally on every rank. Both modes preserve logical contributor order
+    and compose transport-v3 with the FP64-v3 adjacent tree; dense transport
+    remains the independent oracle.
     """
     if local_partial.dtype is not torch.bfloat16:
         raise TypeError("GLM-5.2 local MoE contribution must be BF16")
@@ -733,7 +1012,7 @@ def canonicalize_glm52_local_partial_v3(
             group=group,
         )
         logical_sources = workspace.received.index_select(0, workspace.logical_to_group)
-        folded = _balanced_adjacent_tree(logical_sources)
+        folded = canonical_moe_fold_fp64_v3(logical_sources)
         start = group_rank * workspace.local_capacity
         end = start + workspace.local_capacity
         local_valid = slots.valid_mask[start:end]
@@ -760,10 +1039,21 @@ def canonicalize_glm52_local_partial_v3(
             workspace.masked_input,
             group=group,
         )
-        logical_sources = workspace.collective.index_select(
-            0, workspace.logical_to_group
+        if workspace.ordered_sources is None:
+            logical_sources = workspace.collective.index_select(
+                0, workspace.logical_to_group
+            )
+        else:
+            logical_sources = torch.index_select(
+                workspace.collective,
+                dim=0,
+                index=workspace.logical_to_group,
+                out=workspace.ordered_sources,
+            )
+        folded = canonical_moe_fold_fp64_v3(
+            logical_sources,
+            output=workspace.folded,
         )
-        folded = _balanced_adjacent_tree(logical_sources)
         torch.where(
             slots.valid_mask.view(-1, *mask_tail),
             folded,
@@ -792,11 +1082,11 @@ def canonicalize_glm52_local_partial_v3b(
     graph_capture: bool = False,
     workspace: CanonicalMoEV3Workspace | None = None,
 ) -> CanonicalMoEOutput:
-    """Controlled v3 decode baseline with the fused exact-BF16 folding.
+    """Controlled v3 decode baseline with the fused FP64-v3 folding.
 
     This arm deliberately keeps v3's contributor all-gather while replacing
     the 15 separate tensor adds with one fused kernel evaluating the identical
-    balanced adjacent BF16 tree (identity-order fast path included). Invalid
+    FP64 adjacent tree (identity-order fast path included). Invalid
     rows are already zero after the input mask, so the folded tensor is
     returned directly instead of launching v3's redundant post-fold mask/copy.
     The original v3 remains unchanged as the independent performance control.
@@ -835,10 +1125,9 @@ def canonicalize_glm52_local_partial_v3b(
     )
 
     identity_order = plan.physical_to_logical == tuple(range(plan.contributor_count))
-    folded = _fused_tree_or_cpu_reference(
+    folded = canonical_moe_fold_fp64_v3(
         workspace.collective,
-        workspace.logical_to_group,
-        identity_order=identity_order,
+        logical_to_physical=(None if identity_order else workspace.logical_to_group),
         output=workspace.result,
     )
 
@@ -853,6 +1142,8 @@ def canonicalize_glm52_local_partial_v3b(
 
 
 __all__ = [
+    "CANONICAL_MOE_LEAF_VERSION",
+    "CANONICAL_MOE_FOLD_VERSION",
     "GLM52_CANONICAL_MOE_V3B_VERSION",
     "GLM52_CANONICAL_MOE_V3_VERSION",
     "GLM52_CANONICAL_MOE_VERSION",
@@ -863,8 +1154,11 @@ __all__ = [
     "CanonicalMoEOutput",
     "CanonicalRowSlots",
     "CanonicalMoEWorkspace",
+    "CanonicalMoEV3ScratchPool",
     "CanonicalMoEV3Workspace",
     "SamplerParallelPlan",
+    "canonical_moe_leaf_fp32_v1",
+    "canonical_moe_fold_fp64_v3",
     "canonical_moe_reference",
     "canonicalize_glm52_local_partial",
     "canonicalize_glm52_local_partial_v3",

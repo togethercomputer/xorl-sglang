@@ -1,0 +1,238 @@
+diff --git a/csrc/api/sparse_decode.h b/csrc/api/sparse_decode.h
+index 6df5c84..8860e3e 100644
+--- a/csrc/api/sparse_decode.h
++++ b/csrc/api/sparse_decode.h
+@@ -381,6 +381,12 @@ sparse_attn_decode_interface(
+     }
+
+     DecodeImplMeta impl_meta = impl->get_meta(h_q, s_q);
++    if (model_type == ModelType::MODEL1) {
++        // Give each request two stable scheduler slots. A one-block request
++        // uses its first slot directly and leaves the second as a sentinel;
++        // larger requests use both slots for deterministic contiguous halves.
++        impl_meta.num_sm_parts = 2 * b;
++    }
+
+     SparseAttnDecodeParams params = {
+         b, s_q, h_q, h_kv, d_qk, d_v,
+@@ -436,7 +442,11 @@ sparse_attn_decode_interface(
+             impl_meta.num_sm_parts,
+             at::cuda::getCurrentCUDAStream().stream()
+         };
+-        smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
++        if (model_type == ModelType::MODEL1) {
++            smxx::decode::run_get_model1_decoding_sched_meta_kernel(get_sched_meta_params);
++        } else {
++            smxx::decode::run_get_decoding_sched_meta_kernel(get_sched_meta_params);
++        }
+     }
+     // Stick the metadata pointers to `params`
+     KU_CHECK_DEVICE(tile_scheduler_metadata);
+@@ -452,7 +462,7 @@ sparse_attn_decode_interface(
+     params.num_sm_parts = impl_meta.num_sm_parts;
+
+     // Allocate intermediate buffers for split-KV
+-    const int total_num_splits = b + impl_meta.num_sm_parts;
++    const int total_num_splits = model_type == ModelType::MODEL1 ? 2 * b : b + impl_meta.num_sm_parts;
+     lse_accum = torch::empty({total_num_splits, s_q, h_q}, opts.dtype(at::kFloat));
+     o_accum = torch::empty({total_num_splits, s_q, h_q, d_v}, opts.dtype(at::kFloat));
+     KU_CHECK_CONTIGUOUS(lse_accum);
+@@ -487,7 +497,11 @@ sparse_attn_decode_interface(
+         ku::get_optional_tensor_ptr<float>(attn_sink),
+         at::cuda::getCurrentCUDAStream().stream()
+     };
+-    smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
++    if (model_type == ModelType::MODEL1) {
++        smxx::decode::run_flash_mla_model1_fixed_k2_combine_kernel<bf16>(combine_params);
++    } else {
++        smxx::decode::run_flash_mla_combine_kernel<bf16>(combine_params);
++    }
+
+     delete impl;
+
+diff --git a/csrc/smxx/decode/combine/combine.cu b/csrc/smxx/decode/combine/combine.cu
+index b924ba5..eeee76b 100644
+--- a/csrc/smxx/decode/combine/combine.cu
++++ b/csrc/smxx/decode/combine/combine.cu
+@@ -185,37 +185,52 @@ flash_fwd_mla_combine_kernel(__grid_constant__ const CombineParams params) {
+     }()
+
+
+-template<typename ElementT>
+-void run_flash_mla_combine_kernel(CombineParams &params) {
++template<typename ElementT, int MAX_SPLITS>
++void run_flash_mla_combine_kernel_with_max_splits(CombineParams &params) {
+     static constexpr int HEAD_DIM_V = 512;  // Since only this head dimension is supported by Flash MLA
+     FLASH_ASSERT(params.d_v == HEAD_DIM_V);
+-    MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, NUM_SPLITS, [&] {
+-        constexpr int BLOCK_SIZE_M = 8;
+-        constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
+-        constexpr size_t smem_size = BLOCK_SIZE_M*(NUM_SPLITS+1)*sizeof(float);
+-        auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, NUM_SPLITS, NUM_THREADS>;
+-        CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+-        // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
+-        cudaLaunchAttribute attribute[1];
+-        attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+-        attribute[0].val.programmaticStreamSerializationAllowed = 1;
+-        cudaLaunchConfig_t combine_kernel_config = {
+-            dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
+-            dim3(NUM_THREADS, 1, 1),
+-            0,
+-            params.stream,
+-            attribute,
+-            1
+-        };
+-        CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+-    });
++    constexpr int BLOCK_SIZE_M = 8;
++    constexpr int NUM_THREADS = BLOCK_SIZE_M*32;
++    constexpr size_t smem_size = BLOCK_SIZE_M*(MAX_SPLITS+1)*sizeof(float);
++    auto combine_kernel = &flash_fwd_mla_combine_kernel<ElementT, HEAD_DIM_V, BLOCK_SIZE_M, MAX_SPLITS, NUM_THREADS>;
++    CHECK_CUDA(cudaFuncSetAttribute(combine_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
++    // Use cudaLaunchKernelEx to enable PDL (Programmatic Dependent Launch)
++    cudaLaunchAttribute attribute[1];
++    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
++    attribute[0].val.programmaticStreamSerializationAllowed = 1;
++    cudaLaunchConfig_t combine_kernel_config = {
++        dim3(params.b * params.s_q, 1, ku::ceil_div(params.h_q, BLOCK_SIZE_M)),
++        dim3(NUM_THREADS, 1, 1),
++        0,
++        params.stream,
++        attribute,
++        1
++    };
++    CHECK_CUDA(cudaLaunchKernelEx(&combine_kernel_config, combine_kernel, params));
+     CHECK_CUDA_KERNEL_LAUNCH();
+ }
+
++template<typename ElementT>
++void run_flash_mla_combine_kernel(CombineParams &params) {
++    MLA_NUM_SPLITS_SWITCH(params.num_sm_parts, MAX_SPLITS, [&] {
++        run_flash_mla_combine_kernel_with_max_splits<ElementT, MAX_SPLITS>(params);
++    });
++}
++
++template<typename ElementT>
++void run_flash_mla_model1_fixed_k2_combine_kernel(CombineParams &params) {
++    FLASH_ASSERT(params.num_sm_parts == 2 * params.b);
++    // The combine kernel writes one LSE slot per warp lane, including masked
++    // lanes, so its physical shared-memory width must remain at least 32.
++    run_flash_mla_combine_kernel_with_max_splits<ElementT, 32>(params);
++}
++
+ template void run_flash_mla_combine_kernel<cutlass::bfloat16_t>(CombineParams &params);
++template void run_flash_mla_model1_fixed_k2_combine_kernel<cutlass::bfloat16_t>(CombineParams &params);
+
+ #ifndef FLASH_MLA_DISABLE_FP16
+ template void run_flash_mla_combine_kernel<cutlass::half_t>(CombineParams &params);
++template void run_flash_mla_model1_fixed_k2_combine_kernel<cutlass::half_t>(CombineParams &params);
+ #endif
+
+ }
+diff --git a/csrc/smxx/decode/combine/combine.h b/csrc/smxx/decode/combine/combine.h
+index 0ea21fd..8e30c48 100644
+--- a/csrc/smxx/decode/combine/combine.h
++++ b/csrc/smxx/decode/combine/combine.h
+@@ -7,4 +7,7 @@ namespace smxx::decode {
+ template<typename ElementT>
+ void run_flash_mla_combine_kernel(CombineParams &params);
+
++template<typename ElementT>
++void run_flash_mla_model1_fixed_k2_combine_kernel(CombineParams &params);
++
+ }
+diff --git a/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu b/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
+index 925fa53..670cf66 100644
+--- a/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
++++ b/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.cu
+@@ -205,6 +205,68 @@ get_mla_metadata_kernel_low_smem(__grid_constant__ const GetDecodeSchedMetaParam
+     FLASH_DEVICE_ASSERT(now_req_idx == batch_size && now_block == 0 && now_n_split_idx == 0);
+ }
+
++// MODEL1 uses a request-local, batch-invariant schedule. Every request owns
++// exactly two scheduler entries, so changing or permuting neighboring rows
++// cannot change this request's reduction program.
++__global__ void __launch_bounds__(32, 1, 1)
++get_model1_mla_metadata_kernel(__grid_constant__ const GetDecodeSchedMetaParams params) {
++    if (threadIdx.x != 0) {
++        return;
++    }
++
++    int cumulative_splits = 0;
++    params.num_splits_ptr[0] = 0;
++    for (int req_idx = 0; req_idx < params.b; ++req_idx) {
++        int effective_seq_len = get_effective_seq_len(params, req_idx, params.block_size_n);
++        int num_blocks = max(
++            (effective_seq_len + params.block_size_n - 1) / params.block_size_n,
++            1);
++
++        DecodingSchedMeta* first = params.tile_scheduler_metadata_ptr + 2 * req_idx;
++        first->begin_req_idx = req_idx;
++        first->end_req_idx = req_idx;
++        first->begin_block_idx = 0;
++        first->end_block_idx = 0;
++        first->begin_split_idx = 0;
++        first->is_first_req_splitted = false;
++        first->is_last_req_splitted = false;
++        first->_pad[0] = 0;
++
++        DecodingSchedMeta* second = first + 1;
++        second->begin_req_idx = params.b;
++        second->end_req_idx = params.b;
++        second->begin_block_idx = 0;
++        second->end_block_idx = 0;
++        second->begin_split_idx = 0;
++        second->is_first_req_splitted = false;
++        second->is_last_req_splitted = false;
++        second->_pad[0] = 0;
++        if (num_blocks == 1) {
++            first->end_block_idx = 1;
++
++            // Sparse decode kernels already treat begin_req_idx >= b as an
++            // empty scheduler entry.
++            cumulative_splits += 1;
++        } else {
++            int midpoint = (num_blocks + 1) / 2;
++            first->end_block_idx = midpoint;
++            first->is_first_req_splitted = true;
++            first->is_last_req_splitted = true;
++
++            second->begin_req_idx = req_idx;
++            second->end_req_idx = req_idx;
++            second->begin_block_idx = midpoint;
++            second->end_block_idx = num_blocks;
++            second->begin_split_idx = 1;
++            second->is_first_req_splitted = true;
++            second->is_last_req_splitted = true;
++            cumulative_splits += 2;
++        }
++
++        params.num_splits_ptr[req_idx + 1] = cumulative_splits;
++    }
++}
++
+ void run_get_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params) {
+     int smem_size = sizeof(int) * (params.b*5+1);
+     int max_smem = 0;
+@@ -232,4 +294,10 @@ void run_get_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params) {
+     CHECK_CUDA_KERNEL_LAUNCH();
+ }
+
++void run_get_model1_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params) {
++    FLASH_ASSERT(params.num_sm_parts == 2 * params.b);
++    get_model1_mla_metadata_kernel<<<1, 32, 0, params.stream>>>(params);
++    CHECK_CUDA_KERNEL_LAUNCH();
++}
++
+ }
+diff --git a/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h b/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h
+index 0b1c288..346e5e7 100644
+--- a/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h
++++ b/csrc/smxx/decode/get_decoding_sched_meta/get_decoding_sched_meta.h
+@@ -5,5 +5,6 @@
+ namespace smxx::decode {
+
+ void run_get_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params);
++void run_get_model1_decoding_sched_meta_kernel(GetDecodeSchedMetaParams &params);
+
+ }

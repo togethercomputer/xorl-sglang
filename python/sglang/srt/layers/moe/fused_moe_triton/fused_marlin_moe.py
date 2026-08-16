@@ -6,6 +6,9 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.layers.moe.moe_runner.base import (
+    should_singleton_mxfp4_marlin_base,
+)
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -119,6 +122,69 @@ def swiglu_limit_func(
     output.copy_(F.silu(gate) * up)
 
 
+def is_dsv4_exact_pinned_marlin_geometry(
+    *,
+    dsv4_exact_mode: bool,
+    is_mxfp4_marlin: bool,
+    global_experts: int,
+    local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    topk: int,
+    clamp_limit: Optional[float],
+) -> bool:
+    """The admitted DSV4-Flash exact Marlin geometry."""
+    return (
+        dsv4_exact_mode
+        and is_mxfp4_marlin
+        and global_experts == 256
+        and local_experts == 32
+        and hidden_size == 4096
+        and intermediate_size == 2048
+        and topk == 6
+        and clamp_limit == 10.0
+    )
+
+
+def select_marlin_moe_block_size_m(
+    *,
+    dsv4_exact_mode: bool = False,
+    num_tokens: int,
+    topk: int,
+    local_experts: int,
+    global_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    is_mxfp4_marlin: bool,
+    clamp_limit: Optional[float],
+) -> int:
+    """Select Marlin's row block, pinning the admitted DSV4 exact geometry.
+
+    The generic density heuristic selects blocks 8-32 at admitted DSV4 widths.
+    Pin 64 so a token's routes use one row block per expert. MXFP4 Marlin's
+    separate singleton decomposition fixes the batch-dependent K-stripe
+    partition; this pin retains the DSV4 row-block program.
+    """
+
+    block_size_m = 8
+    for candidate in (8, 16, 32, 48, 64):
+        block_size_m = candidate
+        if num_tokens * topk / local_experts / candidate < 0.9:
+            break
+    if is_dsv4_exact_pinned_marlin_geometry(
+        dsv4_exact_mode=dsv4_exact_mode,
+        is_mxfp4_marlin=is_mxfp4_marlin,
+        global_experts=global_experts,
+        local_experts=local_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        topk=topk,
+        clamp_limit=clamp_limit,
+    ):
+        return 64
+    return block_size_m
+
+
 def swiglu_gpt_oss_sigmoid_alpha_contiguous(
     output: torch.Tensor,
     input: torch.Tensor,  # first half is gate, second half is up
@@ -162,6 +228,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    dsv4_exact_mode: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -235,14 +302,67 @@ def fused_marlin_moe(
     topk = topk_ids.shape[1]
     gemm1_n = 2 * N if is_gated else N
 
-    # M block size selection logic
-    # TODO: tune this further for specific models
-    for block_size_m in [8, 16, 32, 48, 64]:
-        if M * topk / E / block_size_m < 0.9:
-            break
-
     if global_num_experts == -1:
         global_num_experts = E
+    if should_singleton_mxfp4_marlin_base(
+        dsv4_exact_mode=dsv4_exact_mode,
+        is_mxfp4_marlin=is_mxfp4_marlin,
+        num_tokens=M,
+    ):
+        # Marlin partitions each expert's K reduction using the total number of
+        # local expert blocks in the launch. Use the same one-token program for
+        # batched and singleton execution so unrelated routes cannot change
+        # that reduction tree.
+        chunked_out = torch.empty_like(hidden_states)
+        for chunk_start in range(M):
+            chunk_stop = chunk_start + 1
+            chunked_out[chunk_start:chunk_stop] = fused_marlin_moe(
+                hidden_states[chunk_start:chunk_stop],
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating_output[chunk_start:chunk_stop],
+                topk_weights[chunk_start:chunk_stop],
+                topk_ids[chunk_start:chunk_stop],
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                g_idx1=g_idx1,
+                g_idx2=g_idx2,
+                sort_indices1=sort_indices1,
+                sort_indices2=sort_indices2,
+                w1_zeros=w1_zeros,
+                w2_zeros=w2_zeros,
+                w1_global_scale=w1_global_scale,
+                w2_global_scale=w2_global_scale,
+                w1_bias=w1_bias,
+                w2_bias=w2_bias,
+                workspace=workspace,
+                num_bits=num_bits,
+                is_k_full=is_k_full,
+                inplace=False,
+                routed_scaling_factor=routed_scaling_factor,
+                clamp_limit=clamp_limit,
+                gemm1_alpha=gemm1_alpha,
+                activation=activation,
+                is_gated=is_gated,
+                dsv4_exact_mode=dsv4_exact_mode,
+            )
+        if inplace:
+            hidden_states.copy_(chunked_out)
+            return hidden_states
+        return chunked_out
+    block_size_m = select_marlin_moe_block_size_m(
+        dsv4_exact_mode=dsv4_exact_mode,
+        num_tokens=M,
+        topk=topk,
+        local_experts=E,
+        global_experts=global_num_experts,
+        hidden_size=K,
+        intermediate_size=N,
+        is_mxfp4_marlin=is_mxfp4_marlin,
+        clamp_limit=clamp_limit,
+    )
     if (
         M == 1
         and topk <= 32

@@ -26,6 +26,8 @@ from .batch_invariant_ops import (
     set_batch_invariant_mode,
 )
 from .bi_families_v2 import (
+    exact_temperature_scale_bf16_logits,
+    exact_temperature_scale_fp32_logits,
     families_v2_enabled,
     head_v2_full_logits_with_lse,
     head_v2_selected_logprob,
@@ -51,6 +53,8 @@ __all__ = [
     "bi_lm_head_full_logits",
     "bi_lm_head_selected_logprob",
     "bi_lm_head_selected_logprob_from_logits",
+    "exact_temperature_scale_bf16_logits",
+    "exact_temperature_scale_fp32_logits",
     "families_v2_enabled",
     "head_v2_full_logits_with_lse",
     "head_v2_selected_logprob",

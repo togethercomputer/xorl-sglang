@@ -3,17 +3,65 @@
 import base64
 import struct
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import sglang.srt.entrypoints.http_server as http_server
 from sglang.srt.entrypoints.http_server import (
     KIMI_K3_VLM_WARMUP_PNG_PICTURE_BASE64,
     KIMI_VLM_WARMUP_PNG_PICTURE_BASE64,
     MINIMUM_PNG_PICTURE_BASE64,
+    _execute_server_warmup,
     _get_vlm_warmup_image_base64,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestServerWarmup(CustomTestCase):
+    def test_builtin_generation_warmup_issues_temperature_zero_request(self):
+        captured = {}
+        response = SimpleNamespace(
+            status_code=200,
+            text="",
+            json=lambda: {
+                "is_generation": True,
+                "has_image_understanding": False,
+            },
+        )
+        server_args = SimpleNamespace(
+            url=lambda: "http://127.0.0.1:30000",
+            api_key=None,
+            ssl_verify=lambda: False,
+            language_only=False,
+            skip_tokenizer_init=True,
+            dp_size=1,
+            dsv4_flash_exact_mode=False,
+            debug_tensor_dump_input_file=None,
+            disaggregation_mode="null",
+        )
+
+        def post(url, **kwargs):
+            captured["url"] = url
+            captured["json"] = kwargs["json"]
+            return response
+
+        with (
+            patch.object(http_server.time, "sleep"),
+            patch.object(http_server.requests, "get", return_value=response),
+            patch.object(http_server.requests, "post", side_effect=post),
+            patch.object(
+                http_server,
+                "_global_state",
+                SimpleNamespace(tokenizer_manager=SimpleNamespace(server_status=None)),
+            ),
+        ):
+            assert _execute_server_warmup(server_args)
+
+        self.assertTrue(captured["url"].endswith("/generate"))
+        self.assertEqual(captured["json"]["sampling_params"]["temperature"], 0)
 
 
 class TestVlmWarmupImage(CustomTestCase):

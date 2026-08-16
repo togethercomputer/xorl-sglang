@@ -2,14 +2,22 @@ import logging
 from typing import Any, Callable, List, Literal
 
 import torch
+
 from sglang.srt.batch_invariant_ops import (
     RMS_NORM_FAMILY_NO_RESIDUAL,
     RMS_NORM_FAMILY_RESIDUAL_TREE,
     RMSNormFamily,
     bi_lm_head_full_logits,
     bi_lm_head_selected_logprob_from_logits,
+    exact_temperature_scale_fp32_logits,
     head_v2_full_logits_with_lse,
     head_v2_selected_logprob_from_logits,
+)
+from sglang.srt.layers.exact_sampling_transforms import (
+    exact_masked_logits,
+    exact_sampling_identity_rows,
+    exact_seeded_gumbel_sample,
+    exact_selected_logprob_partitioned_from_support,
 )
 
 XorlBiFamily = Literal["v1", "v2"]
@@ -144,7 +152,7 @@ def _apply_xorl_exact_lora_lm_head(
     lm_head: Any,
     base_logits: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply the literal rank-one Triton LoRA head to exact FP32 base logits.
+    """Apply the literal Triton LoRA head to exact FP32 base logits.
 
     ``ParallelLMHeadWithLoRA.apply_lora`` is the serving implementation: its A
     kernel accumulates in FP32 and stores BF16, then its B kernel rounds the
@@ -177,11 +185,6 @@ def _apply_xorl_exact_lora_lm_head(
         )
     if not lora_active:
         return base_logits
-    if getattr(backend, "_glm52_exact_batch_certified", False) is not True:
-        raise RuntimeError(
-            "The XORL exact active-LoRA LM-head contract requires a certified "
-            "one-request GLM-5.2 batch."
-        )
     if getattr(lm_head, "set_lora", None) is not True:
         raise RuntimeError(
             "The XORL exact active-LoRA LM-head contract requires installed "
@@ -205,18 +208,20 @@ def _apply_xorl_exact_lora_lm_head(
             "The XORL exact active-LoRA LM-head contract requires BF16 A/B "
             f"buffers, got {a_buffer.dtype} and {b_buffer.dtype}."
         )
-    expected_a_tail = (1, hidden_states.shape[-1])
-    expected_b_tail = (lm_head.weight.shape[0], 1)
+    physical_rank = a_buffer.shape[-2] if a_buffer.ndim == 3 else -1
+    expected_a_tail = (physical_rank, hidden_states.shape[-1])
+    expected_b_tail = (lm_head.weight.shape[0], physical_rank)
     if (
         a_buffer.ndim != 3
         or tuple(a_buffer.shape[-2:]) != expected_a_tail
         or b_buffer.ndim != 3
         or tuple(b_buffer.shape[-2:]) != expected_b_tail
         or a_buffer.shape[0] != b_buffer.shape[0]
+        or physical_rank <= 0
     ):
         raise RuntimeError(
-            "The XORL exact active-LoRA LM-head contract requires rank-one "
-            "physical buffers [slots,1,hidden] and [slots,local_vocab,1], got "
+            "The XORL exact active-LoRA LM-head contract requires admitted "
+            "physical buffers [slots,rank,hidden] and [slots,local_vocab,rank], got "
             f"A={tuple(a_buffer.shape)} and B={tuple(b_buffer.shape)}."
         )
     if not a_buffer.is_contiguous() or not b_buffer.is_contiguous():
@@ -292,16 +297,18 @@ def xorl_bi_sample_and_score(
     sampling_info: Any,
     *,
     return_logprob: bool,
-    top_logprobs_nums: List[int],
-    token_ids_logprobs: List[List[int]],
+    top_logprobs_nums: List[int] | None,
+    token_ids_logprobs: List[List[int] | None] | None,
     positions: torch.Tensor,
-    sample_from_logprobs: Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor],
+    sample_from_logprobs: (
+        Callable[[torch.Tensor, Any, torch.Tensor], torch.Tensor] | None
+    ),
     sync_token_ids: Callable[[torch.Tensor, Any], None],
     enable_deterministic: bool,
     return_original_logprob: bool,
     family: XorlBiFamily | None = None,
 ) -> torch.Tensor:
-    """Sample and score under the strict public XORL T=1 contract."""
+    """Sample and score under the exact per-row FP32 temperature contract."""
     family = resolve_or_validate_xorl_bi_family(family)
     logits = logits_output.next_token_logits
     if logits is None or logits.dtype != torch.float32:
@@ -314,20 +321,11 @@ def xorl_bi_sample_and_score(
             "The XORL batch-invariant sampler requires deterministic inference "
             "and a per-request sampling seed."
         )
-    if sampling_info.is_all_greedy:
-        raise RuntimeError(
-            "The XORL batch-invariant sampler requires multinomial sampling, "
-            "not greedy decoding."
-        )
-    if (
+    has_sampling_filter = (
         sampling_info.need_top_p_sampling
         or sampling_info.need_top_k_sampling
         or sampling_info.need_min_p_sampling
-    ):
-        raise RuntimeError(
-            "The XORL batch-invariant sampler does not support top-p, top-k, "
-            "or min-p filtering."
-        )
+    )
     if sampling_info.has_custom_logit_processor:
         raise RuntimeError(
             "The XORL batch-invariant sampler does not support custom logit processors."
@@ -351,34 +349,125 @@ def xorl_bi_sample_and_score(
         raise RuntimeError(
             "The XORL batch-invariant sampler rejects SGLANG_RETURN_ORIGINAL_LOGPROB."
         )
-    if any(x > 0 for x in top_logprobs_nums) or any(
-        token_ids is not None for token_ids in token_ids_logprobs
+    if (top_logprobs_nums is not None and any(x > 0 for x in top_logprobs_nums)) or (
+        token_ids_logprobs is not None
+        and any(token_ids is not None for token_ids in token_ids_logprobs)
     ):
         raise RuntimeError(
             "The XORL batch-invariant sampler only returns the sampled token logprob."
         )
 
     torch._assert_async(
-        (sampling_info.temperatures == 1).all(),
-        "The XORL batch-invariant sampler requires temperature == 1.",
-    )
-    torch._assert_async(
         torch.isfinite(logits).all(),
         "The XORL batch-invariant sampler requires finite logits.",
     )
 
-    # Gumbel-max only depends on relative logits, so sampling directly from
-    # the contract logits is identical to sampling from logits - logsumexp.
-    batch_next_token_ids = sample_from_logprobs(logits, sampling_info, positions)
+    transformed_logits = exact_temperature_scale_fp32_logits(
+        logits,
+        sampling_info.temperatures,
+    )
+    sampling_logits = transformed_logits
+    support = None
+    if has_sampling_filter:
+        sampling_logits, support = exact_masked_logits(
+            transformed_logits,
+            sampling_info.top_ks,
+            sampling_info.top_ps,
+            sampling_info.min_ps,
+        )
+
+    is_any_greedy = bool(
+        getattr(sampling_info, "is_any_greedy", sampling_info.is_all_greedy)
+    )
+    greedy_rows = (
+        sampling_info.top_ks <= 1
+        if is_any_greedy
+        else torch.zeros(
+            transformed_logits.shape[0],
+            dtype=torch.bool,
+            device=transformed_logits.device,
+        )
+    )
+    if sampling_info.is_all_greedy:
+        # SamplingParams represents temperature=0 as temperature=1/top_k=1.
+        # Select the stable first argmax directly; this avoids dividing by
+        # zero while preserving SGLang's established greedy normalization.
+        batch_next_token_ids = torch.argmax(transformed_logits, dim=-1)
+    else:
+        # Gumbel-max only depends on relative logits, so sampling directly from
+        # the transformed contract logits is identical to sampling from their
+        # normalized logprobs and keeps selection on the distribution we report.
+        if sample_from_logprobs is None:
+            batch_next_token_ids = exact_seeded_gumbel_sample(
+                transformed_logits,
+                sampling_info.sampling_seed,
+                positions,
+                support=support,
+            )
+        else:
+            # Dependency-injection hook retained for focused sampler tests.
+            batch_next_token_ids = sample_from_logprobs(
+                sampling_logits,
+                sampling_info,
+                positions,
+            )
+        if is_any_greedy:
+            batch_next_token_ids = torch.where(
+                greedy_rows,
+                torch.argmax(transformed_logits, dim=-1),
+                batch_next_token_ids,
+            )
     sync_token_ids(batch_next_token_ids, sampling_info)
 
     if return_logprob:
-        score = (
-            head_v2_selected_logprob_from_logits
-            if family == "v2"
-            else bi_lm_head_selected_logprob_from_logits
-        )
-        selected_logprobs, _, _ = score(logits, batch_next_token_ids)
+        if sampling_info.is_all_greedy:
+            # A deterministic argmax decision has probability one under the
+            # decision-time distribution, hence an exact logprob of +0.
+            selected_logprobs = torch.zeros(
+                transformed_logits.shape[0],
+                dtype=transformed_logits.dtype,
+                device=transformed_logits.device,
+            )
+        elif support is not None:
+            identity_rows = exact_sampling_identity_rows(
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                vocab_size=transformed_logits.shape[1],
+            )
+            score = (
+                head_v2_selected_logprob_from_logits
+                if family == "v2"
+                else bi_lm_head_selected_logprob_from_logits
+            )
+            selected_logprobs, _, _ = exact_selected_logprob_partitioned_from_support(
+                transformed_logits,
+                batch_next_token_ids.to(torch.int64),
+                support,
+                identity_rows,
+                lambda native_logits, native_ids: score(
+                    native_logits,
+                    native_ids,
+                    temperature=None,
+                ),
+            )
+        else:
+            score = (
+                head_v2_selected_logprob_from_logits
+                if family == "v2"
+                else bi_lm_head_selected_logprob_from_logits
+            )
+            selected_logprobs, _, _ = score(
+                transformed_logits,
+                batch_next_token_ids,
+                temperature=None,
+            )
+        if is_any_greedy and not sampling_info.is_all_greedy:
+            selected_logprobs = torch.where(
+                greedy_rows,
+                torch.zeros_like(selected_logprobs),
+                selected_logprobs,
+            )
         logits_output.next_token_logprobs = selected_logprobs
 
     return batch_next_token_ids

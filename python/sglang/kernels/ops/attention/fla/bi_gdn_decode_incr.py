@@ -255,6 +255,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+
 from sglang.kernels.ops.attention.fla.bi_gdn_decode_fast import (
     BIGDNFastDecodeRunner,
     bi_gdn_fast_append_kernel,
@@ -278,7 +279,10 @@ from sglang.kernels.ops.attention.fla.cumsum import (
 )
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_kernel
 from sglang.kernels.ops.attention.fla.op import safe_exp
-from sglang.kernels.ops.attention.fla.solve_tril_decode import solve_tril_decode
+from sglang.kernels.ops.attention.fla.solve_tril_decode import (
+    _sum_rows_16_fla_tree,
+    solve_tril_decode,
+)
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
 
 # Internal choices for the exact Qwen3.5-family GDN serving contract.
@@ -516,7 +520,17 @@ def bi_gdn_incr_solve_row_kernel(
     )
     b_cached = tl.load(p_diag, boundary_check=(0, 1))
     b_op = b_cached - m_I
-    b_new = b_a + tl.sum(b_a[:, None] * b_op, 0)
+    # The oracle's EXPLICIT num_warps=2 tl.sum association tree (imported
+    # from the solve port), so this kernel's diagonal bytes no longer
+    # depend on its own launch config. The previous inline
+    # ``tl.sum(b_a[:, None] * b_op, 0)`` was byte-equal only at
+    # num_warps<=2 -- and Triton 3.6.0 miscompiles this kernel's D=1 merge
+    # dot chain at num_warps<=2 (silent zeros), so the launch moved to 4
+    # warps and the diag tree must be pinned explicitly.
+    b_new = b_a + tl.reshape(
+        _sum_rows_16_fla_tree(tl.reshape(b_a, [1, 16]), tl.reshape(b_op, [1, 16, 16])),
+        [16],
+    )
     b_diag = b_new + tl.where(o_i == r, 1.0, 0.0)
     tl.store(OutDiag + (i_b * H + i_h) * 16 + o_i, b_diag)
 
@@ -1779,7 +1793,16 @@ class BIGDNIncrDecodeRunner(BIGDNFastDecodeRunner):
         # the probe-certified configs (the probe program P2/P4).
         self.kkt_num_warps = 8
         self.kkt_num_stages = 3
-        self.solve_num_warps = 2
+        # 4 warps, not the probe-certified 2: Triton 3.6.0 miscompiles the
+        # D=1 specialization's 16x16 fp32 ieee dot chain at num_warps<=2 --
+        # the OutSeg merge row silently stores zeros (TTIR/PTX correct and
+        # unconditional; the dot pipeline produces zeros), so rows 16..31 of
+        # every chunk go byte-wrong. At num_warps>=4 the kernel's row is
+        # bitwise equal to the full-solve oracle (solve_tril and
+        # solve_tril_decode agree bitwise). Covered by
+        # test_bi_gdn_incr_step_oracle.py (step-vs-rescan byte A/B + solve
+        # row vs full solve across launch configs).
+        self.solve_num_warps = 4
         self.solve_num_stages = 3
         self.wu_num_warps = 4
         self.wu_num_stages = 3
@@ -1822,7 +1845,7 @@ class BIGDNIncrDecodeRunner(BIGDNFastDecodeRunner):
         if self._capture_mode_fn is None:
             # lazy import: the fla layer must not import model_executor at
             # module scope (import cycle).
-            from sglang.srt.model_executor.cuda_graph_runner import (
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
                 get_is_capture_mode,
             )
 
@@ -2343,7 +2366,6 @@ class BIGDNIncrDecodeRunner(BIGDNFastDecodeRunner):
                 src,
                 dst,
                 1e-6,
-                NB=triton.cdiv(l2_rows, 2048),
                 T=l2_rows,
                 D=k,
                 BD=self._next_pow2(k),

@@ -36,6 +36,7 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
+
 from sglang.srt.layers.attention.nsa.glm52_selector import PackedSelectedKV
 
 
@@ -674,8 +675,9 @@ def _apply_glm52_exact_fastpath() -> None:
     bi_gemm_configs._set_glm52_tier_a_enabled(True)
     logger.info(
         "Exact GLM-5.2 zero-K3 serving resolved: canonical fused DSA selector "
-        "with deterministic PAGED mapping, canonical_v3b MoE transport "
-        "(CP prefill: v3), families=v2, Tier-A GEMM tables, "
+        "with deterministic PAGED mapping, selectable dense-v1/v3/v3b MoE "
+        "transport (auto uses v3 for CP prefill and v3b otherwise), "
+        "families=v2, Tier-A GEMM tables, "
         "model-tail status check, prebuilt RoPE cache only"
     )
     _applied = True

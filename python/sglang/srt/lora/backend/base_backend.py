@@ -1,4 +1,5 @@
-from typing import Optional, Tuple, Union
+from contextlib import contextmanager
+from typing import Iterator, Optional, Tuple, Union
 
 import torch
 import triton
@@ -30,9 +31,9 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # reset_batch_state() on DP-attention idle forwards. None means "no
         # batch prepared" — the LoRA layers read it to skip LoRA application.
         self.batch_info: Optional[LoRABatchInfo] = None
-        # CP-v2 gathers rank-local rows before sparse MLPs. The manager
-        # installs matching rank-major physical metadata here for the gathered
-        # row count; attention and dense fully-DP MLPs keep batch_info.
+        # DP attention and CP-v2 can gather rank-local rows before sparse MLPs.
+        # The manager installs matching rank-major physical metadata here for
+        # the gathered row count; local attention keeps batch_info.
         self.context_parallel_mlp_batch_info: Optional[LoRABatchInfo] = None
         self.init_lm_head_config()
         self._is_moe_lora = False
@@ -42,6 +43,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # Request/token caps for serving a batch from the static metadata.
         self.prefill_cuda_graph_max_bs: int | None = None
         self.prefill_cuda_graph_max_tokens: int | None = None
+        # Pointer-stable metadata for MLP rows gathered across DP/CP ranks.
+        self.context_parallel_cuda_graph_batch_info: LoRABatchInfo | None = None
 
     def reset_batch_state(self):
         """Idle-forward counterpart of prepare_lora_batch(): clears all
@@ -75,6 +78,32 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             f"{getattr(gathered_batch_info, 'expected_tokens', None)}, "
             f"activation_rows={num_tokens}."
         )
+
+    @contextmanager
+    def use_gathered_mlp_batch_info(self, num_tokens: int) -> Iterator[None]:
+        """Temporarily route dense and MoE LoRA kernels with gathered rows."""
+
+        gathered = self.context_parallel_mlp_batch_info
+        if gathered is None:
+            raise RuntimeError(
+                "Gathered MLP LoRA metadata is missing for gathered activation "
+                f"rows: activation_rows={num_tokens}."
+            )
+        if gathered.expected_tokens != num_tokens:
+            raise RuntimeError(
+                "Gathered MLP LoRA metadata does not match the activation rows: "
+                f"metadata_rows={gathered.expected_tokens}, activation_rows={num_tokens}."
+            )
+
+        local_batch_info = self.batch_info
+        local_sgemm_batch_info = getattr(self, "sgemm_batch_info", None)
+        self.batch_info = gathered
+        self.sgemm_batch_info = None
+        try:
+            yield
+        finally:
+            self.batch_info = local_batch_info
+            self.sgemm_batch_info = local_sgemm_batch_info
 
     def run_lora_a_embedding(
         self,
@@ -219,6 +248,13 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
             f"LoRA backend {type(self).__name__} does not support the prefill CUDA graph."
         )
 
+    def init_context_parallel_cuda_graph_batch_info(self, num_rows: int):
+        """Allocate fixed metadata for DP/CP-gathered decode-graph rows."""
+        raise NotImplementedError(
+            f"LoRA backend {type(self).__name__} does not support gathered "
+            "decode CUDA graph metadata."
+        )
+
     @property
     def is_moe_lora(self) -> bool:
         return self._is_moe_lora
@@ -247,9 +283,22 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         base = moe_layer.base_layer
         top_k = base.top_k
         qinfo = moe_layer._quant_info
-        E, N, _ = qinfo.w13_weight.shape
-        hidden_dim = qinfo.w2_weight.shape[1]
-        device = qinfo.w13_weight.device
+        # Quant-info payload names and physical shapes are backend-specific.
+        # In particular, MXFP4 Marlin exposes repacked ``w13_qweight`` /
+        # ``w2_qweight`` tensors whose dimensions are not the logical MLP
+        # dimensions.  The shared LoRA workspaces are logical activation
+        # buffers, so size them from the layer contract and use the quantized
+        # payload only to resolve the device.
+        N = 2 * base.intermediate_size_per_partition
+        hidden_dim = base.hidden_size
+        quant_weight = getattr(qinfo, "w13_weight", None)
+        if quant_weight is None:
+            quant_weight = getattr(qinfo, "w13_qweight", None)
+        if quant_weight is None:
+            raise AttributeError(
+                f"{type(qinfo).__name__} exposes neither w13_weight nor w13_qweight"
+            )
+        device = quant_weight.device
         dtype = compute_dtype
         num_experts = base.num_experts
 

@@ -62,6 +62,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+
 from sglang.srt.configs.embedding_model_spec import resolved_embedding_plan
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -185,7 +186,6 @@ from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
-
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -477,13 +477,11 @@ if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
 # Include routers
 from sglang.srt.entrypoints.v1_loads import router as v1_loads_router
 
-
 # route_class is per-router, so included routers need it set too.
 v1_loads_router.route_class = ORJSONRoute
 app.include_router(v1_loads_router)
 
 from sglang.srt.entrypoints.elastic_ep import router as elastic_ep_router
-
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
@@ -649,7 +647,13 @@ async def validate_json_request(raw_request: Request):
 
 def _health_generate_sampling_params(server_args) -> Dict[str, Union[int, float]]:
     """Return a health request that is valid for the selected sampler contract."""
-    if getattr(server_args, "glm52_exact_mode", False):
+    exact_modes = (
+        "glm52_exact_mode",
+        "qwen3_dense_exact_mode",
+        "qwen35_gdn_exact_mode",
+        "dsv4_flash_exact_mode",
+    )
+    if any(getattr(server_args, name, False) for name in exact_modes):
         random_seed = getattr(server_args, "random_seed", None)
         return {
             "max_new_tokens": 1,
@@ -1379,9 +1383,7 @@ async def prepare_weights_update(
     obj: Annotated[PrepareWeightsUpdateReqInput, Body()], request: Request
 ):
     """Arm a two-phase distributed-weight receiver before broadcast."""
-    result = await _global_state.tokenizer_manager.prepare_weights_update(
-        obj, request
-    )
+    result = await _global_state.tokenizer_manager.prepare_weights_update(obj, request)
     content = {"success": result.success, "message": result.message}
     if obj.transport == "p2p":
         content["tensor_map"] = result.tensor_map
@@ -2322,6 +2324,19 @@ def _execute_server_warmup(server_args: ServerArgs):
         # TODO Workaround the bug that embedding errors for list of size 1
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
+
+    if server_args.dsv4_flash_exact_mode:
+        # The first exact DSV4 lane owns one invariant MAX_LEN row at DP rank 0;
+        # warm up precisely that admitted request instead of the generic DP batch.
+        if isinstance(json_data.get("text"), list):
+            json_data["text"] = json_data["text"][0]
+        if (
+            isinstance(json_data.get("input_ids"), list)
+            and json_data["input_ids"]
+            and isinstance(json_data["input_ids"][0], list)
+        ):
+            json_data["input_ids"] = json_data["input_ids"][0]
+        json_data["routed_dp_rank"] = 0
 
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:

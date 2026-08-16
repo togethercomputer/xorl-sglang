@@ -159,7 +159,10 @@ def get_default_hidden_dim(
             config.hidden_size,
         )
     elif module_name == "gate_up_proj":
-        inter = config.intermediate_size
+        if getattr(config, "model_type", None) == "deepseek_v4":
+            inter = config.moe_intermediate_size * config.n_shared_experts
+        else:
+            inter = config.intermediate_size
         first_k = getattr(config, "first_k_dense_replace", None)
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
@@ -169,7 +172,10 @@ def get_default_hidden_dim(
                 inter = moe_inter * n_shared
         return config.hidden_size, inter * 2
     elif module_name == "down_proj":
-        inter = config.intermediate_size
+        if getattr(config, "model_type", None) == "deepseek_v4":
+            inter = config.moe_intermediate_size * config.n_shared_experts
+        else:
+            inter = config.intermediate_size
         first_k = getattr(config, "first_k_dense_replace", None)
         moe_freq = getattr(config, "moe_layer_freq", 1)
         if first_k is not None and layer_idx >= first_k and layer_idx % moe_freq == 0:
@@ -197,6 +203,19 @@ def get_default_hidden_dim(
             config.kv_lora_rank,
             config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
         )
+    elif module_name == "wq_a":
+        return config.hidden_size, config.q_lora_rank
+    elif module_name == "wkv":
+        return config.hidden_size, config.head_dim
+    elif module_name == "self_attn.wq_b":
+        return config.q_lora_rank, config.num_attention_heads * config.head_dim
+    elif module_name == "wo_a":
+        return (
+            config.num_attention_heads * config.head_dim // config.o_groups,
+            config.o_groups * config.o_lora_rank,
+        )
+    elif module_name == "wo_b":
+        return config.o_groups * config.o_lora_rank, config.hidden_size
     elif module_name in DSA_INDEXER_LORA_NAMES:
         from sglang.srt.configs.model_config import (
             get_dsa_index_head_dim,
@@ -281,8 +300,14 @@ def get_normalized_target_modules(
 
     result = set()
     for name in target_modules:
-        base_name = name.split(".")[-1]
-        normalized_name = params_mapping.get(base_name, base_name)
+        # DSV4's attention wq_b and DSA's indexer wq_b have the same leaf
+        # name.  The exact DSV4 adapter uses the parent-qualified spelling so
+        # the two physical families can never alias.
+        if name == "self_attn.wq_b":
+            normalized_name = name
+        else:
+            base_name = name.split(".")[-1]
+            normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
     return result
 
@@ -338,6 +363,7 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
     "down_proj_moe",
     "down_proj_shared_moe",
     "wo_ud",
+    "wo_b",
 ]
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
@@ -346,6 +372,8 @@ REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",
     "fc2_latent_proj",
+    "wq_a",
+    "wkv",
     *DSA_INDEXER_LORA_NAMES,
 ]
 # Attention-projection LoRA modules shard on the attention-TP group, which
@@ -364,6 +392,9 @@ ATTN_TP_LORA_MODULE_NAMES = frozenset(
         "wo_ud",
         "in_proj",
         "in_proj_qkvz",
+        "self_attn.wq_b",
+        "wo_a",
+        "wo_b",
     }
 )
 
@@ -378,6 +409,11 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
         "out_proj",
         "in_proj",
         "in_proj_qkvz",
+        "self_attn.wq_b",
+        "wo_a",
+        "wo_b",
+        "wq_a",
+        "wkv",
         "up_proj",
         "gate_up_proj",
         "down_proj",

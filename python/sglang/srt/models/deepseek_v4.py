@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import functools
 import logging
+import os
 import time
 from contextlib import contextmanager, nullcontext
 from typing import (
@@ -48,6 +49,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_cp_split,
     dsa_use_prefill_cp,
+    gather_dsa_prefill_cp_rows,
     is_dsa_enable_prefill_cp,
     is_dsa_prefill_cp_round_robin_split,
 )
@@ -59,6 +61,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     dsa_cp_reduce_scatter_hidden_states,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
     attn_tp_all_gather,
@@ -78,6 +81,12 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
     is_dp_attention_enabled,
     is_dp_gatherv_active,
+)
+from sglang.srt.layers.dsv4_ownership import (
+    gather_dsv4_owner_plane_rows,
+    reassemble_dsv4_local_rows,
+    reconstruct_dsv4_dp_rows,
+    resolve_dsv4_owner_plane,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
@@ -206,6 +215,158 @@ DEEPSEEK_V4_STACKED_PARAMS_MAPPING: List[Tuple[str, str, int]] = [
     ("gate_up_proj", "gate_proj", 0),
     ("gate_up_proj", "up_proj", 1),
 ]
+
+_DSV4_PP_RESIDUAL = "dsv4_mhc_residual"
+_DSV4_PP_POST = "dsv4_mhc_post"
+_DSV4_PP_COMB = "dsv4_mhc_comb"
+_DSV4_PP_INPUT_IDS = "dsv4_exact_input_ids"
+_DSV4_PP_POSITIONS = "dsv4_exact_positions"
+
+
+def pack_dsv4_exact_pp_proxy(
+    hidden_states: torch.Tensor,
+    *,
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    hc_mult: int,
+    hidden_size: int,
+    deferred_mhc: bool,
+    residual: Optional[torch.Tensor] = None,
+    post: Optional[torch.Tensor] = None,
+    comb: Optional[torch.Tensor] = None,
+) -> PPProxyTensors:
+    """Pack the exact DSV4 state that crosses one physical PP boundary.
+
+    The ordinary mHC PP ABI stores a completed ``[T, hc_mult, H]`` image in a
+    flattened hidden-state slot.  The fused exact lane must instead preserve
+    the deferred FFN ``hc_post`` operands so that the next stage executes the
+    same fused post/pre operation as an unsplit layer sequence.  We keep the
+    existing fixed-width hidden slot by placing the live ``[T, H]`` partial in
+    its first slice; the remaining slices are padding and are never consumed.
+    """
+
+    input_ids = input_ids.reshape(-1)
+    positions = positions.reshape(-1)
+    if input_ids.shape != positions.shape:
+        raise ValueError("Exact DSV4 PP token ids and positions must have one shape")
+
+    rows = hidden_states.shape[0]
+    if deferred_mhc:
+        if hidden_states.ndim != 2 or hidden_states.shape[1] != hidden_size:
+            raise ValueError(
+                "Deferred exact DSV4 PP hidden state must have shape [rows, hidden_size]"
+            )
+        if residual is None or post is None or comb is None:
+            raise ValueError("Deferred exact DSV4 PP requires all mHC operands")
+        expected = (
+            (rows, hc_mult, hidden_size),
+            (rows, hc_mult),
+            (rows, hc_mult, hc_mult),
+        )
+        actual = (tuple(residual.shape), tuple(post.shape), tuple(comb.shape))
+        if actual != expected:
+            raise ValueError(
+                f"Exact DSV4 PP mHC operand shapes must be {expected}, got {actual}"
+            )
+        proxy_hidden = F.pad(hidden_states, (0, (hc_mult - 1) * hidden_size))
+    else:
+        if hidden_states.ndim != 3 or tuple(hidden_states.shape[1:]) != (
+            hc_mult,
+            hidden_size,
+        ):
+            raise ValueError(
+                "Completed exact DSV4 PP hidden state must have shape "
+                "[rows, hc_mult, hidden_size]"
+            )
+        proxy_hidden = hidden_states.flatten(1)
+        residual = hidden_states.new_zeros((rows, hc_mult, hidden_size))
+        post = torch.zeros(
+            (rows, hc_mult), dtype=torch.float32, device=hidden_states.device
+        )
+        comb = torch.zeros(
+            (rows, hc_mult, hc_mult),
+            dtype=torch.float32,
+            device=hidden_states.device,
+        )
+
+    return PPProxyTensors(
+        {
+            "hidden_states": proxy_hidden,
+            _DSV4_PP_RESIDUAL: residual,
+            _DSV4_PP_POST: post,
+            _DSV4_PP_COMB: comb,
+            _DSV4_PP_INPUT_IDS: input_ids,
+            _DSV4_PP_POSITIONS: positions,
+        }
+    )
+
+
+def unpack_dsv4_exact_pp_proxy(
+    pp_proxy_tensors: PPProxyTensors,
+    *,
+    hc_mult: int,
+    hidden_size: int,
+    deferred_mhc: bool,
+) -> tuple[
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Inverse of :func:`pack_dsv4_exact_pp_proxy`."""
+
+    hidden_states = pp_proxy_tensors["hidden_states"]
+    required = (
+        _DSV4_PP_RESIDUAL,
+        _DSV4_PP_POST,
+        _DSV4_PP_COMB,
+        _DSV4_PP_INPUT_IDS,
+        _DSV4_PP_POSITIONS,
+    )
+    missing = [key for key in required if key not in pp_proxy_tensors.tensors]
+    if missing:
+        raise KeyError(f"Exact DSV4 PP proxy is missing: {', '.join(missing)}")
+    if hidden_states.ndim != 2 or hidden_states.shape[1] != hc_mult * hidden_size:
+        raise ValueError(
+            "Exact DSV4 PP hidden slot must have width hc_mult * hidden_size"
+        )
+    if deferred_mhc:
+        hidden_states = hidden_states[:, :hidden_size]
+        residual = pp_proxy_tensors[_DSV4_PP_RESIDUAL]
+        post = pp_proxy_tensors[_DSV4_PP_POST]
+        comb = pp_proxy_tensors[_DSV4_PP_COMB]
+    else:
+        hidden_states = hidden_states.view(-1, hc_mult, hidden_size)
+        residual = post = comb = None
+    return (
+        hidden_states,
+        residual,
+        post,
+        comb,
+        pp_proxy_tensors[_DSV4_PP_INPUT_IDS],
+        pp_proxy_tensors[_DSV4_PP_POSITIONS],
+    )
+
+
+def _align_exact_dsv4_eager_decode_logits_counts(
+    forward_batch: ForwardBatch,
+) -> None:
+    """Make eager DP decode use the same physical logits rows as decode graphs."""
+    if (
+        not forward_batch.forward_mode.is_decode_or_idle()
+        or forward_batch.is_extend_in_batch
+        or forward_batch._original_batch_size is None
+    ):
+        return
+
+    forward_batch.global_num_tokens_for_logprob_cpu = list(
+        forward_batch.global_num_tokens_cpu
+    )
+    forward_batch.global_num_tokens_for_logprob_gpu.copy_(
+        forward_batch.global_num_tokens_gpu
+    )
 
 
 def _is_fused_mhc_post_pre_enabled() -> bool:
@@ -444,9 +605,18 @@ class MqaAttentionBase(nn.Module):
         assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
 
+        self.dsv4_flash_exact_mode = bool(
+            getattr(config, "_dsv4_flash_exact_mode", False)
+        )
         fuse: bool = (
             envs.SGLANG_OPT_FUSE_WQA_WKV.get() if fuse_wqa_wkv is None else fuse_wqa_wkv
         )
+        if self.dsv4_flash_exact_mode and fuse:
+            raise ValueError(
+                "DSV4-Flash exact active-LoRA mode requires unfused wq_a/wkv "
+                "until the fused QKV-A factor boundary is byte-qualified; set "
+                "SGLANG_OPT_FUSE_WQA_WKV=0."
+            )
         fp8: bool = _FP8_WO_A_GEMM if wo_a_fp8 is None else wo_a_fp8
         reduce_results: bool = (
             (self.attn_tp_size == get_parallel().tp_size and self.attn_tp_size > 1)
@@ -529,6 +699,15 @@ class MqaAttentionBase(nn.Module):
             tp_rank=self.attn_tp_rank,
             tp_size=self.attn_tp_size,
         )
+
+        if os.getenv("SGLANG_DSV4_DEBUG_ATTENTION_BOUNDARIES", "0") == "1":
+            self.debug_q_raw = nn.Identity()
+            self.debug_q = nn.Identity()
+            self.debug_kv_raw = nn.Identity()
+            self.debug_attn_core = nn.Identity()
+            self.debug_attn_inverse = nn.Identity()
+            self.debug_wo_a = nn.Identity()
+            self.debug_wo_b = nn.Identity()
 
         from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 
@@ -738,10 +917,14 @@ class MQALayer(MqaAttentionBase):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
+        if hasattr(self, "debug_q_raw"):
+            q = self.debug_q_raw(q)
         if q_out is None:
             q_out = torch.empty_like(q)
         # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        if hasattr(self, "debug_q"):
+            q_out = self.debug_q(q_out)
         return q_out
 
     def _compute_kv_to_cache(
@@ -766,22 +949,63 @@ class MQALayer(MqaAttentionBase):
                 layer_id=self.layer_id, swa_k=kv, forward_batch=forward_batch
             )
             return
+        kv = self._compute_raw_kv(x, qkv_a=qkv_a)
+        self._store_raw_kv_to_cache(kv, positions, forward_batch, attn_backend)
+
+    def _compute_raw_kv(
+        self,
+        x: torch.Tensor,
+        qkv_a: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return WKV projection rows before KV norm, RoPE, or FP8 storage."""
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
+        if hasattr(self, "debug_kv_raw"):
+            kv = self.debug_kv_raw(kv)
+        return kv.contiguous()
+
+    def _store_raw_kv_to_cache(
+        self,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> None:
+        """Apply the canonical fused FP32 KV transform and paged FP8 store."""
         token_to_kv_pool = get_token_to_kv_pool()
         if TYPE_CHECKING:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        swa_loc = attn_backend.get_swa_out_cache_loc(forward_batch)
+        assert kv.shape[0] == positions.shape[0] == swa_loc.shape[0], (
+            "DSV4 fused KV store requires aligned raw rows, positions, and cache "
+            f"locations, got {kv.shape[0]}, {positions.shape[0]}, {swa_loc.shape[0]}"
+        )
         token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
             layer_id=self.layer_id,
-            swa_loc=attn_backend.get_swa_out_cache_loc(forward_batch),
+            swa_loc=swa_loc,
             kv=kv,
             kv_weight=self.kv_norm.weight.data,
             eps=self.eps,
             freqs_cis=self.freqs_cis,
             positions=positions,
         )
+
+    def _gather_exact_cp_raw_kv_to_cache(
+        self,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend,
+    ) -> None:
+        """Rebuild logical CP rows before the same fused store used by CP1."""
+        assert kv.dtype == torch.bfloat16
+        positions = positions.to(dtype=torch.int64).reshape(-1, 1).contiguous()
+        kv = gather_dsa_prefill_cp_rows(kv.contiguous(), forward_batch)
+        positions = gather_dsa_prefill_cp_rows(positions, forward_batch)
+        positions = positions.squeeze(-1)
+        self._store_raw_kv_to_cache(kv, positions, forward_batch, attn_backend)
 
     def _compute_kv_bf16(
         self,
@@ -1012,7 +1236,25 @@ class MQALayer(MqaAttentionBase):
             not unified and self.use_fused_qk_norm_rope
         )
 
-        if do_fused_store:
+        exact_nvidia_raw_store = (
+            getattr(self, "dsv4_flash_exact_mode", False)
+            and _is_cuda
+            and not _is_hip
+            and not unified
+        )
+
+        if exact_nvidia_raw_store:
+            q_lora = self.q_norm(q_lora)
+            q = self._compute_q_b(q_lora, positions, q_out)
+            kv = self._compute_raw_kv(x_linear, qkv_a=qkv_a)
+            if use_cp:
+                self._gather_exact_cp_raw_kv_to_cache(
+                    kv, positions, forward_batch, attn_backend
+                )
+            else:
+                self._store_raw_kv_to_cache(kv, positions, forward_batch, attn_backend)
+            kv = None
+        elif do_fused_store:
             if _is_gfx95_supported:
                 q_for_wqb, q_lora = _fused_rmsnorm_fp8_quant(
                     q_lora,
@@ -1073,12 +1315,7 @@ class MQALayer(MqaAttentionBase):
                 # DSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                kv = gather_dsa_prefill_cp_rows(kv.contiguous(), forward_batch)
         elif _is_npu:
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
@@ -1124,22 +1361,12 @@ class MQALayer(MqaAttentionBase):
                     # unified_kv + DSA CP: the 2-source prefill path needs the
                     # FULL current-chunk KV (extend source + ring write), so
                     # all-gather the per-rank bf16 KV across the CP group.
-                    kv = cp_all_gather_rerange_output(
-                        kv.contiguous(),
-                        self.cp_size,
-                        forward_batch,
-                        torch.cuda.current_stream(),
-                    )
+                    kv = gather_dsa_prefill_cp_rows(kv.contiguous(), forward_batch)
             elif use_cp:
                 # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
                 # write to the FlashMLA cache after gather.
                 kv = self._compute_kv_bf16(x_linear, positions, qkv_a=qkv_a)
-                kv = cp_all_gather_rerange_output(
-                    kv.contiguous(),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                kv = gather_dsa_prefill_cp_rows(kv.contiguous(), forward_batch)
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
                     swa_k=kv,
@@ -1295,6 +1522,8 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+        if hasattr(self, "debug_attn_core"):
+            o = self.debug_attn_core(o)
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True
@@ -1314,8 +1543,11 @@ class MQALayer(MqaAttentionBase):
                 positions=positions,
                 inverse=True,
             )
+        if hasattr(self, "debug_attn_inverse"):
+            o = self.debug_attn_inverse(o)
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
+        o_input = o
 
         if _FP8_WO_A_GEMM:
             import deep_gemm
@@ -1351,7 +1583,20 @@ class MQALayer(MqaAttentionBase):
             wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
+        if getattr(self.wo_a, "lora_active", False):
+            apply_grouped_lora = getattr(self.wo_a, "apply_grouped_lora", None)
+            if not callable(apply_grouped_lora):
+                raise RuntimeError(
+                    "DSV4 grouped wo_a has an active adapter but no grouped LoRA value path"
+                )
+            o = apply_grouped_lora(o, o_input)
+
+        if hasattr(self, "debug_wo_a"):
+            o = self.debug_wo_a(o)
+
         o, _ = self.wo_b(o.flatten(1))
+        if hasattr(self, "debug_wo_b"):
+            o = self.debug_wo_b(o)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
 
@@ -1759,6 +2004,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
+            positions=positions,
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
@@ -1776,10 +2022,19 @@ class DeepseekV4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         *,
+        positions: torch.Tensor,
         input_ids: torch.Tensor,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
+        _dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
+        if _dsv4_exact_mode:
+            return self._run_exact_moe_owner_sync(
+                hidden_states,
+                forward_batch,
+                positions=positions,
+                context_sharded=_use_cp,
+            )
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
@@ -1799,7 +2054,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         # MUST tell the MoE to skip it (mlp_reduce_scatter=True) or it
         # double-reduces. Env-gated via SGLANG_DP_USE_GATHERV, default OFF.
         _use_reduce_scatterv = (
-            _use_tp_moe_gather
+            not _dsv4_exact_mode
+            and _use_tp_moe_gather
             and is_dp_gatherv_active()
             and forward_batch.dp_padding_mode is not None
             and not forward_batch.dp_padding_mode.is_max_len()
@@ -1812,7 +2068,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         # all_reduce. tp_size==attn_dp_size required so the global buffer splits
         # evenly into per-rank chunks.
         _use_reduce_scatter = (
-            envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
+            not _dsv4_exact_mode
+            and envs.SGLANG_DP_USE_REDUCE_SCATTER.get()
             and _use_tp_moe_gather
             and not _use_reduce_scatterv
             and not should_use_dp_reduce_scatterv()
@@ -1865,7 +2122,16 @@ class DeepseekV4DecoderLayer(nn.Module):
         # Skip the MoE-internal post-experts all_reduce when we will do the
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
-        with get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter):
+        lora_backend = getattr(getattr(self.mlp, "experts", None), "lora_backend", None)
+        lora_context = (
+            lora_backend.use_gathered_mlp_batch_info(hidden_states.shape[0])
+            if lora_backend is not None
+            else nullcontext()
+        )
+        with (
+            get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
+            lora_context,
+        ):
             hidden_states = self.mlp(
                 hidden_states,
                 forward_batch,
@@ -1915,6 +2181,124 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
         return hidden_states
+
+    def _run_exact_moe_owner_sync(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        positions: torch.Tensor,
+        context_sharded: bool,
+    ) -> torch.Tensor:
+        """Run exact DSV4 MoE once per logical row on every EP8 contributor."""
+
+        del positions  # The unsplit absolute positions are cached on ForwardBatch.
+        ownership = resolve_dsv4_owner_plane()
+        segment_lengths = list(forward_batch.global_num_tokens_cpu or [])
+        if not segment_lengths and ownership.dp_size == 1:
+            segment_lengths = [hidden_states.shape[0]]
+
+        dp_hidden = reconstruct_dsv4_dp_rows(
+            hidden_states,
+            forward_batch,
+            ownership,
+            segment_lengths,
+            context_sharded=context_sharded,
+        )
+        global_hidden_buffer = get_global_dp_buffer(get_tp_group())
+        full_hidden = gather_dsv4_owner_plane_rows(
+            dp_hidden,
+            ownership,
+            segment_lengths,
+            output=global_hidden_buffer,
+            group=get_tp_group(),
+        )
+
+        def full_metadata(cache_name: str, source_name: str) -> torch.Tensor:
+            cached = getattr(forward_batch, cache_name, None)
+            if cached is not None:
+                return cached
+            source = getattr(forward_batch, source_name, None)
+            if source is None:
+                raise RuntimeError(
+                    f"Exact DSV4 owner movement is missing {source_name}"
+                )
+            dp_source = source.reshape(-1)
+            if context_sharded:
+                from sglang.srt.layers.cp.base import get_cp_strategy
+
+                strategy = get_cp_strategy()
+                if strategy is None:
+                    raise RuntimeError(
+                        "Exact DSV4 metadata requires an active context-parallel strategy"
+                    )
+                local_source = strategy.shard_hidden_states(dp_source, forward_batch)
+                dp_source = reconstruct_dsv4_dp_rows(
+                    local_source,
+                    forward_batch,
+                    ownership,
+                    segment_lengths,
+                    context_sharded=True,
+                )
+            else:
+                dp_source = reconstruct_dsv4_dp_rows(
+                    dp_source,
+                    forward_batch,
+                    ownership,
+                    segment_lengths,
+                    context_sharded=False,
+                )
+            gathered = gather_dsv4_owner_plane_rows(
+                dp_source,
+                ownership,
+                segment_lengths,
+                group=get_tp_group(),
+            )
+            setattr(forward_batch, cache_name, gathered)
+            return gathered
+
+        full_input_ids = full_metadata(
+            "_dsv4_exact_owner_input_ids", "_dsv4_exact_dp_input_ids"
+        )
+        full_positions = full_metadata(
+            "_dsv4_exact_owner_positions", "_dsv4_exact_dp_positions"
+        )
+        if not (
+            full_hidden.shape[0] == full_input_ids.numel() == full_positions.numel()
+        ):
+            raise RuntimeError(
+                "Exact DSV4 hidden, token ID, and absolute-position rows diverged"
+            )
+
+        lora_backend = getattr(getattr(self.mlp, "experts", None), "lora_backend", None)
+        lora_context = (
+            lora_backend.use_gathered_mlp_batch_info(full_hidden.shape[0])
+            if lora_backend is not None
+            else nullcontext()
+        )
+        with (
+            get_forward().scoped(
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=False,
+            ),
+            lora_context,
+        ):
+            completed = self.mlp(
+                full_hidden,
+                forward_batch,
+                input_ids=full_input_ids,
+                input_ids_global=full_input_ids,
+                absolute_positions=full_positions,
+            )
+
+        return reassemble_dsv4_local_rows(
+            completed,
+            forward_batch,
+            ownership,
+            segment_lengths,
+            context_sharded=context_sharded,
+            expected_local_rows=hidden_states.shape[0],
+        )
 
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
@@ -2138,6 +2522,7 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        self.config = config
         self.pp_group = get_pp_group()
         self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
@@ -2352,19 +2737,65 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
+        cp_v2_active = is_cp_v2_active(forward_batch)
+        use_fused = self.use_fused_mhc_post_pre
+        prev_residual = prev_post = prev_comb = None
         if self.pp_group.is_first_rank:
-            hidden_states = self.embed_tokens(input_ids)
+            exact_positions = forward_batch.positions if dsv4_exact_mode else positions
+            hidden_states = (
+                self.embed_tokens(input_ids) if input_embeds is None else input_embeds
+            )
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
         else:
             assert pp_proxy_tensors is not None
-            hidden_states = pp_proxy_tensors["hidden_states"]
-            # Unflatten 2D PP IPC tensor back to 3D mHC shape.
-            if hidden_states.ndim == 2:
-                hidden_states = hidden_states.view(
-                    hidden_states.shape[0], self.hc_mult, self.hidden_size
+            if dsv4_exact_mode:
+                (
+                    hidden_states,
+                    prev_residual,
+                    prev_post,
+                    prev_comb,
+                    input_ids,
+                    exact_positions,
+                ) = unpack_dsv4_exact_pp_proxy(
+                    pp_proxy_tensors,
+                    hc_mult=self.hc_mult,
+                    hidden_size=self.hidden_size,
+                    deferred_mhc=use_fused,
                 )
+                # The proxy carries global owner metadata.  CP-v2 separately
+                # supplies this stage's already-sharded RoPE positions.
+                if not cp_v2_active:
+                    positions = exact_positions
+            else:
+                hidden_states = pp_proxy_tensors["hidden_states"]
+                # Unflatten 2D PP IPC tensor back to 3D mHC shape.
+                if hidden_states.ndim == 2:
+                    hidden_states = hidden_states.view(
+                        hidden_states.shape[0], self.hc_mult, self.hidden_size
+                    )
 
-        if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
+        if dsv4_exact_mode:
+            # Keep the unsplit DP-owner metadata.  Unlike ForwardBatch's local
+            # scheduler fields, these tensors are explicitly forwarded through
+            # every physical pipeline stage with the live mHC state.
+            forward_batch._dsv4_exact_dp_input_ids = input_ids.reshape(-1)
+            forward_batch._dsv4_exact_dp_positions = (exact_positions).reshape(-1)
+            forward_batch.dsv4_exact_logits_rows_reconstructed = False
+            forward_batch.dsv4_exact_logits_owner_rows = None
+            forward_batch.dsv4_exact_logits_dp_rank = None
+            for cache_name in (
+                "_dsv4_exact_owner_input_ids",
+                "_dsv4_exact_owner_positions",
+            ):
+                if hasattr(forward_batch, cache_name):
+                    delattr(forward_batch, cache_name)
+
+        if (
+            not dsv4_exact_mode
+            and get_parallel().attn_dp_size > 1
+            and get_moe_a2a_backend().is_none()
+        ):
             input_ids_global = torch.empty(
                 (get_global_dp_buffer_len(), 1),
                 dtype=input_ids.dtype,
@@ -2377,7 +2808,12 @@ class DeepseekV4Model(nn.Module):
         else:
             input_ids_global = input_ids
 
-        if dsa_use_prefill_cp(forward_batch):
+        context_sharded = dsa_use_prefill_cp(forward_batch)
+        # CP-v2 already shards the embeddings, positions, and KV locations at
+        # the eager-runner boundary.  The model-side split/gather below is the
+        # legacy CP-v1 boundary and must not run a second time.
+        use_cp_v1 = context_sharded and not cp_v2_active
+        if use_cp_v1:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
@@ -2389,7 +2825,7 @@ class DeepseekV4Model(nn.Module):
             if hasattr(forward_batch, _attr):
                 delattr(forward_batch, _attr)
         capture_dspark = self.dspark_layers_to_capture is not None
-        if capture_dspark and dsa_use_prefill_cp(forward_batch):
+        if capture_dspark and context_sharded:
             raise NotImplementedError(
                 "DSpark aux hidden-state capture is not supported together with "
                 "DeepSeek-V4 prefill context parallelism (attn_cp_size > 1). Disable one "
@@ -2408,8 +2844,6 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
             )
         else:
-            use_fused = self.use_fused_mhc_post_pre
-            prev_residual, prev_post, prev_comb = None, None, None
             last_layer = None
             for i in range(self.start_layer, self.end_layer):
                 layer = self.layers[i]
@@ -2438,23 +2872,76 @@ class DeepseekV4Model(nn.Module):
                     else:
                         completed = hidden_states
                     dspark_aux_hidden_states.append(completed.mean(dim=1))
-            if use_fused and last_layer is not None:
+            # A fused exact lane carries the deferred FFN hc_post state across
+            # physical PP boundaries.  Only the terminal stage completes it;
+            # otherwise a pipeline cut would silently change the mHC program.
+            if use_fused and last_layer is not None and self.pp_group.is_last_rank:
                 hidden_states = last_layer.hc_post(
                     hidden_states, prev_residual, prev_post, prev_comb
                 )
 
         # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
-        if self.pp_group.is_last_rank and dsa_use_prefill_cp(forward_batch):
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
+        if self.pp_group.is_last_rank and use_cp_v1:
+            if dsv4_exact_mode:
+                from sglang.srt.layers.cp.base import get_cp_strategy
+
+                strategy = get_cp_strategy()
+                if strategy is None:
+                    raise RuntimeError(
+                        "Exact DSV4 logits require the active CP strategy to "
+                        "reconstruct logical prefill rows"
+                    )
+                hidden_states = strategy.gather_hidden_states(
+                    hidden_states, forward_batch, torch.cuda.current_stream()
+                )
+                logical_rows = int(forward_batch.attn_cp_metadata.total_seq_lens)
+                if hidden_states.shape[0] != logical_rows:
+                    raise RuntimeError(
+                        "Exact DSV4 CP-prefill reconstruction returned the wrong "
+                        f"logical row count: rows={hidden_states.shape[0]}, "
+                        f"expected={logical_rows}"
+                    )
+            else:
+                hidden_states = cp_all_gather_rerange_output(
+                    hidden_states,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
 
         if not self.pp_group.is_last_rank:
+            if dsv4_exact_mode:
+                return pack_dsv4_exact_pp_proxy(
+                    hidden_states,
+                    input_ids=forward_batch._dsv4_exact_dp_input_ids,
+                    positions=forward_batch._dsv4_exact_dp_positions,
+                    hc_mult=self.hc_mult,
+                    hidden_size=self.hidden_size,
+                    deferred_mhc=use_fused,
+                    residual=prev_residual,
+                    post=prev_post,
+                    comb=prev_comb,
+                )
             # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+
+        if dsv4_exact_mode:
+            owner_rows = int(forward_batch._dsv4_exact_dp_input_ids.numel())
+            # CP-v1 reconstructs logical rows above.  CP-v2 deliberately
+            # returns the physical local shard here; EagerRunner gathers it at
+            # the shared model boundary before LogitsProcessor snapshots and
+            # validates this ownership metadata.
+            if not cp_v2_active and hidden_states.shape[0] != owner_rows:
+                raise RuntimeError(
+                    "Exact DSV4 model/head boundary does not contain one complete "
+                    f"logical DP-owner block: rows={hidden_states.shape[0]}, "
+                    f"expected={owner_rows}"
+                )
+            ownership = resolve_dsv4_owner_plane()
+            _align_exact_dsv4_eager_decode_logits_counts(forward_batch)
+            forward_batch.dsv4_exact_logits_rows_reconstructed = True
+            forward_batch.dsv4_exact_logits_owner_rows = owner_rows
+            forward_batch.dsv4_exact_logits_dp_rank = ownership.dp_rank
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -2470,6 +2957,17 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    supported_lora_modules = (
+        "wq_a",
+        "self_attn.wq_b",
+        "wkv",
+        "wo_a",
+        "wo_b",
+        "gate_up_proj",
+        "down_proj",
+        "lm_head",
+    )
+
     def __init__(
         self,
         config: DeepSeekV4Config,
@@ -2503,7 +3001,12 @@ class DeepseekV4ForCausalLM(nn.Module):
                     config.hidden_size,
                     quant_config=quant_config,
                     prefix=add_prefix("lm_head", prefix),
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                    # Exact DSV4 shards vocabulary over the complete
+                    # stage-local DP x CP owner plane, not the body TP1 group.
+                    use_attn_tp_group=(
+                        get_parallel().enable_dp_lm_head
+                        and not getattr(config, "_dsv4_flash_exact_mode", False)
+                    ),
                 )
         else:
             self.lm_head = PPMissingLayer()
@@ -2554,6 +3057,15 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def determine_num_fused_shared_experts(self):
         self.num_fused_shared_experts = 0
+        if (
+            getattr(self.config, "_dsv4_flash_exact_mode", False)
+            and not get_exec().moe.disable_shared_experts_fusion
+        ):
+            raise ValueError(
+                "DSV4-Flash exact active-LoRA mode requires "
+                "disable_shared_experts_fusion=true so every shared-expert "
+                "adapter target has a physical runtime module."
+            )
         if get_exec().moe.disable_shared_experts_fusion:
             return
 
@@ -2591,7 +3103,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp:
+        if self.dsa_enable_prefill_cp and not is_cp_v2_active(forward_batch):
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
@@ -2612,7 +3124,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
-            hidden_states = self.model.forward(
+            hidden_states = self.model(
                 input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
             )
         if not self.pp_group.is_last_rank:

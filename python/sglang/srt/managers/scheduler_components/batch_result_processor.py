@@ -42,6 +42,9 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+from sglang.srt.state_capturer.routed_experts_side_channel import (
+    get_routed_experts_side_channel_publisher,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -125,7 +128,7 @@ class SchedulerBatchResultProcessor:
         Logs a soft warning if the resulting tensor's row count differs from
         the expected `seqlen - 1 - start_len`, to catch silent regressions.
         """
-        if not req.return_routed_experts:
+        if not (req.return_routed_experts or req.return_expert_logits):
             return
         capturer = get_global_experts_capturer()
         if capturer is None:
@@ -138,6 +141,13 @@ class SchedulerBatchResultProcessor:
             req_to_token_pool=self.req_to_token_pool,
             start_len=start_len,
         )
+        if req.return_expert_logits:
+            req.expert_logits = capturer.get_expert_logits(
+                req_pool_idx=req.req_pool_idx,
+                seqlen=seqlen,
+                req_to_token_pool=self.req_to_token_pool,
+                start_len=start_len,
+            )
 
         expected_rows = max(0, seqlen - 1 - start_len)
         if (
@@ -155,6 +165,32 @@ class SchedulerBatchResultProcessor:
                 req.seqlen,
                 req.cached_tokens,
                 req.routed_experts_start_len,
+            )
+
+        publisher = (
+            get_routed_experts_side_channel_publisher(
+                self.server_args.routed_experts_side_channel_dir,
+                self.server_args.routed_experts_side_channel_workers,
+            )
+            if req.return_routed_experts_file
+            else None
+        )
+        if publisher is not None:
+            descriptor = publisher.publish(
+                request_id=req.rid,
+                routed_experts=req.routed_experts,
+                expert_logits=req.expert_logits,
+                start_row=start_len,
+            )
+            req.routed_experts = (
+                {**descriptor, "field": "routed_experts"}
+                if req.routed_experts is not None
+                else None
+            )
+            req.expert_logits = (
+                {**descriptor, "field": "routed_expert_logits"}
+                if req.expert_logits is not None
+                else None
             )
 
     def _maybe_collect_indexer_topk(self, req: Req):

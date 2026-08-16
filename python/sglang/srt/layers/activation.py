@@ -33,7 +33,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
+from sglang.srt.server_args import is_xorl_exact_mode
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -130,14 +131,21 @@ logger = logging.getLogger(__name__)
 class SiluAndMul(BaseFusedOp):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if get_exec().deterministic.rl_on_policy_target is not None:
-            self._forward_method = self.forward_native
+        if is_xorl_exact_mode(get_server_args()):
+            self._forward_method = self.forward_exact
         elif _use_aiter and envs.SGLANG_OPT_USE_AITER_SILU_MUL.get():
             self._forward_method = self.forward_aiter
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
         return F.silu(x[..., :d]) * x[..., d:]
+
+    def forward_exact(self, x: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.batch_invariant_ops.bi_silu_and_mul import (  # noqa: PLC0415
+            fp32_silu_and_mul,
+        )
+
+        return fp32_silu_and_mul(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
@@ -473,8 +481,7 @@ def get_act_fn(
     if quant_config is not None and act_fn_name in quant_config.get_scaled_act_names():
         if intermediate_size is None:
             raise ValueError(
-                "intermediate_size must be specified for scaled "
-                "activation functions."
+                "intermediate_size must be specified for scaled activation functions."
             )
         return ScaledActivation(
             act_fn, intermediate_size, input_is_parallel, params_dtype
@@ -487,7 +494,6 @@ def get_cross_encoder_activation_function(config: PretrainedConfig):
         hasattr(config, "sbert_ce_default_activation_function")
         and config.sbert_ce_default_activation_function is not None
     ):
-
         function_name = config.sbert_ce_default_activation_function
         assert function_name.startswith("torch.nn.modules."), (
             "Loading of activation functions is restricted to "

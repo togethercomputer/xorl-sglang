@@ -385,6 +385,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_residual_num_blocks=(
                 self.model_runner.get_pp_proxy_residual_num_blocks()
             ),
+            pp_proxy_dsv4_exact=self.model_runner.uses_dsv4_exact_pp_proxy(),
         )
         self.buffers.share_buffers()
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
@@ -849,6 +850,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             positions=positions,
             global_num_tokens_gpu=buffers.global_num_tokens_gpu,
             global_num_tokens_for_logprob_gpu=buffers.global_num_tokens_for_logprob_gpu,
+            global_num_tokens_for_logprob_cpu=global_num_tokens_cpu,
             dp_padding_mode=DpPaddingMode.get_default_mode_in_cuda_graph(),
             global_dp_buffer_len=global_dp_buffer_len,
             global_num_tokens_cpu=global_num_tokens_cpu,
@@ -994,6 +996,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+                self.model_runner.lora_manager.prepare_glm52_exact_dp_lora_batch(
+                    forward_batch,
+                    dp_row_counts=[num_tokens] * self.dp_size,
+                )
 
             attn_backend.init_forward_metadata_out_graph(forward_batch, in_capture=True)
 
@@ -1163,6 +1169,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = bs * self.captured_req_width
             graph_size_key = self._capture_graph_size(
                 bs=bs, num_tokens=padded_num_tokens
+            )
+
+        lora_manager = getattr(self.model_runner, "lora_manager", None)
+        if lora_manager is not None and forward_batch.lora_ids is not None:
+            lora_manager.prepare_glm52_exact_dp_lora_batch(
+                forward_batch,
+                dp_row_counts=[padded_num_tokens] * self.dp_size,
             )
 
         self.buffer_registry.fill_from(

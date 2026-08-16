@@ -121,9 +121,9 @@ def _warmup_update(
 
 
 def _require_http_success(response, endpoint):
-    assert response.status_code == 200, (
-        f"{endpoint} returned HTTP {response.status_code}: {response.text}"
-    )
+    assert (
+        response.status_code == 200
+    ), f"{endpoint} returned HTTP {response.status_code}: {response.text}"
     payload = response.json()
     assert payload["success"] is True, f"{endpoint} failed: {payload}"
     return payload
@@ -135,9 +135,9 @@ def _get_server_weight(url, name, size):
         json={"name": name, "truncate_size": size},
         timeout=60,
     )
-    assert response.status_code == 200, (
-        f"get_weights_by_name returned HTTP {response.status_code}: {response.text}"
-    )
+    assert (
+        response.status_code == 200
+    ), f"get_weights_by_name returned HTTP {response.status_code}: {response.text}"
     weight = response.json()
     assert isinstance(weight, list) and len(weight) == size
     return weight
@@ -846,9 +846,9 @@ def test_update_weights_from_distributed(
                 f"sgl_dp_2_instruct_params rank {i}",
             )
 
-    assert len(params["hf_instruct"]) == len(params["hf_base"]), (
-        "hf_instruct_params and hf_base_params have different lengths"
-    )
+    assert len(params["hf_instruct"]) == len(
+        params["hf_base"]
+    ), "hf_instruct_params and hf_base_params have different lengths"
 
     # Check if the weights of lm_head are tied with embed_tokens.
     params_to_check = [
@@ -898,18 +898,18 @@ def test_update_weights_from_distributed(
     # On local H100, it's 1 / 2
     time_limit = 3 if model_name == DEFAULT_SMALL_MODEL_NAME_FOR_TEST else 6
 
-    assert params["broadcast_time"] < time_limit, (
-        f"broadcast_time exceeds time limit {time_limit}s"
-    )
+    assert (
+        params["broadcast_time"] < time_limit
+    ), f"broadcast_time exceeds time limit {time_limit}s"
 
-    assert params["update_sgl_dp_1_time"] < time_limit, (
-        f"update_sgl_dp_one_time exceeds time limit {time_limit}s"
-    )
+    assert (
+        params["update_sgl_dp_1_time"] < time_limit
+    ), f"update_sgl_dp_one_time exceeds time limit {time_limit}s"
 
     if dp_size == 2:
-        assert params["update_sgl_dp_2_time"] < time_limit, (
-            f"update_sgl_dp_two_time exceeds time limit {time_limit}s"
-        )
+        assert (
+            params["update_sgl_dp_2_time"] < time_limit
+        ), f"update_sgl_dp_two_time exceeds time limit {time_limit}s"
 
     # Delete the context and close the parameter queue.
     del context

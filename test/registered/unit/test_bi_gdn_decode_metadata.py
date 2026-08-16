@@ -1,5 +1,9 @@
 import torch
+
 from sglang.kernels.ops.attention.fla.bi_gdn_decode import BIGDNDecodeCache
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _cache(num_slots: int = 4) -> BIGDNDecodeCache:
@@ -335,6 +339,14 @@ def test_graph_workspace_round_trip_updates_live_slot_zero() -> None:
     torch.testing.assert_close(cache.rows_qkv[0], expected[1])
     torch.testing.assert_close(cache.rows_g[0], expected[2])
     torch.testing.assert_close(cache.rows_beta[0], expected[3])
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))
 
 
 def test_graph_workspace_idle_dp_row_preserves_live_slot_zero() -> None:

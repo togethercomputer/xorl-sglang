@@ -34,16 +34,20 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_v2,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.xorl_batch_invariant import (
+    resolve_or_validate_xorl_bi_family,
+)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.layers.xorl_batch_invariant import (
-    resolve_or_validate_xorl_bi_family,
+from sglang.srt.server_args import (
+    get_global_server_args,
+    is_glm52_exact_mode,
+    is_qwen3_dense_exact_mode,
 )
-from sglang.srt.server_args import get_global_server_args, is_glm52_exact_mode
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -443,17 +447,16 @@ class RMSNorm(BaseFusedOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if is_glm52_exact_mode(get_global_server_args()):
+            server_args = get_global_server_args()
+            if is_glm52_exact_mode(server_args) or is_qwen3_dense_exact_mode(
+                server_args
+            ):
                 return self._forward_xorl_batch_invariant(
                     x,
                     residual,
                     post_residual_addition,
                 )
-            if (
-                residual is not None
-                or self.cast_x_before_out_mul
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None or self.cast_x_before_out_mul:
                 return self.forward_native(x, residual, post_residual_addition)
             out = rms_norm_batch_invariant(
                 x,
@@ -623,7 +626,6 @@ class RMSNorm(BaseFusedOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
                 or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -681,11 +683,7 @@ class RMSNorm(BaseFusedOp):
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or self.cast_x_before_out_mul
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None or self.cast_x_before_out_mul:
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
@@ -811,10 +809,7 @@ class RMSNorm(BaseFusedOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if (
-                residual is not None
-                or get_exec().deterministic.rl_on_policy_target == "fsdp"
-            ):
+            if residual is not None:
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,

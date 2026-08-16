@@ -8,6 +8,7 @@ from typing import Any, Dict, Literal, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 from sglang.srt.batch_invariant_ops.bi_gemm_configs import (
     baseline_mm_config,
@@ -25,7 +26,6 @@ from sglang.srt.utils.common import (
     get_device_core_count,
     get_dispatch_device_backend,
 )
-from triton.runtime.errors import OutOfResources
 
 _is_npu = is_npu()
 if _is_npu:
@@ -462,7 +462,6 @@ def log_softmax(input: torch.Tensor, dim: int = -1) -> torch.Tensor:
     Args:
         input: Input tensor
         dim: Dimension along which to compute log_softmax (only -1 or last dim supported)
-    >> Stashed changes
     Returns:
         Tensor with log_softmax applied along the specified dimension
     """
@@ -1543,9 +1542,9 @@ def bi_lm_head_selected_logprob(
     """
     assert hidden.ndim == 2 and weight.ndim == 2, "hidden and weight must be 2D"
     assert hidden.shape[1] == weight.shape[1], "hidden dim mismatch"
-    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-        "the lm-head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
-    )
+    assert (
+        hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    ), "the lm-head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
     assert hidden.is_cuda, "CUDA only"
 
     hidden = hidden.contiguous()
@@ -1621,9 +1620,9 @@ def bi_lm_head_full_logits(
     """
     assert hidden.ndim == 2 and weight.ndim == 2, "hidden and weight must be 2D"
     assert hidden.shape[1] == weight.shape[1], "hidden dim mismatch"
-    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-        "the lm-head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
-    )
+    assert (
+        hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    ), "the lm-head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
     assert hidden.is_cuda, "CUDA only"
 
     hidden = hidden.contiguous()
@@ -1758,9 +1757,9 @@ def bi_router_gemm(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """
     assert hidden.ndim == 2 and weight.ndim == 2, "hidden and weight must be 2D"
     assert hidden.shape[1] == weight.shape[1], "hidden dim mismatch"
-    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
-        "the router contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
-    )
+    assert (
+        hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+    ), "the router contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
     assert hidden.is_cuda, "CUDA only"
 
     hidden = hidden.contiguous()
@@ -1859,9 +1858,9 @@ def bi_router_topk_weights(
     Returns:
         ``[N, top_k]`` ``out_dtype`` routing weights.
     """
-    assert topk_vals.dtype == torch.float32, (
-        "the router contract renorms fp32 top-k scores"
-    )
+    assert (
+        topk_vals.dtype == torch.float32
+    ), "the router contract renorms fp32 top-k scores"
     if norm_topk_prob:
         if _ROUTER_RENORM_FUSED_ENABLED:
             # W3.4: one fused launch replacing the 7-add chain + divide +
@@ -1945,7 +1944,9 @@ def enable_batch_invariant_mode(
             _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
             _batch_invariant_LIB.impl("aten::mm.dtype", _mm_dtype_compat, dispatch_key)
         if "addmm" in selected:
-            _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+            _batch_invariant_LIB.impl(
+                "aten::addmm", addmm_batch_invariant, dispatch_key
+            )
         if "log_softmax" in selected:
             _batch_invariant_LIB.impl(
                 "aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key

@@ -49,6 +49,7 @@ import torch
 import zmq
 import zmq.asyncio
 from pydantic import PlainValidator
+
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -65,7 +66,6 @@ from sglang.srt.utils.msgspec_utils import (
     Base64Bytes,
     msgspec_struct_pydantic_core_schema,
 )
-
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -214,6 +214,10 @@ class GenerateReqInput:
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Whether to detokenize tokens in text in the returned logprobs.
     return_text_in_logprobs: bool = False
+    # Return the selected-token input/output logprob buffers as contiguous
+    # little-endian FP32 bytes.  This is an evidence surface for exact replay:
+    # unlike top-k output it always includes the sampled/teacher-forced token.
+    return_raw_token_logprobs_b64: bool = False
     # Return prompt top logprobs as flat arrays plus shape metadata instead of
     # the nested per-position [logprob, token_id, text] lists.
     return_flat_raw_top_logprobs: bool = False
@@ -229,10 +233,13 @@ class GenerateReqInput:
     ] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return float32 selected-router weights.
+    return_expert_logits: bool = False
     # Absolute start position for returned routings; response covers
     # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
     # 0 = full sequence.
-    routed_experts_start_len: int = 0
+    routed_experts_start_len: Union[List[int], int] = 0
+    return_routed_experts_file: bool = False
     return_indexer_topk: bool = False
 
     # The modalities of the image data [image, multi-images, video]
@@ -406,6 +413,17 @@ class GenerateReqInput:
             raise ValueError(
                 "return_flat_raw_top_logprobs_b64 requires return_flat_raw_top_logprobs."
             )
+        if self.return_raw_token_logprobs_b64:
+            return_logprob_enabled = self.return_logprob is True or (
+                isinstance(self.return_logprob, list)
+                and bool(self.return_logprob)
+                and all(value is True for value in self.return_logprob)
+            )
+            if not return_logprob_enabled:
+                raise ValueError(
+                    "return_raw_token_logprobs_b64 requires return_logprob=true "
+                    "for every request row."
+                )
 
     def _determine_batch_size(self):
         """Determine if this is a single example or a batch and the batch size."""
@@ -477,6 +495,12 @@ class GenerateReqInput:
             self.token_ids_logprob = None
         if self.return_sampling_mask is None:
             self.return_sampling_mask = False
+        if isinstance(self.routed_experts_start_len, list):
+            if len(self.routed_experts_start_len) != 1:
+                raise ValueError(
+                    "a single request accepts exactly one routed_experts_start_len"
+                )
+            self.routed_experts_start_len = int(self.routed_experts_start_len[0])
 
     def _normalize_batch_inputs(self):
         """Normalize inputs for a batch of examples, including parallel sampling expansion."""
@@ -497,9 +521,22 @@ class GenerateReqInput:
         self._normalize_sampling_params(num)
         self._normalize_logprob_params(num)
         self._normalize_return_hidden_states(num)
+        self._normalize_routed_experts_start_len(num)
         self._normalize_custom_logit_processor(num)
         self._normalize_extra_key(num)
         self._normalize_bootstrap_params(num)
+
+    def _normalize_routed_experts_start_len(self, num: int) -> None:
+        value = self.routed_experts_start_len
+        if isinstance(value, list):
+            if len(value) != self.batch_size:
+                raise ValueError(
+                    "routed_experts_start_len must contain one value per batch item: "
+                    f"got {len(value)}, expected {self.batch_size}"
+                )
+            self.routed_experts_start_len = value * self.parallel_sample_num
+        else:
+            self.routed_experts_start_len = [int(value)] * num
 
     def _expand_inputs(self, num):
         """Expand the main inputs (text, input_ids, input_embeds) for parallel sampling."""
@@ -779,6 +816,7 @@ class GenerateReqInput:
             token_ids_logprob=self.token_ids_logprob[i],
             return_sampling_mask=self.return_sampling_mask[i],
             return_text_in_logprobs=self.return_text_in_logprobs,
+            return_raw_token_logprobs_b64=self.return_raw_token_logprobs_b64,
             return_flat_raw_top_logprobs=self.return_flat_raw_top_logprobs,
             return_flat_raw_top_logprobs_b64=self.return_flat_raw_top_logprobs_b64,
             stream=self.stream,
@@ -789,7 +827,13 @@ class GenerateReqInput:
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
-            routed_experts_start_len=self.routed_experts_start_len,
+            return_expert_logits=self.return_expert_logits,
+            routed_experts_start_len=(
+                self.routed_experts_start_len[i]
+                if isinstance(self.routed_experts_start_len, list)
+                else self.routed_experts_start_len
+            ),
+            return_routed_experts_file=self.return_routed_experts_file,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -877,8 +921,10 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
 
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    return_expert_logits: bool = False
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
+    return_routed_experts_file: bool = False
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
@@ -1350,7 +1396,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # (token, layer, top_k). DetokenizerManager encodes to base64 into
     # BatchStrOutput; on the skip_tokenizer_init path the scheduler sends this
     # straight to TokenizerManager, which encodes on demand.
-    routed_experts: Optional[List[Optional[torch.Tensor]]]
+    routed_experts: Optional[List[Optional[Any]]]
+    expert_logits: Optional[List[Optional[Any]]] = None
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
 
@@ -1441,7 +1488,8 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Per-request routed experts, base64-encoded by DetokenizerManager off the
     # tokenizer hot path. Underlying tensor shape is (token, layer, top_k);
     # see BatchTokenIDOutput.routed_experts.
-    routed_experts: Optional[List[Optional[str]]]
+    routed_experts: Optional[List[Optional[Any]]]
+    expert_logits: Optional[List[Optional[Any]]] = None
 
     indexer_topk: Optional[List[Optional[str]]]
 

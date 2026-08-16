@@ -8,7 +8,7 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.entrypoints import http_server
 from sglang.srt.entrypoints.http_server import _health_generate_sampling_params
 from sglang.srt.managers.tokenizer_manager import ServerStatus
-from sglang.srt.sampling.sampling_params import SamplingParams, TOP_K_ALL
+from sglang.srt.sampling.sampling_params import TOP_K_ALL, SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -46,6 +46,36 @@ class TestHealthGenerateSamplingParams(unittest.TestCase):
         )
 
         self.assertEqual(params["sampling_seed"], 42)
+
+    def test_qwen3_dense_exact_health_request_uses_strict_multinomial_contract(self):
+        params = _health_generate_sampling_params(
+            SimpleNamespace(
+                glm52_exact_mode=False,
+                qwen3_dense_exact_mode=True,
+                random_seed=300008,
+            )
+        )
+        normalized = SamplingParams(**params)
+
+        self.assertEqual(normalized.temperature, 1.0)
+        self.assertEqual(normalized.top_p, 1.0)
+        self.assertEqual(normalized.top_k, TOP_K_ALL)
+        self.assertEqual(normalized.min_p, 0.0)
+        self.assertEqual(normalized.sampling_seed, 300008)
+
+    def test_other_exact_health_requests_use_strict_multinomial_contract(self):
+        for exact_mode in ("qwen35_gdn_exact_mode", "dsv4_flash_exact_mode"):
+            with self.subTest(exact_mode=exact_mode):
+                params = _health_generate_sampling_params(
+                    SimpleNamespace(**{exact_mode: True}, random_seed=17)
+                )
+                normalized = SamplingParams(**params)
+
+                self.assertEqual(normalized.temperature, 1.0)
+                self.assertEqual(normalized.top_p, 1.0)
+                self.assertEqual(normalized.top_k, TOP_K_ALL)
+                self.assertEqual(normalized.min_p, 0.0)
+                self.assertEqual(normalized.sampling_seed, 17)
 
 
 class TestHealthGenerateEndpoint(unittest.IsolatedAsyncioTestCase):

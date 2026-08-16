@@ -108,12 +108,13 @@ def is_dsa_enable_prefill_cp():
 
     # Derive from the runtime CP topology + model arch rather than the legacy
     # flag under CP-v2: DSA prefill CP is active when the CP group is on for a
-    # DeepSeek Sparse Attention model.
+    # DeepSeek Sparse Attention or DeepSeek-V4 model.
     if get_parallel().attn_cp_size <= 1:
         return False
-    from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.configs.model_config import is_deepseek_dsa, is_deepseek_v4
 
-    return is_deepseek_dsa(get_server_args().get_model_config().hf_config)
+    hf_config = get_server_args().get_model_config().hf_config
+    return is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
 
 
 def is_dsa_prefill_cp_in_seq_split():
@@ -326,6 +327,30 @@ def dsa_use_prefill_cp(forward_batch, dsa_enable_prefill_cp=None):
         return True
     else:
         return False
+
+
+def gather_dsa_prefill_cp_rows(input_: torch.Tensor, forward_batch):
+    """Materialize logical prefill rows under the active DSA CP protocol."""
+    from sglang.srt.layers.cp.utils import is_cp_v2_active
+
+    if is_cp_v2_active(forward_batch):
+        from sglang.srt.layers.cp.base import get_cp_strategy
+
+        strategy = get_cp_strategy()
+        if strategy is None:
+            raise RuntimeError("DSA CP-v2 row gather requires an active strategy")
+        return strategy.gather_hidden_states(
+            input_, forward_batch, torch.cuda.current_stream()
+        )
+
+    from sglang.srt.layers.utils.cp_utils import cp_all_gather_rerange_output
+
+    return cp_all_gather_rerange_output(
+        input_,
+        get_parallel().attn_cp_size,
+        forward_batch,
+        torch.cuda.current_stream(),
+    )
 
 
 def fp8_mqa_logits_ceil_to_ue8m0(x: torch.Tensor) -> torch.Tensor:

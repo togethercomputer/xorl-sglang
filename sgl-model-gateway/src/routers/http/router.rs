@@ -314,15 +314,12 @@ impl Router {
         events::RequestReceivedEvent {}.emit();
 
         let status = response.status();
-        // For streaming responses, the wrapped body (`BreakerTrackedStream`)
-        // records the circuit-breaker outcome once the stream actually
-        // terminates (success on clean end, failure on mid-stream error).
+        // The wrapped body (`BreakerTrackedStream`) records the
+        // circuit-breaker outcome once the body actually terminates (success
+        // on clean end, failure on a transport error).
         // Recording it eagerly here based on the initial status code would
         // mask "200-then-broken" workers — every request would tick a
-        // success before the stream had a chance to error out.
-        if !is_stream {
-            worker.record_outcome(status.is_success());
-        }
+        // success before the body had a chance to error out.
 
         // Record worker errors for server errors (5xx)
         if status.is_server_error() {
@@ -571,19 +568,9 @@ impl Router {
                     worker_url, route, e
                 );
 
-                // For streaming requests the caller skips the eager
-                // `record_outcome` on the assumption that a
-                // `BreakerTrackedStream` will tick the breaker on drop —
-                // but no tracked stream is installed when send() fails
-                // before any response stream exists. Record the failure
-                // here so a worker flapping at the TCP layer doesn't
-                // stay permanently selectable. Non-streaming requests
-                // are already covered by the caller's
-                // `worker.record_outcome(status.is_success())`, so
-                // gating on `is_stream` avoids double-counting.
-                if is_stream {
-                    worker.record_outcome(false);
-                }
+                // No tracked body exists when send() fails before a response
+                // is returned, so record the transport failure here.
+                worker.record_outcome(false);
                 return convert_reqwest_error(e);
             }
         };
@@ -592,23 +579,36 @@ impl Router {
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
         if !is_stream {
-            // For non-streaming requests, preserve headers
+            // A non-streaming API response can still be very large.  In
+            // particular, batched RL requests may return routed-expert ids
+            // and selected router weights for every token and layer.  Do not
+            // materialize that body in the gateway with `res.bytes()`: many
+            // concurrent responses otherwise multiply a tens-of-megabytes
+            // payload into gigabytes of resident memory.
+            //
+            // Keep the public response non-streaming JSON, but proxy its HTTP
+            // body with backpressure as bytes arrive from the worker.  The
+            // downstream client sees the same status, headers, and JSON bytes;
+            // only the gateway's buffering behavior changes.
             let response_headers = header_utils::preserve_response_headers(res.headers());
+            let mut tracked = BreakerTrackedStream::new(
+                res.bytes_stream(),
+                worker.clone(),
+                worker_url.to_string(),
+            );
+            if !status.is_success() {
+                tracked.mark_errored();
+            }
+            let body = Body::from_stream(tracked);
+            let mut response = Response::new(body);
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
 
-            let response = match res.bytes().await {
-                Ok(body) => {
-                    let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    *response.headers_mut() = response_headers;
-                    response
-                }
-                Err(e) => {
-                    let error_msg = format!("Failed to get response body: {}", e);
-                    error::internal_error("read_response_body_failed", error_msg)
-                }
-            };
-
-            // load_guard dropped here automatically after response body is read
+            // The response now outlives this function, so keep load accounting
+            // attached until the body is consumed or the client disconnects.
+            if let Some(guard) = load_guard {
+                response = AttachedBody::wrap_response(response, guard);
+            }
             response
         } else {
             // Preserve headers for streaming response
@@ -855,6 +855,10 @@ impl RouterTrait for Router {
 mod tests {
     use super::*;
     use crate::core::BasicWorkerBuilder;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
 
     fn create_test_regular_router() -> Router {
         // Create registries
@@ -922,5 +926,65 @@ mod tests {
 
         let worker = router.worker_registry.get_by_url(&url).unwrap();
         assert!(worker.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn non_streaming_body_error_records_failure_without_eager_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            socket.read(&mut request).await.unwrap();
+            socket
+                .write_all(
+                    concat!(
+                        "HTTP/1.1 200 OK\r\n",
+                        "Content-Type: application/json\r\n",
+                        "Content-Length: 10\r\n",
+                        "Connection: close\r\n",
+                        "\r\n",
+                        "abc",
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new(format!("http://{address}"))
+                .worker_type(WorkerType::Regular)
+                .build(),
+        );
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        worker_registry.register(Arc::clone(&worker));
+        let router = Router {
+            worker_registry,
+            policy_registry: Arc::new(PolicyRegistry::new(
+                crate::config::types::PolicyConfig::RoundRobin,
+            )),
+            dp_aware: false,
+            client: Client::new(),
+            retry_config: RetryConfig::default(),
+            enable_igw: false,
+        };
+        let request: GenerateRequest =
+            serde_json::from_value(serde_json::json!({ "text": "hello" })).unwrap();
+
+        let response = router
+            .route_typed_request(None, &request, "/generate", None)
+            .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        server.await.unwrap();
+
+        let breaker = worker.circuit_breaker();
+        assert_eq!(breaker.total_successes(), 0);
+        assert_eq!(breaker.total_failures(), 0);
+
+        let body_result = to_bytes(response.into_body(), usize::MAX).await;
+        assert!(body_result.is_err(), "truncated upstream body must fail");
+        assert_eq!(breaker.total_successes(), 0);
+        assert_eq!(breaker.total_failures(), 1);
     }
 }

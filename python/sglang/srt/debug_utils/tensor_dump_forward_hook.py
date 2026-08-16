@@ -33,6 +33,9 @@ class TensorDumper:
         pp_rank: int,
     ):
         self._dump_layers = dump_layers
+        self._dump_parent_modules = (
+            os.getenv("SGLANG_DEBUG_TENSOR_DUMP_PARENT_MODULES", "0") == "1"
+        )
         self._forward_pass_id = 0
         self._pid = os.getpid()
         self._current_tensors = {}
@@ -114,7 +117,12 @@ class TensorDumper:
                 _, sub_count = self._add_hook_recursive(
                     module, cur_name, top_level_module_name, layers_module_name
                 )
-                if sub_count == 0 or top_level_model:
+                selected_layer_module = cur_name.startswith(layers_prefix + ".")
+                if (
+                    sub_count == 0
+                    or top_level_model
+                    or (self._dump_parent_modules and selected_layer_module)
+                ):
                     # Avoid duplicated output hooks, e.g. self_attn may contain:
                     # self_attn.qkv_proj, self_attn.attn & self_attn.o_proj.
                     # Therefore, we do not need to add output hooks for self_attn,
@@ -122,6 +130,10 @@ class TensorDumper:
                     module.register_forward_hook(
                         self._dump_hook(cur_name, top_level_model)
                     )
+                    if self._dump_parent_modules and selected_layer_module:
+                        module.register_forward_pre_hook(
+                            self._dump_input_hook(cur_name), with_kwargs=True
+                        )
         return model_top_level_module_matched, len(model._modules.items())
 
     def _dump_hook(self, tensor_name, do_dump):
@@ -136,6 +148,17 @@ class TensorDumper:
                 self.add_tensor(tensor_name, output)
 
         return inner_dump_hook
+
+    def _dump_input_hook(self, tensor_name):
+        def inner_dump_input_hook(module, args, kwargs):
+            for index, item in enumerate(args):
+                if isinstance(item, (torch.Tensor, ForwardBatch, PPProxyTensors)):
+                    self.add_tensor(f"{tensor_name}.input.arg{index}", item)
+            for name, item in kwargs.items():
+                if isinstance(item, (torch.Tensor, ForwardBatch, PPProxyTensors)):
+                    self.add_tensor(f"{tensor_name}.input.{name}", item)
+
+        return inner_dump_input_hook
 
 
 def register_forward_hook_for_model(

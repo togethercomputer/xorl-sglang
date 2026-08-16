@@ -27,6 +27,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_flags, get_server_args
 from sglang.srt.utils import get_bool_env_var, is_hip
 
@@ -527,7 +528,7 @@ def _dp_gather_via_all_gather(
 # rank to max_len (all_gather) or all-reducing a sum_len zero-buffer (all_reduce),
 # gather exactly sum(per-rank tokens) via all_gatherv. Env-gated; only the simple
 # tp_size==dp_size (attn_tp_size==1) case is supported for now (e.g. tp8dp8).
-_USE_DP_GATHERV = get_bool_env_var("SGLANG_DP_USE_GATHERV")
+_USE_DP_GATHERV = envs.SGLANG_DP_USE_GATHERV.get()
 
 _DP_GATHER_FP8_GROUP = 128
 # Grow-only gathered fp8 payload / scales buffers, keyed by device.
@@ -536,8 +537,6 @@ _dp_gather_fp8_bufs: dict = {}
 
 @functools.lru_cache(maxsize=1)
 def _use_dp_gather_fp8() -> bool:
-    from sglang.srt.environ import envs
-
     return envs.SGLANG_ENABLE_DP_GATHER_FP8.get()
 
 

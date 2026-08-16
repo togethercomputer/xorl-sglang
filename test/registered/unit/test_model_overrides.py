@@ -2148,9 +2148,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                     nnodes=2,
                                     glm52_exact_mode=True,
                                 ),
-                                SimpleNamespace(
-                                    architectures=["GlmMoeDsaForCausalLM"]
-                                ),
+                                SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"]),
                             ),
                             {
                                 "attention_backend": "dsa",

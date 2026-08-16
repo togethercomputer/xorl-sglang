@@ -586,6 +586,10 @@ class Envs:
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override
     # explicitly to force on/off on any platform.
     SGLANG_DP_USE_REDUCE_SCATTER = EnvBool(_default_hip)
+    # Use exact-size DP-MoE gather/reduce_scatterv for SUM_LEN forwards.
+    # Kept as an EnvField so exact contracts can reject this byte-changing
+    # combine path during startup resolution.
+    SGLANG_DP_USE_GATHERV = EnvBool(False)
     # Quantize the variable-length DP-MoE gather payload (SGLANG_DP_USE_GATHERV
     # path, prefill/extend only) to fp8-e4m3 with per-token-group-128 scales:
     # halves the gathered hidden-state bytes over NCCL; the combine
@@ -791,6 +795,10 @@ class Envs:
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
+    # Opt in to deterministic radix prefix reuse inside the exact GLM-5.2
+    # XORL contract. The default stays radix-disabled, and resolution rejects
+    # cache tiers and adapter-keyed reuse that are outside this path.
+    SGLANG_ENABLE_GLM52_EXACT_RADIX = EnvBool(False)
     # Opt-in perf path for --dsa-prefill-backend flashmla_sparse_q8: fuse the
     # absorbed q bmm with the nope/rope concat + fp8 cast so q is written
     # directly in fp8 ("born fp8") and the standalone concat-cast kernel

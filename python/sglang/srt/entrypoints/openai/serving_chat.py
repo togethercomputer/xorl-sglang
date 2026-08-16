@@ -1887,13 +1887,23 @@ class OpenAIServingChat(OpenAIServingBase):
             video_tokens=video_tokens,
         )
 
+        response_metadata = {"weight_version": ret[0]["meta_info"]["weight_version"]}
+        for key in (
+            "sampling_temperature",
+            "sampling_top_k",
+            "sampling_top_p",
+            "sampling_min_p",
+        ):
+            if key in ret[0]["meta_info"]:
+                response_metadata[key] = ret[0]["meta_info"][key]
+
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata={"weight_version": ret[0]["meta_info"]["weight_version"]},
+            metadata=response_metadata,
             sglext=response_sglext,
         )
 

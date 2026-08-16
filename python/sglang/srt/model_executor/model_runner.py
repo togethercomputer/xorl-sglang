@@ -187,7 +187,6 @@ from sglang.srt.server_args import (  # noqa: F401  (re-export)
     _exact_batch_invariant_ops,
     add_chunked_prefix_cache_attention_backend,
     get_global_server_args,
-    is_batch_invariant_rl_target,
     is_glm52_exact_mode,
     is_qwen35_gdn_exact_mode,
     set_global_server_args_for_scheduler,
@@ -783,9 +782,7 @@ class ModelRunner:
 
     def maybe_enable_batch_invariant_mode(self):
         exact_ops = _exact_batch_invariant_ops(self.server_args)
-        if exact_ops is not None or is_batch_invariant_rl_target(
-            self.server_args.rl_on_policy_target
-        ):
+        if exact_ops is not None:
             from sglang.srt.batch_invariant_ops import (
                 enable_batch_invariant_mode,
                 get_batch_invariant_ops,
@@ -828,6 +825,17 @@ class ModelRunner:
             pp_size=self.ps.pp_size,
             pp_rank=self.ps.pp_rank,
             start_layer=self.layer_info.start_layer,
+        )
+
+    def uses_dsv4_exact_pp_proxy(self) -> bool:
+        """Whether physical PP must carry DSV4's exact deferred mHC state."""
+
+        return self.ps.pp_size > 1 and bool(
+            getattr(
+                self.model_config.hf_text_config,
+                "_dsv4_flash_exact_mode",
+                False,
+            )
         )
 
     def decode_num_tokens_per_req(
@@ -1423,6 +1431,11 @@ class ModelRunner:
             forward_batch.prepare_mlp_sync_batch(self)
         else:
             forward_batch.prepare_attn_tp_scatter_input(self)
+
+        lora_manager = getattr(self, "lora_manager", None)
+        if lora_manager is not None:
+            lora_manager.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
+            lora_manager.prepare_glm52_exact_dp_lora_batch(forward_batch)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those

@@ -3,11 +3,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.utils.common import reserve_rope_cache_for_long_sequences
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _exec_config(
@@ -55,9 +56,8 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
     def test_cpu_cache_provenance_is_per_architecture(self):
         # GLM-5.2's certified table provenance is split: CPU inverse
         # frequencies, CUDA outer product and cos/sin — so its table pin is
-        # None (ambient). Qwen3.5-family exact serving and every other RL
-        # on-policy target evaluate the full table on CPU, matching their
-        # trainers.
+        # None (ambient). Qwen3.5-family exact serving evaluates the full table
+        # on CPU, matching its trainer.
         rope = _rope(128)
         cases = (
             ({"glm52_exact_mode": True, "rl_on_policy_target": "xorl"}, None),
@@ -65,7 +65,6 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
                 {"qwen35_gdn_exact_mode": True, "rl_on_policy_target": "xorl"},
                 torch.device("cpu"),
             ),
-            ({"rl_on_policy_target": "another-trainer"}, torch.device("cpu")),
         )
         for exec_config, expected in cases:
             with (
@@ -113,9 +112,7 @@ class TestGlm52RopePrebuiltGuard(unittest.TestCase):
         compile_mock.assert_called_once()
         self.assertIs(compiled_rope._apply_rotary_emb_wrapped, compiled_apply)
         with (
-            _exec_patch(
-                rl_on_policy_target="xorl", qwen35_gdn_exact_mode=True
-            ),
+            _exec_patch(rl_on_policy_target="xorl", qwen35_gdn_exact_mode=True),
             patch(
                 "sglang.srt.layers.rotary_embedding.base.torch.compile"
             ) as compile_mock,

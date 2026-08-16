@@ -6,13 +6,17 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+
 from sglang.kernels.ops.attention.fla import qwen35_gdn_exact as exact
-from sglang.srt.model_executor.cuda_graph_config import (
-    Backend,
-    Phase,
-    default_cuda_graph_config,
+from sglang.srt.distributed.canonical_moe import (
+    SamplerParallelPlan,
+    canonical_moe_fold_fp64_v3,
 )
+from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
 from sglang.srt.server_args import ServerArgs
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 def _server_args(**overrides):
@@ -23,14 +27,25 @@ def _server_args(**overrides):
     return args
 
 
-def _qwen_config(*, moe: bool):
+def _qwen_config(*, moe: bool, **overrides):
     layers = 40 if moe else 24
-    text_config = SimpleNamespace(
+    values = dict(
         hidden_size=2048 if moe else 1024,
+        intermediate_size=3584,
         num_hidden_layers=layers,
         num_attention_heads=16 if moe else 8,
         num_key_value_heads=2,
         vocab_size=248320,
+        max_position_embeddings=262144,
+        head_dim=256,
+        hidden_act="silu",
+        attention_bias=False,
+        attention_dropout=0.0,
+        use_sliding_window=False,
+        rms_norm_eps=1e-6,
+        rope_theta=10000000.0,
+        partial_rotary_factor=0.25,
+        attn_output_gate=True,
         linear_num_key_heads=16,
         linear_num_value_heads=32 if moe else 16,
         linear_key_head_dim=128,
@@ -38,15 +53,27 @@ def _qwen_config(*, moe: bool):
         linear_conv_kernel_dim=4,
         full_attention_interval=4,
     )
+    values.update(overrides)
+    text_config = SimpleNamespace(**values)
     if moe:
         text_config.num_experts = 256
         text_config.num_experts_per_tok = 8
     return SimpleNamespace(text_config=text_config)
 
 
-def test_qwen35_moe_plain_config_resolves_certified_topology():
+def test_qwen35_moe_admits_physical_pp_without_rewriting_perf_knobs():
     hf_config = _qwen_config(moe=True)
-    args = _server_args(tp_size=8, ep_size=1, disable_cuda_graph_padding=True)
+    args = _server_args(
+        tp_size=8,
+        dp_size=8,
+        ep_size=8,
+        pp_size=3,
+        disable_cuda_graph_padding=True,
+        cuda_graph_bs_decode=[3, 7],
+        max_running_requests=37,
+        max_mamba_cache_size=777,
+        disable_radix_cache=False,
+    )
     # Match the real __post_init__ ordering: generic graph resolution has
     # already materialized defaults before model-specific contracts run.
     args.cuda_graph_config = default_cuda_graph_config()
@@ -74,35 +101,29 @@ def test_qwen35_moe_plain_config_resolves_certified_topology():
     assert args.sampling_defaults == "openai"
     assert args.disable_custom_all_reduce
     assert not args.enable_fused_qk_norm_rope
-    assert args.tp_size == args.dp_size == args.ep_size == 8
-    assert args.pp_size == 1
+    assert (args.tp_size, args.dp_size, args.ep_size, args.pp_size) == (8, 8, 8, 3)
     assert args.enable_dp_attention
     assert args.enable_dp_lm_head
     assert args.disable_piecewise_cuda_graph
-    assert args.max_mamba_cache_size == 1280
-    assert args.cuda_graph_bs_decode == list(range(1, 33))
-    assert args.cuda_graph_max_bs_decode == 32
-    assert args.cuda_graph_config.decode.bs == list(range(1, 33))
-    assert args.cuda_graph_config.decode.max_bs == 32
-    assert (Phase.DECODE, "bs") in args._cuda_graph_config_locked
-    assert (Phase.DECODE, "max_bs") in args._cuda_graph_config_locked
-    assert args.disable_prefill_cuda_graph
-    assert args.cuda_graph_config.prefill.backend == Backend.DISABLED
-    assert (Phase.PREFILL, "backend") in args._cuda_graph_config_locked
-    assert args.disable_overlap_schedule
     assert args.disable_cuda_graph_padding
-    assert args.max_running_requests == 256
-    assert args.max_queued_requests == 512
-    assert args.chunked_prefill_size == -1
-    assert args.max_prefill_tokens == 32768
-    assert args.mem_fraction_static == 0.40
-    assert not args.disable_cuda_graph
-    assert args.disable_radix_cache
+    assert args.max_running_requests == 37
+    assert args.max_mamba_cache_size == 777
+    assert args.cuda_graph_bs_decode == [3, 7]
+    assert not args.disable_radix_cache
+    assert args.mamba_radix_cache_strategy == "extra_buffer"
+    assert args.exact_physical_pp_capable
 
 
-def test_qwen35_dense_resolves_only_the_certified_single_rank_topology():
+def test_qwen35_dense_admits_physical_pp_and_preserves_graph_and_radix_policy():
     hf_config = _qwen_config(moe=False)
-    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=1)
+    args = _server_args(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        pp_size=4,
+        disable_cuda_graph=False,
+        disable_radix_cache=False,
+    )
 
     args._resolve_qwen35_gdn_exact_contract(
         hf_config, model_arch="Qwen3_5ForConditionalGeneration"
@@ -118,8 +139,56 @@ def test_qwen35_dense_resolves_only_the_certified_single_rank_topology():
     assert args.sampling_backend == "pytorch"
     assert args.sampling_defaults == "openai"
     assert args.disable_piecewise_cuda_graph
-    assert args.disable_cuda_graph
-    assert args.disable_radix_cache
+    assert not args.disable_cuda_graph
+    assert not args.disable_radix_cache
+    assert args.mamba_radix_cache_strategy == "extra_buffer"
+    assert args.pp_size == 4
+    assert args.exact_physical_pp_capable
+
+
+@pytest.mark.parametrize("strategy", ["no_buffer"])
+def test_qwen35_exact_rejects_arbitrary_prefix_mamba_radix_checkpoints(strategy):
+    args = _server_args(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        disable_radix_cache=False,
+        mamba_radix_cache_strategy=strategy,
+    )
+
+    with pytest.raises(ValueError, match="aligned Mamba checkpoint strategy"):
+        args._resolve_qwen35_gdn_exact_contract(
+            _qwen_config(moe=False),
+            model_arch="Qwen3_5ForConditionalGeneration",
+        )
+
+
+def test_qwen35_exact_radix_requires_lossless_aligned_checkpoints():
+    bad_interval = _server_args(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        disable_radix_cache=False,
+        mamba_track_interval=96,
+    )
+    with pytest.raises(ValueError, match="64-token GDN chunk boundary"):
+        bad_interval._resolve_qwen35_gdn_exact_contract(
+            _qwen_config(moe=False),
+            model_arch="Qwen3_5ForConditionalGeneration",
+        )
+
+    lossy = _server_args(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        disable_radix_cache=False,
+        enable_int8_mamba_checkpoint=True,
+    )
+    with pytest.raises(ValueError, match="lossless recurrent state checkpoints"):
+        lossy._resolve_qwen35_gdn_exact_contract(
+            _qwen_config(moe=False),
+            model_arch="Qwen3_5ForConditionalGeneration",
+        )
 
 
 @pytest.mark.parametrize("moe", (False, True))
@@ -156,31 +225,20 @@ def test_non_qwen_keeps_conservative_norm_and_rope_defaults():
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     [
-        ("tp_size", 4, "TP8/DP8"),
-        ("dp_size", 4, "DP8"),
-        ("ep_size", 4, "EP8"),
-        ("pp_size", 2, "PP1"),
+        ("dp_size", 4, "DP to equal"),
+        ("ep_size", 4, "EP to equal"),
         ("dtype", "float16", "BF16"),
         ("quantization", "fp8", "unquantized"),
         ("attention_backend", "triton", "FA4"),
         ("linear_attn_prefill_backend", "flashinfer", "triton"),
         ("moe_a2a_backend", "deepep", "moe-a2a-backend none"),
         ("speculative_algorithm", "EAGLE", "speculative"),
-        ("disable_cuda_graph", True, "CUDA graph bucket"),
-        ("max_running_requests", 16, "max-running-requests 256"),
-        ("mem_fraction_static", 0.5, "mem-fraction-static 0.40"),
-        ("max_mamba_cache_size", 512, "max-mamba-cache-size 1280"),
     ],
 )
-def test_qwen35_moe_rejects_programs_outside_the_certified_envelope(
-    name, value, message
-):
+def test_qwen35_moe_rejects_incompatible_arithmetic_mechanisms(name, value, message):
     hf_config = _qwen_config(moe=True)
     args = _server_args(tp_size=8, ep_size=1)
     setattr(args, name, value)
-    if name == "mem_fraction_static":
-        args._mem_fraction_static_user_supplied = True
-
     with pytest.raises(ValueError, match=message):
         args._resolve_qwen35_gdn_exact_contract(
             hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
@@ -223,68 +281,205 @@ def test_qwen35_class_b_is_automatic_and_preserves_exact_envelope():
     assert args.attention_backend == "fa4"
 
 
-@pytest.mark.parametrize("name", ("tp_size", "dp_size", "ep_size", "pp_size"))
-def test_qwen35_dense_rejects_unqualified_distributed_topologies(name):
+@pytest.mark.parametrize("pp_size", (2, 3, 7))
+def test_qwen35_dense_admits_physical_pipeline_stages(pp_size):
     hf_config = _qwen_config(moe=False)
-    args = _server_args()
-    setattr(args, name, 2)
-    with pytest.raises(ValueError, match="TP1/DP1/EP1/PP1"):
+    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=pp_size)
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config, model_arch="Qwen3_5ForConditionalGeneration"
+    )
+    assert args.exact_physical_pp_capable
+
+
+def test_qwen3_dense_admits_only_physical_not_stage_local_parallelism():
+    hf_config = _qwen_config(moe=False, head_dim=128)
+    physical_pp = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=4)
+    physical_pp._resolve_qwen3_dense_exact_contract(
+        hf_config, model_arch="Qwen3ForCausalLM"
+    )
+    assert physical_pp.qwen3_dense_exact_mode
+    assert physical_pp.exact_physical_pp_capable
+    assert physical_pp.pp_size == 4
+
+    stage_local_tp = _server_args(tp_size=2, dp_size=1, ep_size=1, pp_size=4)
+    with pytest.raises(ValueError, match="stage-local TP1/DP1/EP1"):
+        stage_local_tp._resolve_qwen3_dense_exact_contract(
+            _qwen_config(moe=False, head_dim=128),
+            model_arch="Qwen3ForCausalLM",
+        )
+
+
+@pytest.mark.parametrize(
+    "topology",
+    (
+        dict(tp_size=2, dp_size=1, ep_size=1),
+        dict(tp_size=1, dp_size=2, ep_size=1),
+        dict(tp_size=1, dp_size=1, ep_size=2),
+    ),
+)
+def test_qwen35_dense_rejects_stage_local_parallel_arithmetic(topology):
+    hf_config = _qwen_config(moe=False)
+    args = _server_args(**topology, pp_size=3)
+    with pytest.raises(ValueError, match="stage-local TP1/DP1/EP1"):
         args._resolve_qwen35_gdn_exact_contract(
             hf_config, model_arch="Qwen3_5ForConditionalGeneration"
         )
 
 
-def test_qwen35_moe_rejects_explicit_non_graph32_program():
+def test_qwen35_moe_preserves_explicit_graph_program():
     hf_config = _qwen_config(moe=True)
     args = _server_args(tp_size=8, cuda_graph_bs_decode=[8, 10])
-    with pytest.raises(ValueError, match="graph buckets through 32"):
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
+    )
+    assert args.cuda_graph_bs_decode == [8, 10]
+
+
+@pytest.mark.parametrize("contributors", (3, 5))
+def test_qwen35_moe_odd_contributor_plan_uses_deterministic_eager_fold(
+    contributors,
+):
+    args = _server_args(
+        tp_size=contributors,
+        dp_size=contributors,
+        ep_size=contributors,
+        disable_radix_cache=True,
+    )
+    args._resolve_qwen35_gdn_exact_contract(
+        _qwen_config(moe=True),
+        model_arch="Qwen3_5MoeForConditionalGeneration",
+    )
+    assert (args.tp_size, args.dp_size, args.ep_size) == (
+        contributors,
+        contributors,
+        contributors,
+    )
+
+    plan = SamplerParallelPlan.primitive(contributors)
+    assert plan.contributor_count == contributors
+    partials = torch.tensor(
+        [[4096.0, ordinal + 1.0] for ordinal in range(contributors)],
+        dtype=torch.bfloat16,
+    )
+    level = list(partials.double().unbind(0))
+    while len(level) > 1:
+        paired = [
+            level[index] + level[index + 1] for index in range(0, len(level) - 1, 2)
+        ]
+        if len(level) % 2:
+            paired.append(level[-1])
+        level = paired
+    assert torch.equal(canonical_moe_fold_fp64_v3(partials), level[0].bfloat16())
+
+
+def test_qwen35_moe_rejects_architecture_alias_with_unqualified_geometry():
+    hf_config = _qwen_config(moe=True)
+    hf_config.text_config.hidden_size += 1
+    args = _server_args(tp_size=8)
+    with pytest.raises(ValueError, match="qualified model geometry.*hidden_size"):
         args._resolve_qwen35_gdn_exact_contract(
             hf_config, model_arch="Qwen3_5MoeForConditionalGeneration"
         )
 
 
-@pytest.mark.parametrize("moe", (False, True))
-def test_qwen35_rejects_architecture_alias_with_unqualified_geometry(moe):
-    hf_config = _qwen_config(moe=moe)
-    hf_config.text_config.hidden_size += 1
-    args = _server_args(tp_size=8 if moe else 1)
-    architecture = (
-        "Qwen3_5MoeForConditionalGeneration"
-        if moe
-        else "Qwen3_5ForConditionalGeneration"
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        dict(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=24,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            linear_num_value_heads=16,
+        ),
+        dict(
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            linear_num_value_heads=32,
+        ),
+        dict(
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            linear_num_value_heads=32,
+        ),
+        dict(
+            hidden_size=5120,
+            intermediate_size=17408,
+            num_hidden_layers=64,
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            linear_num_value_heads=48,
+        ),
+    ],
+)
+def test_qwen35_dense_admits_family_geometries(geometry):
+    hf_config = _qwen_config(moe=False, **geometry)
+    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=1)
+
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config, model_arch="Qwen3_5ForConditionalGeneration"
     )
-    with pytest.raises(ValueError, match="qualified model geometry.*hidden_size"):
-        args._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=architecture)
+
+    assert args.qwen35_gdn_exact_mode
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("head_dim", 128),
+        ("attention_bias", True),
+        ("linear_num_key_heads", 8),
+        ("linear_num_value_heads", 24),
+        ("linear_conv_kernel_dim", 3),
+        ("full_attention_interval", 8),
+    ],
+)
+def test_qwen35_dense_rejects_unsupported_capabilities(name, value):
+    hf_config = _qwen_config(moe=False, **{name: value})
+    args = _server_args(tp_size=1, dp_size=1, ep_size=1, pp_size=1)
+
+    with pytest.raises(ValueError, match=rf"does not support.*{name}"):
+        args._resolve_qwen35_gdn_exact_contract(
+            hf_config, model_arch="Qwen3_5ForConditionalGeneration"
+        )
 
 
 def test_qwen35_private_resolver_installs_one_tuple_once():
-    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
-    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
-    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
-    import sglang.srt.distributed.communication_op as communication
     import sglang.kernels.ops.attention.fla.bi_gdn_decode as decode
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_fast as fast
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_incr as incremental
     import sglang.kernels.ops.attention.fla.bi_gdn_incr_lazy_heal as heal
     import sglang.kernels.ops.attention.fla.bi_gdn_prefill as prefill
     import sglang.kernels.ops.attention.fla.layernorm_gated as norm
+    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
+    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
+    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
     import sglang.srt.layers.xorl_batch_invariant as xorl_family
 
     active_flags = [
         (prefill, "BI_GDN_PREFILL_ENABLED"),
+        (prefill, "BI_GDN_SOLVE_TRIL_DECODE"),
         (decode, "BI_GDN_DECODE_ENABLED"),
         (decode, "BI_GDN_BS1_STATIC"),
         (decode, "BI_GDN_DECODE_GRAPH"),
         (fast, "BI_GDN_DECODE_FAST_ENABLED"),
-    ]
-    held_flags = [
-        (prefill, "BI_GDN_SOLVE_TRIL_DECODE"),
+        (fast, "BI_GDN_SOLVE_TRIL_DECODE"),
         (fast, "BI_GDN_FUSE_SMALL_ENABLED"),
+        (incremental, "BI_GDN_SOLVE_TRIL_DECODE"),
         (incremental, "BI_GDN_DECODE_INCR_ENABLED"),
         (incremental, "BI_GDN_INCR_DEFER_ENABLED"),
         (incremental, "BI_GDN_VNEW_SLIM_ENABLED"),
+        (heal, "BI_GDN_SOLVE_TRIL_DECODE"),
         (heal, "BI_GDN_LAZY_HEAL_ENABLED"),
     ]
+    held_flags = []
     with ExitStack() as stack:
         stack.enter_context(patch.object(exact, "_applied", False))
         stack.enter_context(patch.object(bi_ops, "ENABLE_JIT_DEEPGEMM", True))
@@ -303,9 +498,6 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         set_head = stack.enter_context(
             patch.object(bi_ops, "set_bi_head_fastpath_enabled")
         )
-        set_combine = stack.enter_context(
-            patch.object(communication, "set_ordered_combine_fused_enabled")
-        )
         startup = stack.enter_context(patch.object(exact.logger, "info"))
         force_family = stack.enter_context(
             patch.object(xorl_family, "force_xorl_bi_family")
@@ -313,6 +505,7 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
 
         server_args = SimpleNamespace(
             disable_cuda_graph=False,
+            disable_radix_cache=True,
             qwen35_gdn_exact_is_moe=True,
         )
         exact._apply_qwen35_gdn_exact(server_args)
@@ -322,18 +515,34 @@ def test_qwen35_private_resolver_installs_one_tuple_once():
         assert not any(getattr(module, name) for module, name in held_flags)
         force_table.assert_called_once_with(True)
         set_norm.assert_called_once_with(4)
+        # The fused GEMM/router/head mechanisms stay held behind their own
+        # live promotion; only the cached-row incremental GDN set is
+        # re-promoted (live trainer-to-sampler gate on the fixed solve
+        # kernel).
         set_tiera.assert_called_once_with(False)
         set_router.assert_called_once_with(False)
         set_head.assert_called_once_with(False)
-        set_combine.assert_called_once_with(False)
         startup.assert_called_once()
         startup_args = startup.call_args.args
         assert startup_args[2] == "v2"
-        assert "conservative no-overlap/no-padding" in startup_args[1]
+        assert "cached-row incremental graph decode" in startup_args[1]
         rendered = startup_args[0] % startup_args[1:]
-        assert "decode, conservative" in rendered
+        assert "decode, cached-row incremental" in rendered
         assert "rmsnorm_family=v2" in rendered
+        assert "moe_fold=canonical_moe_fold_fp64_v3" in rendered
         force_family.assert_not_called()
+
+
+def test_qwen35_graph_with_radix_uses_immediate_recurrent_state_writeback():
+    assert not exact._defer_incremental_state_writeback(
+        SimpleNamespace(disable_radix_cache=False), exact_graph=True
+    )
+    assert exact._defer_incremental_state_writeback(
+        SimpleNamespace(disable_radix_cache=True), exact_graph=True
+    )
+    assert not exact._defer_incremental_state_writeback(
+        SimpleNamespace(disable_radix_cache=True), exact_graph=False
+    )
 
 
 def test_qwen35_public_module_has_no_partial_selection_api():
@@ -342,15 +551,14 @@ def test_qwen35_public_module_has_no_partial_selection_api():
 
 
 def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
-    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
-    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
-    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
-    import sglang.srt.distributed.communication_op as communication
     import sglang.kernels.ops.attention.fla.bi_gdn_decode as decode
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_fast as fast
     import sglang.kernels.ops.attention.fla.bi_gdn_decode_incr as incremental
     import sglang.kernels.ops.attention.fla.bi_gdn_incr_lazy_heal as heal
     import sglang.kernels.ops.attention.fla.bi_gdn_prefill as prefill
+    import sglang.srt.batch_invariant_ops.batch_invariant_ops as bi_ops
+    import sglang.srt.batch_invariant_ops.bi_gemm_configs as gemm_configs
+    import sglang.srt.batch_invariant_ops.bi_gemm_tiera as tiera
 
     with (
         patch.object(exact, "_applied", False),
@@ -368,7 +576,6 @@ def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
         patch.object(tiera, "set_tiera_enabled") as tier_a,
         patch.object(bi_ops, "set_router_renorm_fused_enabled") as router,
         patch.object(bi_ops, "set_bi_head_fastpath_enabled") as head,
-        patch.object(communication, "set_ordered_combine_fused_enabled") as combine,
     ):
         exact._apply_qwen35_gdn_exact(
             SimpleNamespace(
@@ -389,7 +596,6 @@ def test_dense_tuple_uses_only_the_directly_certified_conservative_stack():
         tier_a.assert_called_once_with(False)
         router.assert_called_once_with(False)
         head.assert_called_once_with(False)
-        combine.assert_called_once_with(False)
 
 
 def test_model_runner_resolves_qwen_exact_bi_ops_before_construction():
@@ -410,13 +616,77 @@ def test_gdn_backend_reads_architecture_resolver_flags_at_call_time():
 
     with (
         patch.object(backend, "is_cuda", return_value=True),
-        patch.object(backend._bi_decode_mod, "BI_GDN_DECODE_ENABLED", True),
-        patch.object(backend._bi_fast_mod, "BI_GDN_DECODE_FAST_ENABLED", True),
-        patch.object(backend._bi_prefill_mod, "BI_GDN_PREFILL_ENABLED", True),
+        patch.object(
+            backend,
+            "_bi_decode_mod",
+            SimpleNamespace(BI_GDN_DECODE_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_fast_mod",
+            SimpleNamespace(BI_GDN_DECODE_FAST_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_incr_mod",
+            SimpleNamespace(
+                BI_GDN_DECODE_INCR_ENABLED=True,
+                BI_GDN_INCR_DEFER_ENABLED=True,
+            ),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_heal_mod",
+            SimpleNamespace(BI_GDN_LAZY_HEAL_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_prefill_mod",
+            SimpleNamespace(BI_GDN_PREFILL_ENABLED=True),
+            create=True,
+        ),
     ):
         assert backend._bi_gdn_decode_enabled()
         assert backend._bi_gdn_decode_fast_enabled()
+        assert backend._bi_gdn_decode_incr_enabled()
+        assert backend._bi_gdn_incr_defer_enabled()
+        assert backend._bi_gdn_lazy_heal_enabled()
         assert backend._bi_gdn_prefill_enabled()
+
+
+def test_gdn_backend_selects_cached_row_runner_atomically():
+    import sglang.srt.layers.attention.linear.gdn_backend as backend
+
+    sentinel = object()
+    with (
+        patch.object(backend, "is_cuda", return_value=True),
+        patch.object(
+            backend,
+            "_bi_fast_mod",
+            SimpleNamespace(BI_GDN_DECODE_FAST_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "_bi_incr_mod",
+            SimpleNamespace(BI_GDN_DECODE_INCR_ENABLED=True),
+            create=True,
+        ),
+        patch.object(
+            backend,
+            "BIGDNIncrDecodeRunner",
+            return_value=sentinel,
+            create=True,
+        ) as incr,
+        patch.object(backend, "BIGDNFastDecodeRunner", create=True) as rescan,
+    ):
+        assert backend._make_bi_gdn_decode_runner() is sentinel
+        incr.assert_called_once_with()
+        rescan.assert_not_called()
 
 
 def test_qwen35_gemma_norm_routes_the_certified_family_split():
@@ -804,8 +1074,8 @@ def test_qwen35_sampler_contract_rescore_uses_temperature_and_fast_head():
 
 
 def test_qwen35_sampler_forward_overwrites_stock_logprob_with_contract_value():
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     import sglang.srt.layers.sampler as sampler_module
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
     sampler = sampler_module.Sampler.__new__(sampler_module.Sampler)
     torch.nn.Module.__init__(sampler)
@@ -840,6 +1110,55 @@ def test_qwen35_sampler_forward_overwrites_stock_logprob_with_contract_value():
     sampler._bi_contract_sampled_logprob.assert_called_once()
 
 
+def test_qwen35_sampler_selects_and_scores_from_one_exact_temperature_tensor():
+    import sglang.srt.layers.sampler as sampler_module
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+
+    sampler = sampler_module.Sampler.__new__(sampler_module.Sampler)
+    torch.nn.Module.__init__(sampler)
+    sampler.return_original_logprob = False
+    sampler._glm52_exact_mode = False
+    sampler._qwen3_dense_exact_mode = False
+    sampler.use_qwen35_bi_decode_rescore = True
+    sampler.rl_on_policy_target = "xorl"
+    sampler.use_log_softmax_logprob = True
+    sampler.enable_deterministic = True
+    sampler.use_ascend_backend = False
+    sampler._preprocess_logits = MagicMock(side_effect=lambda logits, _: logits)
+    sampled = torch.tensor([2, 1], dtype=torch.int32)
+    sampler._sample_from_logprobs = MagicMock(return_value=sampled)
+    sampler._sync_token_ids_across_tp = MagicMock()
+    expected_logprob = torch.tensor([-0.25, -0.5])
+    sampler._bi_contract_sampled_logprob = MagicMock(return_value=expected_logprob)
+    sampler.output_logprob_processor = MagicMock()
+    stock = MagicMock()
+    stock.write_output_to.side_effect = lambda output: setattr(
+        output, "next_token_logprobs", torch.tensor([-9.0, -9.0])
+    )
+    sampler.output_logprob_processor.compute_logprobs.return_value = stock
+
+    logits = torch.tensor([[1.25, -0.5, 0.75], [-1.0, 2.0, 0.25]])
+    temperatures = torch.tensor([[0.7], [1.3]])
+    output = LogitsProcessorOutput(next_token_logits=logits)
+
+    actual_ids = sampler.forward(
+        output,
+        _exact_sampling_info(temperatures=temperatures),
+        return_logprob=True,
+        top_logprobs_nums=[0, 0],
+        token_ids_logprobs=[None, None],
+        positions=torch.tensor([0, 0]),
+    )
+
+    transformed = sampler._sample_from_logprobs.call_args.args[0]
+    assert torch.equal(transformed, logits * (1.0 / temperatures))
+    assert torch.equal(actual_ids, sampled)
+    rescore = sampler._bi_contract_sampled_logprob.call_args
+    assert rescore.args[0] is transformed
+    assert rescore.kwargs == {"temperature_applied": True}
+    assert output.next_token_logprobs is expected_logprob
+
+
 def test_qwen35_sampler_rescore_fails_closed_after_logit_mutation():
     import sglang.srt.layers.sampler as sampler_module
 
@@ -856,3 +1175,9 @@ def test_qwen35_sampler_rescore_fails_closed_after_logit_mutation():
             torch.tensor([0]),
             _exact_sampling_info(n=1, logit_bias=torch.zeros((1, 32))),
         )
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

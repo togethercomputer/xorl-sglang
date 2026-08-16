@@ -271,6 +271,23 @@ def _cat(tensors: list[torch.Tensor], dim: int = -1) -> torch.Tensor:
     return _compiled_cat([qk_nope, qk_rope], dim=dim)
 
 
+def _gather_bf16_sparse_paged_kv(
+    kv_cache: torch.Tensor,
+    page_table_1_flattened: torch.Tensor,
+) -> torch.Tensor:
+    """Gather BF16 MLA KV rows for a prefix-sharing ragged extend.
+
+    BF16-pool counterpart of ``dequantize_k_cache_paged`` (which asserts the
+    packed-FP8 656-byte row layout): ``index_select`` copies the stored rows
+    without any arithmetic, so a warm prefix hands the sparse kernel exactly
+    the bytes a cold prefill writes.  Returns ``[num_tokens, 1, dim]`` to
+    match the packed-FP8 dequantizer's output layout.
+    """
+    assert kv_cache.dtype == torch.bfloat16
+    rows = kv_cache.reshape(-1, kv_cache.shape[-1])
+    return rows.index_select(0, page_table_1_flattened).unsqueeze(1)
+
+
 _DSA_IMPL_T: TypeAlias = Literal[
     "flashmla_sparse",
     "flashmla_sparse_q8",
@@ -2115,9 +2132,23 @@ class DeepseekSparseAttnBackend(
                         self.forward_metadata.page_table_1_flattened
                     )
                     assert page_table_1_flattened is not None
-                    kv_cache = dequantize_k_cache_paged(
-                        kv_cache, page_table_1_flattened
-                    )
+                    if kv_cache.dtype == torch.bfloat16:
+                        # A BF16 prefix hit replays the stored KV bytes through
+                        # a pure gather. The packed-FP8 dequantizer only
+                        # understands its 656-byte row layout.
+                        kv_cache = _gather_bf16_sparse_paged_kv(
+                            kv_cache, page_table_1_flattened
+                        )
+                    elif kv_cache.dtype == torch.float8_e4m3fn:
+                        kv_cache = dequantize_k_cache_paged(
+                            kv_cache, page_table_1_flattened
+                        )
+                    else:
+                        raise ValueError(
+                            "DSA prefix-sharing extend supports BF16 and "
+                            "packed-FP8 KV pools; got "
+                            f"kv_cache.dtype={kv_cache.dtype}."
+                        )
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 

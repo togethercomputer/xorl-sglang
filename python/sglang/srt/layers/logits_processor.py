@@ -57,7 +57,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-from sglang.srt.server_args import is_glm52_exact_mode, is_qwen35_gdn_exact_mode
+from sglang.srt.server_args import (
+    is_glm52_exact_mode,
+    is_qwen3_dense_exact_mode,
+    is_qwen35_gdn_exact_mode,
+)
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -243,6 +247,13 @@ class LogitsMetadata:
     # The gather mode for DP attention
     dp_padding_mode: Optional[DpPaddingMode] = None
 
+    # Exact DSV4 logits consume logical DP-owner rows.  CP-prefill has already
+    # been reconstructed before this metadata is created; decode rows are
+    # already complete and use the same explicit layout contract.
+    dsv4_exact_logits_rows_reconstructed: bool = False
+    dsv4_exact_logits_owner_rows: Optional[int] = None
+    dsv4_exact_logits_dp_rank: Optional[int] = None
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -306,6 +317,9 @@ class LogitsMetadata:
             global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
             global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
             dp_padding_mode=DpPaddingMode.SUM_LEN,
+            dsv4_exact_logits_rows_reconstructed=forward_batch.dsv4_exact_logits_rows_reconstructed,
+            dsv4_exact_logits_owner_rows=forward_batch.dsv4_exact_logits_owner_rows,
+            dsv4_exact_logits_dp_rank=forward_batch.dsv4_exact_logits_dp_rank,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
         )
@@ -356,7 +370,11 @@ class LogitsProcessor(nn.Module):
         self.vocab_size = config.vocab_size
         self.logit_scale = logit_scale
         self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
-        self.use_attn_tp_group = get_parallel().enable_dp_lm_head
+        self._qwen3_dense_exact_mode = is_qwen3_dense_exact_mode(get_server_args())
+        self._dsv4_exact_mode = bool(getattr(config, "_dsv4_flash_exact_mode", False))
+        self.use_attn_tp_group = (
+            get_parallel().enable_dp_lm_head and not self._dsv4_exact_mode
+        )
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
         # The Qwen3.5-family exact contract must own both sides of serving's
         # probability surface: input-token rescoring and every next-token
@@ -384,7 +402,7 @@ class LogitsProcessor(nn.Module):
             and self.final_logit_softcapping < 0
         ):
             self.final_logit_softcapping = None
-        if self._glm52_exact_mode:
+        if self._glm52_exact_mode or getattr(self, "_qwen3_dense_exact_mode", False):
             validate_xorl_bi_logit_transforms(
                 self.logit_scale,
                 self.final_logit_softcapping,
@@ -512,13 +530,11 @@ class LogitsProcessor(nn.Module):
             )
 
         if self.use_qwen35_bi_lm_head:
-            logprobs_result.token_logprobs = (
-                self._bi_lm_head_input_token_logprobs(
-                    pruned_states,
-                    input_logprob_indices,
-                    lm_head,
-                    logits_metadata,
-                )
+            logprobs_result.token_logprobs = self._bi_lm_head_input_token_logprobs(
+                pruned_states,
+                input_logprob_indices,
+                lm_head,
+                logits_metadata,
             )
 
         if self._bi_lm_head_decode_active(logits_metadata):
@@ -658,6 +674,15 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[AuxHiddenStates],
         logits_metadata: LogitsMetadata,
     ):
+        if logits_metadata.dsv4_exact_logits_rows_reconstructed:
+            owner_rows = logits_metadata.dsv4_exact_logits_owner_rows
+            if owner_rows is None or hidden_states.shape[0] != int(owner_rows):
+                raise RuntimeError(
+                    "Exact DSV4 logits require the complete reconstructed DP-owner "
+                    "rows before pruning: "
+                    f"rows={hidden_states.shape[0]}, expected={owner_rows}"
+                )
+
         pruned_states_before_norm: Optional[torch.Tensor] = None
         aux_pruned_states = None
         token_to_seq_idx = []
@@ -808,6 +833,26 @@ class LogitsProcessor(nn.Module):
                 pin_memory=is_pin_memory_available(),
             ).to(pruned_states.device, non_blocking=True)
 
+        if logits_metadata.dsv4_exact_logits_rows_reconstructed:
+            segment_lengths = logits_metadata.global_num_tokens_for_logprob_cpu
+            dp_rank = logits_metadata.dsv4_exact_logits_dp_rank
+            if segment_lengths is None or dp_rank is None:
+                raise RuntimeError(
+                    "Exact DSV4 logits require per-DP pruned-row ownership metadata"
+                )
+            if not 0 <= int(dp_rank) < len(segment_lengths):
+                raise RuntimeError(
+                    "Exact DSV4 logits DP rank is outside the pruned-row metadata"
+                )
+            expected_pruned_rows = int(segment_lengths[int(dp_rank)])
+            if pruned_states.shape[0] != expected_pruned_rows:
+                raise RuntimeError(
+                    "Exact DSV4 logits pruning changed the logical DP-owner row "
+                    "count unexpectedly: "
+                    f"rows={pruned_states.shape[0]}, expected={expected_pruned_rows}, "
+                    f"dp_rank={dp_rank}"
+                )
+
         return (
             pruned_states,
             pruned_states_before_norm,
@@ -923,12 +968,13 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self._glm52_exact_mode:
+        if self._glm52_exact_mode or getattr(self, "_qwen3_dense_exact_mode", False):
             return xorl_bi_lm_head(
                 hidden_states,
                 lm_head,
                 use_fp32_lm_head=self.use_fp32_lm_head,
                 embedding_bias=embedding_bias,
+                family="v2",
             )
 
         quant_method = getattr(lm_head, "quant_method", None)
@@ -980,7 +1026,32 @@ class LogitsProcessor(nn.Module):
             logits_metadata.compute_dp_attention_metadata()
             local_hidden_states = hidden_states
             hidden_states = logits_metadata.gathered_buffer
-            dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
+            if self._dsv4_exact_mode:
+                from sglang.srt.layers.dsv4_ownership import (
+                    gather_dsv4_owner_plane_rows,
+                    resolve_dsv4_owner_plane,
+                )
+
+                ownership = resolve_dsv4_owner_plane()
+                if not logits_metadata.dsv4_exact_logits_rows_reconstructed:
+                    raise RuntimeError(
+                        "Exact DSV4 TP8 logits require reconstructed DP-owner rows"
+                    )
+                if logits_metadata.dsv4_exact_logits_dp_rank != ownership.dp_rank:
+                    raise RuntimeError(
+                        "Exact DSV4 logits ownership changed between model and head"
+                    )
+                counts = logits_metadata.global_num_tokens_for_logprob_cpu
+                segment_lengths = [] if counts is None else list(counts)
+                gather_dsv4_owner_plane_rows(
+                    local_hidden_states,
+                    ownership,
+                    segment_lengths,
+                    output=hidden_states,
+                    group=get_parallel().tp_group,
+                )
+            else:
+                dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
             return hidden_states, local_hidden_states
         return hidden_states, hidden_states
 

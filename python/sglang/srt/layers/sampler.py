@@ -6,13 +6,24 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
+from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     is_bi_head_fastpath_enabled,
 )
-from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
+from sglang.srt.batch_invariant_ops.bi_families_v2 import (
+    exact_temperature_scale_bf16_logits,
+    exact_temperature_scale_fp32_logits,
+)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
+)
+from sglang.srt.layers.exact_sampling_transforms import (
+    exact_masked_logits,
+    exact_sampling_identity_rows,
+    exact_seeded_gumbel_sample,
+    exact_selected_logprob_from_support,
+    exact_selected_logprob_partitioned_from_support,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
@@ -22,7 +33,12 @@ from sglang.srt.layers.xorl_batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.server_args import is_glm52_exact_mode, is_qwen35_gdn_exact_mode
+from sglang.srt.server_args import (
+    is_dsv4_flash_exact_mode,
+    is_glm52_exact_mode,
+    is_qwen3_dense_exact_mode,
+    is_qwen35_gdn_exact_mode,
+)
 from sglang.srt.utils.async_probe import sanitize_nan_logits
 from sglang.srt.utils.common import (
     get_bool_env_var,
@@ -79,14 +95,14 @@ class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
         self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
+        self._qwen3_dense_exact_mode = is_qwen3_dense_exact_mode(get_server_args())
+        self._dsv4_flash_exact_mode = is_dsv4_flash_exact_mode(get_server_args())
         self.tp_sync_group = get_tp_group().device_group
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
 
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
-        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(
-            get_server_args()
-        )
+        self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(get_server_args())
         self.return_original_logprob = (
             False
             if self.use_qwen35_bi_decode_rescore
@@ -116,8 +132,8 @@ class Sampler(nn.Module):
         logits_output: LogitsProcessorOutput,
         sampling_info: SamplingBatchInfo,
         return_logprob: bool,
-        top_logprobs_nums: List[int],
-        token_ids_logprobs: List[List[int]],
+        top_logprobs_nums: Optional[List[int]],
+        token_ids_logprobs: Optional[List[Optional[List[int]]]],
         positions: torch.Tensor,
     ):
         """Run a sampler & compute logprobs and update logits_output accordingly.
@@ -134,7 +150,7 @@ class Sampler(nn.Module):
             positions: The positions of the tokens in the sequence. Used for deterministic sampling
                 to get the unique seed for each position.
         """
-        if self._glm52_exact_mode:
+        if self._glm52_exact_mode or getattr(self, "_qwen3_dense_exact_mode", False):
             return xorl_bi_sample_and_score(
                 logits_output,
                 sampling_info,
@@ -142,10 +158,11 @@ class Sampler(nn.Module):
                 top_logprobs_nums=top_logprobs_nums,
                 token_ids_logprobs=token_ids_logprobs,
                 positions=positions,
-                sample_from_logprobs=self._sample_from_logprobs,
+                sample_from_logprobs=None,
                 sync_token_ids=self._sync_token_ids_across_tp,
                 enable_deterministic=self.enable_deterministic,
                 return_original_logprob=SGLANG_RETURN_ORIGINAL_LOGPROB,
+                family="v2",
             )
 
         logits = logits_output.next_token_logits
@@ -153,6 +170,26 @@ class Sampler(nn.Module):
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
         return_sampling_mask = any(sampling_info.return_sampling_masks or [])
+        exact_sampling_logits = None
+
+        has_sampling_filter = (
+            sampling_info.need_top_p_sampling
+            or sampling_info.need_top_k_sampling
+            or sampling_info.need_min_p_sampling
+        )
+        if has_sampling_filter and (
+            self.use_qwen35_bi_decode_rescore or self._dsv4_flash_exact_mode
+        ):
+            return self._forward_exact_filtered(
+                logits_output,
+                logits,
+                sampling_info,
+                return_logprob,
+                top_logprobs_nums,
+                token_ids_logprobs,
+                positions,
+                return_sampling_mask=return_sampling_mask,
+            )
 
         if sampling_info.is_all_greedy:
             if _use_aiter and not _disable_aiter_greedy_sample:
@@ -184,14 +221,23 @@ class Sampler(nn.Module):
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
             if self.rl_on_policy_target is not None:
-                # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
+                if self.use_qwen35_bi_decode_rescore:
+                    exact_sampling_logits = exact_temperature_scale_fp32_logits(
+                        logits,
+                        sampling_info.temperatures,
+                    )
+                    logits_div_temperature = exact_sampling_logits
+                else:
+                    # TODO: use more inplace ops to save memory
+                    logits_div_temperature = exact_temperature_scale_bf16_logits(
+                        logits.bfloat16(),
+                        sampling_info.temperatures,
+                    )
                 logprobs_via_logsoftmax_kernel = torch.log_softmax(
                     logits_div_temperature, dim=-1
                 )
-                del logits_div_temperature
+                if exact_sampling_logits is None:
+                    del logits_div_temperature
 
             if self.use_ascend_backend:
                 # Ascend backend: sample from logits directly.
@@ -209,7 +255,11 @@ class Sampler(nn.Module):
             ):
                 # RL on-policy path: sample from logprobs to match the trainer.
                 batch_next_token_ids = self._sample_from_logprobs(
-                    logprobs_via_logsoftmax_kernel,
+                    (
+                        exact_sampling_logits
+                        if exact_sampling_logits is not None
+                        else logprobs_via_logsoftmax_kernel
+                    ),
                     sampling_info,
                     positions,
                 )
@@ -271,9 +321,14 @@ class Sampler(nn.Module):
             logprob_result.write_output_to(logits_output)
             if self.use_qwen35_bi_decode_rescore:
                 logits_output.next_token_logprobs = self._bi_contract_sampled_logprob(
-                    logits_output.next_token_logits,
+                    (
+                        exact_sampling_logits
+                        if exact_sampling_logits is not None
+                        else logits_output.next_token_logits
+                    ),
                     batch_next_token_ids,
                     sampling_info,
+                    temperature_applied=exact_sampling_logits is not None,
                 )
                 global _bi_decode_rescore_logged
                 if not _bi_decode_rescore_logged:
@@ -287,11 +342,182 @@ class Sampler(nn.Module):
 
         return batch_next_token_ids
 
+    def _forward_exact_filtered(
+        self,
+        logits_output: LogitsProcessorOutput,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        return_logprob: bool,
+        top_logprobs_nums: Optional[List[int]],
+        token_ids_logprobs: Optional[List[Optional[List[int]]]],
+        positions: torch.Tensor,
+        *,
+        return_sampling_mask: bool,
+    ) -> torch.Tensor:
+        """Sample and score one exact, jointly filtered distribution."""
+
+        if not self.enable_deterministic or sampling_info.sampling_seed is None:
+            raise RuntimeError(
+                "Exact filtered sampling requires deterministic inference and per-request seeds"
+            )
+        if self.return_original_logprob:
+            raise RuntimeError(
+                "Exact filtered sampling rejects SGLANG_RETURN_ORIGINAL_LOGPROB"
+            )
+        if (
+            sampling_info.has_custom_logit_processor
+            or sampling_info.logit_bias is not None
+            or sampling_info.grammars
+            or sampling_info.grammar_mask is not None
+            or sampling_info.acc_additive_penalties is not None
+            or sampling_info.acc_scaling_penalties is not None
+            or (
+                sampling_info.penalizer_orchestrator is not None
+                and sampling_info.penalizer_orchestrator.is_required
+            )
+        ):
+            raise RuntimeError(
+                "Exact filtered sampling does not support penalties, grammar, logit bias, or custom processors"
+            )
+
+        if self.use_qwen35_bi_decode_rescore:
+            transformed_logits = exact_temperature_scale_fp32_logits(
+                logits,
+                sampling_info.temperatures,
+            )
+        else:
+            transformed_logits = exact_temperature_scale_bf16_logits(
+                logits.bfloat16(),
+                sampling_info.temperatures,
+            )
+        masked_logits, support = exact_masked_logits(
+            transformed_logits,
+            sampling_info.top_ks,
+            sampling_info.top_ps,
+            sampling_info.min_ps,
+        )
+        greedy_rows = sampling_info.top_ks <= 1
+        if sampling_info.is_all_greedy:
+            batch_next_token_ids = torch.argmax(transformed_logits, dim=-1)
+        else:
+            exact_sampler = getattr(self, "_sample_from_exact_logits", None)
+            if exact_sampler is None:
+                # Dependency-injection fallback for focused CPU unit tests.
+                batch_next_token_ids = self._sample_from_logprobs(
+                    masked_logits,
+                    sampling_info,
+                    positions,
+                )
+            else:
+                batch_next_token_ids = exact_sampler(
+                    transformed_logits,
+                    sampling_info,
+                    positions,
+                    support,
+                )
+            if sampling_info.is_any_greedy:
+                batch_next_token_ids = torch.where(
+                    greedy_rows,
+                    torch.argmax(transformed_logits, dim=-1),
+                    batch_next_token_ids,
+                )
+
+        if return_logprob:
+            identity_rows = exact_sampling_identity_rows(
+                sampling_info.top_ks,
+                sampling_info.top_ps,
+                sampling_info.min_ps,
+                vocab_size=transformed_logits.shape[1],
+            )
+            native_full_logprobs = None
+
+            if self.use_qwen35_bi_decode_rescore:
+
+                def _native_score(native_logits, native_ids):
+                    if is_bi_head_fastpath_enabled():
+                        from sglang.srt.batch_invariant_ops.bi_head_fastpath import (  # noqa: PLC0415
+                            bi_lm_head_selected_logprob_from_logits_fast,
+                        )
+
+                        score = bi_lm_head_selected_logprob_from_logits_fast
+                    else:
+                        from sglang.srt.batch_invariant_ops import (  # noqa: PLC0415
+                            bi_lm_head_selected_logprob_from_logits,
+                        )
+
+                        score = bi_lm_head_selected_logprob_from_logits
+                    return score(native_logits, native_ids, temperature=None)
+
+            else:
+                from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+                    log_softmax as _bi_log_softmax,
+                )
+
+                def _native_score(native_logits, native_ids):
+                    nonlocal native_full_logprobs
+                    native_full_logprobs = _bi_log_softmax(native_logits, dim=-1)
+                    native_selected = native_logits.gather(
+                        1, native_ids.unsqueeze(1)
+                    ).squeeze(1)
+                    native_logprob = native_full_logprobs.gather(
+                        1, native_ids.unsqueeze(1)
+                    ).squeeze(1)
+                    return (
+                        native_logprob,
+                        native_selected - native_logprob,
+                        native_selected,
+                    )
+
+            selected_logprobs, lse, _ = exact_selected_logprob_partitioned_from_support(
+                transformed_logits,
+                batch_next_token_ids.to(torch.int64),
+                support,
+                identity_rows,
+                _native_score,
+            )
+            if sampling_info.is_any_greedy:
+                # top_k=1 is the normalized temperature=0 decision program:
+                # the selected argmax has probability one and logprob +0.
+                selected_logprobs = torch.where(
+                    greedy_rows,
+                    torch.zeros_like(selected_logprobs),
+                    selected_logprobs,
+                )
+            filtered_logprobs = masked_logits - lse.unsqueeze(1)
+            if native_full_logprobs is not None:
+                filtered_logprobs = torch.where(
+                    identity_rows.unsqueeze(1),
+                    native_full_logprobs,
+                    filtered_logprobs,
+                )
+            logprob_result = self.output_logprob_processor.compute_logprobs(
+                filtered_logprobs,
+                top_logprobs_nums,
+                token_ids_logprobs,
+                batch_next_token_ids,
+            )
+            logprob_result.write_output_to(logits_output)
+            logits_output.next_token_logprobs = selected_logprobs
+
+        if return_sampling_mask:
+            self._attach_exact_sampling_mask_to_output(
+                logits_output,
+                sampling_info,
+                batch_next_token_ids,
+                transformed_logits,
+                support,
+            )
+
+        self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        return batch_next_token_ids
+
     def _bi_contract_sampled_logprob(
         self,
         logits: torch.Tensor,
         batch_next_token_ids: torch.Tensor,
         sampling_info: SamplingBatchInfo,
+        *,
+        temperature_applied: bool = False,
     ) -> torch.Tensor:
         """Rescore selected tokens through the pinned contract LSE reduction."""
         from sglang.srt.batch_invariant_ops import (
@@ -325,7 +551,7 @@ class Sampler(nn.Module):
             )
 
         temperature = None
-        if not sampling_info.is_all_greedy:
+        if not sampling_info.is_all_greedy and not temperature_applied:
             if not (
                 self.use_log_softmax_logprob
                 and self.enable_deterministic
@@ -454,6 +680,59 @@ class Sampler(nn.Module):
         logits_output.next_token_sampling_mask_idx = masks
         logits_output.next_token_sampling_logprobs = logprobs
 
+    def _attach_exact_sampling_mask_to_output(
+        self,
+        logits_output: LogitsProcessorOutput,
+        sampling_info: SamplingBatchInfo,
+        batch_next_token_ids: torch.Tensor,
+        transformed_logits: torch.Tensor,
+        support: torch.Tensor,
+    ) -> None:
+        """Return the support and normalization used by exact sampling."""
+        return_sampling_masks = sampling_info.return_sampling_masks or []
+        if not return_sampling_masks:
+            logits_output.next_token_sampling_mask_idx = []
+            logits_output.next_token_sampling_logprobs = []
+            return
+
+        selected_logprobs, _, _ = exact_selected_logprob_from_support(
+            transformed_logits,
+            batch_next_token_ids.to(torch.int64),
+            support,
+        )
+
+        # Preserve the established descending-score response order while using
+        # the exact support as the sole source of membership. Stable sorting
+        # makes token ID the tie breaker, matching exact_sampling_support.
+        ordered_ids = torch.argsort(
+            transformed_logits.detach(), dim=-1, descending=True, stable=True
+        )
+        ordered_support = support.gather(1, ordered_ids)
+        flat_rows, flat_cols = ordered_support.nonzero(as_tuple=True)
+        flat_ids = ordered_ids[flat_rows, flat_cols].to(torch.int32)
+        mask_lengths = ordered_support.sum(dim=-1, dtype=torch.int32)
+
+        flat_ids_cpu = flat_ids.cpu().tolist()
+        mask_lengths_cpu = mask_lengths.cpu().tolist()
+        selected_logprobs_cpu = selected_logprobs.cpu().tolist()
+
+        masks = []
+        logprobs = []
+        cursor = 0
+        for i, should_return in enumerate(return_sampling_masks):
+            mask_len = int(mask_lengths_cpu[i])
+            row_ids = flat_ids_cpu[cursor : cursor + mask_len]
+            cursor += mask_len
+            if should_return:
+                masks.append(row_ids)
+                logprobs.append(float(selected_logprobs_cpu[i]))
+            else:
+                masks.append(None)
+                logprobs.append(None)
+
+        logits_output.next_token_sampling_mask_idx = masks
+        logits_output.next_token_sampling_logprobs = logprobs
+
     def _attach_sampling_mask_to_output(
         self,
         logits_output: LogitsProcessorOutput,
@@ -528,8 +807,9 @@ class Sampler(nn.Module):
     ) -> torch.Tensor:
         """Sample from log-probabilities using the Gumbel trick.
 
-        Used for deterministic sampling with simple cases (no top-k/top-p/min-p).
-        Requires sampling_seed to be set in sampling_info.
+        Exact lanes may pass either their full transformed logits or logits
+        masked by the shared top-k/top-p/min-p program. Requires a per-row
+        ``sampling_seed`` and uses deterministic seeded Gumbel-max.
         """
         assert (
             sampling_info.sampling_seed is not None
@@ -538,6 +818,22 @@ class Sampler(nn.Module):
             logprobs, sampling_info.sampling_seed, positions
         )
         return sampled_index.view(-1).to(torch.int32)
+
+    def _sample_from_exact_logits(
+        self,
+        logits: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+        positions: torch.Tensor,
+        support: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Exact-only endpoint-safe seeded Gumbel-max; generic sampling is unchanged."""
+
+        return exact_seeded_gumbel_sample(
+            logits,
+            sampling_info.sampling_seed,
+            positions,
+            support=support,
+        )
 
     def _sample_from_logits(
         self,

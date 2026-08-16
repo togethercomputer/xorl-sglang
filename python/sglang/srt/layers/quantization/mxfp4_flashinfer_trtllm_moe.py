@@ -366,6 +366,25 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         return StandardCombineInput(hidden_states=output)
 
 
+def is_routed_scale_deferred_to_shared_add(experts) -> bool:
+    """Whether this backend returns routed output before its global scale."""
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
+    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+        Mxfp4MarlinMoEMethod,
+    )
+
+    return isinstance(
+        experts.quant_method,
+        (
+            Mxfp4FlashinferTrtllmMoEMethod,
+            Mxfp4FlashinferCutlassMoEMethod,
+            Mxfp4MarlinMoEMethod,
+        ),
+    )
+
+
 def maybe_fuse_routed_scale_and_shared_add(
     experts,
     routed: torch.Tensor,
@@ -377,21 +396,7 @@ def maybe_fuse_routed_scale_and_shared_add(
     # alpha=scale)`. With no shared output, the missing scale is applied
     # in-place. Otherwise `routed` is already scale-final and we just add
     # `shared` (or pass through if there is none).
-    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
-        Mxfp4FlashinferCutlassMoEMethod,
-    )
-    from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
-        Mxfp4MarlinMoEMethod,
-    )
-
-    fused = isinstance(
-        experts.quant_method,
-        (
-            Mxfp4FlashinferTrtllmMoEMethod,
-            Mxfp4FlashinferCutlassMoEMethod,
-            Mxfp4MarlinMoEMethod,
-        ),
-    )
+    fused = is_routed_scale_deferred_to_shared_add(experts)
     if fused:
         if shared is not None:
             return shared.add_(routed, alpha=routed_scaling_factor)

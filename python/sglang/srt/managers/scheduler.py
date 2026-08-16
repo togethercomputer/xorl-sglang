@@ -42,7 +42,6 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 
-
 from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
@@ -52,7 +51,6 @@ import setproctitle
 import torch
 import torch.distributed
 from torch.distributed import barrier
-
 
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
@@ -104,6 +102,7 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
+from sglang.srt.lora.dsv4 import dsv4_exact_speculative_request_error
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
@@ -319,7 +318,6 @@ from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
-
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -2297,6 +2295,22 @@ class Scheduler(
                 namespace,
             )
 
+    def _maybe_namespace_dsv4_exact_radix_cache(self, req: Req) -> None:
+        """Keep exact DSV4 prefixes on the attention-DP rank that made them."""
+
+        if (
+            not self.server_args.dsv4_flash_exact_mode
+            or self.disable_radix_cache
+            or not self.tree_cache.is_tree_cache()
+        ):
+            return
+
+        namespace = f"dsv4_exact_dp_owner={self.ps.attn_dp_rank}"
+        if req.extra_key:
+            req.extra_key = f"{req.extra_key}|{namespace}"
+        else:
+            req.extra_key = namespace
+
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
             if not req.finished() or not (mm_inputs := req.multimodal_inputs):
@@ -2307,6 +2321,20 @@ class Scheduler(
             # For non-session requests, clear features and mm_inputs
             mm_inputs.release_features()
             req.multimodal_inputs = None
+
+    def _reject_dsv4_exact_speculative_request(self, req: Req) -> bool:
+        """Reject the unsupported request before cache allocation or forwarding."""
+
+        error_msg = dsv4_exact_speculative_request_error(
+            exact_mode=self.server_args.dsv4_flash_exact_mode,
+            speculative_enabled=not self.spec_algorithm.is_none(),
+        )
+        if error_msg is None:
+            return False
+        logger.warning("Rejecting request %s: %s", req.rid, error_msg)
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.output_streamer.stream_output([req], req.return_logprob)
+        return True
 
     def handle_generate_request(
         self,
@@ -2352,7 +2380,9 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                return_expert_logits=recv_req.return_expert_logits,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
+                return_routed_experts_file=recv_req.return_routed_experts_file,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -2447,7 +2477,11 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if self._reject_dsv4_exact_speculative_request(req):
+            return
+
         self._maybe_namespace_elastic_radix_cache(req)
+        self._maybe_namespace_dsv4_exact_radix_cache(req)
 
         if self.spec_algorithm.is_dflash_family():
             error_msg = (

@@ -55,13 +55,18 @@ from sglang.srt.distributed import (
     divide,
     get_pp_group,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_canonical_moe_all_reduce,
 )
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDeferredStatusBook,
     CanonicalDistribution,
+    CanonicalMoEV3ScratchPool,
     CanonicalMoEV3Workspace,
+    CanonicalMoEWorkspace,
     CanonicalRowSlots,
     SamplerParallelPlan,
+    canonical_moe_leaf_fp32_v1,
+    canonicalize_glm52_local_partial,
     canonicalize_glm52_local_partial_v3,
     canonicalize_glm52_local_partial_v3b,
 )
@@ -91,8 +96,8 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.communicator_dsa_cp import (
     CanonicalMoEPositions,
-    DSAMLPOutputLayout,
     DSACPLayerCommunicator,
+    DSAMLPOutputLayout,
     align_glm52_moe_positions,
     maybe_prefetch_next_full_attention_kv,
 )
@@ -100,6 +105,12 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
+)
+from sglang.srt.layers.glm52_positions import (
+    Glm52MlpRowLayout,
+    get_glm52_mlp_row_state,
+    reset_glm52_mlp_row_state,
+    set_glm52_mlp_row_state,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -139,6 +150,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
 )
 from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
+    is_routed_scale_deferred_to_shared_add,
     maybe_fuse_routed_scale_and_shared_add,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -262,6 +274,11 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
 
 logger = logging.getLogger(__name__)
 
+# One-shot per-process marker so the DSV4 exact-combine gate's engagement (or
+# non-engagement) is visible in the serving log; both states are contract
+# evidence (a silent gate was the root cause of an inert byte-program change).
+_dsv4_exact_combine_engagement_logged = False
+
 
 def _is_glm52_architecture(config) -> bool:
     return getattr(config, "indexer_types", None) is not None
@@ -281,14 +298,11 @@ def _uses_glm52_exact_contract(config, *, is_nextn: bool = False) -> bool:
 
 def _resolve_glm52_canonical_transport(config) -> str:
     if _glm52_exact_mode_enabled(config):
-        transport = str(
-            getattr(config, "_glm52_canonical_moe_transport", "canonical_v3b")
-        )
-        if transport != "canonical_v3b":
+        transport = str(getattr(config, "_glm52_canonical_moe_transport", "auto"))
+        if transport not in {"auto", "dense_v1", "canonical_v3", "canonical_v3b"}:
             raise RuntimeError(
-                "The exact GLM-5.2 XORL contract serves the certified "
-                "canonical_v3b transport; "
-                f"{transport!r} is not a selectable alternative"
+                "Exact GLM-5.2 transport must be auto, dense_v1, canonical_v3, "
+                f"or canonical_v3b; got {transport!r}"
             )
         return transport
     transport = str(getattr(config, "_glm52_canonical_moe_transport", "dense_v1"))
@@ -298,6 +312,31 @@ def _resolve_glm52_canonical_transport(config) -> str:
             "or canonical_v3b"
         )
     return transport
+
+
+def _select_glm52_canonical_transport(
+    configured: str, *, prefill_cp: bool, consumer_sharded: bool = False
+) -> str:
+    """Choose transport without making it an exact-mode admission gate.
+
+    Consumer-sharded CP prefill needs v3's destination-routed exchange: dense
+    v1 returns a full-capacity owner plane and therefore cannot substitute for
+    that local row layout. For replicated batches, dense v1 remains available
+    as the independent executable oracle; auto selects the allocation-light
+    v3b fused fold while explicit v3 keeps its independent transport. All three
+    compose the same versioned FP64 fold.
+    """
+
+    if configured == "dense_v1":
+        if consumer_sharded:
+            raise RuntimeError(
+                "dense_v1 cannot produce the consumer-sharded CP prefill row layout; "
+                "use auto or canonical_v3"
+            )
+        return configured
+    if prefill_cp or configured == "canonical_v3":
+        return "canonical_v3"
+    return "canonical_v3b"
 
 
 # One-time SGLANG_OPT_MOE_QUANT_ONCE engagement log (see _moe_quant_once_enabled).
@@ -354,8 +393,7 @@ class DeepseekV2MLP(nn.Module):
             self.down_proj.weight = self.down_proj.weight_packed
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
         self.use_fused_clamp_act_mul = (
@@ -593,6 +631,13 @@ class MoEGate(nn.Module):
             return bi_router_gemm(hidden_states, self.weight)
 
         if get_exec().deterministic.enable_deterministic_inference:
+            if self.is_deepseek_v4:
+                # DSV4 hash_topk consumes FP32 router logits, and the later
+                # correction-bias router uses the same serving-value GEMM.
+                # Deterministic mode must not fall back to BF16 F.linear here.
+                from sglang.kernels.ops.attention.dsv4 import linear_bf16_fp32
+
+                return linear_bf16_fp32(hidden_states, self.weight)
             return F.linear(hidden_states, self.weight, None)
 
         if (
@@ -636,7 +681,6 @@ class MoEGate(nn.Module):
 
 
 class DeepseekV2MoE(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -683,6 +727,9 @@ class DeepseekV2MoE(nn.Module):
             top_k_for_moe = config.num_experts_per_tok + self.num_fused_shared_experts
 
         self.config = config
+        self._dsv4_exact_ordered_combine = bool(
+            getattr(config, "_dsv4_flash_exact_mode", False)
+        )
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
@@ -928,7 +975,13 @@ class DeepseekV2MoE(nn.Module):
         self._glm52_canonical_contract = _uses_glm52_exact_contract(
             config, is_nextn=is_nextn
         )
+        self._canonical_dense_workspaces: dict[tuple, CanonicalMoEWorkspace] = {}
         self._canonical_v3_workspaces: dict[tuple, CanonicalMoEV3Workspace] = {}
+        self._glm52_mixed_prefill_scratch_pool: CanonicalMoEV3ScratchPool | None = None
+        # Keys minted while a CUDA graph was being captured: the captured
+        # graph replays against those tensor addresses forever, so they are
+        # exempt from the single-slot eviction below.
+        self._canonical_v3_pinned_keys: set[tuple] = set()
         self._glm52_deferred_status_book: CanonicalDeferredStatusBook | None = None
         self._glm52_canonical_transport = (
             _resolve_glm52_canonical_transport(config)
@@ -1066,6 +1119,29 @@ class DeepseekV2MoE(nn.Module):
                 hidden_states, forward_batch, input_ids_global=input_ids_global
             )
 
+    def _canonical_exact_leaf(
+        self,
+        routed: torch.Tensor,
+        shared: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Finish one exact GLM/DSV contributor before low-precision transport."""
+        if routed.numel() == 0:
+            return routed
+        if shared is None:
+            raise RuntimeError(
+                "Exact canonical MoE requires an explicit shared-expert partial"
+            )
+        routed_scale = (
+            self.routed_scaling_factor
+            if is_routed_scale_deferred_to_shared_add(self.experts)
+            else 1.0
+        )
+        return canonical_moe_leaf_fp32_v1(
+            shared,
+            routed,
+            routed_scale=float(routed_scale),
+        )
+
     def forward_normal_dual_stream(
         self,
         hidden_states: torch.Tensor,
@@ -1153,7 +1229,12 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
+        exact_leaf = self._glm52_canonical_contract or self._dsv4_exact_ordered_combine
         if deferred_finalize:
+            if exact_leaf:
+                raise RuntimeError(
+                    "Exact canonical MoE does not admit backend-fused leaf finalization"
+                )
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 finalize_flashinfer_trtllm_deferred_output,
             )
@@ -1161,6 +1242,11 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states = finalize_flashinfer_trtllm_deferred_output(
                 final_hidden_states,
                 shared_output,
+            )
+        elif exact_leaf:
+            final_hidden_states = self._canonical_exact_leaf(
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
             )
         else:
             final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
@@ -1173,12 +1259,36 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _post_experts_all_reduce(self, final_hidden_states):
+        """Post-experts TP sum; the DSV4 exact lane pins the canonical fold.
+
+        The stock NCCL all_reduce has a topology-dependent reduction order.
+        The XoRL exact contract requires the canonical source-ranked adjacent
+        FP64 tree over TP partials (the same primitive as Qwen/GLM) so the
+        trainer's raw exchange plus canonical_moe_fold_fp64_v3 reproduces the
+        serving bytes before the one final BF16 output cast.
+        """
+        global _dsv4_exact_combine_engagement_logged
+        if not _dsv4_exact_combine_engagement_logged:
+            _dsv4_exact_combine_engagement_logged = True
+            logger.info(
+                "DSV4 post-experts combine gate: %s",
+                (
+                    "canonical fold ENGAGED"
+                    if self._dsv4_exact_ordered_combine
+                    else "OFF (stock all_reduce)"
+                ),
+            )
+        if self._dsv4_exact_ordered_combine:
+            return tensor_model_parallel_canonical_moe_all_reduce(final_hidden_states)
+        return tensor_model_parallel_all_reduce(final_hidden_states)
 
     def forward_normal(
         self,
@@ -1250,7 +1360,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
                 self.alt_stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(self.alt_stream):
@@ -1307,12 +1416,18 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
-            self.experts,
-            final_hidden_states,
-            None if self._shared_expert_tp1 else shared_output,
-            self.routed_scaling_factor,
-        )
+        if self._glm52_canonical_contract or self._dsv4_exact_ordered_combine:
+            final_hidden_states = self._canonical_exact_leaf(
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+            )
+        else:
+            final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+                self.experts,
+                final_hidden_states,
+                None if self._shared_expert_tp1 else shared_output,
+                self.routed_scaling_factor,
+            )
 
         if self._glm52_canonical_contract:
             return self._canonicalize_glm52_partial(
@@ -1326,12 +1441,127 @@ class DeepseekV2MoE(nn.Module):
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
         ):
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
         # TP1 shared experts are replicated, so add them after all-reduce to
         # avoid summing the same shared output once per TP rank.
         if shared_output is not None and self._shared_expert_tp1:
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _get_canonical_v3_workspace(
+        self,
+        workspace_key: tuple,
+        local_partial: torch.Tensor,
+        *,
+        plan,
+        group,
+        distribution,
+        capture_mode: bool,
+        cache_eager: bool = True,
+    ) -> CanonicalMoEV3Workspace:
+        """Get or allocate a canonical-fold workspace.
+
+        The former unbounded keying retained one workspace set per distinct
+        CP-padded capacity bucket (~92 MiB per sparse layer per 256-row bucket
+        at hidden 6144). Eviction changes only the Python retention policy: a
+        re-mint allocates the same shapes, strides, and kernels as first use,
+        so the serving arithmetic is unchanged.
+
+        Entries minted during CUDA graph capture are pinned: the captured
+        graph replays against their addresses, so they must never be
+        evicted (decode's REPLICATED_CANONICAL bucket). Prefill CUDA graphs
+        are disabled on this lane, so CONSUMER_SHARDED entries are
+        eager-only and safe to drop when the capacity bucket changes.
+
+        Mixed DP x CP prefill is also REPLICATED_CANONICAL, but its collective
+        workspace is contributor-count times the prompt payload. Keeping one
+        such eager workspace in every sparse layer makes residency grow with
+        model depth. The mixed-prefill path instead leases one model-shared
+        slot; this fallback remains available to uncached callers.
+        """
+        if capture_mode or cache_eager:
+            workspace = self._canonical_v3_workspaces.get(workspace_key)
+            if workspace is not None:
+                if capture_mode:
+                    self._canonical_v3_pinned_keys.add(workspace_key)
+                return workspace
+        if not capture_mode and not cache_eager:
+            return CanonicalMoEV3Workspace.allocate(
+                local_partial,
+                plan=plan,
+                group=group,
+                distribution=distribution,
+            )
+        if not capture_mode and distribution is CanonicalDistribution.CONSUMER_SHARDED:
+            stale_keys = [
+                key
+                for key in self._canonical_v3_workspaces
+                if key[0] == distribution.value
+                and key not in self._canonical_v3_pinned_keys
+            ]
+            for key in stale_keys:
+                logger.info(
+                    "canonical-v3 workspace evicted (layer %s): %s -> %s",
+                    self.layer_id,
+                    key[1],
+                    workspace_key[1],
+                )
+                del self._canonical_v3_workspaces[key]
+        workspace = CanonicalMoEV3Workspace.allocate(
+            local_partial,
+            plan=plan,
+            group=group,
+            distribution=distribution,
+        )
+        self._canonical_v3_workspaces[workspace_key] = workspace
+        if capture_mode:
+            self._canonical_v3_pinned_keys.add(workspace_key)
+        return workspace
+
+    def _run_glm52_v3_transport(
+        self,
+        selected_transport: str,
+        local_partial: torch.Tensor,
+        slots: CanonicalRowSlots,
+        *,
+        plan: SamplerParallelPlan,
+        group: dist.ProcessGroup,
+        distribution: CanonicalDistribution,
+        capture_mode: bool,
+        workspace: CanonicalMoEV3Workspace,
+    ):
+        if selected_transport == "canonical_v3":
+            return canonicalize_glm52_local_partial_v3(
+                local_partial,
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=self.layer_id,
+                distribution=distribution,
+                graph_capture=capture_mode,
+                workspace=workspace,
+            )
+        if selected_transport == "canonical_v3b":
+            return canonicalize_glm52_local_partial_v3b(
+                local_partial,
+                slots,
+                plan=plan,
+                group=group,
+                layer_id=self.layer_id,
+                graph_capture=capture_mode,
+                workspace=workspace,
+            )
+        raise RuntimeError(f"Unsupported GLM-5.2 v3 transport {selected_transport!r}")
+
+    def _finish_glm52_canonical(self, canonical, *, capture_mode: bool) -> torch.Tensor:
+        if not capture_mode:
+            if self._glm52_deferred_status_book is None:
+                canonical.raise_for_status()
+            else:
+                self._glm52_deferred_status_book.record(
+                    self.layer_id, canonical.contract_status
+                )
+        return canonical.values
 
     def _canonicalize_glm52_partial(
         self,
@@ -1373,11 +1603,6 @@ class DeepseekV2MoE(nn.Module):
             raise RuntimeError(
                 "GLM-5.2 correction bias must remain FP32 through weight loading"
             )
-        if self._glm52_canonical_transport != "canonical_v3b":
-            raise RuntimeError(
-                "The exact GLM-5.2 owner requires canonical_v3b transport"
-            )
-
         prefill_cp = forward_batch is not None and (
             dsa_use_prefill_cp(forward_batch, self.gate.dsa_enable_prefill_cp)
             or mla_use_prefill_cp(forward_batch, self.gate.mla_enable_prefill_cp)
@@ -1395,7 +1620,7 @@ class DeepseekV2MoE(nn.Module):
         )
         distribution = (
             CanonicalDistribution.CONSUMER_SHARDED
-            if prefill_cp
+            if prefill_cp and plan.attention_dp_size == 1
             else CanonicalDistribution.REPLICATED_CANONICAL
         )
         group = get_parallel().tp_group.device_group
@@ -1406,19 +1631,25 @@ class DeepseekV2MoE(nn.Module):
             local_partial.dtype,
             local_partial.device,
         )
-        workspace = self._canonical_v3_workspaces.get(workspace_key)
-        if workspace is None:
-            workspace = CanonicalMoEV3Workspace.allocate(
-                local_partial,
-                plan=plan,
-                group=group,
-                distribution=distribution,
-            )
-            self._canonical_v3_workspaces[workspace_key] = workspace
-
         capture_mode = get_is_capture_mode()
-        if prefill_cp:
-            canonical = canonicalize_glm52_local_partial_v3(
+        selected_transport = _select_glm52_canonical_transport(
+            self._glm52_canonical_transport,
+            prefill_cp=prefill_cp,
+            consumer_sharded=(distribution is CanonicalDistribution.CONSUMER_SHARDED),
+        )
+        if selected_transport == "dense_v1":
+            dense_workspaces = getattr(self, "_canonical_dense_workspaces", None)
+            if dense_workspaces is None:
+                dense_workspaces = self._canonical_dense_workspaces = {}
+            workspace = dense_workspaces.get(workspace_key)
+            if workspace is None:
+                workspace = CanonicalMoEWorkspace.allocate(
+                    local_partial,
+                    plan=plan,
+                    group=group,
+                )
+                dense_workspaces[workspace_key] = workspace
+            canonical = canonicalize_glm52_local_partial(
                 local_partial,
                 slots,
                 plan=plan,
@@ -1429,23 +1660,64 @@ class DeepseekV2MoE(nn.Module):
                 workspace=workspace,
             )
         else:
-            canonical = canonicalize_glm52_local_partial_v3b(
+            # Idle DP ranks keep a local IDLE mode while participating in another
+            # rank's globally synchronized prefill MLP.
+            mixed_replicated_prefill = (
+                not capture_mode
+                and plan.attention_dp_size > 1
+                and plan.attention_cp_size > 1
+                and distribution is CanonicalDistribution.REPLICATED_CANONICAL
+                and forward_batch is not None
+                and forward_batch.is_extend_in_batch
+            )
+            if mixed_replicated_prefill:
+                pool = self._glm52_mixed_prefill_scratch_pool
+                if pool is None:
+                    raise RuntimeError(
+                        "Mixed-DP/CP GLM prefill has no model-shared scratch pool"
+                    )
+                with pool.lease(
+                    local_partial,
+                    plan=plan,
+                    group=group,
+                    distribution=distribution,
+                ) as workspace:
+                    canonical = self._run_glm52_v3_transport(
+                        selected_transport,
+                        local_partial,
+                        slots,
+                        plan=plan,
+                        group=group,
+                        distribution=distribution,
+                        capture_mode=capture_mode,
+                        workspace=workspace,
+                    )
+                    return self._finish_glm52_canonical(
+                        canonical, capture_mode=capture_mode
+                    )
+            workspace = self._get_canonical_v3_workspace(
+                workspace_key,
+                local_partial,
+                plan=plan,
+                group=group,
+                distribution=distribution,
+                capture_mode=capture_mode,
+                cache_eager=not (
+                    prefill_cp
+                    and distribution is CanonicalDistribution.REPLICATED_CANONICAL
+                ),
+            )
+            canonical = self._run_glm52_v3_transport(
+                selected_transport,
                 local_partial,
                 slots,
                 plan=plan,
                 group=group,
-                layer_id=self.layer_id,
-                graph_capture=capture_mode,
+                distribution=distribution,
+                capture_mode=capture_mode,
                 workspace=workspace,
             )
-        if not capture_mode:
-            if self._glm52_deferred_status_book is None:
-                canonical.raise_for_status()
-            else:
-                self._glm52_deferred_status_book.record(
-                    self.layer_id, canonical.contract_status
-                )
-        return canonical.values
+        return self._finish_glm52_canonical(canonical, capture_mode=capture_mode)
 
     def forward_cpu(
         self,
@@ -1499,7 +1771,7 @@ class DeepseekV2MoE(nn.Module):
             True,  # is_vnni
         )
         if self.tp_size > 1 and not get_forward().fuse_mlp_allreduce:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            final_hidden_states = self._post_experts_all_reduce(final_hidden_states)
         return final_hidden_states
 
     def forward_deepep(
@@ -1610,7 +1882,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -1628,7 +1899,6 @@ class DeepseekV2MoE(nn.Module):
             def _pre_combine_hook(
                 dispatcher: BaseDispatcher, combine_input: CombineInput
             ):
-
                 nonlocal shared_output
 
                 if (
@@ -1666,7 +1936,6 @@ class DeepseekV2MoE(nn.Module):
             def _post_dispatch_hook(
                 dispatcher: BaseDispatcher, dispatch_output: DispatchOutput
             ):
-
                 combine_overlap_args, down_gemm_overlap_args, meta_overlap_args = (
                     compute_overlap_args(dispatch_output, self.alt_stream)
                 )
@@ -1980,7 +2249,6 @@ class DeepseekV2AttentionMLA(
     DeepseekMLARocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2525,7 +2793,6 @@ class DeepseekV2AttentionMLA(
 
 
 class DeepseekV2DecoderLayer(nn.Module):
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2701,6 +2968,33 @@ class DeepseekV2DecoderLayer(nn.Module):
             return "fp8"
         return ""
 
+    def _glm52_mlp_lora_context(self, forward_batch: ForwardBatch, num_tokens: int):
+        """Route GLM MLP LoRA metadata by the rows actually prepared."""
+
+        if not getattr(self, "glm52_xorl_bi_contract", False):
+            return nullcontext()
+        if isinstance(self.mlp, DeepseekV2MoE):
+            backend = getattr(self.mlp.experts, "lora_backend", None)
+        else:
+            backend = getattr(self.mlp.gate_up_proj, "lora_backend", None)
+        if backend is None:
+            return nullcontext()
+        row_state = get_glm52_mlp_row_state(
+            forward_batch,
+            expected_rows=num_tokens,
+        )
+        if row_state.layout.uses_gathered_lora_metadata:
+            return backend.use_gathered_mlp_batch_info(num_tokens)
+
+        local_batch_info = backend.batch_info
+        expected_tokens = getattr(local_batch_info, "expected_tokens", None)
+        if expected_tokens is not None and expected_tokens != num_tokens:
+            raise RuntimeError(
+                "Local GLM-5.2 MLP LoRA metadata does not match the activation rows: "
+                f"metadata_rows={expected_tokens}, activation_rows={num_tokens}."
+            )
+        return nullcontext()
+
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
         mlp_layer_types = getattr(self.config, "mlp_layer_types", None)
         if self.glm52_xorl_bi_contract and mlp_layer_types is not None and not is_nextn:
@@ -2764,6 +3058,12 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch, next_full_attention_layer_id
         )
 
+        if self.glm52_xorl_bi_contract:
+            set_glm52_mlp_row_state(
+                forward_batch,
+                Glm52MlpRowLayout.LOCAL_LOGICAL,
+                hidden_states.shape[0],
+            )
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
@@ -2805,7 +3105,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             fuse_mlp_allreduce=fuse_mlp_allreduce,
             mlp_reduce_scatter=mlp_reduce_scatter,
         ):
-            with _mlp_ctx:
+            with (
+                _mlp_ctx,
+                self._glm52_mlp_lora_context(forward_batch, hidden_states.shape[0]),
+            ):
                 if moe_positions is None:
                     hidden_states = self.mlp(
                         hidden_states,
@@ -2896,6 +3199,20 @@ class DeepseekV2DecoderLayer(nn.Module):
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
+    @staticmethod
+    def _bind_glm52_mixed_prefill_scratch_pool(
+        plan: SamplerParallelPlan,
+        canonical_mlps: list[DeepseekV2MoE],
+    ) -> CanonicalMoEV3ScratchPool | None:
+        pool = (
+            CanonicalMoEV3ScratchPool()
+            if plan.attention_dp_size > 1 and plan.attention_cp_size > 1
+            else None
+        )
+        for mlp in canonical_mlps:
+            mlp._glm52_mixed_prefill_scratch_pool = pool
+        return pool
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2925,11 +3242,6 @@ class DeepseekV2Model(nn.Module):
             )
         self.glm52_parallel_plan: SamplerParallelPlan | None = None
         if self.glm52_xorl_bi_contract:
-            if not self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp:
-                raise RuntimeError(
-                    "The exact GLM-5.2 canonical contract requires DSA context "
-                    "parallelism"
-                )
             server_args = get_server_args()
             forbidden_features = {
                 "two-batch overlap": server_args.enable_two_batch_overlap,
@@ -2973,6 +3285,8 @@ class DeepseekV2Model(nn.Module):
                 pp_size=get_parallel().pp_size,
                 pp_rank=self.pp_group.rank_in_group,
                 physical_ranks=physical_ranks,
+                attention_dp_size=get_parallel().attn_dp_size,
+                ep_size=get_parallel().moe_ep_size,
             )
             self.glm52_parallel_plan.validate_cuda_graph_policy(
                 disable_cuda_graph=server_args.disable_cuda_graph
@@ -2984,6 +3298,7 @@ class DeepseekV2Model(nn.Module):
                 pp_size=get_parallel().pp_size,
                 ep_size=get_parallel().moe_ep_size,
                 attention_cp_size=get_parallel().attn_cp_size,
+                attention_dp_size=get_parallel().attn_dp_size,
             )
 
         if self.pp_group.is_first_rank:
@@ -3048,6 +3363,7 @@ class DeepseekV2Model(nn.Module):
         )
 
         self.glm52_deferred_status_book: CanonicalDeferredStatusBook | None = None
+        self.glm52_mixed_prefill_scratch_pool: CanonicalMoEV3ScratchPool | None = None
         if self.glm52_xorl_bi_contract:
             if self.glm52_parallel_plan is None:
                 raise RuntimeError(
@@ -3065,6 +3381,12 @@ class DeepseekV2Model(nn.Module):
                     if mlp._glm52_canonical_contract:
                         canonical_mlps.append(mlp)
             if canonical_mlps:
+                self.glm52_mixed_prefill_scratch_pool = (
+                    self._bind_glm52_mixed_prefill_scratch_pool(
+                        self.glm52_parallel_plan,
+                        canonical_mlps,
+                    )
+                )
                 self.glm52_deferred_status_book = CanonicalDeferredStatusBook(
                     config.num_hidden_layers
                 )
@@ -3152,6 +3474,12 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        if getattr(self, "glm52_xorl_bi_contract", False):
+            # A CUDA-graph shape is warmed up repeatedly with the same
+            # ForwardBatch before capture. Derived row-layout tensors may be
+            # reused by later MoE layers in this invocation, but must be rebuilt
+            # on every model entry so their alignment operations are captured.
+            reset_glm52_mlp_row_state(forward_batch)
         total_num_layers = self.end_layer - self.start_layer
         dsa_forward_uses_topk = self._dsa_forward_uses_topk()
         if self.pp_group.is_first_rank:
@@ -3384,9 +3712,9 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
-                layer_id: layer.mlp.get_moe_weights()
-                for layer_id, layer in enumerate(self.model.layers)
-                if isinstance(layer.mlp, DeepseekV2MoE)
+                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+                for layer_id in range(self.model.start_layer, self.model.end_layer)
+                if isinstance(self.model.layers[layer_id].mlp, DeepseekV2MoE)
             }
         )
         self.capture_aux_hidden_states = False
@@ -3492,7 +3820,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-
         # Multi-modal: input_ids may be None (use input_embeds).
         # Non-first PP ranks: both are None (activations via pp_proxy_tensors).
         if input_ids is not None:

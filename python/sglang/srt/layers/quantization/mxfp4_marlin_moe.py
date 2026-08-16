@@ -54,6 +54,10 @@ class Mxfp4MarlinMoEMethod:
 
         self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
+    def get_marlin_quant_info(self, layer: Module) -> MarlinMoeQuantInfo:
+        """Expose the native Marlin payload to the active-LoRA runner."""
+        return build_marlin_moe_quant_info(layer)
+
     def create_weights(
         self,
         layer: Module,

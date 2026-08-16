@@ -4,6 +4,7 @@ from typing import Annotated
 
 from fastapi import Body, FastAPI
 from pydantic import TypeAdapter
+
 from sglang.srt.managers.io_struct import (
     GenerateReqInput,
     PrepareWeightsUpdateReqInput,
@@ -19,7 +20,6 @@ from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
 )
-
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
@@ -71,6 +71,23 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
         )
+
+    def test_per_request_routed_experts_start_len(self):
+        req = copy.deepcopy(self.base_req)
+        req.routed_experts_start_len = [3, 7]
+        req.return_routed_experts_file = True
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].routed_experts_start_len, 3)
+        self.assertEqual(req[1].routed_experts_start_len, 7)
+        self.assertTrue(req[0].return_routed_experts_file)
+        self.assertTrue(req[1].return_routed_experts_file)
+
+    def test_scalar_routed_experts_start_len_expands(self):
+        req = copy.deepcopy(self.base_req)
+        req.routed_experts_start_len = 5
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req[0].routed_experts_start_len, 5)
+        self.assertEqual(req[1].routed_experts_start_len, 5)
 
     def test_single_image_to_list_of_lists(self):
         """Test that a single image is converted to a list of single-image lists."""

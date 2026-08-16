@@ -162,11 +162,10 @@ def prepare_cp_forward(forward_batch) -> None:
 
     seq_lens_cpu = _to_int_list(getattr(forward_batch, "seq_lens_cpu", None))
     extend_lens_cpu = _to_int_list(getattr(forward_batch, "extend_seq_lens_cpu", None))
-    num_tokens = (
-        sum(extend_lens_cpu)
-        if extend_lens_cpu is not None
-        else len(forward_batch.input_ids)
-    )
+    # MLP synchronization may already have appended DP padding to the model
+    # inputs.  Keep those rows in the CP layout: both CP strategies treat the
+    # difference from the real per-request extend lengths as suffix padding.
+    num_tokens = len(forward_batch.input_ids)
     if forward_batch.attn_cp_metadata is None:
         forward_batch.attn_cp_metadata = strategy.build_metadata(
             num_tokens=num_tokens,
@@ -243,6 +242,8 @@ def cp_shard_model_inputs(
     complete_hidden_states: Any,
     complete_position_ids: Any,
     forward_batch,
+    *,
+    shard_out_cache_loc: bool = False,
 ):
     """Restore the shared batch so logits processing keeps full-batch metadata."""
     assert is_cp_v2_active(forward_batch)
@@ -251,21 +252,50 @@ def cp_shard_model_inputs(
     )
     sharded_positions = cp_shard_position_ids(complete_position_ids, forward_batch)
 
+    # KV writes happen inside the model body and must use the same CP-local row
+    # layout as the sharded activations and positions.  Slot 0 is the reserved
+    # dummy sink for physical padding rows.  Restore the logical/global layout
+    # before the gather/logits tail (and on exceptions).
+    out_cache_loc_backup = getattr(forward_batch, "out_cache_loc", None)
+    had_local_cache_loc_marker = hasattr(forward_batch, "_cp_v2_out_cache_loc_is_local")
+    local_cache_loc_marker_backup = getattr(
+        forward_batch, "_cp_v2_out_cache_loc_is_local", False
+    )
+    sharded_out_cache_loc = None
+    if shard_out_cache_loc and out_cache_loc_backup is not None:
+        sharded_out_cache_loc = cp_shard_hidden_states(
+            out_cache_loc_backup, forward_batch
+        )
+
     spec_info = getattr(forward_batch, "spec_info", None)
     spec_hidden_states = getattr(spec_info, "hidden_states", None)
     spec_hidden_states_backup = None
+    sharded_spec_hidden_states = None
     if (
         spec_hidden_states is not None
         and spec_hidden_states.shape[0] == complete_hidden_states.shape[0]
     ):
         spec_hidden_states_backup = spec_hidden_states
-        spec_info.hidden_states = cp_shard_hidden_states(
+        sharded_spec_hidden_states = cp_shard_hidden_states(
             spec_hidden_states, forward_batch
         )
 
     try:
+        if sharded_out_cache_loc is not None:
+            forward_batch.out_cache_loc = sharded_out_cache_loc
+            forward_batch._cp_v2_out_cache_loc_is_local = True
+        if sharded_spec_hidden_states is not None:
+            spec_info.hidden_states = sharded_spec_hidden_states
         yield sharded_hidden_states, sharded_positions
     finally:
+        if shard_out_cache_loc and out_cache_loc_backup is not None:
+            forward_batch.out_cache_loc = out_cache_loc_backup
+            if had_local_cache_loc_marker:
+                forward_batch._cp_v2_out_cache_loc_is_local = (
+                    local_cache_loc_marker_backup
+                )
+            else:
+                del forward_batch._cp_v2_out_cache_loc_is_local
         if spec_hidden_states_backup is not None:
             spec_info.hidden_states = spec_hidden_states_backup
 

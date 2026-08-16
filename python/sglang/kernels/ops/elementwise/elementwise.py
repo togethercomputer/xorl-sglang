@@ -461,6 +461,19 @@ def fused_sigmoid_mul(
 
 
 @triton.jit
+def _fused_gate_fp32_fma_rn(multiplicand, multiplier, addend):
+    """Pin the Qwen routed/shared leaf to one IEEE FP32 FMA."""
+    return tl.inline_asm_elementwise(
+        asm="fma.rn.f32 $0, $1, $2, $3;",
+        constraints="=f,f,f,f",
+        args=(multiplicand, multiplier, addend),
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _fused_gate_sigmoid_mul_add_kernel(
     hidden_states_ptr,  # [num_tokens, hidden_dim]
     gate_weight_ptr,  # [hidden_dim]
@@ -495,7 +508,9 @@ def _fused_gate_sigmoid_mul_add_kernel(
         tl.extra.cuda.gdc_launch_dependents()
 
     gate_val = tl.sigmoid(tl.sum(h * w, axis=0))
-    result = f + gate_val * s
+    # The trainer declares the completed contributor leaf as one-round FP32
+    # fma(gate, shared, routed), followed by the single BF16/FP16 store below.
+    result = _fused_gate_fp32_fma_rn(gate_val, s, f)
 
     tl.store(final_hidden_states_ptr + row_offset + offsets, result, mask=mask)
 

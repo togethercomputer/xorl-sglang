@@ -7,6 +7,7 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.batch_invariant_ops import bi_families_v2
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
     disable_batch_invariant_mode,
@@ -38,12 +39,11 @@ from sglang.srt.server_args import (
     RL_ON_POLICY_TARGET_CHOICES,
     XORL_RL_TARGET,
     ServerArgs,
-    is_batch_invariant_rl_target,
     is_glm52_exact_mode,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 def _module_stub(name, **attributes):
@@ -152,10 +152,19 @@ def _scheduler_response_processor():
 
 class TestXorlBatchInvariantTarget(unittest.TestCase):
     def test_xorl_exact_mode_is_resolved_from_the_model(self):
-        self.assertIn(XORL_RL_TARGET, RL_ON_POLICY_TARGET_CHOICES)
-        self.assertFalse(is_batch_invariant_rl_target(XORL_RL_TARGET))
+        self.assertEqual(RL_ON_POLICY_TARGET_CHOICES, [XORL_RL_TARGET])
         self.assertFalse(is_glm52_exact_mode(SimpleNamespace()))
         self.assertTrue(is_glm52_exact_mode(SimpleNamespace(glm52_exact_mode=True)))
+
+    def test_legacy_rl_targets_are_rejected_before_dummy_short_circuit(self):
+        for target in ("fsdp", "xorl-batch-invariant", "another-trainer"):
+            with (
+                self.subTest(target=target),
+                self.assertRaisesRegex(
+                    ValueError, "only supports the current exact XORL contract"
+                ),
+            ):
+                ServerArgs(model_path="dummy", rl_on_policy_target=target)
 
     def test_standard_unfiltered_request_sets_no_rejected_sampling_flag(self):
         params = SamplingParams(
@@ -659,14 +668,14 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Triton LoRA backend"):
                 xorl_bi_lm_head(hidden, lora_head, use_fp32_lm_head=False)
 
-            rank_two_head = _TestParallelLMHeadWithLoRA(
+            zero_rank_head = _TestParallelLMHeadWithLoRA(
                 weight=weight,
-                a_buffer=torch.zeros((2, 2, 16), dtype=torch.bfloat16),
-                b_buffer=torch.zeros((2, 32, 2), dtype=torch.bfloat16),
+                a_buffer=torch.zeros((2, 0, 16), dtype=torch.bfloat16),
+                b_buffer=torch.zeros((2, 32, 0), dtype=torch.bfloat16),
                 callback=lambda *_args: None,
             )
-            with self.assertRaisesRegex(RuntimeError, "rank-one physical buffers"):
-                xorl_bi_lm_head(hidden, rank_two_head, use_fp32_lm_head=False)
+            with self.assertRaisesRegex(RuntimeError, "physical buffers"):
+                xorl_bi_lm_head(hidden, zero_rank_head, use_fp32_lm_head=False)
 
         with self.assertRaisesRegex(RuntimeError, "embedding bias"):
             xorl_bi_lm_head(
@@ -716,8 +725,9 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                         events.append(("sync", token_ids.clone()))
                         token_ids.add_(1)
 
-                    def selected_logprob(actual_logits, token_ids):
+                    def selected_logprob(actual_logits, token_ids, *, temperature):
                         events.append(("score", actual_logits, token_ids.clone()))
+                        self.assertIsNone(temperature)
                         return selected_logprobs, object(), object()
 
                     with (
@@ -762,8 +772,9 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                     self.assertEqual(
                         [event[0] for event in events], ["sample", "sync", "score"]
                     )
-                    self.assertIs(events[0][1], logits)
-                    self.assertIs(events[2][1], logits)
+                    self.assertTrue(torch.equal(events[0][1], logits))
+                    self.assertTrue(torch.equal(events[2][1], logits))
+                    self.assertIs(events[0][1], events[2][1])
                     torch.testing.assert_close(
                         events[1][1], torch.zeros(n, dtype=torch.int32)
                     )
@@ -771,6 +782,108 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                         events[2][2], torch.ones(n, dtype=torch.int32)
                     )
                     self.assertIs(output.next_token_logprobs, selected_logprobs)
+
+    def test_mixed_temperature_is_applied_once_before_sampling_and_scoring(self):
+        logits = torch.tensor(
+            [[1.25, -0.5, 0.75], [-1.0, 2.0, 0.25]],
+            dtype=torch.float32,
+        )
+        temperatures = torch.tensor([[0.7], [1.3]], dtype=torch.float32)
+        sampling_info = self._sampling_info(2)
+        sampling_info.temperatures = temperatures
+        output = SimpleNamespace(next_token_logits=logits, next_token_logprobs=None)
+        sampled = torch.tensor([2, 1], dtype=torch.int32)
+        seen = {}
+
+        def sample_from_logprobs(transformed, *_args):
+            seen["sample"] = transformed
+            return sampled
+
+        def score(transformed, token_ids, *, temperature):
+            seen["score"] = transformed
+            self.assertIsNone(temperature)
+            self.assertTrue(torch.equal(token_ids, sampled))
+            return torch.tensor([-0.5, -0.75]), None, None
+
+        with (
+            _paired_family("v2"),
+            patch(
+                "sglang.srt.layers.xorl_batch_invariant."
+                "head_v2_selected_logprob_from_logits",
+                side_effect=score,
+            ),
+        ):
+            xorl_bi_sample_and_score(
+                output,
+                sampling_info,
+                return_logprob=True,
+                top_logprobs_nums=[0, 0],
+                token_ids_logprobs=[None, None],
+                positions=torch.arange(2),
+                sample_from_logprobs=sample_from_logprobs,
+                sync_token_ids=lambda *_args: None,
+                enable_deterministic=True,
+                return_original_logprob=False,
+                family="v2",
+            )
+
+        expected = logits * (1.0 / temperatures)
+        self.assertTrue(torch.equal(seen["sample"], expected))
+        self.assertIs(seen["sample"], seen["score"])
+
+    def test_sampler_accepts_absent_optional_logprob_lists(self):
+        output = SimpleNamespace(
+            next_token_logits=torch.zeros((1, 32), dtype=torch.float32),
+            next_token_logprobs=None,
+        )
+        expected = torch.tensor([3], dtype=torch.int32)
+
+        actual = xorl_bi_sample_and_score(
+            output,
+            self._sampling_info(1),
+            return_logprob=False,
+            top_logprobs_nums=None,
+            token_ids_logprobs=None,
+            positions=torch.tensor([0]),
+            sample_from_logprobs=lambda *_args: expected,
+            sync_token_ids=lambda *_args: None,
+            enable_deterministic=True,
+            return_original_logprob=False,
+        )
+
+        self.assertIs(actual, expected)
+
+    def test_sampling_without_logprob_accepts_absent_logprob_metadata(self):
+        logits = torch.arange(32, dtype=torch.float32).reshape(1, 32)
+        output = SimpleNamespace(
+            next_token_logits=logits,
+            next_token_logprobs=None,
+        )
+        sampled = torch.tensor([3], dtype=torch.int32)
+
+        with (
+            _paired_family("v2"),
+            patch(
+                "sglang.srt.layers.xorl_batch_invariant."
+                "head_v2_selected_logprob_from_logits"
+            ) as score,
+        ):
+            actual = xorl_bi_sample_and_score(
+                output,
+                self._sampling_info(1),
+                return_logprob=False,
+                top_logprobs_nums=None,
+                token_ids_logprobs=None,
+                positions=torch.tensor([0]),
+                sample_from_logprobs=lambda *_args: sampled,
+                sync_token_ids=lambda *_args: None,
+                enable_deterministic=True,
+                return_original_logprob=False,
+            )
+
+        self.assertIs(actual, sampled)
+        self.assertIsNone(output.next_token_logprobs)
+        score.assert_not_called()
 
     def test_extend_response_consumes_sampled_id_logprob_pair(self):
         scheduler = _scheduler_response_processor()
@@ -897,14 +1010,6 @@ class TestXorlBatchInvariantHeadAndSampler(unittest.TestCase):
                 "requires FP32 logits",
             ),
             "deterministic": ("enable_deterministic", False, "deterministic inference"),
-            "temperature": (
-                "temperatures",
-                torch.tensor([[0.5]]),
-                "temperature == 1",
-            ),
-            "top-p": ("need_top_p_sampling", True, "does not support top-p"),
-            "top-k": ("need_top_k_sampling", True, "does not support top-p"),
-            "min-p": ("need_min_p_sampling", True, "does not support top-p"),
             "penalty": (
                 "penalizer_orchestrator",
                 SimpleNamespace(is_required=True),
