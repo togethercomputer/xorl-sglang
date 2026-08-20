@@ -83,6 +83,14 @@ jobs:
           # no chown of root-owned paths.
           USE_VENV: '1'
         run: |
+          # Patch the script in place to prove the next fix before committing it.
+          # `uv venv --seed` installs ONLY pip on Python 3.12 -- verified locally --
+          # so the venv has no setuptools or wheel, and human-eval (git-cloned at
+          # line 766, legacy setup.py) dies on "invalid command 'bdist_wheel'".
+          # USE_VENV=0 never showed this because the system Python carries Debian's
+          # setuptools and wheel.
+          sed -i 's|^\( *\)source "$UV_VENV/bin/activate"|\1source "$UV_VENV/bin/activate"\n\1uv pip install --quiet setuptools wheel|' scripts/ci/cuda/ci_install_dependency.sh
+          grep -n -A1 'bin/activate"$' scripts/ci/cuda/ci_install_dependency.sh | head -4
           set -o pipefail
           set +e
           bash scripts/ci/cuda/ci_install_dependency.sh 2>&1 | tail -60
