@@ -25,6 +25,9 @@ register_cuda_ci(
     est_time=240,
     stage="base-b",
     runner_config="1-gpu-small",
+    # The skip below cannot carry this: the harness runs each file as
+    # `python3 <file> -f`, not under pytest, so Skipped escapes as exit 255.
+    disabled="needs SM12x; 1-gpu-small is an H100 (SM90) in this fork",
 )
 
 if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12):
