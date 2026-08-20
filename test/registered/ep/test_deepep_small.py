@@ -16,7 +16,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=270, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(
+    est_time=270,
+    stage="base-c",
+    runner_config="4-gpu-h100",
+    disabled="DEFAULT_MODEL_NAME_FOR_TEST_MLA (lmsys/sglang-ci-dsv3-test) is private to lmsys",
+)
 
 
 class TestPureDP(CustomTestCase):
