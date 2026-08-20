@@ -1,0 +1,71 @@
+name: zz-runner-probe
+
+# TEMPORARY. Diagnostic only, delete before merge.
+#
+# Runs on the xorl-sglang H100 scale set and reports EVERY environment gap in one
+# job, instead of the one-per-image-rebuild loop: each rebuild+deploy+rerun cycle
+# costs ~15 minutes and surfaces exactly one missing tool, because the install
+# script exits at its first failure.
+#
+# Nothing here fails the job -- every check is `|| true` and prints its own verdict,
+# so a single run enumerates all of them.
+# push, not workflow_dispatch: dispatch requires the workflow to exist on the default
+# branch, and main is the XoRL line -- this diagnostic has no business there.
+on:
+  push:
+    branches: ['xorl/ci-h100-dev']
+    paths: ['.github/workflows/zz-runner-probe.yml']
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: xorl-sglang-1-h100-gpu-runner
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools on PATH
+        run: |
+          for c in python3 pip uv cargo rustup protoc cmake ninja git curl wget jq \
+                   unzip tar dpkg apt-get sudo nvidia-smi ldconfig numactl ibv_devinfo; do
+            printf '  %-12s %s\n' "$c" "$(command -v $c 2>/dev/null || echo MISSING)"
+          done
+
+      - name: Environment that gates package installs
+        run: |
+          for v in PIP_BREAK_SYSTEM_PACKAGES UV_BREAK_SYSTEM_PACKAGES UV_SYSTEM_PYTHON \
+                   USE_VENV CUDA_HOME VIRTUAL_ENV; do
+            printf '  %-30s %s\n' "$v" "${!v:-<unset>}"
+          done
+          echo "  python3: $(python3 -V 2>&1)"
+          echo "  EXTERNALLY-MANAGED: $(ls /usr/lib/python3.12/EXTERNALLY-MANAGED 2>/dev/null || echo absent)"
+          echo "  sudoers.d mode: $(stat -c '%a %U' /etc/sudoers.d 2>/dev/null)"
+
+      - name: Can each installer actually install?
+        run: |
+          echo "-- sudo --"; sudo -n true 2>&1 && echo "  sudo OK" || echo "  sudo FAILS"
+          echo "-- pip system install --"
+          python3 -m pip install --dry-run --no-input packaging 2>&1 | tail -2 || true
+          echo "-- uv system install --"
+          uv pip install --system --dry-run packaging 2>&1 | tail -3 || true
+          echo "-- uv venv install --"
+          uv venv /tmp/probe-venv >/dev/null 2>&1 && VIRTUAL_ENV=/tmp/probe-venv uv pip install --dry-run packaging 2>&1 | tail -2 || true
+
+      - name: dpkg check for CI_APT_PACKAGES
+        run: |
+          miss=""
+          for p in python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev \
+                   pkg-config build-essential cmake rdma-core infiniband-diags perftest \
+                   libibumad3 libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils \
+                   libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1t64 ffmpeg \
+                   libavcodec-dev libavformat-dev libavutil-dev libswscale-dev; do
+            dpkg -l "$p" 2>/dev/null | grep -q "^ii" || miss="$miss $p"
+          done
+          echo "  missing:${miss:- none}"
+
+      - name: Run the real install script and record where it stops
+        timeout-minutes: 35
+        run: |
+          set +e
+          bash scripts/ci/cuda/ci_install_dependency.sh 2>&1 | tail -40
+          echo "  === install script exit: $? ==="
