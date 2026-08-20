@@ -73,6 +73,16 @@ jobs:
           UV_BREAK_SYSTEM_PACKAGES: '1'
           PIP_BREAK_SYSTEM_PACKAGES: '1'
         run: |
+          # Proving the next image change from the workflow, via sudo, before paying a
+          # rebuild for it. USE_VENV=false makes uv install into the system
+          # interpreter, whose site-packages and bin are root-owned, and the runner is
+          # uid 1001 -- so the install died on
+          # "failed to create directory /usr/local/lib/python3.12/dist-packages/...:
+          # Permission denied". If this run gets past it, the fix belongs in the image
+          # as a chown at build time.
+          sudo mkdir -p /usr/local/lib/python3.12/dist-packages
+          sudo chown -R runner:runner /usr/local/lib/python3.12/dist-packages /usr/local/bin
+          echo "  dist-packages now: $(stat -c '%U' /usr/local/lib/python3.12/dist-packages)"
           set -o pipefail
           set +e
           bash scripts/ci/cuda/ci_install_dependency.sh 2>&1 | tail -60
