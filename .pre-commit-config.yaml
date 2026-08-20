@@ -103,12 +103,6 @@ repos:
         language: system
         files: ^\.github/workflows/.*\.yml$
         pass_filenames: false
-      - id: check-rust-ext-cache-prefix
-        name: check rust-ext cache key prefix defaults match
-        entry: python3 scripts/lint/check_rust_ext_cache_prefix.py
-        language: system
-        files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/_pr-test-rust-ext-build\.yml)$
-        pass_filenames: false
       - id: check-no-bare-pytest-main
         name: reject bare pytest.main calls in __main__ blocks
         entry: python3 scripts/lint/check_no_bare_pytest_main.py

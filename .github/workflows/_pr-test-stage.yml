@@ -54,14 +54,6 @@ on:
         description: 'pytest path to run after the suite (b200 FA4 jit_kernel tests). Empty skips.'
         type: string
         default: ''
-      rust_ext_artifact:
-        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, falls back to the cache; a miss there compiles during install.'
-        type: string
-        default: ''
-      skip_prebuilt_rust_ext:
-        description: 'Take neither the artifact nor the cache, and compile during install. For a stage no prebuild targets: the cache key is arch-blind, so an aarch64 stage would be handed x86_64 modules.'
-        type: boolean
-        default: false
 
       scheduled:
         description: 'The caller is a nightly or weekly workflow, not a per-commit one. Switches on per-file timeouts derived from est_time, the full jit_kernel grids, metrics upload, and serial shards unless dispatched with full_parallel.'
@@ -93,17 +85,29 @@ env:
   HF_HUB_DOWNLOAD_TIMEOUT: 300
   HF_HUB_ETAG_TIMEOUT: 300
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.scheduled || fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/dev' && 'true' || 'false' }}
   USE_VENV: false
 
 jobs:
   run:
     name: ${{ inputs.self_name }} (${{ matrix.partition }})
     # Runs on schedule / parallel-dispatch / non-failed PR with main_package or sgl_kernel changes.
+    #
+    # The last clause is a fork guard. This job lands on a self-hosted H100 inside our
+    # network, and this repository is public with a `first_time_contributors` fork-PR
+    # approval policy -- so one merged pull request would otherwise buy a contributor
+    # the ability to run their own checkout, scripts and test payloads on that
+    # hardware. Upstream's `run-ci` label stood in for this; pr-test.yml no longer
+    # requires it, so the guard is explicit and lives here rather than in the caller,
+    # where a new caller could forget it. Fork pull requests still get lint and the
+    # hosted CPU stage, and skipped counts as passing in pr-test-finish -- dev is
+    # protected by review, so a green fork PR is not self-merging on tests that did
+    # not run.
     if: |
       always() &&
       ((github.event_name == 'schedule' || fromJson(inputs.caller_inputs).test_parallel_dispatch == true) || (!failure() && !cancelled())) &&
-      (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true')
+      (fromJson(inputs.check_changes).main_package == 'true' || fromJson(inputs.check_changes).sgl_kernel == 'true') &&
+      (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     # runs-on resolved from runs_on_map; check-changes already substituted
     # $b200_runner (see runner_configs.py --map). rdma_devices is exported
     # below in a setup step via $GITHUB_ENV.
@@ -130,31 +134,16 @@ jobs:
 
       - uses: ./.github/actions/check-maintenance
 
-      - name: Download artifacts (v4)
-        if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4' }}
-        uses: actions/download-artifact@v4
-        with:
-          path: python/sglang/kernels/aot/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - name: Download artifacts (v6)
-        if: ${{ fromJson(inputs.check_changes).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6' }}
-        uses: actions/download-artifact@v6
-        with:
-          path: python/sglang/kernels/aot/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda*
-
-      - uses: ./.github/actions/download-rust-ext
-        if: ${{ !inputs.skip_prebuilt_rust_ext }}
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
-
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.check_changes).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
+          # Always false, where upstream forwards check_changes.sgl_kernel: this fork
+          # has no sgl-kernel build job -- that job drives docker/buildx, which the
+          # unprivileged ARC runner pods cannot run -- so there is no wheel to install
+          # and `true` would only send the install script hunting for one. A pull
+          # request touching python/sglang/kernels/aot/** still runs every stage,
+          # against the pinned released sgl-kernel rather than a build of the change.
+          CUSTOM_BUILD_SGL_KERNEL=false bash ${{ steps.rc.outputs.install }}
 
       - name: Warmup DeepGEMM JIT Compilation
         if: inputs.warmup_deep_gemm_models != ''

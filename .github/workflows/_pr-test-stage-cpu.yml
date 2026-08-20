@@ -28,10 +28,6 @@ on:
         description: 'timeout-minutes for the Run test step. Required so compute_partitions.py can read it from pr-test.yml without a duplicated default constant.'
         type: string
         required: true
-      rust_ext_artifact:
-        description: 'Artifact of prebuilt Rust extension modules, from rust-ext-build. Empty, or a download that fails, falls back to the cache; a miss there compiles during install.'
-        type: string
-        default: ''
 
 # Reusable workflows do NOT inherit the caller's workflow-level env across the
 # workflow_call boundary, so pr-test.yml's env is redeclared here -- minus the
@@ -39,7 +35,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/dev' && 'true' || 'false' }}
   USE_VENV: false
 
 jobs:
@@ -90,22 +86,19 @@ jobs:
       # This stage compiled the workspace too - 7+ minutes per partition on
       # billable hosted minutes. rust-ext-build's modules need an older glibc than
       # this runner has, which is the safe direction, and both pin Python 3.10.
-      - uses: ./.github/actions/download-rust-ext
-        id: rust_ext
-        with:
-          artifact_name: ${{ inputs.rust_ext_artifact }}
-
       # Both only serve the fallback where this stage compiles the extensions
       # itself, so they follow whether the modules arrived, not the producer job's
       # output. Otherwise rust-cache restores ~1 GB per partition for nothing, on
       # an over-quota cache.
+      # Unconditional, where upstream runs these only as the fallback for a missing
+      # prebuild. This fork has no rust-ext-build job, so the fallback is the only
+      # path and every partition compiles the rust/ workspace itself. rust-cache is
+      # what keeps that off the critical path after the first run seeds it.
       - name: Install protoc + Rust toolchain
-        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
       - name: Rust cache (rust/ workspace)
-        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust
