@@ -63,9 +63,19 @@ jobs:
           done
           echo "  missing:${miss:- none}"
 
+      # UV_BREAK_SYSTEM_PACKAGES is set HERE rather than waiting for an image
+      # rebuild. An env-var gap can be proven from the workflow, so the probe can
+      # run the whole install now and reveal whatever lies BEYOND it -- the previous
+      # probe run stopped at this exact wall and so learned nothing past it.
       - name: Run the real install script and record where it stops
         timeout-minutes: 35
+        env:
+          UV_BREAK_SYSTEM_PACKAGES: '1'
+          PIP_BREAK_SYSTEM_PACKAGES: '1'
         run: |
+          set -o pipefail
           set +e
-          bash scripts/ci/cuda/ci_install_dependency.sh 2>&1 | tail -40
-          echo "  === install script exit: $? ==="
+          bash scripts/ci/cuda/ci_install_dependency.sh 2>&1 | tail -60
+          # PIPESTATUS, not $?: piping to tail made the previous run report tail's
+          # status and print a misleading "exit: 0" under a failed install.
+          echo "  === install script exit: ${PIPESTATUS[0]} ==="
