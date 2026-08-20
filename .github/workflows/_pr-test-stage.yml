@@ -86,7 +86,20 @@ env:
   HF_HUB_ETAG_TIMEOUT: 300
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.scheduled || fromJson(inputs.caller_inputs).skip_pr_test_health_check || fromJson(inputs.caller_inputs).test_parallel_dispatch || fromJson(inputs.caller_inputs).run_all_tests) && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/dev' && 'true' || 'false' }}
-  USE_VENV: false
+  # '1', not true: ci_install_dependency.sh tests [ "$USE_VENV" = "1" ], so both
+  # upstream's `false` and a plain `true` read as "not 1".
+  #
+  # Upstream leaves this off because its runners are root and can install into the
+  # system interpreter. This fork's ARC runner is uid 1001, where USE_VENV=0 is
+  # unsatisfiable: pip only succeeds because site-packages is NOT writable (it prints
+  # "Defaulting to user installation" and lands in ~/.local), while uv needs it
+  # writable and fails with "Permission denied" -- and chowning it to fix uv breaks
+  # pip, which then tries to uninstall Debian's pip and finds no RECORD file.
+  #
+  # A uv venv needs no writable system directory, so both tools agree. The mode is
+  # already wired here: the warmup steps source SGLANG_CI_VENV_PATH and the job ends
+  # with ci_cleanup_venv.sh.
+  USE_VENV: '1'
 
 jobs:
   run:

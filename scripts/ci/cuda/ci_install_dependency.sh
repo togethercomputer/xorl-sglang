@@ -52,6 +52,11 @@ configure_environment() {
         uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
         # shellcheck disable=SC1091
         source "$UV_VENV/bin/activate"
+        # `uv venv --seed` installs ONLY pip on Python 3.12 -- no setuptools, no
+        # wheel. human-eval below is git-cloned and built from a legacy setup.py, so
+        # it dies on "invalid command 'bdist_wheel'". USE_VENV=0 never showed this
+        # because the system interpreter carries Debian's setuptools and wheel.
+        uv pip install --quiet setuptools wheel
         [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
