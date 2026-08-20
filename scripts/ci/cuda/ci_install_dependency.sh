@@ -138,7 +138,15 @@ install_apt_packages() {
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
         build-essential cmake rdma-core infiniband-diags perftest libibumad3
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
-        libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
+        # librdmacm1t64, not librdmacm1: Ubuntu's 64-bit time_t transition renamed
+        # the package, and on noble -- which this fork's runner image is, since its
+        # CUDA 13.2.1 base is ...-ubuntu24.04 -- `librdmacm1` is only a virtual
+        # name. `apt install librdmacm1` quietly selects the t64 package while the
+        # `dpkg -l` check below finds nothing, so the unqualified name leaves this
+        # entry permanently missing and sends every run into the apt-get branch --
+        # which cannot work, because the runner container is uid 1001 and the call
+        # below carries no sudo.
+        libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1t64
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
 
