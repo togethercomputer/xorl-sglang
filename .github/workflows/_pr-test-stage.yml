@@ -30,6 +30,10 @@ on:
         description: 'check-changes.outputs.partitions raw — kept separate to avoid double-fromJson in matrix expressions.'
         type: string
         required: true
+      rust_ext_artifact:
+        description: "rust-ext-build's artifact. Empty, or a failed download, falls back to the cache; a miss there compiles during install -- which is the 290s this exists to avoid."
+        type: string
+        default: ''
       run_timeout_minutes:
         description: 'timeout-minutes for the Run test step. Required so compute_partitions.py can read it from pr-test.yml without a duplicated default constant.'
         type: string
@@ -146,6 +150,10 @@ jobs:
       - uses: ./.github/actions/check-pr-test-health
 
       - uses: ./.github/actions/check-maintenance
+
+      - uses: ./.github/actions/download-rust-ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}

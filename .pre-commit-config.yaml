@@ -114,6 +114,12 @@ repos:
         language: system
         files: ^scripts/lint/(check_|test_check_).*\.py$
         pass_filenames: false
+      - id: check-rust-ext-cache-prefix
+        name: check rust-ext cache key prefix defaults match
+        entry: python3 scripts/lint/check_rust_ext_cache_prefix.py
+        language: system
+        files: ^(\.github/actions/download-rust-ext/action\.yml|\.github/workflows/_pr-test-rust-ext-build\.yml)$
+        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
         entry: python3 scripts/lint/check_registered_tests.py

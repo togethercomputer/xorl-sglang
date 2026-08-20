@@ -115,7 +115,7 @@ jobs:
           max-wait-minutes: '240'
 
   wait-for-base-b:
-    needs: [check-changes, call-gate, wait-for-base-a]
+    needs: [check-changes, call-gate, wait-for-base-a, rust-ext-build]
     if: |
       always() &&
       !cancelled() &&
@@ -163,11 +163,38 @@ jobs:
       require-run-ci: false
     secrets: inherit
 
+  # =============================================== Rust extensions ====================================================
+
+  # Restored, and on a hosted runner. Deleting this moved the rust/ workspace compile
+  # into every stage's install: measured at 290s of a 433s install, 67% of it, and
+  # 290s x 28 GPU shards is about 2.25 GPU-hours per run. Compiling once here instead
+  # lets every stage install with SGLANG_BUILD_RUST_EXTS=none.
+  #
+  # ubuntu-22.04, not the H100 scale set. Upstream compiles on a self-hosted build
+  # node for two reasons that do not hold here: its persistent ~/.cache carried the
+  # cargo target dir, which an ephemeral ARC pod cannot do anyway, and max_glibc 2.35
+  # wanted an old image because upstream's pools span several. Every stage runner in
+  # this fork is the same ubuntu-24.04 ARC image, and jammy's glibc 2.35 modules load
+  # there. So this is free, never queues behind a GPU job, and keeps the GPU fleet for
+  # tests.
+  rust-ext-build:
+    needs: [check-changes, call-gate]
+    if: |
+      !cancelled() &&
+      needs.check-changes.result == 'success' &&
+      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    uses: ./.github/workflows/_pr-test-rust-ext-build.yml
+    with:
+      runs_on: ubuntu-22.04
+      git_ref: ${{ inputs.git_ref || '' }}
+      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
   # =============================================== primary ====================================================
 
   # Runs on 5090 (32GB, SM120)
   base-a-test-1-gpu-small:
-    needs: [check-changes, call-gate]
+    needs: [check-changes, call-gate, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -177,6 +204,7 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '10'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-a-test-cpu:
@@ -192,12 +220,13 @@ jobs:
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
       run_timeout_minutes: '15'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     # No `secrets: inherit`: this stage has no secret consumer, unlike the GPU
     # stages' coredump upload. GITHUB_TOKEN and permissions inherit regardless.
 
   # Runs on 5090 (32GB, SM120)
   base-b-test-1-gpu-small:
-    needs: [check-changes, call-gate, wait-for-base-a]
+    needs: [check-changes, call-gate, wait-for-base-a, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -206,12 +235,18 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
+      # 50, not 30. This value does double duty: it caps the Run test step AND drives
+      # the shard count, since compute_partitions sizes each shard at 0.75 * timeout.
+      # Install is a FIXED ~143s per shard after the rust-ext prebuild, so over-sharding
+      # multiplies it: 1-gpu-large at 30m is 10 shards and 1430s of install, at 50m it
+      # is 6 shards and 858s, and with the throttle lifted both finish in one wave.
+      run_timeout_minutes: '50'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   # Runs on H100 (80GB, SM90) - tests that don't pass on 5090 (FA3, FP8, high VRAM, etc.)
   base-b-test-1-gpu-large:
-    needs: [check-changes, call-gate, wait-for-base-a]
+    needs: [check-changes, call-gate, wait-for-base-a, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -220,12 +255,18 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
+      # 50, not 30. This value does double duty: it caps the Run test step AND drives
+      # the shard count, since compute_partitions sizes each shard at 0.75 * timeout.
+      # Install is a FIXED ~143s per shard after the rust-ext prebuild, so over-sharding
+      # multiplies it: 1-gpu-large at 30m is 10 shards and 1430s of install, at 50m it
+      # is 6 shards and 858s, and with the throttle lifted both finish in one wave.
+      run_timeout_minutes: '50'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
       timeout_per_file: '1800'
     secrets: inherit
 
   base-b-test-2-gpu-large:
-    needs: [check-changes, call-gate, wait-for-base-a]
+    needs: [check-changes, call-gate, wait-for-base-a, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -234,11 +275,17 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
+      # 50, not 30. This value does double duty: it caps the Run test step AND drives
+      # the shard count, since compute_partitions sizes each shard at 0.75 * timeout.
+      # Install is a FIXED ~143s per shard after the rust-ext prebuild, so over-sharding
+      # multiplies it: 1-gpu-large at 30m is 10 shards and 1430s of install, at 50m it
+      # is 6 shards and 858s, and with the throttle lifted both finish in one wave.
+      run_timeout_minutes: '50'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
   base-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-base-b]
+    needs: [check-changes, call-gate, wait-for-base-b, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -247,7 +294,9 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      run_timeout_minutes: '30'
+      # 50 as above; 3 shards -> 2 on the single 4-GPU runner, so two waves not three.
+      run_timeout_minutes: '50'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
       warmup_deep_gemm_models: 'lmsys/sglang-ci-dsv3-test:4'
       warmup_server_models: 'lmsys/sglang-ci-dsv3-test:4'
     secrets: inherit
@@ -259,6 +308,8 @@ jobs:
       [
         call-gate,
         check-changes,
+
+        rust-ext-build,
 
         wait-for-base-a,
         wait-for-base-b,

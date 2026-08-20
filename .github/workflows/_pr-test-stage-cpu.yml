@@ -24,6 +24,10 @@ on:
         description: 'check-changes.outputs.partitions raw -- kept separate to avoid double-fromJson in matrix expressions.'
         type: string
         required: true
+      rust_ext_artifact:
+        description: "rust-ext-build's artifact; empty uses only the cache."
+        type: string
+        default: ''
       run_timeout_minutes:
         description: 'timeout-minutes for the Run test step. Required so compute_partitions.py can read it from pr-test.yml without a duplicated default constant.'
         type: string
@@ -90,15 +94,21 @@ jobs:
       # itself, so they follow whether the modules arrived, not the producer job's
       # output. Otherwise rust-cache restores ~1 GB per partition for nothing, on
       # an over-quota cache.
-      # Unconditional, where upstream runs these only as the fallback for a missing
-      # prebuild. This fork has no rust-ext-build job, so the fallback is the only
-      # path and every partition compiles the rust/ workspace itself. rust-cache is
-      # what keeps that off the critical path after the first run seeds it.
+      # rust-ext-build is back, so these are the fallback again rather than the only
+      # path: they run when the prebuilt modules did not arrive, and otherwise a
+      # ~1 GB rust-cache restore per partition would be pure waste.
+      - uses: ./.github/actions/download-rust-ext
+        id: rust_ext
+        with:
+          artifact_name: ${{ inputs.rust_ext_artifact }}
+
       - name: Install protoc + Rust toolchain
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         timeout-minutes: 10
         run: bash scripts/ci/utils/install_rust_protoc.sh
 
       - name: Rust cache (rust/ workspace)
+        if: ${{ steps.rust_ext.outputs.hit != 'true' }}
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust

@@ -115,7 +115,18 @@ def load_partition_model(path):
 
 
 def compute_max_parallel(size: int) -> int:
-    return max(size // 3, 1)
+    """No throttle in this fork: max_parallel == size.
+
+    Upstream rations `size // 3` because its self-hosted pools are contended by many
+    repositories, so letting one suite claim every runner would starve the others.
+    This fork has its own scale sets (xorl-ci) whose maxRunners it sets itself -- 8
+    one-GPU, 2 two-GPU, 1 four-GPU -- and those are the real cap. Throttling underneath
+    a cap we already chose just serialises work for nothing: base-b-test-1-gpu-large
+    ran 3 shards at a time out of 10, four waves deep, against 8 idle runners.
+
+    Costs no GPU-seconds -- the same shards run either way -- and takes the wall clock
+    down by roughly the wave count."""
+    return size
 
 
 def compute_partitions(
