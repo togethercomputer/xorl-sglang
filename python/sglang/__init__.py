@@ -26,6 +26,24 @@ if _sys.platform == "darwin" and _platform.machine() == "arm64":
 del _platform
 del _sys
 
+# Before any sglang.srt import: the override finder can only patch modules it
+# sees imported, so anything already in sys.modules when it installs is
+# permanently un-overridable. On this base the first such import is the
+# hf_transformers_patches line directly below.
+#
+# Here rather than in launch_server.py / cli/__init__.py, which is the obvious
+# place and the wrong one: those cover `python -m sglang.launch_server` and
+# `sglang serve` and nothing else. Importing `sglang.srt.X` imports the `sglang`
+# package first, so this file has already run by the time either bootstrap could
+# fire, which would leave the Engine API and every test importing
+# `sglang.srt.*` directly with overrides silently inactive. One import here
+# covers every entry point.
+import sglang.overrides.patches as _sglang_overrides  # noqa: F401  # isort: skip
+
+# isort: skip guards the line above. Its POSITION is the contract, not just
+# its presence: isort sorts first-party imports together, and every other
+# `sglang.*` import in this file would sort around it. Only the `del`
+# statements above currently stop it merging into the block below.
 from sglang.srt.utils.hf_transformers_patches import apply_all as _apply_hf_patches
 
 _apply_hf_patches()
