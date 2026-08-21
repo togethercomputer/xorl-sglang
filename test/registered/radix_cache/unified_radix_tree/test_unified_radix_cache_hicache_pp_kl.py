@@ -13,7 +13,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(
+    est_time=900,
+    stage="base-c",
+    runner_config="4-gpu-h100",
+    disabled="hicache KL on Qwen3-32B; hicache/test_qwen35_hicache.py covers this on Qwen3.5",
+)
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
