@@ -309,7 +309,17 @@ jobs:
     secrets: inherit
 
   base-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-base-b, rust-ext-build]
+    # wait-for-base-a, NOT wait-for-base-b: base-c runs concurrently with base-b
+    # rather than after it. base-c is one serial shard of 4 files on the 4-GPU
+    # scale set and was 21.6m of a 47m pipeline; overlapping it with base-b's 15m
+    # takes the pipeline to ~26m without dropping a test.
+    #
+    # The fast-fail gate is kept, just moved up a stage: base-a is the cheap
+    # sanity lane (4 files, ~10m), so a genuinely broken commit still stops here
+    # before 4 GPUs are spent. What is given up is base-b as a gate -- base-c now
+    # runs even when base-b fails, which under GPU contention burns 4 GPUs on a
+    # run that is already red. That is the deliberate trade for the wall clock.
+    needs: [check-changes, call-gate, wait-for-base-a, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
@@ -318,8 +328,11 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      # 50 as above; 3 shards -> 2 on the single 4-GPU runner, so two waves not three.
-      run_timeout_minutes: '50'
+      # 20, not 50: 0.75 * 20 = 15 est-min per shard, so the 18.8 est-min suite
+      # splits into 2 shards across the 4-GPU scale set's maxRunners: 2. LPT pairs
+      # the 387s and 93s files against the 279s and 260s ones, so the longest shard
+      # is ~8m of tests. Measured 1019s serial in run 32452576094.
+      run_timeout_minutes: '20'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
       # Upstream warms both on lmsys/sglang-ci-dsv3-test, which is private to lmsys and
       # unreachable from this fork; the tests that needed it are disabled for the same
