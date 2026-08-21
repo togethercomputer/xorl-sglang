@@ -18,7 +18,12 @@ from PIL import Image, ImageDraw, ImageFont
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.vlm_utils import TestOpenAIMLLMServerBase
 
-register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=240,
+    stage="base-b",
+    runner_config="1-gpu-large",
+    disabled="VLM is peripheral to this fork; kept test_token_id_retokenize_e2e as the representative",
+)
 
 
 class TestPaddleOCRVLServer(TestOpenAIMLLMServerBase):

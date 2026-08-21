@@ -30,7 +30,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=900, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=900,
+    stage="base-b",
+    runner_config="1-gpu-large",
+    disabled="VLM is peripheral to this fork; kept test_token_id_retokenize_e2e as the representative",
+)
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 VISION_BLOCK = "<|vision_start|><|image_pad|><|vision_end|>"
