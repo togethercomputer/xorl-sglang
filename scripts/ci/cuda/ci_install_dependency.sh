@@ -55,6 +55,14 @@ configure_environment() {
         [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
+        # --seed above is not enough on Python 3.12: uv seeds only pip there, not
+        # setuptools or wheel. Anything built from source without build isolation
+        # then dies on a missing build backend -- human-eval's
+        # `uv pip install -e . --no-build-isolation` in install_test_tools is the
+        # one that finds it. Cheap and idempotent, so it runs unconditionally
+        # rather than probing the interpreter version.
+        uv pip install --quiet setuptools wheel
+
         if [ -n "${GITHUB_ENV:-}" ]; then
             # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
             mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
@@ -554,7 +562,12 @@ install_extra_deps() {
     # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
     # re-baseline MODEL_SCORE_THRESHOLDS in
     # test/registered/eval/test_text_models_gsm8k_eval.py first.
-    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
+    #
+    # Sourced rather than pinned inline: _pr-test-stage-cpu.yml installs sgl-eval
+    # from the same file, so a ref written in two places is a CPU lane and a CUDA
+    # lane silently on different evals. Upstream main sources it here too.
+    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
