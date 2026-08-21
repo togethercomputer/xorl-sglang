@@ -21,6 +21,7 @@ register_cuda_ci(
     est_time=600,
     stage="base-b",
     runner_config="2-gpu-large",
+    disabled="PD disaggregation is out of scope for this fork's CI",
 )
 
 
