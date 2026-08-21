@@ -12,6 +12,18 @@
 
 --------------------------------------------------------------------------------
 
+> **XoRL fork.** This is [togethercomputer/xorl-sglang](https://github.com/togethercomputer/xorl-sglang),
+> Together's fork of SGLang, used by [XoRL](https://github.com/togethercomputer/xorl).
+>
+> `dev` tracks upstream **[v0.5.17](https://github.com/sgl-project/sglang/releases/tag/v0.5.17)**
+> (`b6a09f38fc`, 2026-08-07), pinned rather than following `main`. Note v0.5.17 is a
+> tag on `release/v0.5.17`, not an ancestor of upstream `main`: it carries release-only
+> cherry-picks that `main` does not have, so syncing forward is a merge across a fork
+> point rather than a fast-forward.
+>
+> The only intended divergence from that tag is CI, which is cut down to the H100
+> lanes this fork can actually serve. Everything else is upstream.
+
 <p align="center">
 <a href="https://lmsys.org/blog/"><b>Blog</b></a> |
 <a href="https://docs.sglang.io/"><b>Documentation</b></a> |
