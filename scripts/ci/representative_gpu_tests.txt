@@ -1,0 +1,54 @@
+# Representative GPU test allowlist for this fork.
+#
+# Only CUDA registrations on base-a/base-b/base-c are filtered by this file.
+# CPU suites are untouched: they run on elastic ubuntu-latest, cost no GPU,
+# and are what guard the runtime-context ratchets.
+# An absent or empty file disables filtering entirely (upstream behaviour).
+#
+# 45 of 247 GPU tests, 105.7 of 346 est GPU-min.
+# Add a path to re-enable a test; delete one to drop it.
+test/registered/attention/test_gdn_noncontiguous_stride.py  # Qwen3.5: the family this fork serves
+test/registered/attention/test_qwen35_deterministic.py  # Qwen3.5: the family this fork serves
+test/registered/attention/unittests/dense/test_extend_init_contract.py  # base-a fast-fail gate
+test/registered/attention/unittests/dense/test_hybrid_attn.py  # attention: median-cost representative
+test/registered/backends/test_flashinfer_fusion_preflight.py  # backends: median-cost representative
+test/registered/constrained_decoding/test_constrained_decoding.py  # constrained_decoding: median-cost representative
+test/registered/core/test_basic_sanity.py  # base-a fast-fail gate
+test/registered/core/test_basic_sanity_dflash.py  # base-a fast-fail gate
+test/registered/core/test_basic_sanity_eagle3.py  # base-a fast-fail gate
+test/registered/cuda_graph/breakable/test_bcg_with_lora.py  # cuda_graph: median-cost representative
+test/registered/dllm/test_dllm_batching_fdfo.py  # dllm: median-cost representative
+test/registered/dp_attn/test_dp_attention_bcg_kl.py  # dp_attn: median-cost representative
+test/registered/dp_engine/test_data_parallelism.py  # dp_engine: median-cost representative
+test/registered/eplb/test_lplb_distributed.py  # eplb: median-cost representative
+test/registered/gemm/test_hopper_bf16_gemv.py  # gemm: median-cost representative
+test/registered/hicache/test_qwen35_hicache.py  # Qwen3.5: the family this fork serves
+test/registered/input_embedding/test_input_embeddings.py  # input_embedding: median-cost representative
+test/registered/kernels/ops/attention/test_dsa_metadata.py  # kernels: median-cost representative
+test/registered/layers/mamba/test_causal_conv1d.py  # layers: median-cost representative
+test/registered/lora/test_lora_qwen3_5_35b_a3b_logprob_diff.py  # Qwen3.5: the family this fork serves
+test/registered/lora/test_lora_qwen3_5_4b_logprob_diff.py  # Qwen3.5: the family this fork serves
+test/registered/mem_cache/test_post_capture_kv_sizing.py  # mem_cache: median-cost representative
+test/registered/mla/test_mla_fp8.py  # mla: median-cost representative
+test/registered/model_loading/test_weight_cache_daemon.py  # model_loading: median-cost representative
+test/registered/models_e2e/test_gemma4_fp8_per_expert_loading.py  # models_e2e: median-cost representative
+test/registered/moe/test_fused_moe.py  # moe: chosen representative
+test/registered/observability/test_metrics.py  # observability: median-cost representative
+test/registered/openai_server/basic/test_openai_completion_rust.py  # openai_server: median-cost representative
+test/registered/page_major/test_page_major_qwen_hybrid.py  # Qwen3.5: the family this fork serves
+test/registered/pp/test_pp_gemma4.py  # pp: median-cost representative
+test/registered/prefill_only/test_openai_embedding.py  # prefill_only: median-cost representative
+test/registered/quant/test_block_int8.py  # quant: median-cost representative
+test/registered/radix_cache/test_radix_attention.py  # radix_cache: chosen representative
+test/registered/reasoning/test_reasoning.py  # reasoning: median-cost representative
+test/registered/rl/test_fp32_lm_head.py  # rl: XoRL's own area, ~0 cost
+test/registered/rl/test_patch_torch.py  # rl: XoRL's own area, ~0 cost
+test/registered/sampling/test_deterministic_gumbel_u1.py  # sampling: median-cost representative
+test/registered/scheduler/test_load_snapshot_server.py  # scheduler: median-cost representative
+test/registered/scripted_runtime/test_scripted_runtime_core.py  # scripted_runtime: median-cost representative
+test/registered/sessions/test_streaming_session_swa.py  # sessions: chosen representative
+test/registered/spec/dspark/test_dspark_kernel_parity.py  # spec: median-cost representative
+test/registered/tokenizer/test_multi_tokenizer.py  # tokenizer: median-cost representative
+test/registered/unit/lora/test_experimental_sgl_marlin_multi_prefill.py  # unit: median-cost representative
+test/registered/utils/test_phase_checker.py  # utils: median-cost representative
+test/registered/vlm/test_token_id_retokenize_e2e.py  # vlm: median-cost representative
