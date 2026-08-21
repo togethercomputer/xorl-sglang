@@ -29,7 +29,14 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=42, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(
+    est_time=42,
+    stage="base-b",
+    runner_config="1-gpu-small",
+    # nsys runs and writes the .qdstrm, but the .qdstrm -> .nsys-rep conversion
+    # never completes in this runner, so the assert on the .nsys-rep always fails.
+    disabled="nsys does not finalize a .nsys-rep in this runner",
+)
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
 
 OUTPUT_DIR = "./profiler_dir"
