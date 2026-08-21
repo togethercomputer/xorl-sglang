@@ -562,7 +562,12 @@ install_extra_deps() {
     # fails without it. Bumping the SHA can change zero-shot \boxed{} grading, so
     # re-baseline MODEL_SCORE_THRESHOLDS in
     # test/registered/eval/test_text_models_gsm8k_eval.py first.
-    SGL_EVAL_REF="b2a2703c42cae379bbcb8b7ff092df6601a61694"
+    #
+    # Sourced rather than pinned inline: _pr-test-stage-cpu.yml installs sgl-eval
+    # from the same file, so a ref written in two places is a CPU lane and a CUDA
+    # lane silently on different evals. Upstream main sources it here too.
+    # shellcheck source=scripts/ci/utils/sgl_eval_ref.sh
+    source "${SCRIPT_DIR}/../utils/sgl_eval_ref.sh"
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}"
         MOONCAKE_STALE_PKG="mooncake-transfer-engine"
