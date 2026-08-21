@@ -52,6 +52,11 @@ configure_environment() {
         uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
         # shellcheck disable=SC1091
         source "$UV_VENV/bin/activate"
+        # `uv venv --seed` installs ONLY pip on Python 3.12 -- no setuptools, no
+        # wheel. human-eval below is git-cloned and built from a legacy setup.py, so
+        # it dies on "invalid command 'bdist_wheel'". USE_VENV=0 never showed this
+        # because the system interpreter carries Debian's setuptools and wheel.
+        uv pip install --quiet setuptools wheel
         [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
@@ -138,7 +143,15 @@ install_apt_packages() {
         python3 python3-pip python3-venv python3-dev git libnuma-dev libssl-dev pkg-config
         build-essential cmake rdma-core infiniband-diags perftest libibumad3
         libibverbs-dev libibverbs1 ibverbs-providers ibverbs-utils
-        libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1
+        # librdmacm1t64, not librdmacm1: Ubuntu's 64-bit time_t transition renamed
+        # the package, and on noble -- which this fork's runner image is, since its
+        # CUDA 13.2.1 base is ...-ubuntu24.04 -- `librdmacm1` is only a virtual
+        # name. `apt install librdmacm1` quietly selects the t64 package while the
+        # `dpkg -l` check below finds nothing, so the unqualified name leaves this
+        # entry permanently missing and sends every run into the apt-get branch --
+        # which cannot work, because the runner container is uid 1001 and the call
+        # below carries no sudo.
+        libfabric-dev libnl-3-200 libnl-route-3-200 librdmacm1t64
         ffmpeg libavcodec-dev libavformat-dev libavutil-dev libswscale-dev
     )
 
@@ -195,8 +208,24 @@ install_gdrcopy() {
         check libsubunit0 libsubunit-dev python3-venv
     )
 
-    apt-get update || true
-    apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
+    # Everything below writes outside the runner's home -- apt state, /opt, dpkg,
+    # /usr/lib, the ld cache -- and this fork's runner container is uid 1001, not
+    # root. Upstream runs these as root, which is why they carry no sudo (see the
+    # same note in install_apt_packages). Empty when already root, so upstream
+    # behaviour is unchanged.
+    #
+    # This is the only 4+ GPU-gated function, so it had never executed here until
+    # base-c first got a runner: the 1- and 2-GPU jobs return at the gpu_count
+    # check above. It failed with
+    #   E: Could not open lock file /var/lib/dpkg/lock-frontend (13: Permission denied)
+    #   ERROR: Required GDRCopy package nvidia-dkms-580 is unavailable
+    local SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+        SUDO="sudo"
+    fi
+
+    ${SUDO} apt-get update || true
+    ${SUDO} apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
         echo "Warning: apt-get failed while installing GDRCopy build dependencies; checking installed packages"
         local package
         for package in "${gdrcopy_packages[@]}"; do
@@ -207,23 +236,25 @@ install_gdrcopy() {
         done
     }
 
-    rm -rf "${gdrcopy_root}"
-    git clone --branch "v${gdrcopy_version}" --depth 1 \
+    ${SUDO} rm -rf "${gdrcopy_root}"
+    ${SUDO} git clone --branch "v${gdrcopy_version}" --depth 1 \
         https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
-    (
-        cd "${gdrcopy_root}/packages"
-        CUDA=/usr/local/cuda ./build-deb-packages.sh
-        dpkg -i gdrdrv-dkms_*.deb
-        dpkg -i libgdrapi_*.deb
-        dpkg -i gdrcopy-tests_*.deb
-        dpkg -i gdrcopy_*.deb
-    )
+    # One sudo shell for the build and the four dpkg installs: the clone is
+    # root-owned, so build-deb-packages.sh cannot write its output tree as uid
+    # 1001, and splitting these into separate sudo calls would leave the build
+    # unprivileged and the installs privileged.
+    ${SUDO} sh -c "cd '${gdrcopy_root}/packages' \
+        && CUDA=/usr/local/cuda ./build-deb-packages.sh \
+        && dpkg -i gdrdrv-dkms_*.deb \
+        && dpkg -i libgdrapi_*.deb \
+        && dpkg -i gdrcopy-tests_*.deb \
+        && dpkg -i gdrcopy_*.deb"
 
     local lib_path="/usr/lib/${ARCH}-linux-gnu"
     if [ ! -e "${lib_path}/libmlx5.so" ] && [ -e "${lib_path}/libmlx5.so.1" ]; then
-        ln -s "${lib_path}/libmlx5.so.1" "${lib_path}/libmlx5.so"
+        ${SUDO} ln -s "${lib_path}/libmlx5.so.1" "${lib_path}/libmlx5.so"
     fi
-    ldconfig
+    ${SUDO} ldconfig
 
     mark_step_done "${FUNCNAME[0]}"
 }

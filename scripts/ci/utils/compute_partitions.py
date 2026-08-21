@@ -115,7 +115,18 @@ def load_partition_model(path):
 
 
 def compute_max_parallel(size: int) -> int:
-    return max(size // 3, 1)
+    """No throttle in this fork: max_parallel == size.
+
+    Upstream rations `size // 3` because its self-hosted pools are contended by many
+    repositories, so letting one suite claim every runner would starve the others.
+    This fork has its own scale sets (xorl-ci) whose maxRunners it sets itself -- 8
+    one-GPU, 2 two-GPU, 1 four-GPU -- and those are the real cap. Throttling underneath
+    a cap we already chose just serialises work for nothing: base-b-test-1-gpu-large
+    ran 3 shards at a time out of 10, four waves deep, against 8 idle runners.
+
+    Costs no GPU-seconds -- the same shards run either way -- and takes the wall clock
+    down by roughly the wave count."""
+    return size
 
 
 def compute_partitions(
@@ -152,9 +163,11 @@ def compute_partitions(
     for suite, group in suite_tests.items():
         live_est = est_table.get(suite, {})
         total = 0.0
+        static_total = 0.0
         for t in group:
             relpath = os.path.relpath(t.filename, repo_root)
             total += live_est.get(relpath, t.est_time)
+            static_total += t.est_time
 
         fit = fit_table.get(suite) or {}
         coeff = fit.get("coeff", 1.0)
@@ -177,14 +190,34 @@ def compute_partitions(
                     f"Suite {suite!r}: fit bias={bias}s >= target={target}s. "
                     "Investigate the fit or raise the stage's run_timeout_minutes."
                 )
-            ideal_size = math.ceil(coeff * total / budget)
+            live_size = math.ceil(coeff * total / budget)
+            # Take whichever estimator asks for MORE shards. On this fork's
+            # hardware each one is unsafe, in opposite directions, and both
+            # produced timeouts within an hour of each other:
+            #
+            #   base-b-test-1-gpu-large  live model reads ~35% low (93.1 min vs
+            #     est_time's 140.5) because the model is fitted on sgl-project's
+            #     fleet and 1-gpu-small is an H100 here, not their 5090. 3 shards
+            #     of 46.8 est-min into a 50m cap -> 2 timed out (run 32433463686).
+            #   base-a-test-cpu          est_time reads low instead; the model
+            #     asks 10 shards where est_time asks 5. 5 shards into a 15m cap
+            #     -> 4 timed out (run 32439224232).
+            #
+            # More shards is the safe direction: shards get smaller, and
+            # max_parallel == size for CPU and full-parallel runs, so the extra
+            # fanout costs pods rather than wall clock. Overshooting wastes a
+            # little runner startup; undershooting kills the run at the timeout.
+            static_size = math.ceil(static_total / target)
+            ideal_size = max(live_size, static_size)
             # ideal_size > len(group) -> slowest single file alone exceeds
             # the per-shard budget; surface via raise instead of empty shard.
             if ideal_size > len(group):
                 raise RuntimeError(
                     f"Suite {suite!r}: needs {ideal_size} shards but has only "
                     f"{len(group)} test file(s). target={target:.0f}s, "
-                    f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s."
+                    f"coeff={coeff}, bias={bias}s, total_est={total:.0f}s, "
+                    f"static_est={static_total:.0f}s "
+                    f"(live_size={live_size}, static_size={static_size})."
                 )
             size = max(1, ideal_size)
             # The throttle rations scarce self-hosted GPU runners; hosted

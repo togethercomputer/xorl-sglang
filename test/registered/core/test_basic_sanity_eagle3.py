@@ -33,11 +33,28 @@ class TestBasicSanityEagle3(
     CustomTestCase,
 ):
     served_model_name = DEFAULT_TARGET_MODEL_EAGLE3
-    # CUDA 5090 + Llama-3.1-8B measured ~99 median in CI with async-assert
-    # probes off in base-a. AMD EAGLE3 currently sustains lower single-batch
-    # occupancy and needs a longer measurement window to avoid too few
-    # non-NaN samples.
-    fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 98.0
+    # Upstream: CUDA 5090 + Llama-3.1-8B measured ~99 median in CI with
+    # async-assert probes off in base-a, hence 98.0. AMD EAGLE3 sustains lower
+    # single-batch occupancy and needs a longer measurement window to avoid too
+    # few non-NaN samples, hence 80.0.
+    #
+    # 97.0 for this fork, whose runners are H100s in unprivileged ARC pods rather
+    # than the 5090 the 98.0 was calibrated on. Measured here across four runs of
+    # n=20: medians 97.44 / 97.51 / 97.54 / 97.55, peaks 97.89-99.24. Stable, and
+    # unrelated to cluster load -- two of those runs had eight neighbouring 4-GPU
+    # jobs on the same nodes and two had the cluster entirely to themselves, with
+    # the median moving 0.11 between them. So this is a property of the
+    # environment, not noise or contention.
+    #
+    # Still a real gate: the kit exists to catch overlap-scheduler and cuda-graph
+    # regressions, which move single-batch occupancy by far more than the 1.0 given
+    # up here, and 97.0 remains above the kit's own 95.0 default.
+    #
+    # The margin is thinner than I would like -- 0.44 over the lowest median
+    # observed, against a 0.11 spread. If this flakes, 95.0 (the kit default) is the
+    # next stop rather than deleting the assertion, because a fast-fail gate that
+    # flakes blocks every stage behind it.
+    fwd_occupancy_threshold = 80.0 if is_in_amd_ci() else 97.0
     fwd_occupancy_max_new_tokens = 4096 if is_in_amd_ci() else 2048
     fwd_occupancy_acc_length_threshold: float = 1.6
 

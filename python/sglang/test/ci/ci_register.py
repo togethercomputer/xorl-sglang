@@ -1,4 +1,5 @@
 import ast
+import os
 import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -417,4 +418,75 @@ def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistr
 
         ci_tests.extend(registries)
 
+    _apply_representative_allowlist(ci_tests)
     return ci_tests
+
+
+# python/sglang/test/ci/ci_register.py -> repo root is five levels up.
+_REPRESENTATIVE_ALLOWLIST = os.path.normpath(
+    os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        *([os.pardir] * 4),
+        "scripts",
+        "ci",
+        "representative_gpu_tests.txt",
+    )
+)
+_FORK_BASE_STAGES = ("base-a", "base-b", "base-c")
+
+
+def _canonical_test_path(path: str) -> str:
+    """Key a test by the `test/registered/...` tail of its path.
+
+    The two callers disagree on path shape -- run_suite.py globs absolute paths
+    and is invoked after `cd test`, while compute_partitions.py globs
+    `./test/registered/...` from the repo root -- so anything CWD-relative
+    (abspath, relpath against a computed root) matches in one and silently
+    misses in the other. Silently: a miss disables the test rather than erroring,
+    which would quietly empty a suite. The shared tail is stable for both.
+    """
+    p = path.replace(os.sep, "/")
+    marker = "test/registered/"
+    idx = p.find(marker)
+    return p[idx:] if idx != -1 else p.lstrip("./")
+
+
+def _apply_representative_allowlist(ci_tests: List[CIRegistry]) -> None:
+    """Restrict this fork's GPU suites to a representative subset, in place.
+
+    Filtering here rather than by editing 200 `register_cuda_ci(disabled=...)`
+    calls: the test files stay byte-identical to upstream, so an upstream merge
+    has nothing to conflict with, and changing the selection is one line in a
+    text file instead of a 200-file diff.
+
+    It has to be *here* specifically. `collect_tests` is the only thing both
+    sides of the pipeline share -- `scripts/ci/utils/compute_partitions.py`
+    sizes the fanout from it at dispatch, and `test/run_suite.py` picks each
+    shard's files from it at runtime. Filtering in only one would leave the two
+    disagreeing about what a shard contains, which is the cross-shard LPT
+    divergence the workflow comments warn about.
+
+    Scope is deliberately narrow. Only CUDA registrations on this fork's own
+    base-* stages are touched: CPU suites run on elastic ubuntu-latest, cost no
+    GPU, and carry the runtime-context ratchets, while AMD/NPU/XPU and
+    nightly/extra-* suites have no runner here and are already unscheduled.
+    A missing or comment-only file means no filtering at all, so upstream and
+    anyone dropping the file get upstream behaviour.
+    """
+    if not os.path.exists(_REPRESENTATIVE_ALLOWLIST):
+        return
+    allow = set()
+    with open(_REPRESENTATIVE_ALLOWLIST) as f:
+        for line in f:
+            entry = line.split("#", 1)[0].strip()
+            if entry:
+                allow.add(_canonical_test_path(entry))
+    if not allow:
+        return
+    for t in ci_tests:
+        if t.disabled is not None or t.nightly:
+            continue
+        if t.backend is not HWBackend.CUDA or t.stage not in _FORK_BASE_STAGES:
+            continue
+        if _canonical_test_path(t.filename) not in allow:
+            t.disabled = "not in scripts/ci/representative_gpu_tests.txt"

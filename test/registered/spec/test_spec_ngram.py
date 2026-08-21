@@ -10,7 +10,12 @@ from sglang.test.server_fixtures.ngram_fixture import NgramServerBase
 # Per-commit: Paged backend only.
 # - FA3 base test archived to test/manual/spec/test_spec_ngram_fa3.py
 # - Triton + Flashinfer moved to test_spec_ngram_extra.py
-register_cuda_ci(est_time=460, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=460,
+    stage="base-b",
+    runner_config="1-gpu-large",
+    disabled="RL serving makes little use of speculative decoding",
+)
 
 
 class TestNgramSpeculativeDecodingPaged(

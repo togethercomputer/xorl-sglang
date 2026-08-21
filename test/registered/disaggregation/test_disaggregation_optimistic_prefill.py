@@ -16,7 +16,12 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import DEFAULT_MODEL_NAME_FOR_TEST
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(
+    est_time=120,
+    stage="base-b",
+    runner_config="2-gpu-large",
+    disabled="PD disaggregation is out of scope for this fork's CI",
+)
 
 
 FORCE_RETRY_PROB = 0.1

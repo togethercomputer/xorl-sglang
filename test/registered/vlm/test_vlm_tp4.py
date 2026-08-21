@@ -15,7 +15,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=133, stage="base-c", runner_config="4-gpu-h100")
+register_cuda_ci(
+    est_time=133,
+    stage="base-c",
+    runner_config="4-gpu-h100",
+    disabled="VLM is peripheral to this fork; kept test_token_id_retokenize_e2e as the representative",
+)
 
 QWEN35_27B_MODEL = "Qwen/Qwen3.5-27B"
 MMMU_ACCURACY_THRESHOLD = 0.65

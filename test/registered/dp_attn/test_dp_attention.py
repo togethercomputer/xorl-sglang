@@ -22,7 +22,12 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(
+    est_time=420,
+    stage="base-b",
+    runner_config="2-gpu-large",
+    disabled="DEFAULT_MODEL_NAME_FOR_TEST_MLA (lmsys/sglang-ci-dsv3-test) is private to lmsys",
+)
 register_amd_ci(est_time=500, suite="stage-b-test-2-gpu-large-amd")
 
 
