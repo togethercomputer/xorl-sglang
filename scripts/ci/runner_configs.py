@@ -1,8 +1,8 @@
 """Emit runner_config setup for GitHub Actions $GITHUB_OUTPUT.
 
 runner_configs.py <runner_config>
-    Per-field `key=value` lines (install / artifact_version /
-    install_timeout / rdma_devices). `runs_on` is intentionally omitted —
+    Per-field `key=value` lines (install / install_timeout /
+    rdma_devices). `runs_on` is intentionally omitted —
     it carries the `$b200_runner` sentinel and is resolved via --map.
     Called per stage by _pr-test-stage.yml.
 

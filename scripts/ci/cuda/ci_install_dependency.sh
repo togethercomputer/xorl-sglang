@@ -55,6 +55,14 @@ configure_environment() {
         [ "${VIRTUAL_ENV:-}" = "$UV_VENV" ] || { echo "FATAL: venv activation did not set VIRTUAL_ENV correctly"; exit 1; }
         [ "$(command -v python3)" = "$UV_VENV/bin/python3" ] || { echo "FATAL: python3 still resolves outside venv (got $(command -v python3))"; exit 1; }
 
+        # --seed above is not enough on Python 3.12: uv seeds only pip there, not
+        # setuptools or wheel. Anything built from source without build isolation
+        # then dies on a missing build backend -- human-eval's
+        # `uv pip install -e . --no-build-isolation` in install_test_tools is the
+        # one that finds it. Cheap and idempotent, so it runs unconditionally
+        # rather than probing the interpreter version.
+        uv pip install --quiet setuptools wheel
+
         if [ -n "${GITHUB_ENV:-}" ]; then
             # Self-heal: see install_rustup.sh for context on missing _runner_file_commands/.
             mkdir -p "$(dirname "$GITHUB_ENV")" 2>/dev/null || true
