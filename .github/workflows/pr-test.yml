@@ -235,12 +235,20 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      # 50, not 30. This value does double duty: it caps the Run test step AND drives
-      # the shard count, since compute_partitions sizes each shard at 0.75 * timeout.
-      # Install is a FIXED ~143s per shard after the rust-ext prebuild, so over-sharding
-      # multiplies it: 1-gpu-large at 30m is 10 shards and 1430s of install, at 50m it
-      # is 6 shards and 858s, and with the throttle lifted both finish in one wave.
-      run_timeout_minutes: '50'
+      # 16, not 50. Double duty: caps the Run test step AND drives the shard count,
+      # since compute_partitions sizes each shard at 0.75 * timeout -- shrinking it
+      # buys more shards, not shorter ones.
+      #
+      # 50 was tuned for the full 247-test suite, where 1-gpu-large held 222 est-min
+      # and low fanout kept install overhead down. At 41 tests it holds 39.8, and 50
+      # buys just 2 shards of 19.9 est -- ~23m, which was most of the pipeline. 16
+      # gives 4 shards of 9.9 est, ~13m, keeping 4.3m of headroom against the worst
+      # actual/est ratio observed here (1.18x: a 19.9-est shard that ran 23.4m).
+      #
+      # The cost is install, a fixed ~143s per shard: 4 shards spend ~9.5 GPU-min on
+      # it against ~4.8 at 2 shards. That is GPU-seconds, not wall clock -- shards
+      # install concurrently -- and 6 lane-GPU-minutes is worth 10 minutes of wall.
+      run_timeout_minutes: '16'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
@@ -255,12 +263,20 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      # 50, not 30. This value does double duty: it caps the Run test step AND drives
-      # the shard count, since compute_partitions sizes each shard at 0.75 * timeout.
-      # Install is a FIXED ~143s per shard after the rust-ext prebuild, so over-sharding
-      # multiplies it: 1-gpu-large at 30m is 10 shards and 1430s of install, at 50m it
-      # is 6 shards and 858s, and with the throttle lifted both finish in one wave.
-      run_timeout_minutes: '50'
+      # 16, not 50. Double duty: caps the Run test step AND drives the shard count,
+      # since compute_partitions sizes each shard at 0.75 * timeout -- shrinking it
+      # buys more shards, not shorter ones.
+      #
+      # 50 was tuned for the full 247-test suite, where 1-gpu-large held 222 est-min
+      # and low fanout kept install overhead down. At 41 tests it holds 39.8, and 50
+      # buys just 2 shards of 19.9 est -- ~23m, which was most of the pipeline. 16
+      # gives 4 shards of 9.9 est, ~13m, keeping 4.3m of headroom against the worst
+      # actual/est ratio observed here (1.18x: a 19.9-est shard that ran 23.4m).
+      #
+      # The cost is install, a fixed ~143s per shard: 4 shards spend ~9.5 GPU-min on
+      # it against ~4.8 at 2 shards. That is GPU-seconds, not wall clock -- shards
+      # install concurrently -- and 6 lane-GPU-minutes is worth 10 minutes of wall.
+      run_timeout_minutes: '16'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
       timeout_per_file: '1800'
     secrets: inherit
@@ -275,12 +291,20 @@ jobs:
       check_changes: ${{ toJson(needs.check-changes.outputs) }}
       caller_inputs: ${{ toJson(inputs) }}
       partitions: ${{ needs.check-changes.outputs.partitions }}
-      # 50, not 30. This value does double duty: it caps the Run test step AND drives
-      # the shard count, since compute_partitions sizes each shard at 0.75 * timeout.
-      # Install is a FIXED ~143s per shard after the rust-ext prebuild, so over-sharding
-      # multiplies it: 1-gpu-large at 30m is 10 shards and 1430s of install, at 50m it
-      # is 6 shards and 858s, and with the throttle lifted both finish in one wave.
-      run_timeout_minutes: '50'
+      # 16, not 50. Double duty: caps the Run test step AND drives the shard count,
+      # since compute_partitions sizes each shard at 0.75 * timeout -- shrinking it
+      # buys more shards, not shorter ones.
+      #
+      # 50 was tuned for the full 247-test suite, where 1-gpu-large held 222 est-min
+      # and low fanout kept install overhead down. At 41 tests it holds 39.8, and 50
+      # buys just 2 shards of 19.9 est -- ~23m, which was most of the pipeline. 16
+      # gives 4 shards of 9.9 est, ~13m, keeping 4.3m of headroom against the worst
+      # actual/est ratio observed here (1.18x: a 19.9-est shard that ran 23.4m).
+      #
+      # The cost is install, a fixed ~143s per shard: 4 shards spend ~9.5 GPU-min on
+      # it against ~4.8 at 2 shards. That is GPU-seconds, not wall clock -- shards
+      # install concurrently -- and 6 lane-GPU-minutes is worth 10 minutes of wall.
+      run_timeout_minutes: '16'
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 

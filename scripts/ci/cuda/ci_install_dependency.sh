@@ -208,8 +208,24 @@ install_gdrcopy() {
         check libsubunit0 libsubunit-dev python3-venv
     )
 
-    apt-get update || true
-    apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
+    # Everything below writes outside the runner's home -- apt state, /opt, dpkg,
+    # /usr/lib, the ld cache -- and this fork's runner container is uid 1001, not
+    # root. Upstream runs these as root, which is why they carry no sudo (see the
+    # same note in install_apt_packages). Empty when already root, so upstream
+    # behaviour is unchanged.
+    #
+    # This is the only 4+ GPU-gated function, so it had never executed here until
+    # base-c first got a runner: the 1- and 2-GPU jobs return at the gpu_count
+    # check above. It failed with
+    #   E: Could not open lock file /var/lib/dpkg/lock-frontend (13: Permission denied)
+    #   ERROR: Required GDRCopy package nvidia-dkms-580 is unavailable
+    local SUDO=""
+    if [ "$(id -u)" -ne 0 ]; then
+        SUDO="sudo"
+    fi
+
+    ${SUDO} apt-get update || true
+    ${SUDO} apt-get install -y --no-install-recommends "${gdrcopy_packages[@]}" || {
         echo "Warning: apt-get failed while installing GDRCopy build dependencies; checking installed packages"
         local package
         for package in "${gdrcopy_packages[@]}"; do
@@ -220,23 +236,25 @@ install_gdrcopy() {
         done
     }
 
-    rm -rf "${gdrcopy_root}"
-    git clone --branch "v${gdrcopy_version}" --depth 1 \
+    ${SUDO} rm -rf "${gdrcopy_root}"
+    ${SUDO} git clone --branch "v${gdrcopy_version}" --depth 1 \
         https://github.com/NVIDIA/gdrcopy.git "${gdrcopy_root}"
-    (
-        cd "${gdrcopy_root}/packages"
-        CUDA=/usr/local/cuda ./build-deb-packages.sh
-        dpkg -i gdrdrv-dkms_*.deb
-        dpkg -i libgdrapi_*.deb
-        dpkg -i gdrcopy-tests_*.deb
-        dpkg -i gdrcopy_*.deb
-    )
+    # One sudo shell for the build and the four dpkg installs: the clone is
+    # root-owned, so build-deb-packages.sh cannot write its output tree as uid
+    # 1001, and splitting these into separate sudo calls would leave the build
+    # unprivileged and the installs privileged.
+    ${SUDO} sh -c "cd '${gdrcopy_root}/packages' \
+        && CUDA=/usr/local/cuda ./build-deb-packages.sh \
+        && dpkg -i gdrdrv-dkms_*.deb \
+        && dpkg -i libgdrapi_*.deb \
+        && dpkg -i gdrcopy-tests_*.deb \
+        && dpkg -i gdrcopy_*.deb"
 
     local lib_path="/usr/lib/${ARCH}-linux-gnu"
     if [ ! -e "${lib_path}/libmlx5.so" ] && [ -e "${lib_path}/libmlx5.so.1" ]; then
-        ln -s "${lib_path}/libmlx5.so.1" "${lib_path}/libmlx5.so"
+        ${SUDO} ln -s "${lib_path}/libmlx5.so.1" "${lib_path}/libmlx5.so"
     fi
-    ldconfig
+    ${SUDO} ldconfig
 
     mark_step_done "${FUNCNAME[0]}"
 }
