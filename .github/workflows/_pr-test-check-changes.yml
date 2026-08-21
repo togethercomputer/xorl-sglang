@@ -138,19 +138,26 @@ jobs:
 
       - name: Resolve sglang-ci-stats SHA
         id: partition-model-sha
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          # Pin all shards to one immutable commit so dispatch and every
-          # runtime LPT use the same model snapshot. Soft fail -> static.
-          SHA=$(gh api repos/sgl-project/sglang-ci-stats/commits/main --jq '.sha' 2>/dev/null || true)
-          if [[ -n "$SHA" ]]; then
-            echo "Pinned sglang-ci-stats@$SHA"
-            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          else
-            echo "::warning::Could not resolve sglang-ci-stats SHA; using in-source est_time"
-            echo "sha=" >> "$GITHUB_OUTPUT"
-          fi
+          # Deliberately empty in this fork: shards are sized from in-source
+          # est_time, not from upstream's live timing model.
+          #
+          # That model is fitted on sgl-project's fleet, which is not this
+          # hardware -- 1-gpu-small is an H100 here, not the 5090 upstream sizes
+          # it against -- and it reads ~35% low as a result: 93.1 min for
+          # base-b-test-1-gpu-large where est_time says 140.5. Sizing from it gave
+          # 3 shards holding 46.8 est-min each against a 50-minute step timeout,
+          # and two of them died on "The action 'Run test' has timed out after 50
+          # minutes" (run 32433463686). est_time predicted that same run within
+          # ~1.0x, so it is the better estimator here until this fork has enough
+          # history to fit its own.
+          #
+          # Empty sha rather than deleting the fetches: the guards in this file
+          # and in _pr-test-stage{,-cpu}.yml already skip on '', so all three fall
+          # back to est_time together. Falling back in only some of them would
+          # change LPT ordering between dispatch and runtime and put different
+          # tests in a shard than were planned for it.
+          echo "sha=" >> "$GITHUB_OUTPUT"
 
       - name: Fetch live partition model
         if: steps.partition-model-sha.outputs.sha != ''
