@@ -6,6 +6,20 @@ upstream source.
 
 - Mirror overrides live under `sglang/overrides/*` with the same path as the
   upstream module you're replacing.
+- **Only for modules upstream already has.** The finder fires when
+  `sglang.srt.X` is imported and a twin `sglang.overrides.X` exists. A twin whose
+  upstream counterpart does not exist is never imported and never fires -- it
+  looks installed and does nothing. New capability goes in `sglang/xorl/`
+  instead; see [docs/xorl-porting-plan.md](../../../docs/xorl-porting-plan.md).
+- **Not usable for `server_args.py`.** It carries 458 `NS()` field annotations and
+  nine guard tests, including two-way namespace coverage and a mutation ratchet.
+  Dataclass fields are fixed at class creation, so no post-hoc patch can add one
+  and still satisfy those guards. CLI surface is an in-tree edit.
+- **`__apply_patch__` suits replacement, not interleaving.** Replacing a whole
+  function or method is clean. Interleaved edits inside a long method force the
+  twin to copy that method, and the copy then stops tracking upstream fixes with
+  nothing to warn you. Reshape into a seam first, or take the change in-tree
+  deliberately.
 - No symbols or package names are exposed to users beyond the public
   `sglang.srt.*` API.
 
