@@ -1,18 +1,12 @@
 """Override twin of ``sglang.srt.server_args``.
 
-Locks LoRA serving in this fork to the TRT-LLM MoE runner, and hardcodes the
-experimental LoRA optimizations that make it worth using.
+Hardcodes the experimental LoRA optimizations for every LoRA run.
 
-**LoRA requires ``--moe-runner-backend experimental_sgl_trtllm``.** Any other
-resolved MoE runner on a LoRA run raises. This is deliberate: that backend is
-the only MoE LoRA path this fork develops and validates, and silently serving
-LoRA on a different runner produces numerically different results (see the
-padded-intermediate bug fixed in the ``lora.mem_pool`` / ``lora.layers`` twins,
-which only that backend exercises).
-
-Note the default resolves to ``flashinfer_trtllm`` on SM100, *not* to
-``experimental_sgl_trtllm``, so the flag must be passed explicitly even for a
-plain ``--enable-lora`` run.
+The companion requirement -- that LoRA may only be *served* on
+``--moe-runner-backend experimental_sgl_trtllm`` -- is enforced in the
+``lora.lora_manager`` twin instead. Raising during arg resolution would make a
+LoRA ``ServerArgs`` unconstructible and break pure-config unit tests that build
+one without ever loading a model.
 
 **Two env vars are hardcoded on for every LoRA run**, overriding any user value:
 
@@ -63,26 +57,15 @@ def _lora_requested(server_args) -> bool:
     )
 
 
-def enforce_trtllm_lora_and_hardcode_opts(server_args) -> None:
-    """Reject non-TRT-LLM MoE runners on LoRA runs; force the experimental opts.
+def hardcode_lora_opts(server_args) -> None:
+    """Force the experimental LoRA opts on for any LoRA run.
 
-    No-op for non-LoRA runs -- this constrains LoRA serving only, so plain
-    (non-LoRA) deployments keep every MoE runner choice.
+    No-op for non-LoRA runs. The *backend requirement* is enforced separately
+    in the ``lora.lora_manager`` twin, at serving time -- raising here would
+    make a LoRA ServerArgs unconstructible and break pure-config unit tests.
     """
     if not _lora_requested(server_args):
         return
-
-    backend = getattr(server_args, "moe_runner_backend", None)
-    if backend != _TRTLLM_MOE_BACKEND:
-        raise ValueError(
-            f"LoRA serving in this fork requires "
-            f"--moe-runner-backend {_TRTLLM_MOE_BACKEND}, but the resolved MoE "
-            f"runner is {backend!r}. It is the only MoE LoRA path this fork "
-            f"validates; other runners take a different numerical path. "
-            f"Pass --moe-runner-backend {_TRTLLM_MOE_BACKEND} explicitly "
-            f"(the default resolves to 'flashinfer_trtllm' on SM100), or drop "
-            f"--enable-lora / --lora-paths to serve without LoRA."
-        )
 
     master = envs.SGLANG_EXPERIMENTAL_LORA_OPTI
     overridden = []
@@ -124,6 +107,6 @@ def __apply_patch__(public_mod):
         # backend is *rejected* rather than silently rewritten here). Spawned
         # schedulers inherit the env, which is what makes the import-time gate
         # in lora/layers.py see it.
-        enforce_trtllm_lora_and_hardcode_opts(self)
+        hardcode_lora_opts(self)
 
     server_args_cls.__post_init__ = __post_init__
