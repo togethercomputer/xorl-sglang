@@ -36,7 +36,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=110,
-    stage="base-c",
+    stage="lora",
     runner_config="4-gpu-h100",
 )
 
@@ -45,7 +45,7 @@ LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-VL-30B-A3B-Instruct"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 4
-MOE_RUNNER_BACKEND = "triton"
+MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
 EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "fa4"

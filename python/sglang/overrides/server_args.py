@@ -58,13 +58,19 @@ def _lora_requested(server_args) -> bool:
 
 
 def hardcode_lora_opts(server_args) -> None:
-    """Force the experimental LoRA opts on for any LoRA run.
+    """Force the experimental LoRA opts on for a LoRA run on the TRT-LLM runner.
 
-    No-op for non-LoRA runs. The *backend requirement* is enforced separately
-    in the ``lora.lora_manager`` twin, at serving time -- raising here would
+    No-op for non-LoRA runs and for LoRA on any other MoE runner. The companion
+    *requirement* -- that MoE LoRA may only be served on this backend -- is
+    enforced in the ``lora.lora_manager`` twin at serving time; raising here would
     make a LoRA ServerArgs unconstructible and break pure-config unit tests.
     """
     if not _lora_requested(server_args):
+        return
+    if getattr(server_args, "moe_runner_backend", None) != _TRTLLM_MOE_BACKEND:
+        # Only this backend's path consumes these flags, and the master gate also
+        # installs the two-stream overlap onto dense LoRA modules -- so a LoRA run
+        # on any other runner is left completely alone.
         return
 
     master = envs.SGLANG_EXPERIMENTAL_LORA_OPTI

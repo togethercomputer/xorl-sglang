@@ -26,9 +26,13 @@ from sglang.test.runners import SRTRunner
 
 register_cuda_ci(
     est_time=50,
-    stage="base-b",
+    stage="lora",
     runner_config="1-gpu-large",
 )
+
+# MoE LoRA in this fork is served only on the TRT-LLM MoE runner
+# (enforced in sglang/overrides/lora/lora_manager.py).
+MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
 
 # Format: [{"text": "result string", "lps": [0.1, 0.2, ...]}, ...]
 VLLM_CACHED_RESULTS = [
@@ -294,6 +298,7 @@ class TestMoELoraRegression(unittest.TestCase):
             lora_paths=[MOE_LORA_PATH],
             max_loras_per_batch=1,
             tp_size=1,
+            moe_runner_backend=MOE_RUNNER_BACKEND,
             trust_remote_code=True,
             disable_radix_cache=True,
             attention_backend="flashinfer",
