@@ -1680,6 +1680,24 @@ class Qwen3_5ForCausalLM(nn.Module):
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
+    deepep_native_exact_capability = {
+        "label": "Qwen3.5-MoE",
+        "produces_local_leaf": True,
+        "wire_dtype": "bf16",
+        "uses_dispatch_handle": True,
+        "ep_sizes": (2, 4, 8, 16),
+        "runner_backends": ("auto", "triton"),
+        "resolved_runner_backend": "triton",
+        "supports_quantized_experts": False,
+        "attention_backend": "fa4",
+        "expert_count_attr": "num_experts",
+        "requires_dp_equals_ep": True,
+        "enable_dp_lm_head": True,
+        "enable_fp32_router": True,
+        "required_exact_config_flag": "_qwen35_gdn_exact_is_moe",
+        "lora_serving_modes": ("merged", "separate"),
+    }
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -2048,6 +2066,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
+    deepep_native_exact_capability = (
+        Qwen3_5MoeForCausalLM.deepep_native_exact_capability
+    )
+
     """Qwen3.5 MoE Vision-Language Model."""
 
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping

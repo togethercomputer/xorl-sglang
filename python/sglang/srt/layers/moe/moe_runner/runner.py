@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from sglang.srt.lora.lora_moe_runners import LoRAHooks
 
 logger = logging.getLogger(__name__)
+_dsv4_runner_state_capture_done = False
 
 
 class MoeRunner:
@@ -148,30 +149,174 @@ class MoeRunner:
 
         assert self.runner_core is not None
 
-        def _maybe_build_lora_hooks(_runner_input: Any) -> LoRAHooks:
-            from sglang.srt.layers.moe.token_dispatcher.base import DispatchOutput
+        def _maybe_build_lora_hooks(
+            _runner_input: Any, _dispatch_output: DispatchOutput
+        ) -> LoRAHooks:
+            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
             from sglang.srt.lora.lora_moe_runners import build_lora_hooks
 
-            if isinstance(_runner_input, DispatchOutput):
-                hidden_states, topk_ids = (
-                    _runner_input.hidden_states,
-                    _runner_input.topk_output.topk_ids,
-                )
+            hidden_states = _runner_input.hidden_states
+            if hasattr(_runner_input, "topk_output"):
+                topk_ids = _runner_input.topk_output.topk_ids
+                topk_weights = _runner_input.topk_output.topk_weights
             else:
-                hidden_states = _runner_input.hidden_states
                 topk_ids = getattr(_runner_input, "topk_ids", None)
-            if self.lora_enabled and lora_info is not None:
+                topk_weights = getattr(_runner_input, "topk_weights", None)
+            resolved_lora_info = lora_info
+            if self.lora_enabled and resolved_lora_info is not None:
+                # A pre-permute step may replace the DispatchOutput with a
+                # runner-specific object (for example TritonRunnerInput), so
+                # read the transport format from the original dispatch while
+                # adapting LoRA ownership to the runner's received rows.
+                if (
+                    self.config.deepep_native_exact
+                    and DispatchOutputChecker.format_is_deepep_normal(_dispatch_output)
+                ):
+                    from sglang.srt.layers.moe.deepep_native_exact import (  # noqa: PLC0415
+                        adapt_native_lora_context,
+                    )
+
+                    resolved_lora_info = adapt_native_lora_context(
+                        hidden_states,
+                        resolved_lora_info,
+                        dispatch_mode="normal",
+                        topk_ids=topk_ids,
+                    )
+                elif (
+                    self.config.deepep_native_exact
+                    and DispatchOutputChecker.format_is_deepep_ll(_dispatch_output)
+                ):
+                    from sglang.srt.layers.moe.deepep_native_exact import (  # noqa: PLC0415
+                        adapt_native_lora_context,
+                    )
+
+                    resolved_lora_info = adapt_native_lora_context(
+                        hidden_states,
+                        resolved_lora_info,
+                        dispatch_mode="low_latency",
+                        topk_ids=topk_ids,
+                    )
+                global _dsv4_runner_state_capture_done
+                capture_dir = os.environ.get(
+                    "XORL_DSV4_SAMPLER_RUNNER_STATE_CAPTURE_DIR", ""
+                ).strip()
+                if (
+                    capture_dir
+                    and not _dsv4_runner_state_capture_done
+                    and self.config.dsv4_exact_mode
+                    and self.config.layer_id == 0
+                    and resolved_lora_info.single_adapter_id is not None
+                ):
+                    import torch  # noqa: PLC0415
+                    import torch.distributed as dist  # noqa: PLC0415
+
+                    _dsv4_runner_state_capture_done = True
+                    slot = int(resolved_lora_info.single_adapter_id)
+                    os.makedirs(capture_dir, exist_ok=True)
+                    global_rank = dist.get_rank() if dist.is_initialized() else 0
+                    selected_base = {}
+                    raw_global_experts = os.environ.get(
+                        "XORL_DSV4_SAMPLER_RUNNER_CAPTURE_GLOBAL_EXPERTS", ""
+                    ).strip()
+                    if raw_global_experts:
+                        global_experts = [
+                            int(value.strip())
+                            for value in raw_global_experts.split(",")
+                            if value.strip()
+                        ]
+                        local_experts = int(quant_info.w13_qweight.shape[0])
+                        ep_size = int(quant_info.global_num_experts) // local_experts
+                        ep_rank = global_rank % ep_size
+                        local_start = ep_rank * local_experts
+                        for global_expert in global_experts:
+                            local_expert = global_expert - local_start
+                            if 0 <= local_expert < local_experts:
+                                selected_base[str(global_expert)] = {
+                                    "local_expert": local_expert,
+                                    "w13_qweight": quant_info.w13_qweight[local_expert]
+                                    .detach()
+                                    .cpu(),
+                                    "w2_qweight": quant_info.w2_qweight[local_expert]
+                                    .detach()
+                                    .cpu(),
+                                    "w13_scales": quant_info.w13_scales[local_expert]
+                                    .detach()
+                                    .cpu(),
+                                    "w2_scales": quant_info.w2_scales[local_expert]
+                                    .detach()
+                                    .cpu(),
+                                }
+                    torch.save(
+                        {
+                            "schema": "xorl.dsv4_sampler_runner_state.v2",
+                            "global_rank": global_rank,
+                            "layer_id": self.config.layer_id,
+                            "active_slot": slot,
+                            "hidden_states": hidden_states.detach().cpu(),
+                            "topk_ids": topk_ids.detach().cpu(),
+                            "topk_weights": topk_weights.detach().cpu(),
+                            "selected_base": selected_base,
+                            "lora_ranks": resolved_lora_info.lora_ranks.detach().cpu(),
+                            "adapter_enabled": resolved_lora_info.adapter_enabled.detach().cpu(),
+                            "seg_indptr": resolved_lora_info.seg_indptr.detach().cpu(),
+                            "req_to_lora": resolved_lora_info.req_to_lora.detach().cpu(),
+                            "token_lora_mapping": resolved_lora_info.token_lora_mapping.detach().cpu(),
+                            "max_lora_rank": resolved_lora_info.max_lora_rank,
+                            "num_experts": resolved_lora_info.num_experts,
+                            "has_active_lora": resolved_lora_info.has_active_lora,
+                            "single_adapter_id": resolved_lora_info.single_adapter_id,
+                            "experts_shared_outer_loras": resolved_lora_info.experts_shared_outer_loras,
+                            "fully_sharded": resolved_lora_info.fully_sharded,
+                            "tp_size": resolved_lora_info.tp_size,
+                            "tp_rank": resolved_lora_info.tp_rank,
+                            "gate_up_a": resolved_lora_info.gate_up_lora_a_weights[slot]
+                            .detach()
+                            .cpu(),
+                            "gate_up_b": resolved_lora_info.gate_up_lora_b_weights[slot]
+                            .detach()
+                            .cpu(),
+                            "down_a": resolved_lora_info.down_lora_a_weights[slot]
+                            .detach()
+                            .cpu(),
+                            "down_b": resolved_lora_info.down_lora_b_weights[slot]
+                            .detach()
+                            .cpu(),
+                        },
+                        os.path.join(
+                            capture_dir,
+                            f"rank{global_rank:05d}.layer000.runner-state.pt",
+                        ),
+                    )
                 return build_lora_hooks(
                     hidden_states,
-                    lora_info,
+                    resolved_lora_info,
                     topk_ids,
+                    mul_routed_weight=(
+                        not getattr(self.config, "no_combine", False)
+                        and (
+                            not DispatchOutputChecker.format_is_deepep_ll(
+                                _dispatch_output
+                            )
+                            or getattr(self.config, "deepep_native_exact", False)
+                            or getattr(
+                                self.config,
+                                "deepep_native_exact_defer_routed_scale",
+                                False,
+                            )
+                        )
+                    ),
                 )
             return None
 
         # Runners that handle dispatch_output directly (e.g., MarlinRunnerCore)
         # bypass the pre-permute step and do their own alignment internally.
         if hasattr(self.runner_core, "run_from_dispatch"):
-            hooks = _maybe_build_lora_hooks(dispatch_output)
+            hook_input = (
+                self.runner_core.lora_hook_input(dispatch_output, quant_info)
+                if hasattr(self.runner_core, "lora_hook_input")
+                else dispatch_output
+            )
+            hooks = _maybe_build_lora_hooks(hook_input, dispatch_output)
             return self.runner_core.run_from_dispatch(
                 dispatch_output, quant_info, self.config, hooks=hooks
             )
@@ -192,7 +337,7 @@ class MoeRunner:
             dispatch_output, quant_info, self.config, running_state
         )
 
-        hooks = _maybe_build_lora_hooks(runner_input)
+        hooks = _maybe_build_lora_hooks(runner_input, dispatch_output)
 
         runner_output = self.runner_core.run(
             runner_input, quant_info, running_state, hooks=hooks

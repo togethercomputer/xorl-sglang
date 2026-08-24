@@ -55,7 +55,6 @@ from sglang.srt.distributed import (
     divide,
     get_pp_group,
     tensor_model_parallel_all_reduce,
-    tensor_model_parallel_canonical_moe_all_reduce,
 )
 from sglang.srt.distributed.canonical_moe import (
     CanonicalDeferredStatusBook,
@@ -99,7 +98,9 @@ from sglang.srt.layers.communicator_dsa_cp import (
     DSACPLayerCommunicator,
     DSAMLPOutputLayout,
     align_glm52_moe_positions,
+    gather_glm52_mlp_rows,
     maybe_prefetch_next_full_attention_kv,
+    select_glm52_local_mlp_rows,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import is_cp_v2_active
@@ -274,10 +275,7 @@ from sglang.kernels.ops.gemm.fused_a_gemm import (
 
 logger = logging.getLogger(__name__)
 
-# One-shot per-process marker so the DSV4 exact-combine gate's engagement (or
-# non-engagement) is visible in the serving log; both states are contract
-# evidence (a silent gate was the root cause of an inert byte-program change).
-_dsv4_exact_combine_engagement_logged = False
+_glm52_native_deepep_engagement_logged = False
 
 
 def _is_glm52_architecture(config) -> bool:
@@ -293,6 +291,36 @@ def _uses_glm52_exact_contract(config, *, is_nextn: bool = False) -> bool:
         _is_glm52_architecture(config)
         and _glm52_exact_mode_enabled(config)
         and not is_nextn
+    )
+
+
+def _uses_glm52_native_deepep(config, *, is_nextn: bool = False) -> bool:
+    return bool(
+        _uses_glm52_exact_contract(config, is_nextn=is_nextn)
+        and getattr(config, "_deepep_native_exact", False)
+    )
+
+
+def _select_hash_topk_input_ids(
+    hidden_states: torch.Tensor,
+    input_ids: Optional[torch.Tensor],
+    input_ids_global: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Select the token IDs whose logical rows match ``hidden_states``.
+
+    DeepEP can consume either a CP-local hidden-state image or a DP-gathered
+    image. Hash routing is value-dependent, so IDs from the other layout are
+    invalid even though both originate from the same request.
+    """
+    expected_shape = tuple(hidden_states.shape[:-1])
+    for candidate in (input_ids, input_ids_global):
+        if candidate is not None and tuple(candidate.shape) == expected_shape:
+            return candidate
+    local_shape = None if input_ids is None else tuple(input_ids.shape)
+    global_shape = None if input_ids_global is None else tuple(input_ids_global.shape)
+    raise RuntimeError(
+        "HashTopK requires token IDs aligned with the DeepEP hidden-state rows: "
+        f"expected={expected_shape}, local={local_shape}, global={global_shape}"
     )
 
 
@@ -315,7 +343,11 @@ def _resolve_glm52_canonical_transport(config) -> str:
 
 
 def _select_glm52_canonical_transport(
-    configured: str, *, prefill_cp: bool, consumer_sharded: bool = False
+    configured: str,
+    *,
+    prefill_cp: bool,
+    consumer_sharded: bool = False,
+    capture_mode: bool = False,
 ) -> str:
     """Choose transport without making it an exact-mode admission gate.
 
@@ -566,6 +598,7 @@ class MoEGate(nn.Module):
         self._glm52_canonical_contract = _uses_glm52_exact_contract(
             config, is_nextn=is_nextn
         )
+        self._glm52_native_deepep = _uses_glm52_native_deepep(config, is_nextn=is_nextn)
         self._glm52_exact_router = self._glm52_canonical_contract
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
@@ -727,9 +760,24 @@ class DeepseekV2MoE(nn.Module):
             top_k_for_moe = config.num_experts_per_tok + self.num_fused_shared_experts
 
         self.config = config
-        self._dsv4_exact_ordered_combine = bool(
-            getattr(config, "_dsv4_flash_exact_mode", False)
-        )
+        # Resolve this before shared-expert construction. Generic DeepEP makes
+        # shared experts TP1, but GLM-5.2's native exact program deliberately
+        # keeps a TP-sharded shared branch and canonicalizes those BF16
+        # partials independently before the final FP32 routed/shared join.
+        self._glm52_native_deepep = _uses_glm52_native_deepep(config, is_nextn=is_nextn)
+        _dsv4_exact_mode = bool(getattr(config, "_dsv4_flash_exact_mode", False))
+        _dsv4_moe_program = getattr(config, "_dsv4_moe_numerical_program", None)
+        _dsv4_native_deepep = _dsv4_exact_mode
+        self._dsv4_moe_numerical_program = _dsv4_moe_program
+        if _dsv4_exact_mode and _dsv4_moe_program != "deepep_native_exact_v1":
+            raise RuntimeError(
+                "Exact DSV4 requires deepep_native_exact_v1; "
+                f"got {_dsv4_moe_program!r}"
+            )
+        if _dsv4_native_deepep and not get_moe_a2a_backend().is_deepep():
+            raise RuntimeError(
+                "deepep_native_exact_v1 requires --moe-a2a-backend deepep"
+            )
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
@@ -788,6 +836,7 @@ class DeepseekV2MoE(nn.Module):
             ),
             swiglu_limit=getattr(config, "swiglu_limit", None),
             prefix=add_prefix("experts", prefix),
+            deepep_native_exact=bool(getattr(config, "_deepep_native_exact", False)),
         )
 
         if self.is_hash and not (is_nextn and is_deepseek_v4):
@@ -857,7 +906,7 @@ class DeepseekV2MoE(nn.Module):
             # explicitly requested for DSV4 checkpoints whose shared scales are
             # not divisible by the global TP size.
             _shared_expert_use_tp1 = (
-                get_moe_a2a_backend().is_deepep()
+                (get_moe_a2a_backend().is_deepep() and not self._glm52_native_deepep)
                 or get_moe_a2a_backend().is_pplx()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
@@ -990,9 +1039,18 @@ class DeepseekV2MoE(nn.Module):
         )
         self.glm52_parallel_plan: SamplerParallelPlan | None = None
         if self._glm52_canonical_contract:
-            if self._enable_a2a_moe:
+            if self._enable_a2a_moe and not getattr(
+                self, "_glm52_native_deepep", False
+            ):
                 raise RuntimeError(
-                    "GLM-5.2 canonical MoE requires moe_a2a_backend=none"
+                    "GLM-5.2 canonical MoE admits A2A only for its native DeepEP program"
+                )
+            if (
+                getattr(self, "_glm52_native_deepep", False)
+                and not get_moe_a2a_backend().is_deepep()
+            ):
+                raise RuntimeError(
+                    "GLM-5.2 native DeepEP requires moe_a2a_backend=deepep"
                 )
             if self._fuse_shared_experts_inside_sbo:
                 raise RuntimeError(
@@ -1056,9 +1114,19 @@ class DeepseekV2MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if self._glm52_canonical_contract:
-            if self._enable_a2a_moe:
+            if self._enable_a2a_moe and not getattr(
+                self, "_glm52_native_deepep", False
+            ):
                 raise RuntimeError(
-                    "GLM-5.2 canonical MoE requires the non-A2A execution path"
+                    "GLM-5.2 canonical MoE admits A2A only for native DeepEP"
+                )
+            if getattr(self, "_glm52_native_deepep", False):
+                return self.forward_deepep(
+                    hidden_states,
+                    forward_batch,
+                    input_ids=input_ids,
+                    input_ids_global=input_ids_global,
+                    absolute_positions=absolute_positions,
                 )
             return self.forward_normal(
                 hidden_states,
@@ -1116,7 +1184,10 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             return self.forward_deepep(
-                hidden_states, forward_batch, input_ids_global=input_ids_global
+                hidden_states,
+                forward_batch,
+                input_ids=input_ids,
+                input_ids_global=input_ids_global,
             )
 
     def _canonical_exact_leaf(
@@ -1167,7 +1238,6 @@ class DeepseekV2MoE(nn.Module):
         has_shared_output = (
             hidden_states.shape[0] > 0 and self.num_fused_shared_experts == 0
         )
-        server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if get_exec().moe.enable_eplb and not self.is_nextn
@@ -1229,7 +1299,7 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
-        exact_leaf = self._glm52_canonical_contract or self._dsv4_exact_ordered_combine
+        exact_leaf = self._glm52_canonical_contract
         if deferred_finalize:
             if exact_leaf:
                 raise RuntimeError(
@@ -1267,27 +1337,7 @@ class DeepseekV2MoE(nn.Module):
         return final_hidden_states
 
     def _post_experts_all_reduce(self, final_hidden_states):
-        """Post-experts TP sum; the DSV4 exact lane pins the canonical fold.
-
-        The stock NCCL all_reduce has a topology-dependent reduction order.
-        The XoRL exact contract requires the canonical source-ranked adjacent
-        FP64 tree over TP partials (the same primitive as Qwen/GLM) so the
-        trainer's raw exchange plus canonical_moe_fold_fp64_v3 reproduces the
-        serving bytes before the one final BF16 output cast.
-        """
-        global _dsv4_exact_combine_engagement_logged
-        if not _dsv4_exact_combine_engagement_logged:
-            _dsv4_exact_combine_engagement_logged = True
-            logger.info(
-                "DSV4 post-experts combine gate: %s",
-                (
-                    "canonical fold ENGAGED"
-                    if self._dsv4_exact_ordered_combine
-                    else "OFF (stock all_reduce)"
-                ),
-            )
-        if self._dsv4_exact_ordered_combine:
-            return tensor_model_parallel_canonical_moe_all_reduce(final_hidden_states)
+        """Post-experts TP sum for ordinary tensor-parallel execution."""
         return tensor_model_parallel_all_reduce(final_hidden_states)
 
     def forward_normal(
@@ -1305,7 +1355,6 @@ class DeepseekV2MoE(nn.Module):
             self.shared_experts.gate_up_proj
         ):
             return self.forward_cpu(hidden_states)
-        server_args = get_server_args()
         dispatch_info = (
             ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
             if get_exec().moe.enable_eplb and not self.is_nextn
@@ -1416,7 +1465,7 @@ class DeepseekV2MoE(nn.Module):
                 pre_quant_input=pre_quant_input,
             )
 
-        if self._glm52_canonical_contract or self._dsv4_exact_ordered_combine:
+        if self._glm52_canonical_contract:
             final_hidden_states = self._canonical_exact_leaf(
                 final_hidden_states,
                 None if self._shared_expert_tp1 else shared_output,
@@ -1571,6 +1620,7 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: Optional[ForwardBatch],
         fuse_mlp_allreduce: bool,
         mlp_reduce_scatter: bool,
+        force_replicated: bool = False,
     ) -> torch.Tensor:
         if fuse_mlp_allreduce or mlp_reduce_scatter:
             raise RuntimeError(
@@ -1619,9 +1669,13 @@ class DeepseekV2MoE(nn.Module):
             valid_mask=position_valid,
         )
         distribution = (
-            CanonicalDistribution.CONSUMER_SHARDED
-            if prefill_cp and plan.attention_dp_size == 1
-            else CanonicalDistribution.REPLICATED_CANONICAL
+            CanonicalDistribution.REPLICATED_CANONICAL
+            if force_replicated
+            else (
+                CanonicalDistribution.CONSUMER_SHARDED
+                if prefill_cp and plan.attention_dp_size == 1
+                else CanonicalDistribution.REPLICATED_CANONICAL
+            )
         )
         group = get_parallel().tp_group.device_group
         workspace_key = (
@@ -1636,6 +1690,7 @@ class DeepseekV2MoE(nn.Module):
             self._glm52_canonical_transport,
             prefill_cp=prefill_cp,
             consumer_sharded=(distribution is CanonicalDistribution.CONSUMER_SHARDED),
+            capture_mode=capture_mode,
         )
         if selected_transport == "dense_v1":
             dense_workspaces = getattr(self, "_canonical_dense_workspaces", None)
@@ -1778,9 +1833,12 @@ class DeepseekV2MoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
+        absolute_positions: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         shared_output = None
+        glm52_native_deepep = bool(getattr(self, "_glm52_native_deepep", False))
         sbo_enabled_flag = self._fuse_shared_experts_inside_sbo and not self.is_nextn
         sbo_overlap_dispatch_flag = (
             sbo_enabled_flag and SboFlags.enable_dispatch_shared_one_stream_overlap()
@@ -1792,7 +1850,11 @@ class DeepseekV2MoE(nn.Module):
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            if not sbo_enabled_flag and self.num_fused_shared_experts == 0:
+            if (
+                not glm52_native_deepep
+                and not sbo_enabled_flag
+                and self.num_fused_shared_experts == 0
+            ):
                 if self.alt_stream is not None:
                     self.alt_stream.wait_stream(torch.cuda.current_stream())
                     with torch.cuda.stream(self.alt_stream):
@@ -1808,11 +1870,13 @@ class DeepseekV2MoE(nn.Module):
                         torch.cuda.current_stream().wait_event(shared_event)
                 else:
                     shared_output = self._forward_shared_experts(hidden_states)
-            topk_kwargs = (
-                {"input_ids": input_ids_global}
-                if getattr(self, "is_hash", False)
-                else {}
-            )
+            topk_kwargs = {}
+            if getattr(self, "is_hash", False):
+                topk_kwargs["input_ids"] = _select_hash_topk_input_ids(
+                    hidden_states,
+                    input_ids,
+                    input_ids_global,
+                )
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
@@ -1829,6 +1893,40 @@ class DeepseekV2MoE(nn.Module):
         else:
             topk_output = self.topk.empty_topk_output(
                 hidden_states.device, layer_id=self.layer_id
+            )
+
+        # Native DeepEP consumes CP-local rows and already returns an
+        # ownership-complete routed value for those rows.  The GLM shared
+        # expert is different: it remains TP16-sharded, so every contributor
+        # must evaluate the *same* aligned rows before the canonical fold.
+        # Gathering only this branch preserves the native routed path while
+        # preventing rank r's row 0 (logical token r) from being folded with
+        # every other rank's unrelated row 0.
+        glm52_shared_hidden_states = None
+        glm52_shared_positions = None
+        if glm52_native_deepep:
+            if sbo_enabled_flag:
+                raise RuntimeError(
+                    "GLM-5.2 native DeepEP exact mode does not support fused "
+                    "shared-expert overlap"
+                )
+            if absolute_positions is None:
+                raise RuntimeError(
+                    "GLM-5.2 native DeepEP requires aligned local positions"
+                )
+            local_position_values = (
+                absolute_positions.values
+                if isinstance(absolute_positions, CanonicalMoEPositions)
+                else absolute_positions
+            )
+            glm52_shared_hidden_states = gather_glm52_mlp_rows(
+                hidden_states,
+                forward_batch,
+            )
+            glm52_shared_positions = align_glm52_moe_positions(
+                local_position_values,
+                glm52_shared_hidden_states,
+                forward_batch,
             )
 
         if sbo_overlap_dispatch_flag:
@@ -1982,13 +2080,70 @@ class DeepseekV2MoE(nn.Module):
         )
 
         if (
-            hidden_states.shape[0] > 0
+            not glm52_native_deepep
+            and hidden_states.shape[0] > 0
             and not sbo_enabled_flag
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
             and not is_in_breakable_cuda_graph()
         ):
             torch.cuda.current_stream().wait_event(shared_event)
+
+        if glm52_native_deepep:
+            if glm52_shared_hidden_states is None or glm52_shared_positions is None:
+                raise RuntimeError(
+                    "GLM-5.2 native DeepEP did not prepare aligned shared-expert rows"
+                )
+            lora_backend = getattr(self.experts, "lora_backend", None)
+            shared_lora_context = nullcontext()
+            if lora_backend is not None:
+                shared_row_state = get_glm52_mlp_row_state(
+                    forward_batch,
+                    expected_rows=glm52_shared_hidden_states.shape[0],
+                )
+                if shared_row_state.layout.uses_gathered_lora_metadata:
+                    shared_lora_context = lora_backend.use_gathered_mlp_batch_info(
+                        glm52_shared_hidden_states.shape[0]
+                    )
+            with shared_lora_context:
+                shared_output = self._forward_shared_experts(glm52_shared_hidden_states)
+
+        if glm52_native_deepep:
+            if shared_output is None:
+                raise RuntimeError(
+                    "GLM-5.2 native DeepEP requires an explicit TP16 shared-expert partial"
+                )
+            canonical_shared = self._canonicalize_glm52_partial(
+                shared_output.to(torch.bfloat16),
+                glm52_shared_positions,
+                forward_batch=forward_batch,
+                fuse_mlp_allreduce=False,
+                mlp_reduce_scatter=False,
+                force_replicated=False,
+            )
+            if canonical_shared.shape != final_hidden_states.shape:
+                canonical_shared = select_glm52_local_mlp_rows(
+                    canonical_shared,
+                    final_hidden_states,
+                    forward_batch,
+                )
+            global _glm52_native_deepep_engagement_logged
+            if not _glm52_native_deepep_engagement_logged:
+                logger.info(
+                    "GLM-5.2 sampler native DeepEP split ENGAGED: "
+                    "routed=native_deepep_original_handle wire_dtype=bf16 "
+                    "routed_fold=canonical_moe_fold_fp64_v3 "
+                    "shared=aligned_cp_gather_tp16_bf16_fp64_v3 "
+                    "join=canonical_moe_leaf_fp32_v1"
+                )
+                _glm52_native_deepep_engagement_logged = True
+            # Routed scaling was applied to the FP32 route reduction before
+            # the DeepEP BF16 leaf. Join the independently canonical TP16
+            # shared branch without changing either communication contract.
+            return canonical_moe_leaf_fp32_v1(
+                canonical_shared,
+                final_hidden_states,
+            )
 
         if shared_output is not None:
             x = shared_output
@@ -3256,9 +3411,15 @@ class DeepseekV2Model(nn.Module):
                 raise RuntimeError(
                     f"GLM-5.2 canonical contract forbids: {', '.join(enabled)}"
                 )
-            if not get_moe_a2a_backend().is_none():
+            glm52_native_deepep = bool(getattr(config, "_deepep_native_exact", False))
+            if glm52_native_deepep:
+                a2a_valid = get_moe_a2a_backend().is_deepep()
+            else:
+                a2a_valid = get_moe_a2a_backend().is_none()
+            if not a2a_valid:
                 raise RuntimeError(
-                    "GLM-5.2 canonical contract requires moe_a2a_backend=none"
+                    "GLM-5.2 canonical contract requires moe_a2a_backend="
+                    f"{'deepep' if glm52_native_deepep else 'none'}"
                 )
             if server_args.moe_runner_backend != "triton":
                 raise RuntimeError(
@@ -3740,8 +3901,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
         self.num_fused_shared_experts = 0
-        server_args = get_server_args()
-
         if get_exec().moe.disable_shared_experts_fusion:
             return
 

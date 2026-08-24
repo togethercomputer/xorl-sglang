@@ -24,6 +24,7 @@ without needing a per-backend LoRA runner subclass.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable
 
@@ -35,6 +36,8 @@ from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+logger = logging.getLogger(__name__)
+_active_hook_engagement_logged = False
 
 if _is_cuda or _is_hip or _is_xpu:
     from sglang.kernels.ops.moe.moe_lora_align import moe_lora_align_block_size
@@ -188,6 +191,9 @@ class LoRAInfo:
 
     num_experts: int
     has_active_lora: bool = True
+    # Host-derived constant adapter slot for routes whose token ownership is
+    # moved by DeepEP. None means the physical batch is mixed.
+    single_adapter_id: int | None = None
     experts_shared_outer_loras: bool = False
     cg_buffers: dict | None = None
 
@@ -412,6 +418,7 @@ def _add_lora_down_delta(
     num_tokens_post_padded_lora: torch.Tensor | None,
     lora_ids: torch.Tensor | None,
     routing_cache: dict | None = None,
+    mul_routed_weight: bool = True,
 ) -> None:
     """Add LoRA down delta to intermediate_cache in-place."""
     from sglang.kernels.ops.moe.fused_moe_lora_kernel import fused_moe_lora
@@ -442,7 +449,7 @@ def _add_lora_down_delta(
             topk_ids=topk_ids,
             topk_weights=topk_weights,
             token_lora_mapping=token_lora_mapping,
-            mul_routed_weight=True,
+            mul_routed_weight=mul_routed_weight,
             experts_shared_outer_loras_a=False,
             experts_shared_outer_loras_b=lora_info.experts_shared_outer_loras,
             routing_cache=routing_cache,
@@ -476,7 +483,7 @@ def _add_lora_down_delta(
             expand_num_warps=4,
             expand_num_stages=2,
             expand_split_k=1,
-            mul_routed_weight=True,
+            mul_routed_weight=mul_routed_weight,
             fully_sharded=lora_info.fully_sharded,
             offset=offset,
         )
@@ -486,6 +493,8 @@ def build_lora_hooks(
     hidden_states: torch.Tensor,
     lora_info: LoRAInfo,
     topk_ids: torch.Tensor,
+    *,
+    mul_routed_weight: bool = True,
 ) -> LoRAHooks:
     """Build LoRA hook closures for injection into any MoE runner.
 
@@ -499,6 +508,16 @@ def build_lora_hooks(
     # graph (adapter_enabled is all-zero, kernels early-exit on GPU).
     if not get_is_capture_mode() and not lora_info.has_active_lora:
         return LoRAHooks()
+
+    global _active_hook_engagement_logged
+    if not _active_hook_engagement_logged:
+        logger.info(
+            "MoE active-LoRA hooks ENGAGED: max_rank=%d shared_outer=%s mul_routed_weight=%s",
+            lora_info.max_lora_rank,
+            lora_info.experts_shared_outer_loras,
+            mul_routed_weight,
+        )
+        _active_hook_engagement_logged = True
 
     # Compute alignment / mapping (once, shared by both hooks)
     token_lora_mapping: torch.Tensor | None = None
@@ -558,6 +577,7 @@ def build_lora_hooks(
             num_tokens_post_padded_lora,
             lora_ids,
             routing_cache=routing_cache,
+            mul_routed_weight=mul_routed_weight,
         )
 
     return LoRAHooks(after_gate_up=after_gate_up, after_down=after_down)

@@ -193,24 +193,41 @@ def _copy_output(dst: Any, src: Any) -> Any:
         and len(dst) == len(src)
     ):
         copied = [_copy_output(d, s) for d, s in zip(dst, src)]
-        return tuple(copied) if isinstance(dst, tuple) else copied
+        if isinstance(dst, list):
+            dst[:] = copied
+            return dst
+        if all(value is original for value, original in zip(copied, dst)):
+            return dst
+        return tuple(copied)
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
-            dst_val = getattr(dst, key, None)
-            if torch.is_tensor(dst_val) and torch.is_tensor(src_val):
-                dst_val.copy_(src_val)
-            else:
-                setattr(dst, key, src_val)
+            if not hasattr(dst, key):
+                object.__setattr__(dst, key, src_val)
+                continue
+            dst_val = getattr(dst, key)
+            copied_val = _copy_output(dst_val, src_val)
+            if copied_val is dst_val:
+                continue
+            try:
+                setattr(dst, key, copied_val)
+            except (AttributeError, TypeError):
+                # Frozen dataclasses such as CanonicalMoEOutput and its
+                # CanonicalRowSlots metadata still own mutable tensor storage.
+                # Preserve those object/tensor identities across replay while
+                # allowing non-tensor metadata to be refreshed.
+                object.__setattr__(dst, key, copied_val)
         return dst
 
     if isinstance(dst, dict) and isinstance(src, dict):
         for key, src_val in src.items():
-            dst_val = dst.get(key)
-            if torch.is_tensor(dst_val) and torch.is_tensor(src_val):
-                dst_val.copy_(src_val)
-            else:
+            if key not in dst:
                 dst[key] = src_val
+                continue
+            dst_val = dst[key]
+            copied_val = _copy_output(dst_val, src_val)
+            if copied_val is not dst_val:
+                dst[key] = copied_val
         return dst
 
     return src

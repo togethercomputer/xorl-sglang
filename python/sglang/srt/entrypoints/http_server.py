@@ -2674,7 +2674,7 @@ def _setup_and_run_http_server(
                 asyncio.run(_run_with_ssl_refresh())
             else:
                 # Default case, one tokenizer process
-                uvicorn.run(
+                config = uvicorn.Config(
                     app,
                     host=server_args.host,
                     port=server_args.port,
@@ -2687,6 +2687,11 @@ def _setup_and_run_http_server(
                     ssl_ca_certs=server_args.ssl_ca_certs,
                     ssl_keyfile_password=server_args.ssl_keyfile_password,
                 )
+                server = uvicorn.Server(config)
+                tokenizer_manager._http_server_shutdown_callback = lambda: setattr(
+                    server, "should_exit", True
+                )
+                server.run()
         else:
             # Multiple tokenizer and http processes
             from uvicorn.config import LOGGING_CONFIG
@@ -2825,6 +2830,12 @@ def launch_server(
         run_scheduler_process_func=run_scheduler_process_func,
         run_detokenizer_process_func=run_detokenizer_process_func,
     )
+
+    # A non-zero node owns schedulers only. _launch_subprocesses blocks until
+    # those schedulers exit and returns no tokenizer manager; falling through
+    # would incorrectly try to start FastAPI with tokenizer_manager=None.
+    if server_args.node_rank >= 1:
+        return
 
     if envs.SGLANG_RUST_SERVER.get():
         # The Rust server serves api-server, tokenizer, and detokenizer, so the

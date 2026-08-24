@@ -165,6 +165,25 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             deepep_mode=get_deepep_mode(),
             async_finish=True,
             return_recv_hook=True,
+            **(
+                {
+                    "deepep_native_exact": moe_runner_config.deepep_native_exact,
+                    "routed_scaling_factor": (
+                        1.0
+                        if (
+                            moe_runner_config.routed_scaling_factor_in_topk
+                            or moe_runner_config.deepep_native_exact_defer_routed_scale
+                        )
+                        else float(
+                            1.0
+                            if moe_runner_config.routed_scaling_factor is None
+                            else moe_runner_config.routed_scaling_factor
+                        )
+                    ),
+                }
+                if a2a_backend.is_deepep()
+                else {}
+            ),
         )
     elif a2a_backend.is_flashinfer():
         return FlashinferDispatcher(
@@ -256,6 +275,7 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        deepep_native_exact: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -339,6 +359,15 @@ class FusedMoE(torch.nn.Module):
         self.hidden_size = hidden_size
 
         server_args = get_server_args()
+        # ModelConfig deliberately clears this marker for draft/MTP models.
+        # Do not recover it from the process-wide target ServerArgs here.
+        deepep_native_exact = bool(deepep_native_exact)
+        # Native DeepEP transports the literal fused runner's BF16 rank-local
+        # leaf. Keep the stock local routing-weight and top-k combine program;
+        # only the cross-rank transport/fold changes.
+        if deepep_native_exact:
+            inplace = False
+            no_combine = False
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
@@ -360,6 +389,12 @@ class FusedMoE(torch.nn.Module):
             routing_method_type=routing_method_type,
             gate_up_interleaved=gate_up_interleaved,
             dsv4_exact_mode=bool(getattr(server_args, "dsv4_flash_exact_mode", False)),
+            glm52_exact_mode=bool(getattr(server_args, "glm52_exact_mode", False)),
+            deepep_native_exact=deepep_native_exact,
+            deepep_native_exact_defer_routed_scale=(
+                deepep_native_exact
+                and bool(getattr(server_args, "dsv4_flash_exact_mode", False))
+            ),
         )
 
         self.quant_method: Optional[FusedMoEMethodBase] = None
@@ -411,19 +446,6 @@ class FusedMoE(torch.nn.Module):
         )
 
         self.quant_method.create_moe_runner(self, self.moe_runner_config)
-        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
-        self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
-
-        if (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
-            or get_moe_runner_backend().is_flashinfer_trtllm()
-        ):
-            if self.moe_runner_config.inplace:
-                print_info_once(
-                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
-                )
-            self.moe_runner_config.inplace = False
-
         self.should_fuse_routed_scaling_factor_in_topk = (
             (
                 isinstance(self.quant_method, ModelOptNvFp4FusedMoEMethod)
@@ -443,6 +465,21 @@ class FusedMoE(torch.nn.Module):
                 and get_moe_runner_backend().is_flashinfer_trtllm_routed()
             )
         )
+        self.moe_runner_config.routed_scaling_factor_in_topk = (
+            self.should_fuse_routed_scaling_factor_in_topk
+        )
+        self.dispatcher = create_moe_dispatcher(self.moe_runner_config)
+        self._use_ascend_fuseep = get_moe_a2a_backend().is_ascend_fuseep()
+
+        if (
+            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            or get_moe_runner_backend().is_flashinfer_trtllm()
+        ):
+            if self.moe_runner_config.inplace:
+                print_info_once(
+                    "Setting inplace to False for FlashInfer TRTLLM MoE backend."
+                )
+            self.moe_runner_config.inplace = False
 
         self.routing_method_type = routing_method_type
 

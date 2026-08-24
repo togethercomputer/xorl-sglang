@@ -939,6 +939,18 @@ class TestDeterministicGlmDsa(unittest.TestCase):
             server_args.cuda_graph_config.decode.backend = Backend.DISABLED
             server_args._validate_glm52_exact_resolved_contract()
 
+            server_args.debug_tensor_dump_output_folder = "/tmp/glm52-components"
+            with self.assertRaisesRegex(ValueError, "outside explicit non-certifying"):
+                server_args._validate_glm52_exact_resolved_contract()
+            server_args.glm52_exact_diagnostic_tensor_dump = True
+            server_args._validate_glm52_exact_resolved_contract()
+            server_args.debug_tensor_dump_output_folder = None
+            with self.assertRaisesRegex(
+                ValueError, "requires debug_tensor_dump_output_folder"
+            ):
+                server_args._validate_glm52_exact_resolved_contract()
+            server_args.glm52_exact_diagnostic_tensor_dump = False
+
         with (
             patch.object(envs.SGLANG_ENABLE_CP_V2, "get", return_value=False),
             self.assertRaisesRegex(ValueError, "SGLANG_ENABLE_CP_V2"),
@@ -1031,6 +1043,146 @@ class TestDeterministicGlmDsa(unittest.TestCase):
             self.assertRaisesRegex(ValueError, "drifted.*attn_cp_size"),
         ):
             server_args._validate_glm52_exact_resolved_contract()
+
+    def test_glm52_xorl_admits_native_deepep_without_changing_dp1_cp16_topology(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.nnodes = 2
+        server_args.tp_size = 16
+        server_args.dp_size = 1
+        server_args.ep_size = 1
+        server_args.moe_a2a_backend = "deepep"
+        server_args.deepep_native_exact = True
+        server_args.disable_cuda_graph = True
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args._cuda_graph_config_locked = set()
+        hf_config = self._glm_model_config().hf_config
+
+        server_args._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_dsa_model=True,
+        )
+        server_args._resolve_deepep_native_exact_contract(
+            hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+        )
+
+        self.assertTrue(hf_config._deepep_native_exact)
+        self.assertEqual(server_args.moe_a2a_backend, "deepep")
+        self.assertEqual(server_args.moe_runner_backend, "triton")
+        self.assertEqual(server_args.quantization, "fp8")
+        self.assertEqual(server_args.tp_size, 16)
+        self.assertEqual(server_args.ep_size, 16)
+        self.assertEqual(server_args.dp_size, 1)
+        self.assertEqual(server_args.attn_cp_size, 16)
+        self.assertTrue(server_args.disable_cuda_graph)
+
+        server_args.page_size = 64
+        server_args.enable_dp_attention = True
+        with (
+            patch.object(envs.SGLANG_ENABLE_CP_V2, "get", return_value=True),
+            patch.object(
+                envs.SGLANG_DISABLE_DSA_INDEXER_FUSION,
+                "get",
+                return_value=False,
+            ),
+        ):
+            server_args._validate_glm52_exact_resolved_contract()
+
+    def test_glm52_native_deepep_auto_keeps_full_decode_graph(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.rl_on_policy_target = "xorl"
+        server_args.nnodes = 2
+        server_args.tp_size = 16
+        server_args.dp_size = 1
+        server_args.ep_size = 1
+        server_args.moe_a2a_backend = "deepep"
+        server_args.deepep_native_exact = True
+        server_args.deepep_mode = "auto"
+        server_args.disable_cuda_graph = False
+        server_args.cuda_graph_config = CudaGraphConfig()
+        server_args._cuda_graph_config_locked = set()
+        hf_config = self._glm_model_config().hf_config
+
+        server_args._resolve_glm52_exact_contract(
+            hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+            is_dsa_model=True,
+        )
+        server_args._resolve_deepep_native_exact_contract(
+            hf_config,
+            model_arch="GlmMoeDsaForCausalLM",
+        )
+
+        self.assertEqual(server_args.ep_size, 16)
+        self.assertEqual(server_args.deepep_mode, "auto")
+        self.assertFalse(server_args.disable_cuda_graph)
+        self.assertEqual(server_args.cuda_graph_config.decode.backend, Backend.FULL)
+        self.assertEqual(
+            server_args.cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+
+    def test_native_deepep_deterministic_requires_patched_runtime_abi(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.deepep_native_exact = True
+        stock_deepep = SimpleNamespace(
+            Buffer=type(
+                "StockBuffer",
+                (),
+                {
+                    "combine": lambda self, x, handle: None,
+                    "low_latency_dispatch": lambda self, x, topk_idx: None,
+                    "low_latency_combine": lambda self, x, handle: None,
+                },
+            )
+        )
+
+        with (
+            patch.object(
+                server_args_module.importlib,
+                "import_module",
+                return_value=stock_deepep,
+            ),
+            self.assertRaisesRegex(ValueError, "XoRL patched DeepEP ABI"),
+        ):
+            server_args._validate_native_deepep_runtime_abi()
+
+    def test_native_deepep_deterministic_accepts_patched_runtime_abi(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.deepep_native_exact = True
+
+        class PatchedBuffer:
+            def combine(self, x, handle, *, reduction_mode=None):
+                pass
+
+            def low_latency_dispatch(
+                self, x, topk_idx, *, topk_weights=None, reduction_mode=None
+            ):
+                pass
+
+            def low_latency_combine(
+                self,
+                x,
+                handle,
+                *,
+                reduction_mode=None,
+                input_is_preweighted=False,
+                routed_scaling_factor=1.0,
+            ):
+                pass
+
+        patched_deepep = SimpleNamespace(
+            ReductionMode=SimpleNamespace(DETERMINISTIC=object()),
+            LowLatencyReductionMode=SimpleNamespace(DETERMINISTIC=object()),
+            Buffer=PatchedBuffer,
+        )
+        with patch.object(
+            server_args_module.importlib,
+            "import_module",
+            return_value=patched_deepep,
+        ):
+            server_args._validate_native_deepep_runtime_abi()
 
     def test_glm52_xorl_derives_every_mixed_dp_cp_factorization(self):
         for dp_size, cp_size in ((2, 8), (4, 4), (8, 2)):
@@ -2115,6 +2267,51 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertEqual(server_args.deepep_mode, "low_latency")
         self.assertFalse(server_args.disable_cuda_graph)
         self.assertTrue(server_args.enforce_shared_experts_fusion)
+
+
+class TestDeepEPNormalCudaGraphPolicy(CustomTestCase):
+    def _args(self, *, decode_backend, prefill_backend):
+        args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="deepep",
+            deepep_mode="normal",
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            decode=PhaseConfig(backend=decode_backend),
+            prefill=PhaseConfig(backend=prefill_backend),
+        )
+        args._handle_a2a_moe()
+        return args
+
+    def test_preserves_only_breakable_decode_with_disabled_prefill(self):
+        args = self._args(
+            decode_backend=Backend.BREAKABLE,
+            prefill_backend=Backend.DISABLED,
+        )
+
+        self.assertEqual(args.cuda_graph_config.decode.backend, Backend.BREAKABLE)
+        self.assertEqual(args.cuda_graph_config.prefill.backend, Backend.DISABLED)
+
+    def test_disables_unqualified_graph_combinations(self):
+        for decode_backend, prefill_backend in (
+            (Backend.FULL, Backend.DISABLED),
+            (Backend.BREAKABLE, Backend.BREAKABLE),
+            (Backend.TC_PIECEWISE, Backend.DISABLED),
+        ):
+            with self.subTest(
+                decode_backend=decode_backend,
+                prefill_backend=prefill_backend,
+            ):
+                args = self._args(
+                    decode_backend=decode_backend,
+                    prefill_backend=prefill_backend,
+                )
+                self.assertEqual(
+                    args.cuda_graph_config.decode.backend, Backend.DISABLED
+                )
+                self.assertEqual(
+                    args.cuda_graph_config.prefill.backend, Backend.DISABLED
+                )
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

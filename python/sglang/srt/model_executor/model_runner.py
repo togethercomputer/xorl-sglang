@@ -1434,6 +1434,7 @@ class ModelRunner:
 
         lora_manager = getattr(self, "lora_manager", None)
         if lora_manager is not None:
+            lora_manager.prepare_deepep_native_exact_dp_lora_batch(forward_batch)
             lora_manager.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
             lora_manager.prepare_glm52_exact_dp_lora_batch(forward_batch)
 
@@ -1578,11 +1579,18 @@ class ModelRunner:
             not self.is_draft_worker
             and (experts_capturer := get_global_experts_capturer()) is not None
         ):
+            outgoing_pp_proxy_tensors = (
+                output.logits_output
+                if isinstance(output.logits_output, PPProxyTensors)
+                else None
+            )
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
                 can_run_graph=output.can_run_graph,
                 cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
                 no_copy_to_cpu=no_copy_to_cpu,
+                incoming_pp_proxy_tensors=pp_proxy_tensors,
+                outgoing_pp_proxy_tensors=outgoing_pp_proxy_tensors,
             )
 
         if (indexer_capturer := get_global_indexer_capturer()) is not None:

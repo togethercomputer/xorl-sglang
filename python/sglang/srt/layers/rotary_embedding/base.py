@@ -151,10 +151,14 @@ class RotaryEmbedding(BaseFusedOp):
         deterministic = get_exec().deterministic
         if deterministic.rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
-            # Both GLM-5.2 and exact Qwen3.5-family serving use the compiled
-            # Class-B expression selected by their architecture contracts.
-            if not deterministic.qwen35_gdn_exact_mode or getattr(
-                deterministic, "qwen35_rope_class_b", False
+            qwen35_class_b = getattr(deterministic, "qwen35_rope_class_b", False)
+            # Qwen3 dense exact serving uses the eager BF16 Class-A
+            # expression paired with its trainer. GLM-5.2, generic RL
+            # targets, and Qwen3.5 when its architecture contract explicitly
+            # selects Class B retain the compiled expression.
+            if qwen35_class_b or (
+                not deterministic.qwen35_gdn_exact_mode
+                and not getattr(deterministic, "qwen3_dense_exact_mode", False)
             ):
                 self._apply_rotary_emb_wrapped = torch.compile(
                     dynamic=True,

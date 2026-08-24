@@ -1,4 +1,11 @@
-ARG CUDA_VERSION=13.0.1
+ARG CUDA_VERSION=13.2.0
+ARG DEEPEP_GPU_TARGET=sm90
+ARG DEEPEP_WHEEL_URL=https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/deep_ep-1.2.1%2B65538ab.xorl.c85744ca7250-cp312-cp312-linux_x86_64.whl
+ARG DEEPEP_WHEEL_SHA256=f30485d585a4cd935f44ffadd276d7ea8603a919cff60302bbb40ded344cdccb
+ARG DEEPEP_SOURCE_URL=https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/deep_ep-1.2.1%2B65538ab.xorl.c85744ca7250.tar.gz
+ARG DEEPEP_SOURCE_SHA256=1c191d78d0132049ac6caa988266d2fa4502d78a26735d65bd46b5fa18ee5f77
+ARG SGL_KERNEL_WHEEL_URL=https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/sglang_kernel-0.4.5%2Bxorl.torch212.cu132.sm90-cp312-cp312-linux_x86_64.whl
+ARG SGL_KERNEL_WHEEL_SHA256=f02e35414c18fd311ce29b7d27c9a07678f3932a9be3cabfec8d322f7b738f21
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -177,8 +184,12 @@ ENV LANG=en_US.UTF-8 \
 FROM base AS torch_deps
 
 ARG CUDA_VERSION
+ARG TARGETARCH
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
+ARG DEEPEP_GPU_TARGET
+ARG SGL_KERNEL_WHEEL_URL
+ARG SGL_KERNEL_WHEEL_SHA256
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
@@ -193,20 +204,32 @@ RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.ru
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
+    && target_arch="${TARGETARCH:-$(uname -m)}" \
     && case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
         12.8.1) CUINDEX=128 ;; \
         12.9.1) CUINDEX=129 ;; \
         13.0.1) CUINDEX=130 ;; \
+        13.1.1|13.2.0) CUINDEX=132 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
-    && if [ "$CUDA_VERSION" = "12.6.1" ]; then \
+    && if [ "$DEEPEP_GPU_TARGET" = "sm90" ]; then \
+        test "$CUDA_VERSION" = "13.2.0"; \
+        { [ "$target_arch" = "amd64" ] || [ "$target_arch" = "x86_64" ]; }; \
+        test -n "$SGL_KERNEL_WHEEL_URL"; \
+        test -n "$SGL_KERNEL_WHEEL_SHA256"; \
+        wheel_name="$(basename "$SGL_KERNEL_WHEEL_URL" | sed 's/%2[Bb]/+/g')"; \
+        curl --retry 3 --retry-delay 2 -fsSL -o "/tmp/$wheel_name" "$SGL_KERNEL_WHEEL_URL"; \
+        echo "$SGL_KERNEL_WHEEL_SHA256  /tmp/$wheel_name" | sha256sum -c -; \
+        python3 -m pip install "/tmp/$wheel_name" --force-reinstall --no-deps; \
+        rm "/tmp/$wheel_name"; \
+    elif [ "$CUDA_VERSION" = "12.6.1" ]; then \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
         python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
-    elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
+    elif [ "$CUDA_VERSION" = "13.0.1" ] || [ "$CUDA_VERSION" = "13.1.1" ] || [ "$CUDA_VERSION" = "13.2.0" ]; then \
         # --no-deps prevents pip from pulling torch from default PyPI
         python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
     ; \
@@ -233,6 +256,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         12.8.1) CUINDEX=128 ;; \
         12.9.1) CUINDEX=129 ;; \
         13.0.1) CUINDEX=130 ;; \
+        13.1.1|13.2.0) CUINDEX=132 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && cd /tmp/sglang_deps/python \
@@ -241,6 +265,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
+    && if [ "$DEEPEP_GPU_TARGET" != "sm90" ]; then \
+           sed -E -i "s|sglang-kernel @ https://github.com/togethercomputer/xorl-wheels/releases/download/[^\"]+|sglang-kernel==${SGL_KERNEL_VERSION}|" pyproject.toml && \
+           sed -i 's/torch==2\.12\.1/torch==2.11.0/' pyproject.toml && \
+           sed -i 's/torchcodec==0\.15\.0/torchcodec==0.11.1/' pyproject.toml && \
+           sed -i 's/torchvision==0\.27\.1/torchvision==0.26.0/' pyproject.toml; \
+       fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
@@ -268,18 +298,63 @@ RUN python3 -m pip install --ignore-installed --no-deps distro
 FROM torch_deps AS deepep_builder
 
 ARG CUDA_VERSION
+ARG TARGETARCH
 ARG BUILD_AND_DOWNLOAD_PARALLEL
 ARG GRACE_BLACKWELL
 ARG HOPPER_SBO
 ARG HOPPER_SBO_DEEPEP_COMMIT
 ARG DEEPEP_COMMIT
+ARG DEEPEP_WHEEL_URL
+ARG DEEPEP_WHEEL_SHA256
+ARG DEEPEP_SOURCE_URL
+ARG DEEPEP_SOURCE_SHA256
+ARG DEEPEP_GPU_TARGET
 ARG GITHUB_ARTIFACTORY
 
 WORKDIR /build
 
-# Clone DeepEP
+# The certified Hopper profile installs the released sm90 wheel.  An explicitly
+# selected multiarch x86 CUDA 13 profile builds the same patched source for its
+# broader target set, but that separate artifact is not exact-qualified here.
 RUN set -eux; \
-    if [ "$GRACE_BLACKWELL" = "1" ]; then \
+    target_arch="${TARGETARCH:-$(uname -m)}"; \
+    use_xorl_wheel=0; \
+    use_xorl_source=0; \
+    if [ "$DEEPEP_GPU_TARGET" = "sm90" ]; then \
+      test "$CUDA_VERSION" = "13.2.0"; \
+      { [ "$target_arch" = "amd64" ] || [ "$target_arch" = "x86_64" ]; }; \
+      test "$GRACE_BLACKWELL" = "0"; \
+      test "$HOPPER_SBO" = "0"; \
+      test -n "$DEEPEP_SOURCE_URL"; \
+      test -n "$DEEPEP_SOURCE_SHA256"; \
+      test -n "$DEEPEP_WHEEL_URL"; \
+      test -n "$DEEPEP_WHEEL_SHA256"; \
+      use_xorl_source=1; \
+      use_xorl_wheel=1; \
+    elif [ -n "$DEEPEP_SOURCE_URL" ] \
+       && [ "$CUDA_VERSION" = "13.2.0" ] \
+       && { [ "$target_arch" = "amd64" ] || [ "$target_arch" = "x86_64" ]; } \
+       && [ "$GRACE_BLACKWELL" = "0" ] \
+       && [ "$HOPPER_SBO" = "0" ]; then \
+      use_xorl_source=1; \
+    fi; \
+    if [ "$use_xorl_source" = "1" ]; then \
+      test -n "$DEEPEP_SOURCE_URL"; \
+      test -n "$DEEPEP_SOURCE_SHA256"; \
+      python3 -c 'import sys, torch; print(torch.__version__, torch.version.cuda); sys.exit(0 if torch.__version__ == "2.12.1+cu132" and torch.version.cuda == "13.2" else 1)'; \
+      mkdir -p DeepEP; \
+      curl --retry 3 --retry-delay 2 -fsSL -o deepep-source.tar.gz "$DEEPEP_SOURCE_URL"; \
+      echo "$DEEPEP_SOURCE_SHA256  deepep-source.tar.gz" | sha256sum -c -; \
+      tar -xzf deepep-source.tar.gz --strip-components=1 -C DeepEP; \
+      rm deepep-source.tar.gz; \
+      if [ "$use_xorl_wheel" = "1" ]; then \
+        mkdir -p /wheels; \
+        wheel_name="$(basename "$DEEPEP_WHEEL_URL" | sed 's/%2[Bb]/+/g')"; \
+        curl --retry 3 --retry-delay 2 -fsSL -o "/wheels/$wheel_name" "$DEEPEP_WHEEL_URL"; \
+        echo "$DEEPEP_WHEEL_SHA256  /wheels/$wheel_name" | sha256sum -c -; \
+        touch /build/.use_xorl_deepep_wheel; \
+      fi; \
+    elif [ "$GRACE_BLACKWELL" = "1" ]; then \
       if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
         git clone https://github.com/fzyzcjy/DeepEP.git && \
         cd DeepEP && \
@@ -313,26 +388,28 @@ RUN set -eux; \
 
 # Build DeepEP wheel
 RUN --mount=type=cache,target=/root/.cache/pip \
-    cd /build/DeepEP && \
-    case "$CUDA_VERSION" in \
+    if [ ! -f /build/.use_xorl_deepep_wheel ]; then \
+      cd /build/DeepEP && \
+      case "$CUDA_VERSION" in \
         12.6.1) \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0' \
             ;; \
         12.8.1) \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0' \
             ;; \
-        12.9.1|13.0.1) \
+        12.9.1|13.0.1|13.1.1|13.2.0) \
             CHOSEN_TORCH_CUDA_ARCH_LIST='9.0;10.0;10.3' \
             ;; \
         *) \
             echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
             ;; \
-    esac && \
-    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+      esac && \
+      if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
         sed -i "/^    include_dirs = \['csrc\/'\]/a\    include_dirs.append('${CUDA_HOME}/include/cccl')" setup.py; \
-    fi && \
-    TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} \
-        python3 setup.py bdist_wheel -d /wheels
+      fi && \
+      TORCH_CUDA_ARCH_LIST="${CHOSEN_TORCH_CUDA_ARCH_LIST}" MAX_JOBS=${BUILD_AND_DOWNLOAD_PARALLEL} \
+          python3 setup.py bdist_wheel -d /wheels; \
+    fi
 
 ########################################################
 # PARALLEL STAGE 3: HPC-Ops Builder (needs torch_deps)
@@ -374,6 +451,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         12.8.1) CUINDEX=128 ;; \
         12.9.1) CUINDEX=129 ;; \
         13.0.1) CUINDEX=130 ;; \
+        13.1.1|13.2.0) CUINDEX=132 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
@@ -665,6 +743,8 @@ FROM framework AS framework_final
 ARG BRANCH_TYPE
 ARG BUILD_TYPE
 ARG CUDA_VERSION
+ARG DEEPEP_GPU_TARGET
+ARG SGL_KERNEL_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 
@@ -686,6 +766,12 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 # Clean up __pycache__/tests/pyc in same RUN to avoid writing ~28k files to layer
 RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
+    && if [ "$DEEPEP_GPU_TARGET" != "sm90" ]; then \
+           sed -E -i "s|sglang-kernel @ https://github.com/togethercomputer/xorl-wheels/releases/download/[^\"]+|sglang-kernel==${SGL_KERNEL_VERSION}|" python/pyproject.toml && \
+           sed -i 's/torch==2\.12\.1/torch==2.11.0/' python/pyproject.toml && \
+           sed -i 's/torchcodec==0\.15\.0/torchcodec==0.11.1/' python/pyproject.toml && \
+           sed -i 's/torchvision==0\.27\.1/torchvision==0.26.0/' python/pyproject.toml; \
+       fi \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \

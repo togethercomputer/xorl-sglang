@@ -4151,7 +4151,11 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
     "k_proj",
     "v_proj",
+    # Qwen3.5 trainer/serving GDN projection spellings.
+    "g_proj",
     "o_proj",
+    "out_proj",
+    "in_proj_qkvz",
     "q_a_proj",
     "kv_a_proj_with_mqa",
     "q_b_proj",

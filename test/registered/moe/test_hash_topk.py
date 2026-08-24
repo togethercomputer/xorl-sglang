@@ -13,6 +13,9 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.state_capturer.routed_experts import (
+    disable_routed_experts_capture_for_draft,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
@@ -29,6 +32,16 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     )
     recorded = {}
 
+    def fake_capture(topk_config, layer_id, topk_ids, topk_weights):
+        recorded["capture_config"] = topk_config
+        recorded["capture_layer_id"] = layer_id
+        recorded["capture_topk_ids"] = topk_ids.clone()
+        recorded["capture_topk_weights"] = topk_weights.clone()
+
+    monkeypatch.setattr(
+        hash_topk_module, "capture_routed_experts_if_allowed", fake_capture
+    )
+
     class FakeRecorder:
         def on_select_experts(self, *, topk_ids):
             recorded["topk_ids"] = topk_ids.clone()
@@ -44,6 +57,7 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
         vocab_size=2,
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=2.5,
+        layer_id=7,
     )
     with torch.no_grad():
         topk.tid2eid.copy_(torch.tensor([[0, 65], [63, 127]], dtype=torch.int32))
@@ -78,6 +92,17 @@ def test_hash_topk_remaps_per_rank_fused_shared_slots(monkeypatch):
     assert output.topk_ids.tolist() == [[0, 66, 194], [63, 128, 194]]
     assert torch.allclose(output.topk_weights[:, -1], torch.full((2,), 0.4))
     assert recorded["topk_ids"].tolist() == [[0, 65], [63, 127]]
+    # R3 captures the logical route, not the physical slots consumed locally.
+    assert recorded["capture_layer_id"] == 7
+    assert recorded["capture_config"] is topk.topk_config
+    assert recorded["capture_topk_ids"].tolist() == [
+        [0, 65, 256],
+        [63, 127, 256],
+    ]
+    assert torch.allclose(
+        recorded["capture_topk_weights"],
+        torch.tensor([[0.5, 0.5, 0.4], [0.5, 0.5, 0.4]]),
+    )
 
 
 def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
@@ -98,6 +123,20 @@ def test_hash_topk_empty_output_keeps_per_rank_shared_slot(monkeypatch):
     assert output.topk_ids.shape == (0, 7)
     assert output.topk_weights.shape == (0, 7)
     assert output.router_logits.shape == (0, 6)
+
+
+def test_hash_topk_draft_router_cannot_write_target_capture():
+    topk = HashTopK(
+        topk=2,
+        num_experts=8,
+        num_fused_shared_experts=0,
+        vocab_size=2,
+    )
+    assert topk.topk_config.allow_routed_experts_capture
+
+    disable_routed_experts_capture_for_draft(torch.nn.Sequential(topk))
+
+    assert not topk.topk_config.allow_routed_experts_capture
 
 
 def test_deepep_empty_forward_does_not_append_shared_slot_twice():

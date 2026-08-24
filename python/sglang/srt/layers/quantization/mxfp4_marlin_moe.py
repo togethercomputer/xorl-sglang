@@ -7,7 +7,7 @@ import torch
 from torch.nn import Module
 
 from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
-from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
 from sglang.srt.utils import log_info_on_rank0, round_up, set_weight_attrs
 from sglang.srt.utils.common import is_sm90_supported, is_sm120_supported
 
@@ -26,6 +26,17 @@ def build_marlin_moe_quant_info(layer: Module) -> MarlinMoeQuantInfo:
     """
     expert_map = getattr(layer.dispatcher, "local_expert_mapping", None)
     global_num_experts = layer.dispatcher.num_experts if expert_map is not None else -1
+    if get_moe_a2a_backend().is_deepep():
+        # DeepEP has already converted global routes to rank-local IDs and
+        # retained -1 for non-local slots.  Marlin still needs EP mode for
+        # those sentinels and the global expert count for its fixed geometry;
+        # the mapping tensor itself is only an EP-mode witness downstream.
+        expert_map = torch.empty(
+            0,
+            dtype=torch.int32,
+            device=layer.w13_weight.device,
+        )
+        global_num_experts = layer.num_experts
     return MarlinMoeQuantInfo(
         w13_qweight=layer.w13_weight,
         w2_qweight=layer.w2_weight,
@@ -173,12 +184,19 @@ class Mxfp4MarlinMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
         from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
-        topk_output = dispatch_output.topk_output
-        if not TopKOutputChecker.format_is_standard(topk_output):
-            raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+        if not (
+            DispatchOutputChecker.format_is_deepep_normal(dispatch_output)
+            or DispatchOutputChecker.format_is_deepep_ll(dispatch_output)
+        ):
+            topk_output = dispatch_output.topk_output
+            if not TopKOutputChecker.format_is_standard(topk_output):
+                raise ValueError(
+                    f"Unsupported topk output format: {topk_output.format}"
+                )
         hidden_states = dispatch_output.hidden_states
         target_hidden_size = layer.w13_weight.shape[1] * 16
         if hidden_states.shape[-1] == target_hidden_size:
@@ -196,5 +214,10 @@ class Mxfp4MarlinMoEMethod:
             dispatch_output._replace(hidden_states=hidden_states_padded),
             quant_info=quant_info,
         )
+
+        from sglang.srt.layers.moe.token_dispatcher import CombineInputChecker
+
+        if CombineInputChecker.format_is_deepep(runner_output):
+            return runner_output
 
         return StandardCombineInput(hidden_states=runner_output.hidden_states)

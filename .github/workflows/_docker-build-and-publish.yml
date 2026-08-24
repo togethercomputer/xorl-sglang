@@ -122,6 +122,7 @@ jobs:
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=12.9.1 \
             --build-arg BUILD_TYPE=all \
+            --build-arg DEEPEP_GPU_TARGET=multiarch \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             "${METADATA_ARGS[@]}" \
@@ -144,6 +145,9 @@ jobs:
           fi
           mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
 
+          # The public multi-architecture image retains its CUDA 13.0 / Torch
+          # 2.11 generic ABI. XoRL's certified H100 image uses the Dockerfile's
+          # sm90 default and installs both locked Torch 2.12 release wheels.
           docker buildx build \
             --target ${{ inputs.docker_target }} \
             --platform linux/amd64 \
@@ -151,6 +155,7 @@ jobs:
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=all \
+            --build-arg DEEPEP_GPU_TARGET=multiarch \
             --build-arg GRACE_BLACKWELL=0 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             "${METADATA_ARGS[@]}" \
@@ -234,6 +239,7 @@ jobs:
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=12.9.1 \
             --build-arg BUILD_TYPE=all \
+            --build-arg DEEPEP_GPU_TARGET=multiarch \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             "${METADATA_ARGS[@]}" \
@@ -256,6 +262,8 @@ jobs:
           fi
           mapfile -t METADATA_ARGS < /tmp/docker-metadata-cu130.args
 
+          # Keep both architectures on the existing CUDA 13.0 / Torch 2.11
+          # ABI in the generic manifest. ARM64 follows its guarded source path.
           docker buildx build \
             --target ${{ inputs.docker_target }} \
             --platform linux/arm64 \
@@ -263,6 +271,7 @@ jobs:
             -f docker/Dockerfile \
             --build-arg CUDA_VERSION=13.0.1 \
             --build-arg BUILD_TYPE=all \
+            --build-arg DEEPEP_GPU_TARGET=multiarch \
             --build-arg GRACE_BLACKWELL=1 \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             "${METADATA_ARGS[@]}" \

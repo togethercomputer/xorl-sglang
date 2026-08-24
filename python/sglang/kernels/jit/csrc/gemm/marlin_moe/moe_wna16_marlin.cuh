@@ -613,6 +613,7 @@ void marlin_mm(
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce,
+    int expert_block_partition_count,
     bool is_zp_float) {
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
@@ -704,7 +705,14 @@ void marlin_mm(
   host::RuntimeDeviceCheck(cudaDeviceGetAttribute(&max_shared_mem, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
   host::RuntimeCheck(max_shared_mem > 0);
 
-  // Set thread config
+  host::RuntimeCheck(
+      expert_block_partition_count >= 1 && expert_block_partition_count <= 64,
+      "expert_block_partition_count must be in [1, 64], got ",
+      expert_block_partition_count);
+
+  // Set thread config. A fixed expert-block partition represents one valid
+  // route per virtual problem, so select the same execution configuration as
+  // the top-k1/single-row program that it must reproduce byte-for-byte.
   exec_config_t exec_cfg;
   thread_config_t thread_tfg;
   if (thread_k != -1 && thread_n != -1) {
@@ -714,12 +722,14 @@ void marlin_mm(
     host::RuntimeCheck(prob_k % thread_k == 0, "prob_k = ", prob_k, " is not divisible by thread_k = ", thread_k);
   } else {
     // Auto config
+    int exec_prob_m = expert_block_partition_count > 1 ? 1 : prob_m;
+    int exec_top_k = expert_block_partition_count > 1 ? 1 : top_k;
     exec_cfg = determine_exec_config<scalar_t, kIsEP, kHasBias>(
         q_type,
-        prob_m,
+        exec_prob_m,
         prob_n,
         prob_k,
-        top_k,
+        exec_top_k,
         thread_m_blocks,
         m_block_size_8,
         num_bits,
@@ -736,7 +746,7 @@ void marlin_mm(
   int num_threads = thread_tfg.num_threads;
   thread_k = thread_tfg.thread_k;
   thread_n = thread_tfg.thread_n;
-  int blocks = sms * exec_cfg.blocks_per_sm;
+  int blocks = sms * exec_cfg.blocks_per_sm * expert_block_partition_count;
   if (exec_cfg.blocks_per_sm > 1) max_shared_mem = max_shared_mem / exec_cfg.blocks_per_sm - kSharedMemoryLaunchReserve;
 
   int thread_k_blocks = thread_k / 16;
@@ -829,7 +839,8 @@ void marlin_mm(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
-      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce,
+      expert_block_partition_count, max_shared_mem);
   // clang-format on
 }
 
@@ -871,6 +882,7 @@ void moe_wna16_marlin_gemm(
     int64_t group_size,
     bool use_atomic_add,
     bool use_fp32_reduce,
+    int64_t expert_block_partition_count,
     bool is_zp_float) {
   using namespace host;
 
@@ -1112,5 +1124,6 @@ void moe_wna16_marlin_gemm(
       sms,
       use_atomic_add,
       use_fp32_reduce,
+      static_cast<int>(expert_block_partition_count),
       is_zp_float);
 }

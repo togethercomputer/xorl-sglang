@@ -31,15 +31,68 @@ from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner_utils.buffers import (
     add_dsv4_exact_pp_proxy_buffers,
 )
+from sglang.srt.models.deepseek_v2 import _select_hash_topk_input_ids
 from sglang.srt.models.deepseek_v4 import (
     DeepseekV4Model,
     MQALayer,
+    _select_dsv4_layer_input_ids,
     pack_dsv4_exact_pp_proxy,
     unpack_dsv4_exact_pp_proxy,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def test_hash_topk_uses_cp_local_ids_for_cp_local_deepep_rows():
+    hidden = torch.zeros((4, 8))
+    local_ids = torch.tensor([11, 12, 13, 14])
+    global_ids = torch.arange(10)
+
+    assert _select_hash_topk_input_ids(hidden, local_ids, global_ids) is local_ids
+
+
+def test_hash_topk_uses_global_ids_for_dp_gathered_deepep_rows():
+    hidden = torch.zeros((10, 8))
+    local_ids = torch.arange(4)
+    global_ids = torch.arange(10)
+
+    assert _select_hash_topk_input_ids(hidden, local_ids, global_ids) is global_ids
+
+
+def test_hash_topk_rejects_ids_from_a_different_row_layout():
+    hidden = torch.zeros((6, 8))
+
+    with pytest.raises(RuntimeError, match="expected=\\(6,\\)"):
+        _select_hash_topk_input_ids(hidden, torch.arange(4), torch.arange(10))
+
+
+def test_dsv4_cp_v2_layers_use_boundary_sharded_token_ids():
+    global_ids = torch.arange(10)
+    local_ids = torch.tensor([0, 4, 8, 0])
+    hidden = torch.zeros((4, 3, 8))
+    forward_batch = SimpleNamespace(cp_v2_input_ids=local_ids)
+
+    selected = _select_dsv4_layer_input_ids(
+        global_ids,
+        hidden,
+        forward_batch,
+        context_sharded=True,
+        cp_v2_active=True,
+    )
+
+    assert selected is local_ids
+
+
+def test_dsv4_cp_v2_layers_reject_unaligned_boundary_ids():
+    with pytest.raises(RuntimeError, match="model-body rows"):
+        _select_dsv4_layer_input_ids(
+            torch.arange(10),
+            torch.zeros((4, 3, 8)),
+            SimpleNamespace(cp_v2_input_ids=torch.arange(3)),
+            context_sharded=True,
+            cp_v2_active=True,
+        )
 
 
 def test_fused_mhc_proxy_round_trips_every_live_operand_bitwise():

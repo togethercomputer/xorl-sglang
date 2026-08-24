@@ -18,6 +18,7 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPDispatcher,
     DeepEPLLCombineInput,
     DeepEPLLDispatchOutput,
+    DeepEPLLExactDispatchOutput,
     DeepEPNormalCombineInput,
     DeepEPNormalDispatchOutput,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "DeepEPDispatcher",
     "DeepEPNormalDispatchOutput",
     "DeepEPLLDispatchOutput",
+    "DeepEPLLExactDispatchOutput",
     "DeepEPLLCombineInput",
     "DeepEPNormalCombineInput",
     "AscendTPDispatcher",

@@ -77,6 +77,10 @@ class LoRABatchInfo:
     # MoE LoRA batch info
     moe_lora_info: Optional[MoELoRABatchInfo] = None
 
+    # Host-derived constant active adapter slot for the entire physical batch.
+    # None means base-only or mixed adapters.
+    single_adapter_id: Optional[int] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0
@@ -278,6 +282,11 @@ def get_normalized_target_modules(
         "q_proj": "qkv_proj",
         "k_proj": "qkv_proj",
         "v_proj": "qkv_proj",
+        # Qwen3.5 trainers expose the GDN z projection as ``g_proj`` while
+        # the serving model packs q/k/v/z into ``in_proj_qkvz``.  q/k/v also
+        # occur in full-attention layers and therefore continue to select
+        # qkv_proj; g_proj contributes the additional GDN packed target.
+        "g_proj": "in_proj_qkvz",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
         "out_proj": "out_proj",

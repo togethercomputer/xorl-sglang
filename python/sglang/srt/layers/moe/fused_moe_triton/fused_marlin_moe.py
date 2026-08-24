@@ -229,6 +229,7 @@ def fused_marlin_moe(
     activation: str = "silu",
     is_gated: bool = True,
     dsv4_exact_mode: bool = False,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -313,7 +314,11 @@ def fused_marlin_moe(
         # local expert blocks in the launch. Use the same one-token program for
         # batched and singleton execution so unrelated routes cannot change
         # that reduction tree.
-        chunked_out = torch.empty_like(hidden_states)
+        chunked_out = (
+            hidden_states.new_empty((M, topk, K))
+            if no_combine
+            else torch.empty_like(hidden_states)
+        )
         for chunk_start in range(M):
             chunk_stop = chunk_start + 1
             chunked_out[chunk_start:chunk_stop] = fused_marlin_moe(
@@ -347,8 +352,9 @@ def fused_marlin_moe(
                 activation=activation,
                 is_gated=is_gated,
                 dsv4_exact_mode=dsv4_exact_mode,
+                no_combine=no_combine,
             )
-        if inplace:
+        if inplace and not no_combine:
             hidden_states.copy_(chunked_out)
             return hidden_states
         return chunked_out
@@ -421,6 +427,13 @@ def fused_marlin_moe(
         hidden_states.dtype == torch.half
         or torch.cuda.get_device_capability(hidden_states.device)[0] >= 9
     ) and (not is_mxfp4_marlin)
+    # DSV4's certified route is the active-LoRA Marlin runner, including the
+    # pre-optimizer all-zero LoRA-B state.  Server startup also executes a
+    # no-adapter fused warmup; keep that non-admitted control on the stock
+    # scheduler so it cannot create rank skew long enough to time out DeepEP.
+    # MarlinLoraRunnerCore owns the fixed per-route partitions for the admitted
+    # active-LoRA normal program.
+    expert_block_partition_count = 1
 
     intermediate_cache1 = moe_wna16_marlin_gemm(
         hidden_states,
@@ -448,6 +461,7 @@ def fused_marlin_moe(
         is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
+        expert_block_partition_count=expert_block_partition_count,
         is_zp_float=False,
     )
 
@@ -502,7 +516,11 @@ def fused_marlin_moe(
         topk_weights,
         moe_block_size=block_size_m,
         top_k=1,
-        mul_topk_weights=True,
+        # The native exact program owns route weighting and accumulation.  It
+        # consumes one unweighted BF16 expert value per slot, multiplies by the
+        # preserved FP32 routing metadata, and only then stores a BF16
+        # rank leaf for DeepEP communication.
+        mul_topk_weights=not no_combine,
         is_ep=expert_map is not None,
         b_q_type=scalar_type2,
         size_m=M * topk,
@@ -511,8 +529,12 @@ def fused_marlin_moe(
         is_k_full=is_k_full,
         use_atomic_add=use_atomic_add,
         use_fp32_reduce=True,
+        expert_block_partition_count=expert_block_partition_count,
         is_zp_float=False,
     ).view(-1, topk, K)
+
+    if no_combine:
+        return intermediate_cache3.contiguous()
 
     output = zero_copy_context.get_moe_output(hidden_states)
     if output is None:

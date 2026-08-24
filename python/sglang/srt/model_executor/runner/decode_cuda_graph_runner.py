@@ -579,6 +579,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return max(request_counts)
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # DP attention can give an empty owner the local IDLE mode while a
+        # peer is running a DP-global EXTEND.  IDLE is ordinarily eligible for
+        # decode-graph replay, but doing so here would make the owners execute
+        # different collective geometries (decode graph versus eager prefill).
+        # Keep every owner on the eager extend path for that mixed local-mode
+        # step; a genuinely global idle/decode step remains graph eligible.
+        if forward_batch.forward_mode.is_idle() and forward_batch.is_extend_in_batch:
+            return False
+
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -996,6 +1005,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
+                self.model_runner.lora_manager.prepare_dsv4_flash_exact_dp_lora_batch(
+                    forward_batch,
+                    dp_row_counts=[num_tokens] * self.dp_size,
+                )
                 self.model_runner.lora_manager.prepare_glm52_exact_dp_lora_batch(
                     forward_batch,
                     dp_row_counts=[num_tokens] * self.dp_size,
@@ -1106,6 +1119,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         self.deepep_adapter.replay()
 
+        lora_manager = getattr(self.model_runner, "lora_manager", None)
+        if lora_manager is not None:
+            # Native DeepEP's destination expert ranks read graph-static LoRA
+            # controls. Refresh (or clear) them for every replay, including
+            # the pre-planned branch below, rather than reusing capture-time
+            # inactive controls or a previous request's active adapter.
+            lora_manager.prepare_deepep_native_exact_dp_lora_batch(forward_batch)
+
         if not forward_batch.needs_forward_metadata_init():
             # Pre-planned (plan-stream load_batch already ran).
             # In speculative decoding, these two fields are still needed.
@@ -1171,8 +1192,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 bs=bs, num_tokens=padded_num_tokens
             )
 
-        lora_manager = getattr(self.model_runner, "lora_manager", None)
         if lora_manager is not None and forward_batch.lora_ids is not None:
+            lora_manager.prepare_dsv4_flash_exact_dp_lora_batch(
+                forward_batch,
+                dp_row_counts=[padded_num_tokens] * self.dp_size,
+            )
             lora_manager.prepare_glm52_exact_dp_lora_batch(
                 forward_batch,
                 dp_row_counts=[padded_num_tokens] * self.dp_size,

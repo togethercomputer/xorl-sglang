@@ -46,6 +46,29 @@ from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
+_PP_IDLE_PROXY_SLOT = "__sglang_pp_idle_proxy_slot__"
+
+
+def _pp_resolve_proxy_slot(
+    pp_proxy_tensors: PPProxyTensors,
+    cur_batch: Optional[ScheduleBatch],
+    *,
+    pp_rank: int,
+    mb_id: int,
+) -> Optional[PPProxyTensors]:
+    """Validate one downstream PP proxy heartbeat against local scheduling."""
+
+    upstream_idle = bool(pp_proxy_tensors.tensors.pop(_PP_IDLE_PROXY_SLOT, False))
+    if upstream_idle != (cur_batch is None):
+        raise RuntimeError(
+            "Pipeline scheduler ring lost batch-slot alignment: "
+            f"upstream_idle={upstream_idle}, "
+            f"local_batch_present={cur_batch is not None}, "
+            f"pp_rank={pp_rank}, mb_id={mb_id}"
+        )
+    return None if upstream_idle else pp_proxy_tensors
+
+
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
 
@@ -65,6 +88,12 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
 @dataclass
 class PPBatchMetadata:
     can_run_cuda_graph: bool
+    # The ScheduleBatch remains live while its PP result is in flight.  Normal
+    # scheduling may filter it (including setting out_cache_loc to an empty
+    # tensor) before the terminal stage's response returns, so keep immutable
+    # ownership snapshots for response relay and routed-expert publication.
+    req_pool_indices: Optional[torch.Tensor] = None
+    out_cache_loc: Optional[torch.Tensor] = None
 
 
 class SchedulerPPMixin:
@@ -111,6 +140,16 @@ class SchedulerPPMixin:
                             recv_reqs,
                             async_send=True,
                         )
+                    if self.gracefully_exit:
+                        # ShutdownReq must reach every PP stage before this
+                        # stage tears down its Gloo links.  The normal loop
+                        # otherwise has no graceful-exit check and the final
+                        # stage observes only a connection reset.
+                        self._pp_commit_comm_work(self.send_req_work)
+                        self.send_req_work = []
+                        return
+                elif self.gracefully_exit:
+                    return
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -120,9 +159,26 @@ class SchedulerPPMixin:
                 self.running_mbs[mb_id] = self.running_batch
                 cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 self.cur_batch_for_debug = cur_batch
+                if not self.pp_group.is_first_rank:
+                    # Every PP ring slot carries exactly one proxy-plane
+                    # message, including slots where the upstream stage has
+                    # no batch.  Request forwarding happens before local
+                    # scheduling and is not sufficient to keep independently
+                    # mutating PP scheduler rings aligned across a long
+                    # DP-attention idle tail.  Without this heartbeat, one DP
+                    # owner can admit the next request in a different PP slot:
+                    # PP0 then waits forever sending a proxy while PP1 waits
+                    # for an output from another slot.
+                    pp_proxy_tensors = _pp_resolve_proxy_slot(
+                        self._pp_recv_proxy_tensors(),
+                        cur_batch,
+                        pp_rank=self.ps.pp_rank,
+                        mb_id=mb_id,
+                    )
+                else:
+                    pp_proxy_tensors = None
                 if cur_batch:
                     server_is_idle = False
-                    pp_proxy_tensors = self._pp_recv_proxy_tensors()
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
@@ -170,6 +226,14 @@ class SchedulerPPMixin:
                                 async_send=True,
                                 msg_type="proxy",
                             )
+                    else:
+                        # Keep the downstream stage on this exact ring slot even
+                        # when there is no model forward to provide a proxy.
+                        self.send_proxy_work = self._pp_send_dict_to_next_stage(
+                            {_PP_IDLE_PROXY_SLOT: True},
+                            async_send=True,
+                            msg_type="proxy",
+                        )
 
                 self.pp_outputs = next_pp_outputs
 
@@ -1031,6 +1095,10 @@ class SchedulerPPMixin:
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
+        from sglang.srt.state_capturer.routed_experts import (
+            add_routed_experts_to_pp_output,
+        )
+
         tensor_dict = {
             "next_token_ids": result.next_token_ids,
         }
@@ -1041,6 +1109,7 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+        add_routed_experts_to_pp_output(tensor_dict, result.routed_experts_output)
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1154,6 +1223,9 @@ class SchedulerPPMixin:
         pp_outputs: PPProxyTensors,
     ):
         from sglang.srt.managers.scheduler import GenerationBatchResult
+        from sglang.srt.state_capturer.routed_experts import (
+            publish_routed_experts_from_pp_output,
+        )
 
         logits_output = None
         extend_input_len_per_req = None
@@ -1172,6 +1244,8 @@ class SchedulerPPMixin:
         self.future_map.stash(
             batch.req_pool_indices, RelayPayload(bonus_tokens=next_token_ids)
         )
+        if self.pp_group.is_first_rank:
+            publish_routed_experts_from_pp_output(pp_outputs.tensors)
         batch.input_ids = None
         output_result = GenerationBatchResult(
             logits_output=logits_output,
@@ -1303,6 +1377,11 @@ class SchedulerPPMixin:
         with torch.profiler.record_function("run_batch"):
             with self.forward_stream_ctx:
                 self.forward_stream.wait_stream(self.schedule_stream)
+                # run_batch may filter/idle the live ScheduleBatch before the
+                # delayed PP response returns.  Snapshot the response owner's
+                # cache and request rows before entering the forward.
+                owner_req_pool_indices = cur_batch.req_pool_indices.clone()
+                owner_out_cache_loc = cur_batch.out_cache_loc.clone()
                 set_time_batch(
                     cur_batch.reqs,
                     "set_run_batch_cpu_start_time",
@@ -1317,9 +1396,29 @@ class SchedulerPPMixin:
                 )
                 mb_metadata[mb_id] = PPBatchMetadata(
                     can_run_cuda_graph=result.can_run_cuda_graph,
+                    req_pool_indices=owner_req_pool_indices,
+                    out_cache_loc=owner_out_cache_loc,
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
+                if (
+                    getattr(
+                        getattr(self, "server_args", None),
+                        "moe_a2a_backend",
+                        None,
+                    )
+                    == "deepep"
+                    and getattr(getattr(self, "ps", None), "dp_size", 1) > 1
+                ):
+                    # PP scheduling performs the next DP-attention metadata
+                    # collective on a different stream.  With asynchronous
+                    # DeepEP kernels, an uneven decode tail can otherwise let
+                    # an idle DP rank enter that next collective while its peer
+                    # still needs the rank in the current DeepEP epoch.  The
+                    # resulting cross-stream dependency spins the active
+                    # DeepEP ranks forever.  Complete the current PP forward
+                    # before any rank can advance its scheduler collective.
+                    event.synchronize()
                 if self.pp_group.is_last_rank:
                     # (last rank) buffer the outputs for async batch depth
                     last_rank_comm_queue.append(

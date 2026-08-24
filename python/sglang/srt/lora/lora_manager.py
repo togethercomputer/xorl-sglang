@@ -40,6 +40,10 @@ from sglang.srt.lora.dsv4 import (
     is_dsv4_flash_exact_adapter,
 )
 from sglang.srt.lora.glm52 import is_glm52_xorl_shared_outer_adapter
+from sglang.srt.lora.glm52_router_bundle import (
+    apply_glm52_router_bundle_transaction,
+    restore_glm52_router_snapshot,
+)
 from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
@@ -50,7 +54,9 @@ from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
     LoRABatchInfo,
     LoRAType,
+    MoELoRABatchInfo,
     auto_detect_lora_target_modules,
+    get_lm_head_pruned_lens,
     get_normalized_target_modules,
     get_target_module_name,
 )
@@ -67,6 +73,39 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 logger = logging.getLogger(__name__)
 
 
+_QWEN35_LORA_MODEL_TYPES = frozenset(
+    {
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+        "xorl_qwen3_5",
+        "xorl_qwen3_5_moe",
+    }
+)
+
+
+def _expand_qwen35_logical_lora_targets(
+    target_modules: Iterable[str], base_hf_config: AutoConfig
+) -> set[str]:
+    """Add the serving GDN output leaf selected by trainer ``o_proj``.
+
+    Qwen3.5 trainers expose both full-attention and linear-attention output
+    projections with the logical suffix ``o_proj``.  The serving model keeps
+    the former as ``o_proj`` but names the GDN leaf ``out_proj``.  PEFT's
+    suffix matching therefore exports both physical tensor families under an
+    adapter manifest that legitimately lists only ``o_proj``.
+    """
+
+    expanded = set(target_modules)
+    if (
+        getattr(base_hf_config, "model_type", None) in _QWEN35_LORA_MODEL_TYPES
+        and "o_proj" in expanded
+    ):
+        expanded.add("out_proj")
+    return expanded
+
+
 def _local_request_segments(
     forward_batch: ForwardBatch,
     *,
@@ -76,15 +115,26 @@ def _local_request_segments(
 
     lora_ids = list(forward_batch.lora_ids or [])
     forward_mode = getattr(forward_batch, "forward_mode", None)
-    is_extend = bool(getattr(forward_batch, "is_extend_in_batch", False)) or bool(
-        forward_mode is not None and forward_mode.is_extend()
-    )
-    if is_extend:
+    # `is_extend_in_batch` is a DP-global property.  An idle or decode owner can
+    # therefore observe it while another owner is extending.  Segment lengths,
+    # however, describe this owner's local requests and must follow its local
+    # forward mode.
+    is_local_extend = bool(forward_mode is not None and forward_mode.is_extend())
+    if is_local_extend:
         lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if lengths is None:
-            raise RuntimeError(
-                f"{family} gathered LoRA extend metadata requires request row lengths"
-            )
+            # GPU-only scheduling deliberately omits the host mirror.  This
+            # gather is already a host-side exactness boundary, so materialize
+            # the authoritative device lengths here rather than guessing from
+            # the DP-global token count.
+            lengths = getattr(forward_batch, "extend_seq_lens", None)
+            if lengths is None:
+                raise RuntimeError(
+                    f"{family} gathered LoRA local extend metadata requires "
+                    "request row lengths"
+                )
+            if isinstance(lengths, torch.Tensor):
+                lengths = lengths.detach().cpu().tolist()
         lengths = [int(length) for length in lengths]
     else:
         lengths = [1] * len(lora_ids)
@@ -183,6 +233,143 @@ def _glm52_flatten_dp_request_segments(
     )
 
 
+def _collapse_exact_native_deepep_request_uids(
+    ownership: LogicalRowOwnership,
+    physical_owners: list[object],
+    dp_row_counts: list[int],
+) -> list[Optional[str]]:
+    """Recover real request identities from an exact DP/CP owner plane.
+
+    Only one CP rank owns scheduler request metadata.  The remaining CP ranks
+    can carry ``None``-filled synchronization replicas even though their rows
+    belong to the same active request.  DP/PP synchronization can also turn an
+    owner with no scheduler requests into a positive-length, non-IDLE row.  Its
+    empty request-ID plane, rather than tensor length or forward mode, proves
+    that row is fabricated.  Conversely, a logical owner with a real request
+    ID and no adapter must remain visible and make an active-plus-base batch
+    fail the native-DeepEP single-adapter contract.
+    """
+
+    if len(physical_owners) != ownership.contributor_count:
+        raise RuntimeError(
+            "Native DeepEP exact LoRA ownership metadata must name every "
+            "DP/CP contributor"
+        )
+    if len(dp_row_counts) != ownership.dp_size or any(
+        int(count) < 0 for count in dp_row_counts
+    ):
+        raise RuntimeError(
+            "Native DeepEP exact LoRA ownership requires one nonnegative "
+            "pre-padding row count per logical DP owner"
+        )
+
+    logical_uids: list[Optional[str]] = []
+    for dp_rank, row_count in enumerate(dp_row_counts):
+        start = dp_rank * ownership.cp_size
+        replicas = physical_owners[start : start + ownership.cp_size]
+        normalized: list[tuple[Optional[str], ...]] = []
+        fabricated_idle_replicas: list[bool] = []
+        real_request_counts: list[int] = []
+        for replica_metadata in replicas:
+            if (
+                not isinstance(replica_metadata, (tuple, list))
+                or len(replica_metadata) != 3
+            ):
+                raise RuntimeError(
+                    "Native DeepEP exact LoRA ownership gather returned invalid "
+                    f"CP metadata at dp_rank={dp_rank}"
+                )
+            replica, fabricated_idle, real_request_count = replica_metadata
+            if not isinstance(replica, (tuple, list)) or not isinstance(
+                fabricated_idle, bool
+            ):
+                raise RuntimeError(
+                    "Native DeepEP exact LoRA ownership gather returned invalid "
+                    f"CP metadata at dp_rank={dp_rank}"
+                )
+            replica_uids = tuple(replica)
+            if (
+                isinstance(real_request_count, bool)
+                or not isinstance(real_request_count, int)
+                or not 0 <= real_request_count <= len(replica_uids)
+            ):
+                raise RuntimeError(
+                    "Native DeepEP exact LoRA ownership returned an invalid "
+                    "real-request count: "
+                    f"dp_rank={dp_rank}, requests={real_request_count}, "
+                    f"uid_rows={len(replica_uids)}"
+                )
+            if any(
+                uid is not None and not isinstance(uid, str) for uid in replica_uids
+            ):
+                raise RuntimeError(
+                    "Native DeepEP exact LoRA request UIDs must be strings or None"
+                )
+            replica_active = {uid for uid in replica_uids if uid is not None}
+            if len(replica_active) > 1 or (
+                replica_active and any(uid is None for uid in replica_uids)
+            ):
+                raise RuntimeError(
+                    "Native DeepEP MoE-LoRA currently requires every real request "
+                    "to use one active adapter; mixed adapters or active-plus-base "
+                    "batches are not transported"
+                )
+            if fabricated_idle and (replica_active or real_request_count):
+                raise RuntimeError(
+                    "Native DeepEP exact LoRA ownership marked a real request "
+                    f"as fabricated idle padding at dp_rank={dp_rank}"
+                )
+            normalized.append(replica_uids)
+            fabricated_idle_replicas.append(fabricated_idle)
+            real_request_counts.append(real_request_count)
+
+        if any(fabricated_idle_replicas) and not all(fabricated_idle_replicas):
+            raise RuntimeError(
+                "Native DeepEP exact LoRA ownership has inconsistent fabricated-"
+                f"idle metadata across CP replicas at dp_rank={dp_rank}"
+            )
+
+        active = {
+            uid
+            for replica_uids in normalized
+            for uid in replica_uids
+            if uid is not None
+        }
+
+        # DP/PP synchronization can expose a positive, non-IDLE physical row
+        # even though the logical owner has no scheduler request.  The request
+        # plane is authoritative.  Keep the original-IDLE bit as an additional
+        # consistency witness, but do not require it for this synthetic case.
+        if not any(real_request_counts):
+            if active:
+                raise RuntimeError(
+                    "Native DeepEP exact LoRA ownership attached an adapter to "
+                    f"a request-free synchronization owner at dp_rank={dp_rank}"
+                )
+            continue
+
+        # A zero-count DP owner contributes only fabricated synchronization
+        # rows.  It cannot simultaneously own a real scheduler request.
+        if int(row_count) == 0:
+            raise RuntimeError(
+                "Native DeepEP exact LoRA ownership has real requests on a "
+                f"zero-row DP owner at dp_rank={dp_rank}"
+            )
+        if len(active) > 1:
+            raise RuntimeError(
+                "Native DeepEP MoE-LoRA currently requires every real request "
+                "to use one active adapter; mixed adapters are not transported"
+            )
+        if active:
+            # None-only CP replicas describe the same logical owner and are
+            # intentionally collapsed.  A true mixed batch is represented in
+            # one scheduler-owned replica and was rejected above.
+            logical_uids.append(next(iter(active)))
+        else:
+            logical_uids.append(None)
+    return logical_uids
+
+
 class LoRAManager:
     def __init__(
         self,
@@ -233,6 +420,25 @@ class LoRAManager:
         self.lora_strict_loading: bool = getattr(
             server_args, "lora_strict_loading", False
         )
+        # The resolved server contract is authoritative.  Some composite HF
+        # configs return a reconstructed text config from get_text_config(),
+        # which need not retain private resolver markers.
+        self.deepep_native_exact: bool = bool(
+            getattr(server_args, "deepep_native_exact", False)
+        )
+        self.dsv4_flash_exact_mode: bool = bool(
+            getattr(server_args, "dsv4_flash_exact_mode", False)
+        )
+        self.glm52_exact_mode: bool = bool(
+            getattr(server_args, "glm52_exact_mode", False)
+        )
+        # Rehydrate the resolved family markers on the exact text config used
+        # by LoRA.  Composite HF configs may reconstruct get_text_config()
+        # without preserving private attributes from ModelConfig's cached text
+        # config; the immutable ServerArgs contract remains authoritative.
+        self.base_hf_config._deepep_native_exact = self.deepep_native_exact
+        self.base_hf_config._dsv4_flash_exact_mode = self.dsv4_flash_exact_mode
+        self.base_hf_config._glm52_exact_mode = self.glm52_exact_mode
 
         # LoRA backend for running sgemm kernels
         logger.info(f"Using {lora_backend} as backend of LoRA kernels.")
@@ -268,13 +474,13 @@ class LoRAManager:
             num_tokens_per_req=num_tokens_per_req,
         )
         if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
-            if max_bs_in_cuda_graph != 1 or num_tokens_per_req != 1:
+            if num_tokens_per_req != 1:
                 raise RuntimeError(
                     "Gather-aware DSV4-Flash decode graphs currently require "
-                    "one local one-token request per DP rank."
+                    "one-token decode rows."
                 )
             self.lora_backend.init_context_parallel_cuda_graph_batch_info(
-                num_rows=self.dp_size
+                num_rows=max_bs_in_cuda_graph * self.dp_size
             )
         elif (
             getattr(self.base_hf_config, "_glm52_exact_mode", False)
@@ -415,6 +621,22 @@ class LoRAManager:
             self.validate_new_adapter(new_adapter, lora_ref)
             self.configs[lora_ref.lora_id] = new_adapter
 
+            router_marker = new_adapter.hf_config.get("_xorl_glm52_router_bundle")
+            if router_marker is not None:
+                snapshots = getattr(self, "_glm52_router_snapshots", {})
+                if snapshots or self.loras:
+                    raise RuntimeError(
+                        "Exact GLM-5.2 router sidecars are admitted only on a fresh single-tenant sampler"
+                    )
+                snapshot = apply_glm52_router_bundle_transaction(
+                    self.base_model,
+                    self.base_hf_config,
+                    new_adapter.hf_config,
+                    lora_ref.lora_path,
+                )
+                snapshots[lora_ref.lora_id] = snapshot
+                self._glm52_router_snapshots = snapshots
+
             # load weights
             self.load_lora_weights(lora_ref)
 
@@ -444,6 +666,16 @@ class LoRAManager:
         whose peer failed.
         """
         errors = []
+
+        snapshots = getattr(self, "_glm52_router_snapshots", {})
+        snapshot = snapshots.pop(lora_id, None)
+        if snapshot is not None:
+            try:
+                restore_glm52_router_snapshot(
+                    self.base_model, self.base_hf_config, snapshot
+                )
+            except Exception as e:
+                errors.append(f"GLM-5.2 router rollback failed: {e}")
 
         pending_event = self.pending_lora_load_events.pop(lora_id, None)
         if pending_event is not None:
@@ -598,14 +830,19 @@ class LoRAManager:
                 "Gather-aware DSV4-Flash active LoRA requires initialized "
                 "fixed metadata during CUDA graph capture."
             )
-        if uses_decode_cuda_graph and (
-            not forward_batch.forward_mode.is_decode()
-            or self.max_bs_in_cuda_graph != 1
-            or forward_batch.batch_size != 1
+        if uses_decode_cuda_graph and not forward_batch.forward_mode.is_decode():
+            raise RuntimeError(
+                "Gather-aware DSV4-Flash CUDA graphs support decode only."
+            )
+        if (
+            uses_decode_cuda_graph
+            and not get_is_capture_mode()
+            and forward_batch.batch_size != 1
         ):
             raise RuntimeError(
                 "Gather-aware DSV4-Flash decode graphs currently require one "
-                "local one-token request per DP rank."
+                "live local one-token request per DP rank; extra graph slots "
+                "must be base-only capture padding."
             )
         for uid in set(lora_ids):
             if uid is not None:
@@ -687,6 +924,15 @@ class LoRAManager:
         assert (
             adapter is not None and lora_ref is not None
         ), f"LoRA adapter with ID {lora_ref.lora_id} is not loaded. This should have been verified before request is sent to the backend."
+
+        if lora_ref.lora_id in getattr(self, "_glm52_router_snapshots", {}):
+            return self.create_lora_update_result(
+                success=False,
+                error_message=(
+                    "Exact GLM-5.2 router-sidecar adapters cannot be hot-unloaded; "
+                    "replace the fresh single-tenant sampler process instead"
+                ),
+            )
 
         try:
             pending_events = getattr(self, "pending_lora_load_events", {})
@@ -779,8 +1025,97 @@ class LoRAManager:
         if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
             self.lora_backend._dsv4_flash_exact_batch_certified = False
 
+    def _prepare_dsv4_flash_exact_global_lm_head_batch(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        ownership: LogicalRowOwnership,
+        parallel,
+        template_batch_info: LoRABatchInfo,
+    ) -> None:
+        """Build LoRA metadata for the globally gathered exact logits rows.
+
+        LogitsProcessor prunes each DP owner's extend rows before it gathers
+        them into one rank-major lm_head input.  The ordinary LoRA preparation
+        sees only the local request set, so its pruned metadata is necessarily
+        too short for that global tensor.  Gather the same per-owner pruned
+        segments and rebuild the lm_head metadata in the logits row order.
+        """
+
+        if not bool(getattr(forward_batch, "is_extend_in_batch", False)):
+            return
+        global_logprob_rows = getattr(
+            forward_batch, "global_num_tokens_for_logprob_cpu", None
+        )
+        if global_logprob_rows is None:
+            return
+
+        local_mode = getattr(forward_batch, "forward_mode", None)
+        local_uids = list(forward_batch.lora_ids or [])
+        if local_mode is not None and local_mode.is_extend():
+            local_pruned_lens = get_lm_head_pruned_lens(forward_batch)
+            if local_pruned_lens is None:
+                raise RuntimeError(
+                    "Exact DSV4 extend logits are missing local pruned LoRA lengths."
+                )
+        elif local_mode is not None and local_mode.is_decode():
+            local_pruned_lens = [1] * len(local_uids)
+        else:
+            local_pruned_lens = []
+        if len(local_uids) != len(local_pruned_lens):
+            raise RuntimeError(
+                "Exact DSV4 lm_head metadata requires one pruned row length "
+                f"per local request: uids={len(local_uids)}, "
+                f"lengths={len(local_pruned_lens)}."
+            )
+
+        local_segments = tuple(zip(local_uids, local_pruned_lens))
+        physical_segments = parallel.tp_group.all_gather_object(local_segments)
+        global_row_counts = list(global_logprob_rows)
+        global_segments = _flatten_dp_request_segments(
+            ownership,
+            physical_segments,
+            global_row_counts,
+            family="DSV4-Flash lm_head",
+        )
+        global_uids = [uid for uid, _ in global_segments]
+        global_pruned_lens = [rows for _, rows in global_segments]
+        global_weight_indices = []
+        for uid in global_uids:
+            effective_uid = uid
+            if uid is not None and getattr(
+                self.loras[uid], "_dsv4_flash_exact_all_zero", False
+            ):
+                effective_uid = None
+            global_weight_indices.append(self.memory_pool.get_buffer_id(effective_uid))
+
+        physical_batch = copy(forward_batch)
+        physical_batch.batch_size = len(global_segments)
+        physical_batch.lora_ids = global_uids
+        physical_batch.forward_mode = ForwardMode.EXTEND
+        physical_batch.return_logprob = True
+        physical_batch.extend_seq_lens_cpu = global_pruned_lens
+        physical_batch.extend_logprob_start_lens_cpu = [0] * len(global_segments)
+        lm_head_info, pass_infos = self.lora_backend._prepare_lm_head_batch_info(
+            physical_batch,
+            global_weight_indices,
+            template_batch_info,
+        )
+        expected_rows = sum(global_row_counts)
+        if lm_head_info is None or lm_head_info.expected_tokens != expected_rows:
+            raise RuntimeError(
+                "Exact DSV4 gathered lm_head metadata has the wrong row count: "
+                f"metadata_rows={getattr(lm_head_info, 'expected_tokens', None)}, "
+                f"gathered_rows={expected_rows}."
+            )
+        self.lora_backend.lm_head_batch_info = lm_head_info
+        self.lora_backend.lm_head_pass_batch_infos = pass_infos
+
     def prepare_dsv4_flash_exact_dp_lora_batch(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        dp_row_counts: Optional[List[int]] = None,
     ) -> None:
         """Build per-request metadata for DP/CP-owned exact DSV4 rows."""
 
@@ -788,17 +1123,35 @@ class LoRAManager:
             return
         from sglang.srt.layers.dsv4_ownership import resolve_dsv4_owner_plane
 
+        self.lora_backend._dsv4_flash_exact_gathered_base_only = False
         parallel = get_parallel()
         ownership = resolve_dsv4_owner_plane(parallel)
         local_segments = _local_request_segments(forward_batch, family="DSV4-Flash")
         physical_segments = parallel.tp_group.all_gather_object(local_segments)
         global_num_tokens = list(forward_batch.global_num_tokens_cpu or [])
+        # Graph capability is not graph execution: an IDLE owner can be
+        # graph-capable while DP-wide admission sends every owner through an
+        # eager EXTEND fallback.  Only the decode graph runner supplies
+        # physical row counts, so use that explicit call-site signal rather
+        # than inferring execution from ForwardMode plus initialized buffers.
+        uses_decode_cuda_graph = dp_row_counts is not None
+        physical_row_counts = global_num_tokens
+        if uses_decode_cuda_graph:
+            physical_row_counts = list(dp_row_counts)
         global_segments = _flatten_dp_request_segments(
             ownership,
             physical_segments,
-            global_num_tokens,
+            physical_row_counts,
             family="DSV4-Flash",
         )
+        if uses_decode_cuda_graph:
+            # Decode-graph gather buffers are owner-major fixed row blocks.
+            # Expand each base-padding segment to one slot per physical row so
+            # the pointer-stable graph metadata has the same layout as the
+            # gathered activation: real owner rows first, then base-only pad.
+            global_segments = [
+                (uid, 1) for uid, rows in global_segments for _ in range(rows)
+            ]
         global_uids = [uid for uid, _ in global_segments]
         global_request_lens = [rows for _, rows in global_segments]
 
@@ -849,46 +1202,41 @@ class LoRAManager:
                 scalings[slot] = adapter.scaling
 
         has_active_lora = any(rank > 0 for rank in lora_ranks)
-        uses_decode_cuda_graph = (
-            hasattr(self, "max_bs_in_cuda_graph")
-            and forward_batch.batch_size <= self.max_bs_in_cuda_graph
-            and forward_batch.forward_mode.is_cuda_graph()
-        )
         if not has_active_lora and not uses_decode_cuda_graph:
             self.lora_backend.context_parallel_mlp_batch_info = None
+            self.lora_backend._dsv4_flash_exact_gathered_base_only = True
             return
 
         device = self.device
         total_tokens = sum(global_request_lens)
         if uses_decode_cuda_graph:
-            if (
-                global_num_tokens != [1] * ownership.dp_size
-                or global_request_lens != [1] * ownership.dp_size
-                or total_tokens != ownership.dp_size
-            ):
-                raise RuntimeError(
-                    "Gather-aware DSV4-Flash decode graph metadata requires one "
-                    "row and one request segment per DP owner, got "
-                    f"dp_size={ownership.dp_size}, owner_rows={global_num_tokens}, "
-                    f"request_rows={global_request_lens}."
-                )
             global_batch_info = self.lora_backend.context_parallel_cuda_graph_batch_info
             if global_batch_info is None:
                 raise RuntimeError(
                     "Gathered DSV4-Flash decode graph metadata was not initialized."
                 )
+            capacity = global_batch_info.weight_indices.numel()
             if (
-                global_batch_info.bs != total_tokens
-                or global_batch_info.expected_tokens != total_tokens
-                or global_batch_info.weight_indices.numel() != len(weight_indices)
+                total_tokens > capacity
+                or global_batch_info.seg_lens.numel() != capacity
+                or global_batch_info.seg_indptr.numel() != capacity + 1
             ):
                 raise RuntimeError(
-                    "Gathered DSV4-Flash decode graph metadata has the wrong "
+                    "Gathered DSV4-Flash decode graph metadata has insufficient "
                     "physical row capacity: "
-                    f"metadata_rows={global_batch_info.bs}, "
-                    f"physical_rows={total_tokens}, owners={len(weight_indices)}."
+                    f"metadata_rows={capacity}, physical_rows={total_tokens}."
                 )
-            global_batch_info.weight_indices.copy_(
+            base_slot = self.memory_pool.get_buffer_id(None)
+            global_batch_info.seg_lens.zero_()
+            global_batch_info.seg_lens[:total_tokens].fill_(1)
+            global_batch_info.seg_indptr[0].zero_()
+            torch.cumsum(
+                global_batch_info.seg_lens,
+                dim=0,
+                out=global_batch_info.seg_indptr[1:],
+            )
+            global_batch_info.weight_indices.fill_(base_slot)
+            global_batch_info.weight_indices[:total_tokens].copy_(
                 torch.tensor(weight_indices, dtype=torch.int32, device=device)
             )
             global_batch_info.lora_ranks.copy_(
@@ -897,6 +1245,10 @@ class LoRAManager:
             global_batch_info.scalings.copy_(
                 torch.tensor(scalings, dtype=torch.float32, device=device)
             )
+            global_batch_info.bs = total_tokens
+            global_batch_info.num_segments = total_tokens
+            global_batch_info.max_len = 1
+            global_batch_info.expected_tokens = total_tokens
             global_batch_info.has_active_lora = has_active_lora
         else:
             segment_lens = torch.tensor(
@@ -927,6 +1279,13 @@ class LoRAManager:
                 ),
             )
 
+        active_adapter_ids = {
+            slot for slot in weight_indices if slot >= 0 and lora_ranks[slot] > 0
+        }
+        global_batch_info.single_adapter_id = (
+            next(iter(active_adapter_ids)) if len(active_adapter_ids) == 1 else None
+        )
+
         physical_batch = copy(forward_batch)
         physical_batch.batch_size = len(global_request_lens)
         physical_batch.lora_ids = global_uids
@@ -942,6 +1301,246 @@ class LoRAManager:
             physical_batch, global_batch_info
         )
         self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
+        self._prepare_dsv4_flash_exact_global_lm_head_batch(
+            forward_batch,
+            ownership=ownership,
+            parallel=parallel,
+            template_batch_info=global_batch_info,
+        )
+
+    def prepare_deepep_native_exact_dp_lora_batch(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        """Make one active MoE adapter visible to every native-DeepEP rank.
+
+        DeepEP dispatches expert rows after the request-owning DP rank prepares
+        its local LoRA batch.  The actual row mapping is unknowable until after
+        dispatch, so this method distributes only the active adapter identity.
+        ``adapt_native_lora_context`` rebuilds the mapping from the received
+        rows.  Mixed ownership is rejected because it is not on the wire.
+        """
+
+        if not getattr(
+            self,
+            "deepep_native_exact",
+            getattr(self.base_hf_config, "_deepep_native_exact", False),
+        ):
+            return
+
+        backend = self.lora_backend
+        backend.deepep_native_moe_batch_info = None
+        from sglang.srt.layers.moe.deepep_native_exact import (  # noqa: PLC0415
+            update_native_lora_graph_control,
+        )
+
+        # Full decode graphs capture before a request owns an adapter. Clear
+        # the graph-static EP-global control first; the active case below
+        # republishes one gathered adapter identity on every expert rank.
+        update_native_lora_graph_control(adapter_id=None, adapter_rank=None)
+        # Eager DP synchronization pads ``lora_ids`` with ``None`` after
+        # recording the request-derived batch size.  Those entries are
+        # fabricated collective rows, not base-model requests.  Transport the
+        # adapter identity of the original requests only; a real ``None``
+        # inside that slice remains an active-plus-base batch and is rejected
+        # below.
+        padded_uids = tuple(forward_batch.lora_ids or ())
+        original_batch_size = getattr(forward_batch, "_original_batch_size", None)
+        if original_batch_size is None:
+            local_uids = padded_uids
+        else:
+            original_batch_size = int(original_batch_size)
+            if not 0 <= original_batch_size <= len(padded_uids):
+                raise RuntimeError(
+                    "Native DeepEP LoRA ownership has an invalid pre-padding "
+                    f"batch size: original={original_batch_size}, padded={len(padded_uids)}"
+                )
+            local_uids = padded_uids[:original_batch_size]
+        parallel = get_parallel()
+        ep_group = parallel.moe_ep_group
+        if parallel.moe_ep_size != self.ep_size or ep_group.world_size != self.ep_size:
+            raise RuntimeError(
+                "Native DeepEP LoRA ownership requires the full expert-parallel "
+                "group: "
+                f"runtime_ep_size={parallel.moe_ep_size}, "
+                f"group_size={ep_group.world_size}, configured_ep_size={self.ep_size}"
+            )
+        dsv4_exact_mode = bool(
+            getattr(
+                self,
+                "dsv4_flash_exact_mode",
+                getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False),
+            )
+        )
+        glm52_exact_mode = bool(
+            getattr(
+                self,
+                "glm52_exact_mode",
+                getattr(self.base_hf_config, "_glm52_exact_mode", False),
+            )
+        )
+        exact_owner_plane = dsv4_exact_mode or glm52_exact_mode
+        if exact_owner_plane:
+            original_forward_mode = getattr(
+                forward_batch, "_original_forward_mode", None
+            )
+            local_forward_mode = (
+                original_forward_mode
+                if original_forward_mode is not None
+                else getattr(forward_batch, "forward_mode", None)
+            )
+            fabricated_idle = bool(
+                local_forward_mode is not None and local_forward_mode.is_idle()
+            )
+            local_real_request_count = len(
+                tuple(getattr(forward_batch, "rids", ()) or ())
+            )
+            physical_owners = ep_group.all_gather_object(
+                (local_uids, fabricated_idle, local_real_request_count)
+            )
+            if dsv4_exact_mode:
+                from sglang.srt.layers.dsv4_ownership import resolve_dsv4_owner_plane
+
+                ownership = resolve_dsv4_owner_plane(parallel)
+            else:
+                ownership = LogicalRowOwnership(
+                    dp_size=int(parallel.attn_dp_size),
+                    cp_size=int(parallel.attn_cp_size),
+                    dp_rank=int(parallel.attn_dp_rank),
+                    cp_rank=int(parallel.attn_cp_rank),
+                    contributor_count=self.ep_size,
+                )
+                if (
+                    int(parallel.attn_tp_size) != 1
+                    or int(ep_group.rank_in_group) != ownership.source_ordinal
+                ):
+                    raise RuntimeError(
+                        "Native DeepEP GLM-5.2 LoRA ownership requires an "
+                        "EP-ordered DP/CP owner plane with attention TP1"
+                    )
+            dp_row_counts = getattr(
+                forward_batch, "original_global_num_tokens_cpu", None
+            )
+            if dp_row_counts is None:
+                raise RuntimeError(
+                    "Native DeepEP exact LoRA ownership requires pre-padding DP "
+                    "row counts"
+                )
+            flattened_uids = _collapse_exact_native_deepep_request_uids(
+                ownership,
+                physical_owners,
+                [int(count) for count in dp_row_counts],
+            )
+            gathered_request_counts = [
+                (
+                    len(owner[0])
+                    if isinstance(owner, (tuple, list))
+                    and len(owner) == 3
+                    and isinstance(owner[0], (tuple, list))
+                    else -1
+                )
+                for owner in physical_owners
+            ]
+            gathered_real_request_counts = [
+                (
+                    owner[2]
+                    if isinstance(owner, (tuple, list))
+                    and len(owner) == 3
+                    and isinstance(owner[2], int)
+                    and not isinstance(owner[2], bool)
+                    else -1
+                )
+                for owner in physical_owners
+            ]
+        else:
+            physical_uids = ep_group.all_gather_object(local_uids)
+            if not all(isinstance(uids, (tuple, list)) for uids in physical_uids):
+                raise RuntimeError(
+                    "Native DeepEP LoRA ownership gather returned invalid rank metadata"
+                )
+            flattened_uids = [uid for rank_uids in physical_uids for uid in rank_uids]
+            gathered_request_counts = [len(rank_uids) for rank_uids in physical_uids]
+            gathered_real_request_counts = None
+        active_uids = {uid for uid in flattened_uids if uid is not None}
+        if not active_uids:
+            return
+        if len(active_uids) != 1 or any(uid is None for uid in flattened_uids):
+            raise RuntimeError(
+                "Native DeepEP MoE-LoRA currently requires every physical row "
+                "to use one active adapter; mixed adapters or active-plus-base "
+                "batches are not transported; "
+                f"exact_owner_plane={exact_owner_plane}, "
+                "gathered_request_counts="
+                f"{gathered_request_counts}, "
+                "gathered_real_request_counts="
+                f"{gathered_real_request_counts}, "
+                "pre_padding_dp_rows="
+                f"{getattr(forward_batch, 'original_global_num_tokens_cpu', None)}"
+            )
+
+        uid = next(iter(active_uids))
+        if uid not in self.loras or uid not in self.lora_refs:
+            raise RuntimeError(
+                "Native DeepEP gathered batch references an adapter missing "
+                f"from this EP rank: {uid}"
+            )
+        self.fetch_new_loras({uid})
+        slot = self.memory_pool.get_buffer_id(uid)
+        adapter = self.loras[uid]
+
+        lora_ranks = torch.zeros(
+            self.max_loras_per_batch, dtype=torch.int64, device=self.device
+        )
+        lora_ranks[slot] = adapter.config.r
+        scalings = torch.zeros(
+            self.max_loras_per_batch, dtype=torch.float32, device=self.device
+        )
+        scalings[slot] = adapter.scaling
+        adapter_enabled = torch.zeros(
+            self.max_loras_per_batch, dtype=torch.int32, device=self.device
+        )
+        adapter_enabled[slot] = 1
+        seg_indptr = torch.zeros(2, dtype=torch.int32, device=self.device)
+        req_to_lora = torch.tensor([slot], dtype=torch.int32, device=self.device)
+
+        backend.deepep_native_moe_batch_info = LoRABatchInfo(
+            use_cuda_graph=False,
+            bs=1,
+            num_segments=1,
+            seg_indptr=seg_indptr,
+            weight_indices=req_to_lora,
+            lora_ranks=lora_ranks,
+            scalings=scalings,
+            max_len=0,
+            seg_lens=torch.zeros(1, dtype=torch.int32, device=self.device),
+            permutation=None,
+            expected_tokens=None,
+            has_active_lora=True,
+            req_seg_indptr=seg_indptr,
+            req_weight_indices=req_to_lora,
+            moe_lora_info=MoELoRABatchInfo(
+                seg_indptr=seg_indptr,
+                req_to_lora=req_to_lora,
+                adapter_enabled=adapter_enabled,
+                token_lora_mapping=torch.empty(
+                    0, dtype=torch.int32, device=self.device
+                ),
+            ),
+            single_adapter_id=slot,
+        )
+        update_native_lora_graph_control(
+            adapter_id=slot,
+            adapter_rank=int(adapter.config.r),
+        )
+        if getattr(backend, "_deepep_native_logged_control_uid", None) != uid:
+            logger.info(
+                "Native DeepEP LoRA control installed: ep_rank=%s/%s "
+                "adapter=%s slot=%s cuda_graph_static_control=updated",
+                parallel.moe_ep_rank,
+                parallel.moe_ep_size,
+                uid,
+                slot,
+            )
+            backend._deepep_native_logged_control_uid = uid
 
     def prepare_glm52_exact_dp_lora_batch(
         self,
@@ -1126,7 +1725,7 @@ class LoRAManager:
     def glm52_context_parallel_lora_batch(
         self, forward_batch: ForwardBatch, local_num_tokens: int
     ) -> Iterator[None]:
-        """Use certified GLM-5.2 CP-local LoRA metadata in the sharded body.
+        """Use certified exact-model CP-local LoRA metadata in the sharded body.
 
         ``ForwardBatch.init_new`` prepares LoRA metadata before CP-v2 shards the
         model input.  Triton LoRA kernels size their grids and row masks from
@@ -1148,6 +1747,8 @@ class LoRAManager:
             yield
             return
 
+        dsv4_exact = bool(getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False))
+        family = "DSV4-Flash" if dsv4_exact else "GLM-5.2"
         backend = self.lora_backend
         strategy = None
         moe_a2a_backend = None
@@ -1177,17 +1778,24 @@ class LoRAManager:
             "configured_cp_strategy": self.cp_strategy == "interleave",
             "live_cp_strategy": getattr(strategy, "name", None) == "interleave",
             "live_cp_size": getattr(strategy, "cp_size", None) == self.attn_cp_size,
-            "shared_outer_lora": self._experts_shared_outer_override is True,
+            # GLM's expert factors require the shared-outer construction.
+            # DSV4 has an explicit per-expert factor inventory instead.
+            "shared_outer_lora": dsv4_exact
+            or self._experts_shared_outer_override is True,
             "dp_attention": self.enable_dp_attention,
             "triton_backend": backend.name == "triton",
             "moe_lora": backend.is_moe_lora,
-            "no_moe_row_reordering": moe_a2a_backend == "none",
+            # Native exact DeepEP is admissible because the shared runner rebuilds
+            # one-active-adapter metadata after dispatch from the received
+            # row count; every other reordering path remains rejected.
+            "no_moe_row_reordering": moe_a2a_backend == "none"
+            or bool(getattr(self.base_hf_config, "_deepep_native_exact", False)),
             "no_experimental_lora_reordering": not bool(_SGLANG_EXPERIMENTAL_LORA_OPTI),
         }
         incompatible = [name for name, satisfied in mechanism.items() if not satisfied]
         if incompatible:
             raise RuntimeError(
-                "GLM-5.2 CP-v2 LoRA is missing required execution mechanisms: "
+                f"{family} CP-v2 LoRA is missing required execution mechanisms: "
                 + ", ".join(incompatible)
             )
         if backend.batch_info is None:
@@ -1388,6 +1996,15 @@ class LoRAManager:
             backend.context_parallel_mlp_batch_info = None
             backend.batch_info = full_batch_info
 
+    @contextmanager
+    def exact_context_parallel_lora_batch(
+        self, forward_batch: ForwardBatch, local_num_tokens: int
+    ) -> Iterator[None]:
+        """Model-neutral entry point for the certified GLM/DSV4 CP-v2 path."""
+
+        with self.glm52_context_parallel_lora_batch(forward_batch, local_num_tokens):
+            yield
+
     def prepare_lora_batch(self, forward_batch: ForwardBatch):
         # set up batch info shared by all lora modules
         self._validate_glm52_active_adapters(forward_batch)
@@ -1448,14 +2065,23 @@ class LoRAManager:
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
         )
+        active_adapter_ids = {
+            wi for wi in weight_indices if wi >= 0 and lora_ranks[wi] > 0
+        }
+        self.lora_backend.batch_info.single_adapter_id = (
+            next(iter(active_adapter_ids)) if len(active_adapter_ids) == 1 else None
+        )
         if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
             self.lora_backend.batch_info.expected_tokens = (
                 sum(forward_batch.extend_seq_lens_cpu)
                 if forward_batch.forward_mode.is_extend()
                 else bs
             )
-            if use_cuda_graph:
-                self.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
+            # Gathered DSV4 metadata is prepared exactly once after execution
+            # is selected: ModelRunner does it for eager fallback, while the
+            # decode graph runner supplies explicit physical row counts for
+            # capture/replay.  Preparing here would double-enter host
+            # collectives on live owners but not on IDLE owners.
         if getattr(self.base_hf_config, "_dsv4_flash_exact_mode", False):
             self.lora_backend._dsv4_flash_exact_batch_certified = True
 
@@ -1694,7 +2320,7 @@ class LoRAManager:
 
             if not isinstance(config.target_modules, list):
                 raise ValueError(
-                    f"SGLang currently only supports inferring LoRA target modules when a list of "
+                    "SGLang currently only supports inferring LoRA target modules when a list of "
                     "suffixes is provided in `target_modules` field of PEFT config. Please explicitly "
                     "specify `--lora-target-modules` during server startup. You can specify `all` to "
                     "enable all support modules types. "
@@ -1718,6 +2344,10 @@ class LoRAManager:
             else:
                 # Otherwise, infer target_modules from adapter configs.
                 self.target_modules.update(adapter_target_modules)
+
+        self.target_modules = _expand_qwen35_logical_lora_targets(
+            self.target_modules, self.base_hf_config
+        )
 
         # Fusion folds wk + weights_proj into wk_weights_proj, so the modules
         # LoRA wraps are absent and an indexer-targeted adapter is silently dropped.

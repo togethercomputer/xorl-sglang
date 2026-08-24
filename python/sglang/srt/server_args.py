@@ -21,6 +21,7 @@ import dataclasses
 import glob
 import importlib
 import importlib.util
+import inspect
 import json
 import logging
 import math
@@ -100,6 +101,9 @@ from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+_DSV4_DEEPEP_NATIVE_EXACT_PROGRAM = "deepep_native_exact_v1"
+
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
@@ -2700,6 +2704,11 @@ class ServerArgs:
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",
         NS("exec.moe"),
     ] = "auto"
+    deepep_native_exact: A[
+        bool,
+        "Use deterministic normal and low-latency DeepEP combine for a model that declares the exact BF16 local-leaf capability.",
+        NS("exec.moe"),
+    ] = False
     fuseep_mode: A[
         Literal[1, 2],
         "Select the mode when enable Ascend FuseEP MoE, 1 -> dispatch_gmm_combine_decode is executed；2 -> dispatch_ffn_combine is executed (support hybrid deployment when 2).",
@@ -3154,6 +3163,11 @@ class ServerArgs:
     enable_lora: A[
         Optional[bool],
         "Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.",
+        NS("lora"),
+    ] = None
+    lora_serving_mode: A[
+        Optional[Literal["merged", "separate"]],
+        "Exact train/serve publication contract. merged serves W+sBA without an active adapter; separate publishes A/B and requires active sampler LoRA.",
         NS("lora"),
     ] = None
     enable_lora_overlap_loading: A[
@@ -3744,6 +3758,11 @@ class ServerArgs:
     debug_tensor_dump_input_file: A[
         Optional[str], "The input filename for dumping tensors", NS("observability")
     ] = None
+    glm52_exact_diagnostic_tensor_dump: A[
+        bool,
+        "Permit tensor-dump hooks only for explicit GLM-5.2 exact-path localization. Outputs from this diagnostic mode are non-certifying.",
+        NS("observability"),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Misc runtime features
@@ -4068,6 +4087,8 @@ class ServerArgs:
         from sglang.srt.arg_groups.overrides import materialize_declarations
 
         materialize_declarations(self)
+        self._validate_native_deepep_runtime_abi()
+        self._resolve_native_deepep_graph_capacity()
         self._validate_dsv4_flash_exact_resolved_contract()
         self._validate_glm52_exact_resolved_contract()
 
@@ -5503,6 +5524,26 @@ class ServerArgs:
 
         _validate_dsv4_flash_exact_quantization_config(config)
 
+        native_deepep = bool(self.deepep_native_exact)
+        if native_deepep and self.moe_a2a_backend != "deepep":
+            raise ValueError(
+                "Exact DSV4 --deepep-native-exact requires --moe-a2a-backend deepep"
+            )
+        hf_config._deepep_native_exact = native_deepep
+        config._deepep_native_exact = native_deepep
+        if native_deepep:
+            self._dsv4_moe_numerical_program = _DSV4_DEEPEP_NATIVE_EXACT_PROGRAM
+            hf_config._dsv4_moe_numerical_program = _DSV4_DEEPEP_NATIVE_EXACT_PROGRAM
+            config._dsv4_moe_numerical_program = _DSV4_DEEPEP_NATIVE_EXACT_PROGRAM
+            if importlib.util.find_spec("deep_ep") is None:
+                raise ImportError(
+                    f"{_DSV4_DEEPEP_NATIVE_EXACT_PROGRAM} requires the deep_ep package"
+                )
+            logger.info(
+                "DSV4 exact MoE selected %s with real pre-expert DeepEP dispatch and handle combine",
+                _DSV4_DEEPEP_NATIVE_EXACT_PROGRAM,
+            )
+
         # The model-owned exact path has eight fixed logical MoE leaves.  Each
         # leaf is one complete EP expert slice plus one eighth of the shared
         # expert; the trainer folds the same eight leaves.  A smaller EP with
@@ -5547,7 +5588,7 @@ class ServerArgs:
                 (None, "dsv4"),
             ),
             "page_size": (self.page_size, (None, 256)),
-            "moe_a2a_backend": (self.moe_a2a_backend, ("none",)),
+            "moe_a2a_backend": (self.moe_a2a_backend, ("none", "deepep")),
             "moe_runner_backend": (
                 self.moe_runner_backend,
                 ("auto", "marlin"),
@@ -5643,6 +5684,13 @@ class ServerArgs:
         if not self.glm52_exact_mode:
             return
 
+        native_deepep = bool(self.deepep_native_exact)
+        if native_deepep and self.moe_a2a_backend != "deepep":
+            raise ValueError(
+                "Exact GLM-5.2 --deepep-native-exact requires "
+                "--moe-a2a-backend deepep"
+            )
+
         self._declare_exact_physical_pp_capability(
             hf_config, _text_model_config(hf_config)
         )
@@ -5730,7 +5778,10 @@ class ServerArgs:
             ),
             "dsa_topk_backend": (self.dsa_topk_backend, ("sgl-kernel",)),
             "moe_dense_tp_size": (self.moe_dense_tp_size, (None, 1)),
-            "moe_a2a_backend": (self.moe_a2a_backend, ("none",)),
+            "moe_a2a_backend": (
+                self.moe_a2a_backend,
+                (("deepep",) if native_deepep else ("none",)),
+            ),
             "moe_dp_size": (self.moe_dp_size, (1,)),
             "ep_num_redundant_experts": (self.ep_num_redundant_experts, (0,)),
             "ep_dispatch_algorithm": (self.ep_dispatch_algorithm, (None,)),
@@ -5861,6 +5912,29 @@ class ServerArgs:
 
         if not self.dsv4_flash_exact_mode:
             return
+        # These environment switches select a different numerical reduction
+        # regardless of which exact MoE program was resolved.  Reject them
+        # first so direct contract validation remains deterministic even when
+        # a focused caller has not run the program resolver yet.
+        early_disabled_envs = (
+            envs.SGLANG_DP_USE_GATHERV,
+            envs.SGLANG_DP_USE_REDUCE_SCATTER,
+        )
+        enabled_early_envs = [
+            setting.name for setting in early_disabled_envs if setting.get()
+        ]
+        if enabled_early_envs:
+            raise ValueError(
+                "The DSV4-Flash exact arithmetic implementation drifted after "
+                "runtime resolution: "
+                + ", ".join(f"{name} is enabled" for name in enabled_early_envs)
+            )
+        dsv4_moe_program = getattr(self, "_dsv4_moe_numerical_program", None)
+        if dsv4_moe_program != _DSV4_DEEPEP_NATIVE_EXACT_PROGRAM:
+            raise ValueError(
+                "The DSV4-Flash exact arithmetic implementation requires "
+                f"{_DSV4_DEEPEP_NATIVE_EXACT_PROGRAM}; got {dsv4_moe_program!r}"
+            )
         dsv4_cp_size = (
             8 // self.dp_size if self.dp_size > 0 and 8 % self.dp_size == 0 else None
         )
@@ -5870,7 +5944,8 @@ class ServerArgs:
             "kv_cache_dtype": "fp8_e4m3",
             "attention_backend": "dsv4",
             "page_size": 256,
-            "moe_a2a_backend": "none",
+            "moe_a2a_backend": "deepep",
+            "deepep_native_exact": True,
             "moe_runner_backend": "marlin",
             "flashinfer_mxfp4_moe_precision": "default",
             "fp8_gemm_runner_backend": "triton",
@@ -5929,6 +6004,99 @@ class ServerArgs:
                 f"resolution: {', '.join(mismatches)}"
             )
 
+    def _resolve_native_deepep_graph_capacity(self) -> None:
+        """Pin native-exact low-latency receive slabs to graph source rows.
+
+        DeepEP allocates ``EP * per_rank_capacity`` receive rows for every
+        local expert.  A full decode graph has a fixed local source-row
+        ceiling: its resolved maximum batch size.  Use that exact ceiling when
+        the operator did not configure one, and reject an explicit mismatch so
+        graph capture cannot exceed DeepEP's ABI or silently retain a different
+        fixed receive layout.  This applies to every native-exact auto family,
+        not just DSV4: Qwen and GLM graph buckets routinely exceed DeepEP's
+        generic per-rank default of 128 rows.
+        """
+
+        if not self.deepep_native_exact or self.deepep_mode != "auto":
+            return
+        decode_graph = getattr(self.cuda_graph_config, "decode", None)
+        if decode_graph is None or decode_graph.backend != Backend.FULL:
+            return
+        required = decode_graph.max_bs
+        if not isinstance(required, int) or isinstance(required, bool) or required <= 0:
+            raise ValueError(
+                "Native exact DeepEP auto full decode graphs require a positive "
+                "resolved cuda_graph_config[decode].max_bs"
+            )
+        capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+        if not capacity.is_set():
+            capacity.set(required)
+            logger.info(
+                "Native exact DeepEP pinned per-rank low-latency dispatch "
+                "capacity to full decode graph max_bs=%d",
+                required,
+            )
+            return
+        configured = capacity.get()
+        if configured != required:
+            raise ValueError(
+                "Native exact DeepEP auto full decode graphs require "
+                "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK to equal the "
+                f"resolved decode graph max_bs ({required}); got {configured}. "
+                "A smaller value violates DeepEP's input ABI and a different "
+                "value changes the fixed receive layout captured by the graph."
+            )
+
+    def _validate_native_deepep_runtime_abi(self) -> None:
+        """Require the patched deterministic DeepEP Python ABI before startup."""
+
+        if not self.deepep_native_exact:
+            return
+        try:
+            deep_ep = importlib.import_module("deep_ep")
+        except ImportError as error:
+            raise ValueError(
+                "Deterministic native exact DeepEP requires the XoRL patched "
+                "DeepEP build; the deep_ep package is not importable"
+            ) from error
+
+        missing = []
+        for enum_name in ("ReductionMode", "LowLatencyReductionMode"):
+            enum_type = getattr(deep_ep, enum_name, None)
+            if enum_type is None or not hasattr(enum_type, "DETERMINISTIC"):
+                missing.append(f"deep_ep.{enum_name}.DETERMINISTIC")
+
+        buffer_type = getattr(deep_ep, "Buffer", None)
+        required_parameters = {
+            "combine": ("reduction_mode",),
+            "low_latency_dispatch": ("topk_weights", "reduction_mode"),
+            "low_latency_combine": (
+                "reduction_mode",
+                "input_is_preweighted",
+                "routed_scaling_factor",
+            ),
+        }
+        for method_name, parameter_names in required_parameters.items():
+            method = getattr(buffer_type, method_name, None)
+            if method is None:
+                missing.append(f"deep_ep.Buffer.{method_name}")
+                continue
+            try:
+                parameters = inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                missing.append(f"inspectable deep_ep.Buffer.{method_name}")
+                continue
+            missing.extend(
+                f"deep_ep.Buffer.{method_name}(..., {parameter_name}=...)"
+                for parameter_name in parameter_names
+                if parameter_name not in parameters
+            )
+        if missing:
+            raise ValueError(
+                "Deterministic native exact DeepEP requires the XoRL patched "
+                "DeepEP ABI; missing " + ", ".join(missing)
+            )
+
     def _validate_glm52_exact_resolved_contract(self) -> None:
         """Fail if a late pass changed a bit-relevant GLM mechanism."""
 
@@ -5946,6 +6114,7 @@ class ServerArgs:
             )
         glm52_dp_owned = self.dp_size > 1
         glm52_cp_size = self.tp_size // self.dp_size
+        glm52_native_deepep = bool(self.deepep_native_exact)
         expected = {
             "dtype": "bfloat16",
             "quantization": "fp8",
@@ -5963,7 +6132,7 @@ class ServerArgs:
             "moe_dp_size": 1,
             "attn_cp_size": glm52_cp_size,
             "moe_dense_tp_size": 1,
-            "moe_a2a_backend": "none",
+            "moe_a2a_backend": "deepep" if glm52_native_deepep else "none",
             "ep_num_redundant_experts": 0,
             "ep_dispatch_algorithm": None,
             "init_expert_location": "trivial",
@@ -5987,7 +6156,6 @@ class ServerArgs:
             "is_embedding": False,
             "enable_two_batch_overlap": False,
             "enable_single_batch_overlap": False,
-            "debug_tensor_dump_output_folder": None,
             "msprobe_dump_config": None,
             "lora_backend": "triton",
             "experts_shared_outer_loras": True,
@@ -6003,6 +6171,18 @@ class ServerArgs:
             for name, value in expected.items()
             if getattr(self, name, None) != value
         ]
+        if self.glm52_exact_diagnostic_tensor_dump:
+            if self.debug_tensor_dump_output_folder is None:
+                mismatches.append(
+                    "glm52_exact_diagnostic_tensor_dump=True requires "
+                    "debug_tensor_dump_output_folder"
+                )
+        elif self.debug_tensor_dump_output_folder is not None:
+            mismatches.append(
+                "debug_tensor_dump_output_folder="
+                f"{self.debug_tensor_dump_output_folder!r} (expected None outside explicit "
+                "non-certifying GLM-5.2 diagnostics)"
+            )
         if self.max_lora_rank is not None and (
             isinstance(self.max_lora_rank, bool)
             or not isinstance(self.max_lora_rank, int)
@@ -6200,10 +6380,11 @@ class ServerArgs:
                     "Exact Qwen3.5-family MoE requires DP to equal stage-local "
                     "TP so the dense GDN/head program remains TP1 on each owner"
                 )
-            if self.moe_a2a_backend != "none":
+            required_a2a = "deepep" if self.deepep_native_exact else "none"
+            if self.moe_a2a_backend != required_a2a:
                 raise ValueError(
                     "The exact Qwen3.5-family MoE XORL contract requires "
-                    "--moe-a2a-backend none"
+                    f"--moe-a2a-backend {required_a2a}"
                 )
             # These are ownership selections, not topology certification.  A
             # DP-owned launch needs request-local attention and a DP-owned head;
@@ -6279,6 +6460,214 @@ class ServerArgs:
             "shape-aware exact SwiGLU, and the families-v2 BF16 lm-head"
         )
 
+    def _resolve_deepep_native_exact_contract(
+        self,
+        hf_config,
+        *,
+        model_arch: str,
+    ) -> None:
+        """Resolve exact DeepEP from a capability declared by the model class."""
+
+        text_config = _text_model_config(hf_config)
+        enabled = bool(self.deepep_native_exact)
+        hf_config._deepep_native_exact = enabled
+        text_config._deepep_native_exact = enabled
+        lora_mode = self.lora_serving_mode
+        if lora_mode not in (None, "merged", "separate"):
+            raise ValueError(
+                "--lora-serving-mode must be merged or separate, " f"got {lora_mode!r}"
+            )
+        if not enabled and lora_mode is not None:
+            raise ValueError(
+                "--lora-serving-mode is an exact train/serve contract and "
+                "requires --deepep-native-exact"
+            )
+        hf_config._lora_serving_mode = lora_mode
+        text_config._lora_serving_mode = lora_mode
+        if not enabled:
+            return
+        if self.rl_on_policy_target != XORL_RL_TARGET:
+            raise ValueError(
+                "--deepep-native-exact requires --rl-on-policy-target xorl"
+            )
+
+        from sglang.srt.models.registry import ModelRegistry
+
+        model_cls, resolved_arch = ModelRegistry.resolve_model_cls([model_arch])
+        capability = getattr(model_cls, "deepep_native_exact_capability", None)
+        if not isinstance(capability, dict):
+            raise ValueError(
+                f"{resolved_arch} does not declare deepep_native_exact_capability"
+            )
+        if not capability.get("produces_local_leaf"):
+            raise ValueError(
+                f"{resolved_arch} cannot produce the exact DeepEP local leaf"
+            )
+        if capability.get("wire_dtype") != "bf16":
+            raise ValueError(
+                f"{resolved_arch} must declare a BF16 exact DeepEP wire leaf"
+            )
+        if not capability.get("uses_dispatch_handle"):
+            raise ValueError(
+                f"{resolved_arch} does not declare real DeepEP dispatch-handle combine"
+            )
+        required_exact_flag = capability.get("required_exact_config_flag")
+        if required_exact_flag and not bool(
+            getattr(
+                text_config,
+                required_exact_flag,
+                getattr(hf_config, required_exact_flag, False),
+            )
+        ):
+            raise ValueError(
+                f"{resolved_arch} exact DeepEP requires model arithmetic flag "
+                f"{required_exact_flag}"
+            )
+
+        active_lora = bool(self.enable_lora)
+        if lora_mode == "merged" and active_lora:
+            raise ValueError(
+                "--lora-serving-mode merged publishes W+sBA and must not enable "
+                "a sampler adapter"
+            )
+        if active_lora and lora_mode != "separate":
+            raise ValueError(
+                "Active sampler LoRA under --deepep-native-exact requires "
+                "--lora-serving-mode separate"
+            )
+        if lora_mode == "separate" and not active_lora:
+            raise ValueError(
+                "--lora-serving-mode separate requires --enable-lora on the sampler"
+            )
+        supported_lora_modes = tuple(capability.get("lora_serving_modes", ()))
+        if lora_mode is not None and lora_mode not in supported_lora_modes:
+            raise ValueError(
+                f"{resolved_arch} exact DeepEP does not support "
+                f"lora_serving_mode={lora_mode!r}"
+            )
+
+        if self.dtype not in ("auto", "bf16", "bfloat16"):
+            raise ValueError("--deepep-native-exact requires BF16 model values")
+        if (
+            not capability.get("supports_quantized_experts", False)
+            and self.quantization is not None
+        ):
+            raise ValueError(
+                f"{resolved_arch} exact DeepEP requires unquantized experts"
+            )
+        required_attention_backend = capability.get("attention_backend")
+        if required_attention_backend and self.attention_backend not in (
+            None,
+            required_attention_backend,
+        ):
+            raise ValueError(
+                f"{resolved_arch} exact DeepEP requires the "
+                f"{required_attention_backend} attention backend"
+            )
+        if self.moe_a2a_backend != "deepep":
+            raise ValueError("--deepep-native-exact requires --moe-a2a-backend deepep")
+        admitted_runners = tuple(capability.get("runner_backends", ()))
+        if self.moe_runner_backend not in admitted_runners:
+            raise ValueError(
+                f"{resolved_arch} exact DeepEP requires one of the declared MoE "
+                f"runners {admitted_runners}; got {self.moe_runner_backend!r}"
+            )
+        if self.deepep_mode not in ("auto", "normal"):
+            raise ValueError(
+                "--deepep-native-exact requires --deepep-mode auto or normal"
+            )
+        if self.deepep_dispatcher_output_dtype not in ("auto", "bf16"):
+            raise ValueError(
+                "--deepep-native-exact requires --deepep-dispatcher-output-dtype bf16"
+            )
+        if self.tp_size <= 1:
+            raise ValueError(
+                "--deepep-native-exact qualification requires a multi-rank stage-local owner plane"
+            )
+        if self.ep_size == 1:
+            self.ep_size = self.tp_size
+        if self.ep_size != self.tp_size:
+            raise ValueError(
+                "--deepep-native-exact requires EP to equal stage-local TP"
+            )
+        supported_ep_sizes = tuple(capability.get("ep_sizes", ()))
+        if self.ep_size not in supported_ep_sizes:
+            raise ValueError(
+                f"{resolved_arch} exact DeepEP supports EP sizes "
+                f"{supported_ep_sizes}; got EP{self.ep_size}"
+            )
+        if (
+            self.deepep_mode == "auto"
+            and capability.get("requires_active_lora_for_auto", False)
+            and not active_lora
+        ):
+            raise ValueError(
+                f"{resolved_arch} exact DeepEP auto mode requires active LoRA"
+            )
+        num_experts = int(
+            getattr(text_config, capability.get("expert_count_attr", "num_experts"), 0)
+        )
+        if num_experts <= 0 or num_experts % self.ep_size:
+            raise ValueError(
+                "--deepep-native-exact requires complete equal expert ownership across EP"
+            )
+        if capability.get("requires_dp_equals_ep", False):
+            if self.dp_size == 1:
+                self.dp_size = self.tp_size
+            if self.dp_size != self.tp_size:
+                raise ValueError(
+                    "--deepep-native-exact requires DP to equal the owner plane "
+                    "so dense layers remain TP1"
+                )
+
+        self.dtype = "bfloat16"
+        if required_attention_backend:
+            self.attention_backend = required_attention_backend
+        # Native DeepEP is only the MoE transport half of the contract. Keep
+        # the already-resolved family arithmetic around the shared transport.
+        if capability.get("enable_qwen3_dense_exact", False):
+            self.qwen3_dense_exact_mode = True
+            hf_config._qwen3_dense_exact_mode = True
+            text_config._qwen3_dense_exact_mode = True
+        self.moe_runner_backend = capability["resolved_runner_backend"]
+        self.deepep_dispatcher_output_dtype = "bf16"
+        self.enable_dp_attention = True
+        if capability.get("enable_dp_lm_head", False):
+            self.enable_dp_lm_head = True
+        self.enable_fp32_router = bool(capability.get("enable_fp32_router", False))
+        if capability.get("disable_fp32_lm_head", False):
+            self.enable_fp32_lm_head = False
+        self.enable_deterministic_inference = True
+        self.sampling_backend = "pytorch"
+        self.sampling_defaults = "openai"
+        self.disable_custom_all_reduce = True
+        self.disable_overlap_schedule = True
+        if self.deepep_mode == "auto":
+            # Prefill selects the normal exact collective and stays eager;
+            # decode selects the fixed-capacity deterministic LL path and may be
+            # captured by the ordinary full CUDA-graph backend.
+            self.cuda_graph_config.prefill.backend = Backend.DISABLED
+        else:
+            self.disable_piecewise_cuda_graph = True
+            native_breakable_decode = (
+                self.cuda_graph_config.decode.backend == Backend.BREAKABLE
+                and self.cuda_graph_config.prefill.backend == Backend.DISABLED
+            )
+            # DeepEP NORMAL collectives are not directly capturable.  The
+            # breakable backend gives them an explicit eager MoE island (see
+            # EPMoE._a2a_forward_with_output_impl) while retaining CUDA graphs
+            # for the surrounding decode segments.
+            self.disable_cuda_graph = not native_breakable_decode
+            if not native_breakable_decode:
+                self.cuda_graph_config.decode.backend = Backend.DISABLED
+                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+        logger.info(
+            "%s native DeepEP exact program selected: real top-k dispatch, "
+            "BF16 local leaves, deterministic hierarchical combine, EP%d",
+            capability.get("label", resolved_arch),
+            self.ep_size,
+        )
+
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
@@ -6306,6 +6695,7 @@ class ServerArgs:
         )
         self._resolve_qwen35_gdn_exact_contract(hf_config, model_arch=model_arch)
         self._resolve_qwen3_dense_exact_contract(hf_config, model_arch=model_arch)
+        self._resolve_deepep_native_exact_contract(hf_config, model_arch=model_arch)
 
         if self.enable_dsa_cache_layer_split and not is_deepseek_dsa(hf_config):
             raise ValueError(
@@ -7964,9 +8354,22 @@ class ServerArgs:
                         "--deepep-mode low_latency or auto."
                     )
             if self.deepep_mode == "normal":
-                logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                native_breakable_decode = (
+                    self.cuda_graph_config.decode.backend == Backend.BREAKABLE
+                    and self.cuda_graph_config.prefill.backend == Backend.DISABLED
+                )
+                if native_breakable_decode:
+                    logger.warning(
+                        "DeepEP normal dispatch is running as an eager MoE island "
+                        "inside the explicitly requested breakable decode graph; "
+                        "prefill CUDA graph remains disabled"
+                    )
+                else:
+                    logger.warning(
+                        "Cuda graph is disabled because deepep_mode=`normal`"
+                    )
+                    self.cuda_graph_config.decode.backend = Backend.DISABLED
+                    self.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         if (
             self.moe_a2a_backend == "none" and is_npu()
