@@ -1,8 +1,10 @@
 """Contract tests for exact dense Qwen3 serving."""
 
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+import torch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -102,6 +104,43 @@ def test_dense_qwen3_model_construction_uses_runtime_contract(monkeypatch):
     monkeypatch.setattr(qwen2, "get_exec", lambda: runtime)
 
     assert qwen2._is_qwen3_dense_exact_runtime()
+
+
+def test_dense_qwen3_rope_uses_eager_bf16_class_a_application():
+    from sglang.srt.layers.rotary_embedding import base
+    from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+
+    deterministic = SimpleNamespace(
+        rl_on_policy_target="xorl",
+        glm52_exact_mode=False,
+        qwen35_gdn_exact_mode=False,
+        qwen35_rope_class_b=False,
+        qwen3_dense_exact_mode=True,
+    )
+    with (
+        patch.object(
+            base,
+            "get_exec",
+            return_value=SimpleNamespace(deterministic=deterministic),
+        ),
+        patch.object(base.torch, "compile") as compile_mock,
+        patch.object(
+            base.RotaryEmbedding,
+            "_cos_sin_cache_out_device",
+            return_value=torch.device("cpu"),
+        ),
+    ):
+        rope = base.RotaryEmbedding(
+            head_size=64,
+            rotary_dim=64,
+            max_position_embeddings=128,
+            base=1_000_000,
+            is_neox_style=True,
+            dtype=torch.bfloat16,
+        )
+
+    compile_mock.assert_not_called()
+    assert rope._apply_rotary_emb_wrapped is apply_rotary_emb
 
 
 @pytest.mark.parametrize(

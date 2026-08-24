@@ -501,9 +501,11 @@ def _fused_moe_kernel_sequence(
     gemm1_limit: Optional[float],
     filter_expert: bool,
     hooks: Optional[Any] = None,
+    force_intermediate_output: bool = False,
     swiglu_limit: Optional[float] = None,
     gate_up_interleaved: bool = True,
     a1_q: Optional[torch.Tensor] = None,
+    preweight_no_combine_routes: bool = False,
 ) -> torch.Tensor:
     """Run the MoE kernel/activation/kernel/combine sequence in a single shot.
 
@@ -770,8 +772,20 @@ def _fused_moe_kernel_sequence(
     )
 
     # LoRA hooks force the second kernel to write to intermediate_cache3 so
-    # hooks.after_down can inspect/modify it before reduction.
-    _use_intermediate = not no_combine and (topk != 1 or hooks)
+    # hooks.after_down can inspect/modify initialized route rows.  This also
+    # applies to no_combine: its public output is route-major, but the hook
+    # must run before those rows are copied there.
+    has_hooks = bool(
+        hooks and (hooks.after_gate_up is not None or hooks.after_down is not None)
+    )
+    # Active MoE-LoRA writes the down GEMM through the route-major
+    # intermediate so its hook can update initialized route rows.  GLM-5.2's
+    # exact native base path must use that same destination program even when
+    # no adapter is installed; otherwise adapter presence alone changes the
+    # BF16 base result before the hook is applied.
+    _use_intermediate = (
+        force_intermediate_output or has_hooks or (not no_combine and topk != 1)
+    )
 
     out_slice = None
     if use_fused_moe_sum_all_reduce:
@@ -799,7 +813,8 @@ def _fused_moe_kernel_sequence(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        not apply_router_weight_on_input and not no_combine,
+        not apply_router_weight_on_input
+        and (not no_combine or preweight_no_combine_routes),
         1,
         down_config or config,
         compute_type=compute_type,
@@ -827,7 +842,8 @@ def _fused_moe_kernel_sequence(
         routed_scaling_factor = 1.0
 
     if no_combine:
-        pass
+        if _use_intermediate:
+            out_hidden_states.copy_(intermediate_cache3)
     elif _is_cuda or _is_musa:
         if use_fused_moe_sum_all_reduce:
             if routed_scaling_factor != 1.0:

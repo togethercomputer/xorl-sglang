@@ -255,6 +255,7 @@ class EagerRunner(BaseRunner):
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
+        owner_forward_batch = forward_batch
 
         if not self.enable_pdmux:
             forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
@@ -291,6 +292,21 @@ class EagerRunner(BaseRunner):
 
         if not cp_v2_active:
             forward_batch.attn_cp_metadata = None
+
+        # Routed-expert capture must see the CP width after CP metadata is
+        # prepared but before the model's DP/MLP-sync-padded router tensors are
+        # consumed.  In particular, DSV4 may append suffix rows for the other
+        # DP owner's wider shard; those rows are numerical execution padding,
+        # not part of the logical route sidechannel.
+        from sglang.srt.state_capturer.routed_experts import (
+            get_global_experts_capturer,
+        )
+
+        if (experts_capturer := get_global_experts_capturer()) is not None:
+            experts_capturer.prepare_forward(
+                forward_batch,
+                owner_forward_batch=owner_forward_batch,
+            )
 
         category = (
             "target_verify"
@@ -359,7 +375,7 @@ class EagerRunner(BaseRunner):
             lora_context = contextlib.nullcontext()
             if self.model_runner.server_args.enable_lora:
                 lora_context = (
-                    self.model_runner.lora_manager.glm52_context_parallel_lora_batch(
+                    self.model_runner.lora_manager.exact_context_parallel_lora_batch(
                         forward_batch, sharded_input_embeds.shape[0]
                     )
                 )

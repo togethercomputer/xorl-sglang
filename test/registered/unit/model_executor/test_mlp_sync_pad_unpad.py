@@ -104,6 +104,15 @@ class TestMlpSyncPadUnpad(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "raw per-rank request counts"):
             DecodeCudaGraphRunner._max_dp_batch_size(fb)
 
+    def test_idle_dp_owner_follows_global_eager_extend(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.IDLE,
+            is_extend_in_batch=True,
+        )
+
+        self.assertFalse(runner.can_run_graph(forward_batch))
+
     def test_decode_graph_ignores_lora_ids_without_lora_manager(self):
         """Merged-weight sync may retain request LoRA IDs with serving LoRA off."""
 
@@ -131,6 +140,44 @@ class TestMlpSyncPadUnpad(CustomTestCase):
 
         with self.assertRaises(ReachedBufferFill):
             runner.load_batch(forward_batch)
+
+    def test_preplanned_decode_graph_refreshes_native_deepep_lora_control(self):
+        """Plan-stream metadata reuse must still refresh graph-static EP LoRA."""
+
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.ragged_verify_mode = False
+        runner.deepep_adapter = MagicMock()
+        runner.bs = 1
+        runner.raw_num_token = 1
+        runner.captured_req_width = 1
+        runner.enable_pdmux = False
+        runner._capture_graph_size = MagicMock(return_value=1)
+        runner._resolve_lora_variant = MagicMock(return_value="active")
+        runner._make_graph_key = MagicMock(return_value=(1, "active"))
+        runner.buffers = SimpleNamespace(
+            input_ids=torch.zeros(1, dtype=torch.int64),
+            positions=torch.zeros(1, dtype=torch.int64),
+        )
+        lora_manager = MagicMock()
+        runner.model_runner = SimpleNamespace(
+            lora_manager=lora_manager,
+            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: False),
+            is_draft_worker=False,
+        )
+        forward_batch = SimpleNamespace(
+            input_ids=torch.tensor([7]),
+            positions=torch.tensor([3]),
+            lora_ids=["adapter-a"],
+            needs_forward_metadata_init=lambda: False,
+        )
+
+        runner.load_batch(forward_batch)
+
+        lora_manager.prepare_deepep_native_exact_dp_lora_batch.assert_called_once_with(
+            forward_batch
+        )
+        runner.deepep_adapter.replay.assert_called_once_with()
+        self.assertEqual(runner._replay_graph_key, (1, "active"))
 
     def test_decode_post_forward_unpads_per_request_tensors(self):
         fb = ForwardBatch(

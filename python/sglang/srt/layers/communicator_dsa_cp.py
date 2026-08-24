@@ -233,6 +233,92 @@ def gather_glm52_mlp_rows(
     return global_rows
 
 
+def select_glm52_local_mlp_rows(
+    hidden_states: torch.Tensor,
+    local_layout: torch.Tensor,
+    forward_batch: ForwardBatch,
+    *,
+    context=None,
+) -> torch.Tensor:
+    """Select this DP/CP owner's rows from a replicated complete MLP result."""
+
+    runtime_context = get_parallel() if context is None else context
+    prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
+    local_rows = local_layout.shape[0]
+    if (
+        getattr(runtime_context, "attn_dp_size", 1) == 1
+        and hidden_states.shape == local_layout.shape
+    ):
+        # DP1 prefill already uses consumer-sharded canonical transport.
+        return hidden_states
+
+    ownership = _glm52_row_ownership(runtime_context)
+    segment_lengths = list(get_dp_global_num_tokens() or [])
+    if not segment_lengths and ownership.dp_size == 1:
+        metadata = getattr(forward_batch, "attn_cp_metadata", None)
+        logical_rows = getattr(metadata, "total_seq_lens", None)
+        segment_lengths = [
+            (
+                int(logical_rows)
+                if prefill_cp and logical_rows is not None
+                else local_rows * ownership.cp_size if prefill_cp else local_rows
+            )
+        ]
+    try:
+        block = ownership.dp_block_slice(segment_lengths)
+    except ValueError as error:
+        raise RuntimeError(
+            "Replicated complete DSA MLP rows have invalid DP ownership metadata"
+        ) from error
+    if (
+        hidden_states.shape[0] != sum(segment_lengths)
+        or hidden_states.shape[1:] != local_layout.shape[1:]
+    ):
+        raise RuntimeError(
+            "Replicated complete DSA MLP rows do not match the rank-local "
+            "CP residual capacity in the DP/CP layout"
+        )
+
+    cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
+    if prefill_cp and cp_metadata is not None and ownership.dp_size > 1:
+        logical_rows = getattr(cp_metadata, "total_seq_lens", None)
+        block_rows = block.stop - block.start
+        if logical_rows is None or block_rows != int(logical_rows):
+            raise RuntimeError(
+                "Replicated complete DSA MLP rows do not match the CP-v2 "
+                "logical row metadata"
+            )
+        from sglang.srt.layers.cp.base import get_cp_strategy
+
+        strategy = get_cp_strategy()
+        if strategy is None:
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 source reassembly requires an active strategy"
+            )
+        local_hidden_states = strategy.shard_hidden_states(
+            hidden_states[block], forward_batch
+        )
+        if local_hidden_states.shape != local_layout.shape:
+            raise RuntimeError(
+                "GLM-5.2 CP-v2 source reassembly returned the wrong physical "
+                f"shape: local={tuple(local_hidden_states.shape)}, "
+                f"expected={tuple(local_layout.shape)}"
+            )
+        return local_hidden_states
+
+    try:
+        source = ownership.local_source_slice(
+            segment_lengths,
+            local_rows=local_rows,
+            context_sharded=prefill_cp,
+        )
+    except ValueError as error:
+        raise RuntimeError(
+            "Replicated complete DSA MLP rows do not match the logical source layout"
+        ) from error
+    return hidden_states[source]
+
+
 def dsa_cp_reduce_scatter_hidden_states(hidden_states: torch.Tensor):
     attn_dp_size = get_parallel().attn_dp_size
     attn_tp_size = get_parallel().attn_tp_size
@@ -507,80 +593,15 @@ class DSACPLayerCommunicator(LayerCommunicator):
                     "Complete local DSA MLP output must match the residual layout"
                 )
             return hidden_states, residual
-        prefill_cp = dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(
-            forward_batch
+        return (
+            select_glm52_local_mlp_rows(
+                hidden_states,
+                residual,
+                forward_batch,
+                context=self._context,
+            ),
+            residual,
         )
-        local_rows = residual.shape[0]
-        if (
-            getattr(self._context, "attn_dp_size", 1) == 1
-            and hidden_states.shape == residual.shape
-        ):
-            # DP1 prefill uses the existing consumer-sharded canonical
-            # transport, which already returns this rank's physical CP rows.
-            return hidden_states, residual
-        ownership = _glm52_row_ownership(self._context)
-        segment_lengths = list(get_dp_global_num_tokens() or [])
-        if not segment_lengths and ownership.dp_size == 1:
-            metadata = getattr(forward_batch, "attn_cp_metadata", None)
-            logical_rows = getattr(metadata, "total_seq_lens", None)
-            segment_lengths = [
-                (
-                    int(logical_rows)
-                    if prefill_cp and logical_rows is not None
-                    else local_rows * ownership.cp_size if prefill_cp else local_rows
-                )
-            ]
-        try:
-            block = ownership.dp_block_slice(segment_lengths)
-        except ValueError as error:
-            raise RuntimeError(
-                "Replicated complete DSA MLP rows have invalid DP ownership metadata"
-            ) from error
-        if (
-            hidden_states.shape[0] != sum(segment_lengths)
-            or hidden_states.shape[1:] != residual.shape[1:]
-        ):
-            raise RuntimeError(
-                "Replicated complete DSA MLP rows do not match the rank-local "
-                "CP residual capacity in the DP/CP layout"
-            )
-        cp_metadata = getattr(forward_batch, "attn_cp_metadata", None)
-        if prefill_cp and cp_metadata is not None and ownership.dp_size > 1:
-            logical_rows = getattr(cp_metadata, "total_seq_lens", None)
-            block_rows = block.stop - block.start
-            if logical_rows is None or block_rows != int(logical_rows):
-                raise RuntimeError(
-                    "Replicated complete DSA MLP rows do not match the CP-v2 "
-                    "logical row metadata"
-                )
-            from sglang.srt.layers.cp.base import get_cp_strategy
-
-            strategy = get_cp_strategy()
-            if strategy is None:
-                raise RuntimeError(
-                    "GLM-5.2 CP-v2 source reassembly requires an active strategy"
-                )
-            local_hidden_states = strategy.shard_hidden_states(
-                hidden_states[block], forward_batch
-            )
-            if local_hidden_states.shape != residual.shape:
-                raise RuntimeError(
-                    "GLM-5.2 CP-v2 source reassembly returned the wrong physical "
-                    f"shape: local={tuple(local_hidden_states.shape)}, "
-                    f"residual={tuple(residual.shape)}"
-                )
-            return local_hidden_states, residual
-        try:
-            source = ownership.local_source_slice(
-                segment_lengths,
-                local_rows=local_rows,
-                context_sharded=prefill_cp,
-            )
-        except ValueError as error:
-            raise RuntimeError(
-                "Replicated complete DSA MLP rows do not match the logical source layout"
-            ) from error
-        return hidden_states[source], residual
 
 
 class DSACPCommunicateSimpleFn(CommunicateSimpleFn):

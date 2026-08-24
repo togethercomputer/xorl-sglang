@@ -83,9 +83,6 @@ from sglang.srt.layers.dp_attention import (
     is_dp_gatherv_active,
 )
 from sglang.srt.layers.dsv4_ownership import (
-    gather_dsv4_owner_plane_rows,
-    reassemble_dsv4_local_rows,
-    reconstruct_dsv4_dp_rows,
     resolve_dsv4_owner_plane,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -174,6 +171,56 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
 if _is_npu:
     import torch_npu
+
+
+def _select_dsv4_mlp_lora_context(
+    lora_backend: Any | None,
+    num_tokens: int,
+    *,
+    exact_mode: bool,
+):
+    """Select gathered LoRA metadata without losing exact base-only batches."""
+
+    if lora_backend is None:
+        return nullcontext()
+    if exact_mode:
+        # CP-v2 already installed this physical owner's local metadata.  Real
+        # DeepEP keeps local activation rows here, then the shared native
+        # runner remaps the single-adapter metadata to the received row count
+        # after dispatch.  Selecting the all-owner gathered metadata at this
+        # point would pair (for example) twelve metadata rows with one local
+        # activation row before DeepEP can run.
+        return nullcontext()
+    return lora_backend.use_gathered_mlp_batch_info(num_tokens)
+
+
+def _select_dsv4_layer_input_ids(
+    input_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    *,
+    context_sharded: bool,
+    cp_v2_active: bool,
+) -> torch.Tensor:
+    """Return token IDs aligned with the model body's current CP row image."""
+
+    if not context_sharded or not cp_v2_active:
+        return input_ids
+    local_input_ids = getattr(forward_batch, "cp_v2_input_ids", None)
+    if local_input_ids is None:
+        # CP-v2 currently shards embeddings and positions in its shared
+        # boundary context but does not retain the corresponding IDs. Reuse
+        # the active strategy and the same metadata to derive that exact row
+        # image once for the model body.
+        from sglang.srt.layers.cp.utils import cp_shard_hidden_states
+
+        local_input_ids = cp_shard_hidden_states(input_ids, forward_batch)
+    if local_input_ids.ndim != 1 or local_input_ids.shape[0] != hidden_states.shape[0]:
+        raise RuntimeError(
+            "DSV4 CP-v2 token IDs do not match the model-body rows: "
+            f"ids={tuple(local_input_ids.shape)}, rows={hidden_states.shape[0]}"
+        )
+    return local_input_ids
 
 
 class MhcOps(NamedTuple):
@@ -879,6 +926,68 @@ class MQALayer(MqaAttentionBase):
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
 
+    def _maybe_capture_exact_attention_component(
+        self,
+        name: str,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Persist one position-aligned serving attention boundary per rank."""
+
+        capture_dir = os.environ.get(
+            "XORL_DSV4_SAMPLER_ATTENTION_CAPTURE_DIR", ""
+        ).strip()
+        raw_layer = os.environ.get("XORL_DSV4_ATTENTION_CAPTURE_LAYER", "").strip()
+        raw_position = os.environ.get(
+            "XORL_DSV4_ATTENTION_CAPTURE_POSITION", ""
+        ).strip()
+        if not capture_dir or not raw_layer or not raw_position:
+            return
+        capture_layers = {
+            int(layer.strip()) for layer in raw_layer.split(",") if layer.strip()
+        }
+        if self.layer_id not in capture_layers:
+            return
+        capture_key = (self.layer_id, name)
+        captured = self.__dict__.setdefault(
+            "_xorl_dsv4_captured_attention_components", set()
+        )
+        if capture_key in captured:
+            return
+        flat_positions = positions.detach().reshape(-1)
+        target_position = int(raw_position)
+        matching = (flat_positions == target_position).nonzero(as_tuple=True)[0]
+        if matching.numel() == 0:
+            return
+        if matching.numel() != 1 or value.shape[0] != flat_positions.numel():
+            raise RuntimeError(
+                f"DSV4 sampler attention component {name} cannot align value and "
+                f"positions: value={tuple(value.shape)} "
+                f"positions={tuple(flat_positions.shape)} matches={matching.numel()}"
+            )
+        captured.add(capture_key)
+        global_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+        os.makedirs(capture_dir, exist_ok=True)
+        output_path = os.path.join(
+            capture_dir,
+            f"rank{global_rank:05d}.layer{self.layer_id:03d}.{name}."
+            f"position{target_position:05d}.pt",
+        )
+        torch.save(
+            {
+                "schema": "xorl.dsv4_sampler_attention_component.v1",
+                "global_rank": global_rank,
+                "layer": self.layer_id,
+                "component": name,
+                "position": target_position,
+                "source_shape": tuple(value.shape),
+                "value": value.index_select(0, matching).detach().cpu(),
+            },
+            output_path,
+        )
+
     def _get_npu_rope_position_cache(
         self, positions: torch.Tensor, dtype: torch.dtype, inverse: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1473,6 +1582,7 @@ class MQALayer(MqaAttentionBase):
                 q_out,
                 x_quant=x_quant,
             )
+        self._maybe_capture_exact_attention_component("q_pre_attention", q, positions)
 
         # The cache write is always fused / already done by _forward_prepare* --
         # tell the backend to skip its own store_cache. When `kv is None`
@@ -1522,6 +1632,9 @@ class MQALayer(MqaAttentionBase):
                     save_kv_cache=save_kv_cache,
                 )
             o = o[:, tp_slice, :]
+        self._maybe_capture_exact_attention_component(
+            "attention_core_output", o, positions
+        )
         if hasattr(self, "debug_attn_core"):
             o = self.debug_attn_core(o)
         if _is_npu:
@@ -1543,10 +1656,14 @@ class MQALayer(MqaAttentionBase):
                 positions=positions,
                 inverse=True,
             )
+        self._maybe_capture_exact_attention_component(
+            "attention_inverse_output", o, positions
+        )
         if hasattr(self, "debug_attn_inverse"):
             o = self.debug_attn_inverse(o)
 
         o = o.view(o.shape[0], self.n_local_groups, -1)
+        self._maybe_capture_exact_attention_component("wo_a_input", o, positions)
         o_input = o
 
         if _FP8_WO_A_GEMM:
@@ -1591,6 +1708,8 @@ class MQALayer(MqaAttentionBase):
                 )
             o = apply_grouped_lora(o, o_input)
 
+        self._maybe_capture_exact_attention_component("wo_a_output", o, positions)
+
         if hasattr(self, "debug_wo_a"):
             o = self.debug_wo_a(o)
 
@@ -1599,6 +1718,8 @@ class MQALayer(MqaAttentionBase):
             o = self.debug_wo_b(o)
         if self.attn_tp_size > 1 and self.attn_tp_size < get_parallel().tp_size:
             o = attn_tp_all_reduce(o)
+
+        self._maybe_capture_exact_attention_component("attention_output", o, positions)
 
         return o
 
@@ -1685,6 +1806,77 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.use_fused_mhc_post_pre = _is_fused_mhc_post_pre_enabled()
         self._input_layernorm_weight_bf16 = None
         self._post_attention_layernorm_weight_bf16 = None
+
+    def _maybe_capture_exact_component(
+        self,
+        name: str,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor,
+    ) -> None:
+        """Persist one position-aligned serving component on each physical rank."""
+
+        capture_dir = os.environ.get(
+            "XORL_DSV4_SAMPLER_COMPONENT_CAPTURE_DIR", ""
+        ).strip()
+        raw_layer = os.environ.get("XORL_DSV4_COMPONENT_CAPTURE_LAYER", "").strip()
+        raw_position = os.environ.get(
+            "XORL_DSV4_COMPONENT_CAPTURE_POSITION", ""
+        ).strip()
+        if not capture_dir or not raw_layer or not raw_position:
+            return
+        capture_layers = {
+            int(layer.strip()) for layer in raw_layer.split(",") if layer.strip()
+        }
+        if self.layer_id not in capture_layers:
+            return
+        if self.use_fused_mhc_post_pre:
+            raise RuntimeError(
+                "DSV4 component capture requires completed, non-fused MHC boundaries"
+            )
+        capture_key = (self.layer_id, name)
+        captured = self.__dict__.setdefault("_xorl_dsv4_captured_components", set())
+        if capture_key in captured:
+            return
+        flat_positions = positions.detach().reshape(-1)
+        target_position = int(raw_position)
+        matching = (flat_positions == target_position).nonzero(as_tuple=True)[0]
+        if matching.numel() == 0:
+            return
+        if matching.numel() != 1 or value.shape[0] != flat_positions.numel():
+            raise RuntimeError(
+                f"DSV4 sampler component {name} cannot align value and positions: "
+                f"value={tuple(value.shape)} positions={tuple(flat_positions.shape)} "
+                f"matches={matching.numel()}"
+            )
+        flat_input_ids = input_ids.detach().reshape(-1)
+        token_id = (
+            int(flat_input_ids.index_select(0, matching).item())
+            if flat_input_ids.numel() == flat_positions.numel()
+            else None
+        )
+        captured.add(capture_key)
+        global_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+        os.makedirs(capture_dir, exist_ok=True)
+        output_path = os.path.join(
+            capture_dir,
+            f"rank{global_rank:05d}.layer{self.layer_id:03d}.{name}.position{target_position:05d}.pt",
+        )
+        torch.save(
+            {
+                "schema": "xorl.dsv4_sampler_component.v1",
+                "global_rank": global_rank,
+                "layer": self.layer_id,
+                "component": name,
+                "position": target_position,
+                "token_id": token_id,
+                "source_shape": tuple(value.shape),
+                "value": value.index_select(0, matching).detach().cpu(),
+            },
+            output_path,
+        )
 
     def _build_self_attn(
         self,
@@ -1893,6 +2085,12 @@ class DeepseekV4DecoderLayer(nn.Module):
         Optional[torch.Tensor],
     ]:
         use_fused = self.use_fused_mhc_post_pre
+        self._maybe_capture_exact_component(
+            "layer_input",
+            hidden_states,
+            positions,
+            input_ids,
+        )
 
         if prev_residual is not None and use_fused:
             residual, post, comb, hidden_states = _get_mhc_ops().mhc_fused_post_pre(
@@ -1939,6 +2137,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
+        self._maybe_capture_exact_component(
+            "attention_input",
+            hidden_states,
+            positions,
+            input_ids,
+        )
+
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 x=hidden_states,
@@ -1946,6 +2151,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 x_quant=x_quant,
             )
+        self._maybe_capture_exact_component(
+            "attention_output",
+            hidden_states,
+            positions,
+            input_ids,
+        )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(
@@ -1989,6 +2200,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_fused = True
         else:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            self._maybe_capture_exact_component(
+                "post_attention_residual",
+                hidden_states,
+                positions,
+                input_ids,
+            )
             residual = hidden_states
             hidden_states, post, comb, norm_fused = self.hc_pre(
                 hidden_states,
@@ -2001,6 +2218,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             if not norm_fused:
                 hidden_states = self.post_attention_layernorm(hidden_states)
 
+        self._maybe_capture_exact_component(
+            "ffn_input",
+            hidden_states,
+            positions,
+            input_ids,
+        )
+
         hidden_states = self._run_moe_ffn_dp_sync(
             hidden_states,
             forward_batch,
@@ -2008,9 +2232,21 @@ class DeepseekV4DecoderLayer(nn.Module):
             input_ids=input_ids,
             input_ids_global=input_ids_global,
         )
+        self._maybe_capture_exact_component(
+            "ffn_output",
+            hidden_states,
+            positions,
+            input_ids,
+        )
 
         if not use_fused:
             hidden_states = self.hc_post(hidden_states, residual, post, comb)
+            self._maybe_capture_exact_component(
+                "layer_output",
+                hidden_states,
+                positions,
+                input_ids,
+            )
             return hidden_states, None, None, None
 
         # Return the deferred FFN hc_post state; the next layer consumes it with
@@ -2028,13 +2264,6 @@ class DeepseekV4DecoderLayer(nn.Module):
     ) -> torch.Tensor:
         _use_cp = self.dsa_enable_prefill_cp and dsa_use_prefill_cp(forward_batch)
         _dsv4_exact_mode = bool(getattr(self.config, "_dsv4_flash_exact_mode", False))
-        if _dsv4_exact_mode:
-            return self._run_exact_moe_owner_sync(
-                hidden_states,
-                forward_batch,
-                positions=positions,
-                context_sharded=_use_cp,
-            )
         _use_tp_moe_gather = (
             not _use_cp
             and get_parallel().attn_dp_size > 1
@@ -2123,10 +2352,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         # reduce via reduce_scatterv/reduce_scatter at the combine below
         # (else double-reduce).
         lora_backend = getattr(getattr(self.mlp, "experts", None), "lora_backend", None)
-        lora_context = (
-            lora_backend.use_gathered_mlp_batch_info(hidden_states.shape[0])
-            if lora_backend is not None
-            else nullcontext()
+        lora_context = _select_dsv4_mlp_lora_context(
+            lora_backend,
+            hidden_states.shape[0],
+            exact_mode=_dsv4_exact_mode,
         )
         with (
             get_forward().scoped(mlp_reduce_scatter=mlp_reduce_scatter),
@@ -2181,124 +2410,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             attn_tp_all_gather(gathered, hidden_states.contiguous())
             hidden_states = torch.cat(gathered)
         return hidden_states
-
-    def _run_exact_moe_owner_sync(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        *,
-        positions: torch.Tensor,
-        context_sharded: bool,
-    ) -> torch.Tensor:
-        """Run exact DSV4 MoE once per logical row on every EP8 contributor."""
-
-        del positions  # The unsplit absolute positions are cached on ForwardBatch.
-        ownership = resolve_dsv4_owner_plane()
-        segment_lengths = list(forward_batch.global_num_tokens_cpu or [])
-        if not segment_lengths and ownership.dp_size == 1:
-            segment_lengths = [hidden_states.shape[0]]
-
-        dp_hidden = reconstruct_dsv4_dp_rows(
-            hidden_states,
-            forward_batch,
-            ownership,
-            segment_lengths,
-            context_sharded=context_sharded,
-        )
-        global_hidden_buffer = get_global_dp_buffer(get_tp_group())
-        full_hidden = gather_dsv4_owner_plane_rows(
-            dp_hidden,
-            ownership,
-            segment_lengths,
-            output=global_hidden_buffer,
-            group=get_tp_group(),
-        )
-
-        def full_metadata(cache_name: str, source_name: str) -> torch.Tensor:
-            cached = getattr(forward_batch, cache_name, None)
-            if cached is not None:
-                return cached
-            source = getattr(forward_batch, source_name, None)
-            if source is None:
-                raise RuntimeError(
-                    f"Exact DSV4 owner movement is missing {source_name}"
-                )
-            dp_source = source.reshape(-1)
-            if context_sharded:
-                from sglang.srt.layers.cp.base import get_cp_strategy
-
-                strategy = get_cp_strategy()
-                if strategy is None:
-                    raise RuntimeError(
-                        "Exact DSV4 metadata requires an active context-parallel strategy"
-                    )
-                local_source = strategy.shard_hidden_states(dp_source, forward_batch)
-                dp_source = reconstruct_dsv4_dp_rows(
-                    local_source,
-                    forward_batch,
-                    ownership,
-                    segment_lengths,
-                    context_sharded=True,
-                )
-            else:
-                dp_source = reconstruct_dsv4_dp_rows(
-                    dp_source,
-                    forward_batch,
-                    ownership,
-                    segment_lengths,
-                    context_sharded=False,
-                )
-            gathered = gather_dsv4_owner_plane_rows(
-                dp_source,
-                ownership,
-                segment_lengths,
-                group=get_tp_group(),
-            )
-            setattr(forward_batch, cache_name, gathered)
-            return gathered
-
-        full_input_ids = full_metadata(
-            "_dsv4_exact_owner_input_ids", "_dsv4_exact_dp_input_ids"
-        )
-        full_positions = full_metadata(
-            "_dsv4_exact_owner_positions", "_dsv4_exact_dp_positions"
-        )
-        if not (
-            full_hidden.shape[0] == full_input_ids.numel() == full_positions.numel()
-        ):
-            raise RuntimeError(
-                "Exact DSV4 hidden, token ID, and absolute-position rows diverged"
-            )
-
-        lora_backend = getattr(getattr(self.mlp, "experts", None), "lora_backend", None)
-        lora_context = (
-            lora_backend.use_gathered_mlp_batch_info(full_hidden.shape[0])
-            if lora_backend is not None
-            else nullcontext()
-        )
-        with (
-            get_forward().scoped(
-                fuse_mlp_allreduce=False,
-                mlp_reduce_scatter=False,
-            ),
-            lora_context,
-        ):
-            completed = self.mlp(
-                full_hidden,
-                forward_batch,
-                input_ids=full_input_ids,
-                input_ids_global=full_input_ids,
-                absolute_positions=full_positions,
-            )
-
-        return reassemble_dsv4_local_rows(
-            completed,
-            forward_batch,
-            ownership,
-            segment_lengths,
-            context_sharded=context_sharded,
-            expected_local_rows=hidden_states.shape[0],
-        )
 
     # ------------------------------------------------------------------
     # TBO op decomposition (prefill two-batch-overlap, EP / mori path)
@@ -2587,6 +2698,68 @@ class DeepseekV4Model(nn.Module):
 
         self.dspark_layers_to_capture: Optional[List[int]] = None
 
+    def _maybe_capture_exact_layer_output(
+        self,
+        *,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Persist one sampler residual row for trainer/sampler localization.
+
+        The hook is inert unless both XORL_DSV4_LAYER_CAPTURE_DIR and
+        XORL_DSV4_LAYER_CAPTURE_POSITION are set. Each physical rank writes at
+        most one tensor per local decoder layer, so the diagnostic neither
+        changes the model value nor creates cross-rank file contention.
+        """
+
+        capture_dir = os.environ.get("XORL_DSV4_LAYER_CAPTURE_DIR", "").strip()
+        raw_position = os.environ.get("XORL_DSV4_LAYER_CAPTURE_POSITION", "").strip()
+        if not capture_dir or not raw_position:
+            return
+        target_position = int(raw_position)
+        flat_positions = positions.detach().reshape(-1)
+        matching = (flat_positions == target_position).nonzero(as_tuple=True)[0]
+        if matching.numel() == 0:
+            return
+
+        captured = self.__dict__.setdefault(
+            "_xorl_dsv4_captured_layer_positions", set()
+        )
+        capture_key = (target_position, int(layer_id))
+        if capture_key in captured:
+            return
+        if hidden_states.shape[0] == flat_positions.numel():
+            row = hidden_states.index_select(0, matching[:1])
+        elif hidden_states.shape[0] == 1:
+            row = hidden_states
+        else:
+            raise RuntimeError(
+                "DSV4 layer capture cannot align hidden rows with positions: "
+                f"hidden={tuple(hidden_states.shape)} positions={tuple(flat_positions.shape)}"
+            )
+        captured.add(capture_key)
+        global_rank = (
+            torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        )
+        os.makedirs(capture_dir, exist_ok=True)
+        output_path = os.path.join(
+            capture_dir,
+            f"rank{global_rank:05d}.layer{int(layer_id):02d}.position{target_position:05d}.pt",
+        )
+        torch.save(
+            {
+                "schema": "xorl.dsv4_sampler_layer_output.v1",
+                "global_rank": global_rank,
+                "pp_rank": int(self.pp_group.rank_in_group),
+                "layer": int(layer_id),
+                "position": target_position,
+                "source_shape": tuple(hidden_states.shape),
+                "hidden": row.detach().cpu(),
+            },
+            output_path,
+        )
+
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens
 
@@ -2819,6 +2992,13 @@ class DeepseekV4Model(nn.Module):
             positions = cp_split_and_rebuild_position(forward_batch, positions)
             input_ids = cp_round_robin_input_ids(input_ids)
             input_ids_global = input_ids
+        layer_input_ids = _select_dsv4_layer_input_ids(
+            input_ids,
+            hidden_states,
+            forward_batch,
+            context_sharded=context_sharded,
+            cp_v2_active=cp_v2_active,
+        )
 
         # Reset Compressor's per-step freqs_cis cache from any previous step.
         for _attr in ("freqs_cis_c4", "freqs_cis_c128"):
@@ -2858,11 +3038,17 @@ class DeepseekV4Model(nn.Module):
                         positions=positions,
                         hidden_states=hidden_states,
                         forward_batch=forward_batch,
-                        input_ids=input_ids,
+                        input_ids=layer_input_ids,
                         input_ids_global=input_ids_global,
                         prev_residual=prev_residual,
                         prev_post=prev_post,
                         prev_comb=prev_comb,
+                    )
+                if dsv4_exact_mode:
+                    self._maybe_capture_exact_layer_output(
+                        layer_id=i,
+                        hidden_states=hidden_states,
+                        positions=positions,
                     )
                 if capture_dspark and i in self.dspark_layers_to_capture:
                     if use_fused:
@@ -2957,6 +3143,24 @@ class DeepseekV4Model(nn.Module):
 
 
 class DeepseekV4ForCausalLM(nn.Module):
+    deepep_native_exact_capability = {
+        "label": "DeepSeek-V4",
+        "produces_local_leaf": True,
+        "wire_dtype": "bf16",
+        "uses_dispatch_handle": True,
+        "ep_sizes": (8,),
+        "runner_backends": ("marlin",),
+        "resolved_runner_backend": "marlin",
+        "supports_quantized_experts": True,
+        "expert_count_attr": "n_routed_experts",
+        "requires_dp_equals_ep": False,
+        "enable_dp_lm_head": False,
+        "enable_fp32_router": False,
+        "requires_active_lora_for_auto": True,
+        "required_exact_config_flag": "_dsv4_flash_exact_mode",
+        "lora_serving_modes": ("separate",),
+    }
+
     supported_lora_modules = (
         "wq_a",
         "self_attn.wq_b",

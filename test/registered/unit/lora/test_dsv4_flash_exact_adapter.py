@@ -375,7 +375,9 @@ def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None
                     extend_seq_lens_cpu=(
                         [token_counts[local_rank]] if is_extend else None
                     ),
-                    forward_mode=ForwardMode.IDLE,
+                    forward_mode=(
+                        ForwardMode.EXTEND if is_extend else ForwardMode.DECODE
+                    ),
                 )
 
                 manager.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
@@ -397,6 +399,266 @@ def test_exact_dp_lora_metadata_follows_every_request_owner(monkeypatch) -> None
                 ]
 
     assert fetched == [{None, "adapter"}] * 128
+
+
+def test_exact_dp_lora_rebuilds_global_pruned_lm_head_metadata(monkeypatch) -> None:
+    from dataclasses import replace
+
+    import sglang.srt.lora.lora_manager as lora_manager_module
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+    from sglang.srt.lora.lora_manager import LoRAManager
+    from sglang.srt.lora.utils import (
+        LoRABatchInfo,
+        get_lm_head_pruned_lens,
+        merge_and_chunk_segments,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    class _MemoryPool:
+        uid_to_buffer_id = {None: 0, "adapter": 1}
+
+        @staticmethod
+        def get_buffer_id(uid):
+            return _MemoryPool.uid_to_buffer_id[uid]
+
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(r=1),
+        scaling=1,
+        _dsv4_flash_exact_adapter_certified=True,
+        _dsv4_flash_exact_all_zero=False,
+    )
+    backend = object.__new__(BaseLoRABackend)
+    backend._is_moe_lora = True
+    backend.context_parallel_mlp_batch_info = None
+    backend.sgemm_batch_info = None
+    local_lm_head_info = LoRABatchInfo(
+        use_cuda_graph=False,
+        bs=1,
+        num_segments=1,
+        seg_indptr=torch.tensor([0, 20], dtype=torch.int32),
+        weight_indices=torch.tensor([1], dtype=torch.int32),
+        lora_ranks=torch.tensor([0, 1], dtype=torch.int64),
+        scalings=torch.tensor([0.0, 1.0]),
+        max_len=20,
+        seg_lens=torch.tensor([20], dtype=torch.int32),
+        permutation=None,
+        expected_tokens=20,
+        has_active_lora=True,
+    )
+    backend.batch_info = local_lm_head_info
+    backend.lm_head_batch_info = local_lm_head_info
+    backend.lm_head_pass_batch_infos = None
+
+    def _prepare_lm_head_batch_info(physical_batch, weight_indices, template):
+        pruned_lens = get_lm_head_pruned_lens(physical_batch)
+        assert pruned_lens is not None
+        total = sum(pruned_lens)
+        seg_weight_indices, seg_lens_cpu = merge_and_chunk_segments(
+            weight_indices, pruned_lens, chunk_size=total
+        )
+        seg_lens = torch.tensor(seg_lens_cpu, dtype=torch.int32)
+        seg_indptr = torch.zeros(len(seg_lens_cpu) + 1, dtype=torch.int32)
+        seg_indptr[1:] = torch.cumsum(seg_lens, dim=0)
+        return (
+            replace(
+                template,
+                bs=len(seg_lens_cpu),
+                num_segments=len(seg_lens_cpu),
+                seg_indptr=seg_indptr,
+                weight_indices=torch.tensor(seg_weight_indices, dtype=torch.int32),
+                max_len=max(seg_lens_cpu),
+                seg_lens=seg_lens,
+                expected_tokens=total,
+            ),
+            None,
+        )
+
+    backend._prepare_lm_head_batch_info = _prepare_lm_head_batch_info
+
+    manager = object.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    manager.max_loras_per_batch = 2
+    manager.device = torch.device("cpu")
+    manager.lora_backend = backend
+    manager.memory_pool = _MemoryPool()
+    manager.loras = {"adapter": adapter}
+    manager.lora_refs = {"adapter": object()}
+    manager.fetch_new_loras = lambda _: None
+
+    full_dp0 = (("adapter", 26),)
+    full_dp1 = ((None, 70),)
+    pruned_dp0 = (("adapter", 20),)
+    pruned_dp1 = ((None, 8),)
+
+    def gather(local_segments):
+        if local_segments == full_dp0:
+            return [full_dp0] * 4 + [full_dp1] * 4
+        assert local_segments == pruned_dp0
+        return [pruned_dp0] * 4 + [pruned_dp1] * 4
+
+    monkeypatch.setattr(
+        lora_manager_module,
+        "get_parallel",
+        lambda: _dsv4_parallel_context(
+            dp_size=2,
+            cp_size=4,
+            dp_rank=0,
+            gather=gather,
+        ),
+    )
+    batch = SimpleNamespace(
+        batch_size=1,
+        lora_ids=["adapter"],
+        global_num_tokens_cpu=[26, 70],
+        global_num_tokens_for_logprob_cpu=[20, 8],
+        is_extend_in_batch=True,
+        return_logprob=True,
+        extend_seq_lens_cpu=[26],
+        extend_logprob_start_lens_cpu=[6],
+        forward_mode=ForwardMode.EXTEND,
+    )
+
+    manager.prepare_dsv4_flash_exact_dp_lora_batch(batch)
+
+    assert backend.context_parallel_mlp_batch_info.expected_tokens == 96
+    assert backend.lm_head_batch_info.expected_tokens == 28
+    assert backend.lm_head_batch_info.seg_lens.tolist() == [20, 8]
+    assert backend.lm_head_batch_info.weight_indices.tolist() == [1, 0]
+
+
+def test_idle_owner_can_select_gathered_lm_head_metadata() -> None:
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+    from sglang.srt.lora.utils import LoRABatchInfo
+
+    gathered = LoRABatchInfo(
+        use_cuda_graph=False,
+        bs=2,
+        num_segments=2,
+        seg_indptr=torch.tensor([0, 20, 28], dtype=torch.int32),
+        weight_indices=torch.tensor([1, 0], dtype=torch.int32),
+        lora_ranks=torch.tensor([0, 1], dtype=torch.int64),
+        scalings=torch.tensor([0.0, 1.0]),
+        max_len=20,
+        seg_lens=torch.tensor([20, 8], dtype=torch.int32),
+        permutation=None,
+        expected_tokens=28,
+        has_active_lora=True,
+    )
+    backend = object.__new__(BaseLoRABackend)
+    backend.batch_info = None
+    backend.context_parallel_mlp_batch_info = gathered
+
+    assert backend.get_batch_info_for_rows(28) is gathered
+    assert backend.get_batch_info_for_rows(1) is None
+
+
+def test_idle_owner_lm_head_uses_global_pruned_metadata() -> None:
+    from torch import nn
+
+    from sglang.srt.lora.layers import ParallelLMHeadWithLoRA
+
+    layer = object.__new__(ParallelLMHeadWithLoRA)
+    nn.Module.__init__(layer)
+    layer.base_layer = nn.Linear(3, 2, bias=False)
+    layer.weight = layer.base_layer.weight
+    layer.set_lora = True
+    layer.lora_backend = SimpleNamespace(
+        batch_info=None,
+        lm_head_batch_info=object(),
+        context_parallel_mlp_batch_info=None,
+    )
+    calls = []
+
+    def apply_lora(base_output, hidden_states):
+        calls.append(hidden_states.shape[0])
+        return base_output + 1
+
+    layer.apply_lora = apply_lora
+    output = layer(torch.ones(4, 3))
+
+    assert calls == [4]
+    assert torch.equal(output, layer.base_layer(torch.ones(4, 3)) + 1)
+
+
+def test_idle_owner_lm_head_passes_gathered_decode_metadata_to_csgmv() -> None:
+    from torch import nn
+
+    from sglang.srt.lora.layers import ParallelLMHeadWithLoRA
+
+    gathered = SimpleNamespace(expected_tokens=4)
+    seen = []
+
+    class _Backend:
+        _lm_head_pass_idx = None
+        lm_head_pass_batch_infos = None
+        lm_head_batch_info = None
+
+        def get_batch_info_for_rows(self, rows):
+            assert rows == 4
+            return gathered
+
+        def run_lora_a_sgemm(self, x, _weights, *, pruned_batch_info):
+            seen.append(("a", pruned_batch_info))
+            return x
+
+        def run_lora_b_sgemm(self, *, x, pruned_batch_info, **_kwargs):
+            seen.append(("b", pruned_batch_info))
+            return x
+
+    layer = object.__new__(ParallelLMHeadWithLoRA)
+    nn.Module.__init__(layer)
+    layer.lora_backend = _Backend()
+    layer.lm_head_A_buffer = torch.empty(1)
+    layer.lm_head_B_buffer = torch.empty(1)
+    layer.output_offset = torch.empty(0, dtype=torch.int32)
+    layer.output_offset_cpu = torch.empty(0, dtype=torch.int32)
+
+    hidden = torch.ones(4, 3)
+    output = layer.apply_lora(torch.zeros_like(hidden), hidden)
+
+    assert output is hidden
+    assert seen == [("a", gathered), ("b", gathered)]
+
+
+def test_exact_global_extend_uses_each_dp_owners_local_forward_mode() -> None:
+    from sglang.srt.lora.lora_manager import _local_request_segments
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    idle_batch = SimpleNamespace(
+        lora_ids=[],
+        is_extend_in_batch=True,
+        extend_seq_lens_cpu=None,
+        forward_mode=ForwardMode.IDLE,
+    )
+    assert _local_request_segments(idle_batch, family="DSV4-Flash") == ()
+
+    decode_batch = SimpleNamespace(
+        lora_ids=["adapter"],
+        is_extend_in_batch=True,
+        extend_seq_lens_cpu=None,
+        forward_mode=ForwardMode.DECODE,
+    )
+    assert _local_request_segments(decode_batch, family="DSV4-Flash") == (
+        ("adapter", 1),
+    )
+
+
+def test_exact_gpu_only_local_extend_materializes_device_lengths() -> None:
+    from sglang.srt.lora.lora_manager import _local_request_segments
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    batch = SimpleNamespace(
+        lora_ids=["adapter-a", "adapter-b"],
+        is_extend_in_batch=True,
+        extend_seq_lens_cpu=None,
+        extend_seq_lens=torch.tensor([5, 7], device="cpu"),
+        forward_mode=ForwardMode.EXTEND,
+    )
+
+    assert _local_request_segments(batch, family="DSV4-Flash") == (
+        ("adapter-a", 5),
+        ("adapter-b", 7),
+    )
 
 
 @pytest.mark.parametrize("dp_size", [1, 2, 4, 8])
@@ -426,16 +688,18 @@ def test_exact_decode_graph_reuses_fixed_dp_row_metadata(
     backend.max_loras_per_batch = 2
     backend._is_moe_lora = True
     backend.context_parallel_mlp_batch_info = None
-    backend.init_context_parallel_cuda_graph_batch_info(num_rows=dp_size)
+    max_local_rows = 4
+    max_gathered_rows = max_local_rows * dp_size
+    backend.init_context_parallel_cuda_graph_batch_info(num_rows=max_gathered_rows)
     backend.moe_cg_buffers = {
         "adapter_enabled": torch.zeros(2, dtype=torch.int32),
-        "token_lora_mapping": torch.full((dp_size,), -1, dtype=torch.int32),
+        "token_lora_mapping": torch.full((max_gathered_rows,), -1, dtype=torch.int32),
     }
 
     manager = object.__new__(LoRAManager)
     manager.base_hf_config = SimpleNamespace(_dsv4_flash_exact_mode=True)
     manager.max_loras_per_batch = 2
-    manager.max_bs_in_cuda_graph = 1
+    manager.max_bs_in_cuda_graph = max_local_rows
     manager.dp_size = dp_size
     manager.device = torch.device("cpu")
     manager.lora_backend = backend
@@ -484,29 +748,119 @@ def test_exact_decode_graph_reuses_fixed_dp_row_metadata(
             "scalings",
         )
     }
-    manager.prepare_dsv4_flash_exact_dp_lora_batch(batch)
+    graph_row_counts = [max_local_rows] * dp_size
+    manager.prepare_dsv4_flash_exact_dp_lora_batch(
+        batch, dp_row_counts=graph_row_counts
+    )
 
     assert backend.context_parallel_mlp_batch_info is fixed
     assert fixed.use_cuda_graph is True
-    expected = [0] * dp_size
-    expected[first_owner] = 1
-    assert fixed.expected_tokens == fixed.bs == dp_size
-    assert fixed.seg_lens.tolist() == [1] * dp_size
-    assert fixed.seg_indptr.tolist() == list(range(dp_size + 1))
+    expected = [
+        _MemoryPool.uid_to_buffer_id[row_uid]
+        for owner_uid in owners
+        for row_uid in [owner_uid, *([None] * (max_local_rows - 1))]
+    ]
+    assert fixed.expected_tokens == fixed.bs == max_gathered_rows
+    assert fixed.seg_lens.tolist() == [1] * max_gathered_rows
+    assert fixed.seg_indptr.tolist() == list(range(max_gathered_rows + 1))
     assert fixed.weight_indices.tolist() == expected
     assert fixed.moe_lora_info.token_lora_mapping.tolist() == expected
 
     owners[first_owner] = None
     owners[second_owner] = "adapter"
     batch.lora_ids = [owners[0]]
-    manager.prepare_dsv4_flash_exact_dp_lora_batch(batch)
-    expected = [0] * dp_size
-    expected[second_owner] = 1
+    manager.prepare_dsv4_flash_exact_dp_lora_batch(
+        batch, dp_row_counts=graph_row_counts
+    )
+    expected = [
+        _MemoryPool.uid_to_buffer_id[row_uid]
+        for owner_uid in owners
+        for row_uid in [owner_uid, *([None] * (max_local_rows - 1))]
+    ]
     assert backend.context_parallel_mlp_batch_info is fixed
     assert fixed.weight_indices.tolist() == expected
     assert {
         name: id(getattr(fixed, name)) for name in fixed_tensor_ids
     } == fixed_tensor_ids
+
+
+def test_exact_idle_owner_eager_fallback_does_not_select_graph_metadata(
+    monkeypatch,
+) -> None:
+    import sglang.srt.lora.lora_manager as lora_manager_module
+    from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
+    from sglang.srt.lora.lora_manager import LoRAManager
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    class _MemoryPool:
+        uid_to_buffer_id = {None: 0, "adapter": 1}
+
+        @staticmethod
+        def get_buffer_id(uid):
+            return _MemoryPool.uid_to_buffer_id[uid]
+
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(r=1),
+        scaling=1,
+        _dsv4_flash_exact_adapter_certified=True,
+        _dsv4_flash_exact_all_zero=False,
+    )
+    backend = object.__new__(TritonLoRABackend)
+    backend.device = torch.device("cpu")
+    backend.max_loras_per_batch = 2
+    backend._is_moe_lora = True
+    backend.context_parallel_mlp_batch_info = None
+    backend.init_context_parallel_cuda_graph_batch_info(num_rows=8)
+    backend.moe_cg_buffers = {
+        "adapter_enabled": torch.zeros(2, dtype=torch.int32),
+        "token_lora_mapping": torch.full((8,), -1, dtype=torch.int32),
+    }
+
+    manager = object.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    manager.max_loras_per_batch = 2
+    manager.max_bs_in_cuda_graph = 4
+    manager.dp_size = 2
+    manager.device = torch.device("cpu")
+    manager.lora_backend = backend
+    manager.memory_pool = _MemoryPool()
+    manager.loras = {"adapter": adapter}
+    manager.lora_refs = {"adapter": object()}
+    manager.fetch_new_loras = lambda _: None
+
+    owner_segments = [(("adapter", 1),)] * 4 + [()] * 4
+
+    def gather(local_segments):
+        assert local_segments == ()
+        return owner_segments
+
+    monkeypatch.setattr(
+        lora_manager_module,
+        "get_parallel",
+        lambda: _dsv4_parallel_context(
+            dp_size=2,
+            cp_size=4,
+            dp_rank=1,
+            gather=gather,
+        ),
+    )
+    idle_eager_fallback = SimpleNamespace(
+        batch_size=0,
+        lora_ids=[],
+        global_num_tokens_cpu=[1, 0],
+        global_num_tokens_for_logprob_cpu=None,
+        is_extend_in_batch=True,
+        forward_mode=ForwardMode.IDLE,
+    )
+
+    fixed = backend.context_parallel_cuda_graph_batch_info
+    manager.prepare_dsv4_flash_exact_dp_lora_batch(idle_eager_fallback)
+
+    dynamic = backend.context_parallel_mlp_batch_info
+    assert dynamic is not fixed
+    assert dynamic.use_cuda_graph is False
+    assert dynamic.expected_tokens == 1
+    assert dynamic.weight_indices.tolist() == [1]
 
 
 @pytest.mark.parametrize("dp_size", [1, 2, 4, 8])
@@ -797,6 +1151,150 @@ def test_exact_resolution_supports_every_dsv4_dp_cp_factorization(
     assert args.exact_physical_pp_capable
 
 
+def test_exact_dsv4_native_deepep_is_selected_by_explicit_exact_switch(
+    monkeypatch,
+) -> None:
+    from sglang.srt.server_args import ServerArgs
+
+    monkeypatch.setattr(
+        "sglang.srt.server_args.importlib.util.find_spec", lambda _name: object()
+    )
+    config = _official_config()
+    args = ServerArgs(model_path="dummy")
+    args.rl_on_policy_target = "xorl"
+    args.tp_size = 8
+    args.ep_size = 8
+    args.dp_size = 2
+    args.moe_a2a_backend = "deepep"
+    args.deepep_native_exact = True
+    args.deepep_mode = "normal"
+
+    args._resolve_dsv4_flash_exact_contract(
+        config,
+        model_arch="DeepseekV4ForCausalLM",
+    )
+
+    assert args.dsv4_flash_exact_mode is True
+    assert args.moe_a2a_backend == "deepep"
+    assert args.disable_shared_experts_fusion is True
+    assert args.deepep_native_exact is True
+    assert args._dsv4_moe_numerical_program == "deepep_native_exact_v1"
+    assert config._dsv4_moe_numerical_program == "deepep_native_exact_v1"
+    assert config._deepep_native_exact is True
+
+    from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+
+    args.cuda_graph_config = CudaGraphConfig()
+    args._resolve_deepep_native_exact_contract(
+        config,
+        model_arch="DeepseekV4ForCausalLM",
+    )
+    assert args.moe_runner_backend == "marlin"
+    assert args.deepep_mode == "normal"
+    assert args.deepep_dispatcher_output_dtype == "bf16"
+    assert args.disable_cuda_graph is True
+    assert args.dp_size == 2
+
+
+def test_exact_dsv4_native_deepep_admits_deterministic_active_lora_full_graph(
+    monkeypatch,
+) -> None:
+    from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
+    from sglang.srt.server_args import ServerArgs
+
+    monkeypatch.setattr(
+        "sglang.srt.server_args.importlib.util.find_spec", lambda _name: object()
+    )
+    config = _official_config()
+    args = ServerArgs(model_path="dummy")
+    args.rl_on_policy_target = "xorl"
+    args.tp_size = 8
+    args.ep_size = 8
+    args.dp_size = 1
+    args.moe_a2a_backend = "deepep"
+    args.deepep_native_exact = True
+    args.deepep_mode = "auto"
+    args.enable_lora = True
+    args.lora_serving_mode = "separate"
+    args.cuda_graph_config = CudaGraphConfig()
+    args.cuda_graph_config.decode.backend = Backend.FULL
+    args.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+    args._resolve_dsv4_flash_exact_contract(
+        config,
+        model_arch="DeepseekV4ForCausalLM",
+    )
+    args._resolve_deepep_native_exact_contract(
+        config,
+        model_arch="DeepseekV4ForCausalLM",
+    )
+
+    assert args.deepep_mode == "auto"
+    assert args.lora_serving_mode == "separate"
+    assert args.moe_runner_backend == "marlin"
+    assert args.deepep_dispatcher_output_dtype == "bf16"
+    assert args.disable_cuda_graph is False
+    assert args.cuda_graph_config.decode.backend == Backend.FULL
+    assert args.cuda_graph_config.prefill.backend == Backend.DISABLED
+
+
+def test_exact_dsv4_native_deepep_full_graph_pins_dispatch_capacity(
+    monkeypatch,
+) -> None:
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
+    from sglang.srt.server_args import ServerArgs
+
+    capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+    monkeypatch.delenv(capacity.name, raising=False)
+    args = ServerArgs(model_path="dummy")
+    args.deepep_native_exact = True
+    args.deepep_mode = "auto"
+    args.dsv4_flash_exact_mode = True
+    args._dsv4_moe_numerical_program = "deepep_native_exact_v1"
+    args.cuda_graph_config = CudaGraphConfig()
+    args.cuda_graph_config.decode.backend = Backend.FULL
+    args.cuda_graph_config.decode.max_bs = 8
+
+    args._resolve_native_deepep_graph_capacity()
+
+    assert capacity.get() == 8
+
+
+def test_exact_dsv4_native_deepep_full_graph_rejects_dispatch_capacity_drift(
+    monkeypatch,
+) -> None:
+    from sglang.srt.environ import envs
+    from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
+    from sglang.srt.server_args import ServerArgs
+
+    capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+    monkeypatch.setenv(capacity.name, "128")
+    args = ServerArgs(model_path="dummy")
+    args.deepep_native_exact = True
+    args.deepep_mode = "auto"
+    args.dsv4_flash_exact_mode = True
+    args._dsv4_moe_numerical_program = "deepep_native_exact_v1"
+    args.cuda_graph_config = CudaGraphConfig()
+    args.cuda_graph_config.decode.backend = Backend.FULL
+    args.cuda_graph_config.decode.max_bs = 4
+
+    with pytest.raises(ValueError, match=r"decode graph max_bs \(4\); got 128"):
+        args._resolve_native_deepep_graph_capacity()
+
+
+def test_exact_dsv4_native_resolved_contract_requires_deepep_backend() -> None:
+    from sglang.srt.server_args import ServerArgs
+
+    args = ServerArgs(model_path="dummy")
+    args.dsv4_flash_exact_mode = True
+    args._dsv4_moe_numerical_program = "deepep_native_exact_v1"
+    args.moe_a2a_backend = "none"
+
+    with pytest.raises(ValueError, match="moe_a2a_backend='none'.*expected 'deepep'"):
+        args._validate_dsv4_flash_exact_resolved_contract()
+
+
 @pytest.mark.parametrize(
     ("name", "value", "message"),
     (
@@ -835,6 +1333,8 @@ def test_exact_resolution_admits_torch_compile_as_execution_policy() -> None:
     args.tp_size = 8
     args.ep_size = 8
     args.dp_size = 8
+    args.deepep_native_exact = True
+    args.moe_a2a_backend = "deepep"
 
     args._resolve_dsv4_flash_exact_contract(
         _official_config(), model_arch="DeepseekV4ForCausalLM"
@@ -891,6 +1391,71 @@ def test_gathered_mlp_lora_metadata_is_scoped_and_restored() -> None:
     assert backend.sgemm_batch_info is local_sgemm
     with pytest.raises(RuntimeError, match="metadata_rows=8, activation_rows=7"):
         with backend.use_gathered_mlp_batch_info(7):
+            pass
+
+
+def test_gathered_mlp_lora_metadata_allows_only_missing_zero_row_idle() -> None:
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+
+    backend = object.__new__(BaseLoRABackend)
+    local = SimpleNamespace(expected_tokens=1)
+    local_sgemm = object()
+    backend.batch_info = local
+    backend.context_parallel_mlp_batch_info = None
+    backend.sgemm_batch_info = local_sgemm
+
+    with backend.use_gathered_mlp_batch_info(0):
+        assert backend.batch_info is None
+        assert backend.sgemm_batch_info is None
+
+    assert backend.batch_info is local
+    assert backend.sgemm_batch_info is local_sgemm
+    with pytest.raises(RuntimeError, match="activation_rows=1"):
+        with backend.use_gathered_mlp_batch_info(1):
+            pass
+
+
+def test_dsv4_native_mlp_keeps_dispatch_local_lora_context() -> None:
+    from sglang.srt.models.deepseek_v4 import _select_dsv4_mlp_lora_context
+
+    generic_context = object()
+    calls = []
+
+    class _Backend:
+        def use_gathered_mlp_batch_info(self, rows):
+            calls.append(("generic", rows))
+            return generic_context
+
+    backend = _Backend()
+    with _select_dsv4_mlp_lora_context(backend, 1, exact_mode=True):
+        pass
+    assert (
+        _select_dsv4_mlp_lora_context(backend, 2, exact_mode=False) is generic_context
+    )
+    assert calls == [("generic", 2)]
+
+
+def test_exact_dsv4_gathered_base_only_state_is_literal_and_fail_closed() -> None:
+    from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+
+    backend = object.__new__(BaseLoRABackend)
+    local = SimpleNamespace(expected_tokens=6)
+    local_sgemm = object()
+    backend.batch_info = local
+    backend.sgemm_batch_info = local_sgemm
+    backend.context_parallel_mlp_batch_info = None
+    backend._dsv4_flash_exact_gathered_base_only = True
+
+    with backend.use_dsv4_exact_gathered_mlp_batch_info(12):
+        assert backend.batch_info is None
+        assert backend.sgemm_batch_info is None
+
+    assert backend.batch_info is local
+    assert backend.sgemm_batch_info is local_sgemm
+
+    backend._dsv4_flash_exact_gathered_base_only = False
+    with pytest.raises(RuntimeError, match="missing for an exact DSV4 activation"):
+        with backend.use_dsv4_exact_gathered_mlp_batch_info(12):
             pass
 
 
@@ -1190,6 +1755,7 @@ def test_exact_resolved_contract_rejects_alternate_dp_combine(
 
 
 def test_exact_batch_checks_decode_graph_metadata_shape_not_topology() -> None:
+    import sglang.srt.lora.lora_manager as lora_manager_module
     from sglang.srt.lora.lora_manager import LoRAManager
     from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -1205,9 +1771,22 @@ def test_exact_batch_checks_decode_graph_metadata_shape_not_topology() -> None:
     manager._validate_dsv4_flash_exact_batch(batch)
     assert manager.lora_backend._dsv4_flash_exact_batch_certified is True
 
-    manager.max_bs_in_cuda_graph = 1
+    manager.max_bs_in_cuda_graph = 4
     manager.dp_size = 4
     manager._validate_dsv4_flash_exact_batch(batch)
+    assert manager.lora_backend._dsv4_flash_exact_batch_certified is True
+
+    capture_padding = SimpleNamespace(
+        batch_size=4,
+        forward_mode=ForwardMode.DECODE,
+        lora_ids=[None] * 4,
+    )
+    original_capture_mode = lora_manager_module.get_is_capture_mode
+    lora_manager_module.get_is_capture_mode = lambda: True
+    try:
+        manager._validate_dsv4_flash_exact_batch(capture_padding)
+    finally:
+        lora_manager_module.get_is_capture_mode = original_capture_mode
     assert manager.lora_backend._dsv4_flash_exact_batch_certified is True
 
     invalid_batch = SimpleNamespace(
@@ -1215,9 +1794,37 @@ def test_exact_batch_checks_decode_graph_metadata_shape_not_topology() -> None:
         forward_mode=ForwardMode.DECODE,
         lora_ids=[None, None],
     )
-    manager.max_bs_in_cuda_graph = 2
-    with pytest.raises(RuntimeError, match="one local one-token request"):
+    manager.max_bs_in_cuda_graph = 4
+    with pytest.raises(RuntimeError, match="one live local one-token request"):
         manager._validate_dsv4_flash_exact_batch(invalid_batch)
+
+
+def test_exact_decode_graph_init_allocates_owner_major_padding_capacity() -> None:
+    from sglang.srt.lora.lora_manager import LoRAManager
+
+    calls = []
+    manager = LoRAManager.__new__(LoRAManager)
+    manager.base_hf_config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    manager.dp_size = 2
+    manager.lora_backend = SimpleNamespace(
+        init_cuda_graph_batch_info=lambda **kwargs: calls.append(("local", kwargs)),
+        init_context_parallel_cuda_graph_batch_info=lambda **kwargs: calls.append(
+            ("gathered", kwargs)
+        ),
+    )
+
+    manager.init_cuda_graph_batch_info(
+        max_bs_in_cuda_graph=4,
+        num_tokens_per_req=1,
+    )
+
+    assert calls == [
+        (
+            "local",
+            {"max_bs_in_cuda_graph": 4, "num_tokens_per_req": 1},
+        ),
+        ("gathered", {"num_rows": 8}),
+    ]
 
 
 @pytest.mark.parametrize("lora_ids", [["policy"], [None]])

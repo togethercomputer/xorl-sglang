@@ -3,9 +3,11 @@ from __future__ import annotations
 import enum
 import functools
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
+    Any,
     Dict,
     List,
     Literal,
@@ -90,6 +92,175 @@ logger = logging.getLogger(__name__)
 SWA_WINDOW = 128
 C4_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
+_CAPTURED_OPERATOR_INPUTS: set[tuple[int, int, int]] = set()
+
+
+def _scheduler_snapshot(metadata: Any) -> dict[str, Any]:
+    config = getattr(metadata, "config", None)
+    config_snapshot = None
+    if config is not None:
+        config_snapshot = {
+            name: getattr(config, name)
+            for name in (
+                "b",
+                "s_q",
+                "h_q",
+                "page_block_size",
+                "h_k",
+                "causal",
+                "is_fp8_kvcache",
+                "topk",
+                "extra_page_block_size",
+                "extra_topk",
+            )
+        }
+    return {
+        "have_initialized": bool(getattr(metadata, "have_initialized", False)),
+        "config": config_snapshot,
+        "tile_scheduler_metadata": (
+            metadata.tile_scheduler_metadata.detach().cpu().clone()
+            if isinstance(
+                getattr(metadata, "tile_scheduler_metadata", None), torch.Tensor
+            )
+            else None
+        ),
+        "num_splits": (
+            metadata.num_splits.detach().cpu().clone()
+            if isinstance(getattr(metadata, "num_splits", None), torch.Tensor)
+            else None
+        ),
+    }
+
+
+def _referenced_cache_rows(
+    cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather split-plane FlashMLA rows in sparse-decode order."""
+
+    length = int(topk_length.reshape(-1)[0].item())
+    references = indices.reshape(-1, indices.shape[-1])[0, :length]
+    page_size = cache.shape[1]
+    valid = references[
+        (references >= 0) & (references < cache.shape[0] * page_size)
+    ].to(torch.int64)
+    if not valid.numel():
+        return references.detach().cpu().clone(), torch.empty(
+            (0, 584), dtype=torch.uint8
+        )
+
+    cache_bytes = cache.detach().view(torch.uint8)
+    page_stride = cache_bytes.stride(0)
+    page_storage = cache_bytes.as_strided(
+        (cache.shape[0], page_stride),
+        (page_stride, 1),
+    )
+    pages = torch.div(valid, page_size, rounding_mode="floor")
+    offsets = torch.remainder(valid, page_size)
+    payload_offsets = offsets[:, None] * 576 + torch.arange(576, device=cache.device)
+    scale_offsets = (
+        page_size * 576 + offsets[:, None] * 8 + torch.arange(8, device=cache.device)
+    )
+    rows = torch.cat(
+        (
+            page_storage[pages[:, None], payload_offsets],
+            page_storage[pages[:, None], scale_offsets],
+        ),
+        dim=1,
+    )
+    return references.detach().cpu().clone(), rows.detach().cpu().clone()
+
+
+def _maybe_capture_operator_inputs(
+    *,
+    layer_id: int,
+    position: int,
+    ratio: int,
+    q: torch.Tensor,
+    attn_sink: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    extra_k_cache: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+    scheduler_before: dict[str, Any],
+    scheduler_after: Any,
+    output: torch.Tensor,
+) -> None:
+    capture_dir = os.environ.get("XORL_DSV4_SAMPLER_OPERATOR_CAPTURE_DIR", "").strip()
+    raw_layer = os.environ.get("XORL_DSV4_OPERATOR_CAPTURE_LAYER", "").strip()
+    raw_positions = os.environ.get("XORL_DSV4_OPERATOR_CAPTURE_POSITIONS", "").strip()
+    if (
+        not capture_dir
+        or not raw_layer
+        or not raw_positions
+        or layer_id != int(raw_layer)
+    ):
+        return
+    target_positions = {
+        int(item.strip()) for item in raw_positions.split(",") if item.strip()
+    }
+    if position not in target_positions:
+        return
+    global_rank = (
+        torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    )
+    capture_key = (global_rank, layer_id, position)
+    if capture_key in _CAPTURED_OPERATOR_INPUTS:
+        return
+
+    raw_references, raw_rows = _referenced_cache_rows(k_cache, indices, topk_length)
+    extra_references = None
+    extra_rows = None
+    if (
+        extra_k_cache is not None
+        and extra_indices is not None
+        and extra_topk_length is not None
+    ):
+        extra_references, extra_rows = _referenced_cache_rows(
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        )
+    _CAPTURED_OPERATOR_INPUTS.add(capture_key)
+    os.makedirs(capture_dir, exist_ok=True)
+    torch.save(
+        {
+            "schema": "xorl.dsv4_sampler_flashmla_operator_capture.v2",
+            "engine": "sampler",
+            "global_rank": global_rank,
+            "layer": layer_id,
+            "position": position,
+            "ratio": ratio,
+            "q": q.detach().cpu().clone(),
+            "attn_sink": attn_sink.detach().cpu().clone(),
+            "raw_indices": indices.detach().cpu().clone(),
+            "raw_topk_length": topk_length.detach().cpu().clone(),
+            "raw_references": raw_references,
+            "raw_referenced_cache_rows": raw_rows,
+            "extra_indices": (
+                extra_indices.detach().cpu().clone()
+                if extra_indices is not None
+                else None
+            ),
+            "extra_topk_length": (
+                extra_topk_length.detach().cpu().clone()
+                if extra_topk_length is not None
+                else None
+            ),
+            "extra_references": extra_references,
+            "extra_referenced_cache_rows": extra_rows,
+            "scheduler_before": scheduler_before,
+            "scheduler_after": _scheduler_snapshot(scheduler_after),
+            "output": output.detach().cpu().clone(),
+        },
+        os.path.join(
+            capture_dir,
+            f"rank{global_rank:05d}.layer{layer_id:03d}.position{position:05d}.pt",
+        ),
+    )
 
 
 def _get_logical_forward_mode(forward_batch: ForwardBatch) -> ForwardMode:
@@ -1770,6 +1941,31 @@ class DeepseekV4AttnBackend(
             assert attn_sink is not None
 
             flashmla_metadata = core_attn_metadata.get_flashmla_metadata(compress_ratio)
+            operator_capture_position = None
+            operator_scheduler_before = None
+            raw_capture_layer = os.environ.get(
+                "XORL_DSV4_OPERATOR_CAPTURE_LAYER", ""
+            ).strip()
+            raw_capture_positions = os.environ.get(
+                "XORL_DSV4_OPERATOR_CAPTURE_POSITIONS", ""
+            ).strip()
+            if (
+                os.environ.get("XORL_DSV4_SAMPLER_OPERATOR_CAPTURE_DIR", "").strip()
+                and raw_capture_layer
+                and raw_capture_positions
+                and layer_id == int(raw_capture_layer)
+                and q.shape[0] == 1
+                and core_attn_metadata.positions_casual.numel() == 1
+            ):
+                candidate_position = int(core_attn_metadata.positions_casual.item())
+                target_positions = {
+                    int(item.strip())
+                    for item in raw_capture_positions.split(",")
+                    if item.strip()
+                }
+                if candidate_position in target_positions:
+                    operator_capture_position = candidate_position
+                    operator_scheduler_before = _scheduler_snapshot(flashmla_metadata)
 
             assert (
                 swa_page_indices.shape[-1] % 64 == 0
@@ -1837,6 +2033,25 @@ class DeepseekV4AttnBackend(
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
                 )[0]
+
+            if operator_capture_position is not None:
+                assert operator_scheduler_before is not None
+                _maybe_capture_operator_inputs(
+                    layer_id=layer_id,
+                    position=operator_capture_position,
+                    ratio=compress_ratio,
+                    q=q,
+                    attn_sink=attn_sink,
+                    k_cache=swa_k_cache,
+                    indices=swa_page_indices,
+                    topk_length=swa_topk_lengths,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices=extra_indices,
+                    extra_topk_length=extra_topk_lengths,
+                    scheduler_before=operator_scheduler_before,
+                    scheduler_after=flashmla_metadata,
+                    output=o,
+                )
 
             o = o.squeeze(1)
             return o

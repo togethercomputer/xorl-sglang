@@ -552,6 +552,36 @@ def test_cp_lora_batch_installs_single_request_local_segment():
     assert backend.batch_info is full_batch_info
 
 
+def test_dsv4_cp_lora_uses_per_expert_factors_without_shared_outer():
+    manager, backend, full_batch_info, *_ = _make_cp_lora_manager(batch_size=1)
+    manager.base_hf_config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    manager.tp_size = manager.ep_size = 8
+    manager.dp_size = 2
+    manager.attn_cp_size = 4
+    manager._experts_shared_outer_override = False
+    forward_batch = _cp_forward_batch(batch_size=1)
+    forward_batch.attn_cp_metadata.per_rank_actual_token = [1024] * 4
+    forward_batch.global_num_tokens_cpu = [4096, 0]
+    prepared_global = SimpleNamespace(expected_tokens=4096)
+    backend.context_parallel_mlp_batch_info = prepared_global
+    strategy = SimpleNamespace(name="interleave", cp_size=4, cp_rank=0)
+
+    with (
+        patch("sglang.srt.layers.cp.base.get_cp_strategy", return_value=strategy),
+        patch(
+            "sglang.srt.lora.lora_manager.get_parallel",
+            return_value=SimpleNamespace(attn_dp_rank=0, attn_cp_rank=0),
+        ),
+    ):
+        with manager.exact_context_parallel_lora_batch(
+            forward_batch, local_num_tokens=1024
+        ):
+            assert backend.batch_info.expected_tokens == 1024
+            assert backend.context_parallel_mlp_batch_info is prepared_global
+
+    assert backend.batch_info is full_batch_info
+
+
 def test_mixed_dp_cp_lora_context_uses_prepared_global_mlp_metadata():
     manager, backend, full_batch_info, *_ = _make_cp_lora_manager(
         batch_size=1, lengths=[4096]
@@ -784,6 +814,37 @@ def test_glm_decoder_routes_mlp_metadata_by_runtime_row_layout(gathered_layout):
             dense_layer, forward_batch, 32
         ):
             pass
+
+
+def test_glm_gathered_mlp_metadata_is_selected_on_locally_idle_owner():
+    gathered_batch_info = SimpleNamespace(expected_tokens=8)
+    backend = object.__new__(TritonLoRABackend)
+    backend.batch_info = None
+    backend.context_parallel_mlp_batch_info = gathered_batch_info
+    backend.sgemm_batch_info = None
+
+    class FakeMoE:
+        def __init__(self):
+            self.experts = SimpleNamespace(lora_backend=backend)
+
+    sparse_layer = SimpleNamespace(
+        glm52_xorl_bi_contract=True,
+        mlp=FakeMoE(),
+    )
+    forward_batch = SimpleNamespace()
+    set_glm52_mlp_row_state(
+        forward_batch,
+        Glm52MlpRowLayout.GLOBAL_LOGICAL,
+        8,
+    )
+
+    with patch("sglang.srt.models.deepseek_v2.DeepseekV2MoE", FakeMoE):
+        with DeepseekV2DecoderLayer._glm52_mlp_lora_context(
+            sparse_layer, forward_batch, 8
+        ):
+            assert backend.batch_info is gathered_batch_info
+
+    assert backend.batch_info is None
 
 
 def test_fused_moe_uses_cp_gathered_metadata_and_row_guard():

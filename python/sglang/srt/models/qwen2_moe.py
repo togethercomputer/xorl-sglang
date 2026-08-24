@@ -318,6 +318,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.RenormalizeNaive,
             num_fused_shared_experts=self.num_fused_shared_experts,
             inplace=not _needs_hidden_after_experts,
+            deepep_native_exact=bool(getattr(config, "_deepep_native_exact", False)),
         )
 
         self.gate = ReplicatedLinear(
@@ -553,25 +554,47 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         shared_output = None
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
+            if self.experts.moe_runner_config.deepep_native_exact:
+                from sglang.srt.layers.moe.deepep_native_exact import (  # noqa: PLC0415
+                    native_exact_router_topk,
+                )
+                from sglang.srt.layers.moe.topk import (  # noqa: PLC0415
+                    capture_routed_experts_if_allowed,
+                )
+
+                router_logits = self._bi_router_logits(hidden_states)
+                topk_weights, topk_ids = native_exact_router_topk(
+                    router_logits,
+                    top_k=self.top_k,
+                    renormalize=self.topk.topk_config.renormalize,
+                )
+                capture_routed_experts_if_allowed(
+                    self.topk.topk_config,
+                    self.topk.layer_id,
+                    topk_ids,
+                    topk_weights,
+                )
+                topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=(
+                        ExpertLocationDispatchInfo.init_new(
+                            layer_id=self.layer_id,
+                        )
+                        if not self.is_nextn
+                        else None
+                    ),
+                )
             if enable_dual_stream:
                 shared_output = shared_expert_on_independent_stream(
                     hidden_states.clone(), self._forward_shared_experts
                 )
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(
-                        layer_id=self.layer_id,
-                    )
-                    if not self.is_nextn
-                    else None
-                ),
-            )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(
@@ -651,7 +674,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         if get_moe_a2a_backend().is_deepep():
-            _require_no_canonical_moe_fold_under_deepep()
+            if not self.experts.moe_runner_config.deepep_native_exact:
+                _require_no_canonical_moe_fold_under_deepep()
             return self._forward_deepep(hidden_states, forward_batch)
 
         use_fused_gate = (

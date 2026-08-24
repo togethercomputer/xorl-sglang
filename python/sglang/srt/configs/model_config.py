@@ -586,6 +586,31 @@ class ModelConfig:
         )
         model_config.hf_config._dsv4_flash_exact_mode = dsv4_flash_exact_mode
         model_config.hf_text_config._dsv4_flash_exact_mode = dsv4_flash_exact_mode
+        dsv4_moe_program = (
+            getattr(server_args, "_dsv4_moe_numerical_program", None)
+            if not is_draft_model
+            else None
+        )
+        model_config.hf_config._dsv4_moe_numerical_program = dsv4_moe_program
+        model_config.hf_text_config._dsv4_moe_numerical_program = dsv4_moe_program
+        # The startup-side numerical-program resolver also records native
+        # DeepEP on the startup ModelConfig.  Worker processes rebuild a fresh
+        # ModelConfig here, so propagate that transport contract explicitly as
+        # well.  Draft workers are intentionally excluded: the exact target
+        # program does not qualify speculative/draft execution.
+        deepep_native_exact = (
+            bool(getattr(server_args, "deepep_native_exact", False))
+            and not is_draft_model
+        )
+        model_config.hf_config._deepep_native_exact = deepep_native_exact
+        model_config.hf_text_config._deepep_native_exact = deepep_native_exact
+        lora_serving_mode = (
+            getattr(server_args, "lora_serving_mode", None)
+            if not is_draft_model
+            else None
+        )
+        model_config.hf_config._lora_serving_mode = lora_serving_mode
+        model_config.hf_text_config._lora_serving_mode = lora_serving_mode
         return model_config
 
     def _config_draft_model(self):

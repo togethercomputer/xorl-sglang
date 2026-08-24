@@ -206,10 +206,103 @@ def fused_experts_none_to_marlin(
         activation=runner_config.activation,
         is_gated=runner_config.is_gated,
         dsv4_exact_mode=runner_config.dsv4_exact_mode,
+        no_combine=runner_config.no_combine,
     ).to(hidden_states.dtype)
 
     return StandardCombineInput(
         hidden_states=output,
+    )
+
+
+@register_fused_func("deepep", "marlin")
+def fused_experts_deepep_normal_to_marlin(
+    dispatch_output,
+    quant_info: MarlinMoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+):
+    """Run local MXFP4-Marlin experts on a real DeepEP normal receive batch."""
+    from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPNormalCombineInput,
+    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import (
+        StandardDispatchOutput,
+    )
+    from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+    if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+        raise NotImplementedError(
+            "MXFP4-Marlin currently supports DeepEP normal dispatch only; "
+            f"received {dispatch_output.format.value}"
+        )
+    if getattr(runner_config, "deepep_native_exact", False):
+        from sglang.srt.layers.moe.deepep_native_exact import (
+            canonicalize_native_routing_metadata,
+        )
+
+        topk_ids = dispatch_output.topk_ids.to(torch.int32).contiguous()
+        topk_weights = canonicalize_native_routing_metadata(
+            dispatch_output.topk_weights
+        )
+    else:
+        topk_ids = dispatch_output.topk_ids
+        topk_weights = dispatch_output.topk_weights
+    # A rank may own none of the selected experts for a small decode batch.
+    # DeepEP still requires the matching empty combine payload, while Marlin's
+    # alignment and GEMM kernels do not define an M=0 launch.
+    if dispatch_output.hidden_states.shape[0] == 0:
+        hidden_states = dispatch_output.hidden_states.clone()
+        if getattr(runner_config, "no_combine", False):
+            from sglang.srt.layers.moe.deepep_native_exact import (
+                native_zero_row_runner_routes,
+                reduce_native_runner_routes_to_bf16,
+            )
+
+            routes = native_zero_row_runner_routes(
+                dispatch_output.hidden_states,
+                topk_ids,
+            )
+            hidden_states = reduce_native_runner_routes_to_bf16(
+                routes,
+                topk_ids,
+                topk_weights,
+            )
+        return DeepEPNormalCombineInput(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+    topk_output = StandardTopKOutput(
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        # The Marlin implementation consumes the explicit top-k tensors; it
+        # only requires this tensor to carry the matching row dimension.
+        router_logits=topk_weights,
+    )
+    local = fused_experts_none_to_marlin(
+        StandardDispatchOutput(
+            hidden_states=dispatch_output.hidden_states,
+            hidden_states_scale=dispatch_output.hidden_states_scale,
+            topk_output=topk_output,
+        ),
+        quant_info,
+        runner_config,
+    )
+    hidden_states = local.hidden_states
+    if getattr(runner_config, "no_combine", False):
+        from sglang.srt.layers.moe.deepep_native_exact import (
+            reduce_native_runner_routes_to_bf16,
+        )
+
+        hidden_states = reduce_native_runner_routes_to_bf16(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+        )
+    return DeepEPNormalCombineInput(
+        hidden_states=hidden_states,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
     )
 
 

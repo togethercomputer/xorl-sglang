@@ -25,6 +25,10 @@ import torch
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.batch_invariant_ops import (
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+)
 from sglang.srt.distributed import (
     get_pp_group,
     moe_expert_parallel_all_reduce,
@@ -48,7 +52,7 @@ from sglang.srt.layers.moe import (
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -101,8 +105,40 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 
+
+def _qwen3_moe_norm_family(*, layer_id: Optional[int] = None, residual: bool = False):
+    """Resolve the architecture-owned Qwen3 families-v2 RMSNorm site."""
+
+    if not getattr(get_exec().deterministic, "qwen3_dense_exact_mode", False):
+        return None
+    if residual or (layer_id is not None and layer_id > 0):
+        return RMS_NORM_FAMILY_RESIDUAL_TREE
+    return RMS_NORM_FAMILY_NO_RESIDUAL
+
+
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+def _can_fuse_qwen3_set_kv_buffer(
+    forward_batch: ForwardBatch,
+    *,
+    compatible_with_fused_kv_buffer: bool,
+) -> bool:
+    """Return whether RoPE can own the KV-cache write for this call.
+
+    RL exactness pins ``RotaryEmbedding`` to ``forward_native``.  That
+    implementation deliberately does not accept ``fused_set_kv_buffer_arg``,
+    so the attention call must retain the ordinary KV write in that mode.
+    Keep this decision paired with ``save_kv_cache`` below: doing only one
+    half either asserts in RoPE or silently omits the decode cache update.
+    """
+
+    return (
+        compatible_with_fused_kv_buffer
+        and get_exec().deterministic.rl_on_policy_target is None
+        and enable_fused_set_kv_buffer(forward_batch)
+    )
 
 
 def compute_yarn_parameters(
@@ -264,6 +300,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
+            deepep_native_exact=bool(getattr(config, "_deepep_native_exact", False)),
         )
 
         # Router gate: description-driven quant, mirroring vllm-ascend. Only the
@@ -347,15 +384,40 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             # router_logits: (num_tokens, n_experts)
-            router_logits, _ = self.gate(hidden_states)
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=forward_batch.num_token_non_padded,
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-            )
+            if self.experts.moe_runner_config.deepep_native_exact:
+                from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+                    bi_router_gemm,
+                )
+                from sglang.srt.layers.moe.deepep_native_exact import (  # noqa: PLC0415
+                    native_exact_router_topk,
+                )
+                from sglang.srt.layers.moe.topk import (  # noqa: PLC0415
+                    capture_routed_experts_if_allowed,
+                )
+
+                router_logits = bi_router_gemm(hidden_states, self.gate.weight)
+                topk_weights, topk_ids = native_exact_router_topk(
+                    router_logits,
+                    top_k=self.top_k,
+                    renormalize=self.topk.topk_config.renormalize,
+                )
+                capture_routed_experts_if_allowed(
+                    self.topk.topk_config,
+                    self.topk.layer_id,
+                    topk_ids,
+                    topk_weights,
+                )
+                topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
+            else:
+                router_logits, _ = self.gate(hidden_states)
+                topk_output = self.topk(
+                    hidden_states,
+                    router_logits,
+                    num_token_non_padded=forward_batch.num_token_non_padded,
+                    expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                        layer_id=self.layer_id,
+                    ),
+                )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         final_hidden_states = self.experts(
@@ -530,6 +592,7 @@ class Qwen3MoeAttention(nn.Module):
             )
         )
         self._used_fused_qk_norm_rope_last_call = False
+        self._used_fused_set_kv_buffer_last_call = False
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -540,8 +603,14 @@ class Qwen3MoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
+        qk_norm_family = _qwen3_moe_norm_family()
+        qk_norm_kwargs = (
+            {"batch_invariant_family": qk_norm_family}
+            if qk_norm_family is not None
+            else {}
+        )
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **qk_norm_kwargs)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **qk_norm_kwargs)
         self.alt_stream = alt_stream
 
     def op_prepare(self, state):
@@ -622,6 +691,7 @@ class Qwen3MoeAttention(nn.Module):
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             self._used_fused_qk_norm_rope_last_call = True
+            self._used_fused_set_kv_buffer_last_call = False
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -633,6 +703,10 @@ class Qwen3MoeAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
+            can_fuse_set_kv_buffer = _can_fuse_qwen3_set_kv_buffer(
+                forward_batch,
+                compatible_with_fused_kv_buffer=self.compatible_with_fused_kv_buffer,
+            )
             q, k = self.rotary_emb(
                 positions,
                 q,
@@ -643,12 +717,12 @@ class Qwen3MoeAttention(nn.Module):
                         layer=self.attn,
                         forward_batch=forward_batch,
                     )
-                    if enable_fused_set_kv_buffer(forward_batch)
-                    and self.compatible_with_fused_kv_buffer
+                    if can_fuse_set_kv_buffer
                     else None
                 ),
             )
             self._used_fused_qk_norm_rope_last_call = False
+            self._used_fused_set_kv_buffer_last_call = can_fuse_set_kv_buffer
         return q, k, v
 
     def forward_prepare(
@@ -679,11 +753,7 @@ class Qwen3MoeAttention(nn.Module):
 
         q, k, v, fb = inner_state
 
-        must_save_kv = self._used_fused_qk_norm_rope_last_call
-        save_kv_cache = must_save_kv or not (
-            enable_fused_set_kv_buffer(forward_batch)
-            and self.compatible_with_fused_kv_buffer
-        )
+        save_kv_cache = not self._used_fused_set_kv_buffer_last_call
         attn_output = self.attn(
             q,
             k,
@@ -784,9 +854,23 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        input_norm_family = _qwen3_moe_norm_family(layer_id=layer_id)
+        input_norm_kwargs = (
+            {"batch_invariant_family": input_norm_family}
+            if input_norm_family is not None
+            else {}
+        )
+        post_norm_family = _qwen3_moe_norm_family(residual=True)
+        post_norm_kwargs = (
+            {"batch_invariant_family": post_norm_family}
+            if post_norm_family is not None
+            else {}
+        )
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, **input_norm_kwargs
+        )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size, eps=config.rms_norm_eps, **post_norm_kwargs
         )
 
         self.layer_communicator = LayerCommunicator(
@@ -924,6 +1008,13 @@ class Qwen3MoeModel(Qwen2MoeModel):
             decoder_layer_type=decoder_layer_type,
             alt_stream=alt_stream,
         )
+        final_norm_family = _qwen3_moe_norm_family(residual=True)
+        if self.pp_group.is_last_rank and final_norm_family is not None:
+            self.norm = RMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                batch_invariant_family=final_norm_family,
+            )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: List[int]):
         self.layers_to_capture = layers_to_capture
@@ -933,6 +1024,24 @@ class Qwen3MoeModel(Qwen2MoeModel):
 
 class Qwen3MoeForCausalLM(nn.Module):
     fall_back_to_pt_during_load = False
+    deepep_native_exact_capability = {
+        "label": "Qwen3-MoE",
+        "produces_local_leaf": True,
+        "wire_dtype": "bf16",
+        "uses_dispatch_handle": True,
+        "ep_sizes": (2, 4, 8, 16),
+        "runner_backends": ("auto", "triton"),
+        "resolved_runner_backend": "triton",
+        "supports_quantized_experts": False,
+        "attention_backend": "fa4",
+        "expert_count_attr": "num_experts",
+        "requires_dp_equals_ep": True,
+        "enable_dp_lm_head": True,
+        "enable_fp32_router": True,
+        "enable_qwen3_dense_exact": True,
+        "disable_fp32_lm_head": True,
+        "lora_serving_modes": ("merged", "separate"),
+    }
 
     # Mapping from fused module names to their component weight names.
     # Required for quantization configs (e.g., ModelOpt FP4) to correctly identify

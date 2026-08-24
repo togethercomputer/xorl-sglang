@@ -18,6 +18,8 @@ No torch.compile.
 
 from __future__ import annotations
 
+import copy
+import dataclasses
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -149,19 +151,61 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         ``cap`` rows; everything else returns exactly ``cap``.
         """
         if torch.is_tensor(output):
-            return min(cap, output.shape[0])
+            return cap if output.ndim == 0 else min(cap, output.shape[0])
         if isinstance(output, PPProxyTensors):
             rows = [t.shape[0] for t in output.tensors.values()]
             return min([cap, *rows])
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            return min(
+                [
+                    cap,
+                    *(
+                        self._output_rows(getattr(output, field.name), cap)
+                        for field in dataclasses.fields(output)
+                        if getattr(output, field.name) is not None
+                    ),
+                ]
+            )
+        if isinstance(output, dict):
+            return min(
+                [
+                    cap,
+                    *(
+                        self._output_rows(value, cap)
+                        for value in output.values()
+                        if value is not None
+                    ),
+                ]
+            )
         if isinstance(output, (list, tuple)) and output:
-            return min(self._output_rows(o, cap) for o in output if o is not None)
+            return min(
+                [
+                    cap,
+                    *(
+                        self._output_rows(value, cap)
+                        for value in output
+                        if value is not None
+                    ),
+                ]
+            )
         return cap
+
+    @staticmethod
+    def _map_dataclass(output: Any, map_value: Callable[[Any], Any]) -> Any:
+        clone = copy.copy(output)
+        for field in dataclasses.fields(output):
+            object.__setattr__(
+                clone, field.name, map_value(getattr(output, field.name))
+            )
+        return clone
 
     def _alloc_full_buffer(self, output: Any, size: int) -> Any:
         """A same-structure buffer as ``output`` but with ``size`` leading rows."""
         if output is None:
             return None
         if torch.is_tensor(output):
+            if output.ndim == 0:
+                return output.new_empty(())
             return output.new_empty((size, *output.shape[1:]))
         if isinstance(output, PPProxyTensors):
             return PPProxyTensors(
@@ -174,20 +218,39 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
             return tuple(self._alloc_full_buffer(o, size) for o in output)
         if isinstance(output, list):
             return [self._alloc_full_buffer(o, size) for o in output]
-        raise TypeError(f"Unsupported BCG output type: {type(output)}")
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            return self._map_dataclass(
+                output, lambda value: self._alloc_full_buffer(value, size)
+            )
+        if isinstance(output, dict):
+            return {
+                key: self._alloc_full_buffer(value, size)
+                for key, value in output.items()
+            }
+        # Non-tensor leaves are capture-invariant Python metadata.
+        return output
 
     def _slice_output(self, output: Any, num_tokens: int) -> Any:
         if output is None:
             return None
         if torch.is_tensor(output):
-            return output[:num_tokens]
+            return output if output.ndim == 0 else output[:num_tokens]
         if isinstance(output, PPProxyTensors):
             return output[:num_tokens]
         if isinstance(output, tuple):
             return tuple(self._slice_output(item, num_tokens) for item in output)
         if isinstance(output, list):
             return [self._slice_output(item, num_tokens) for item in output]
-        raise TypeError(f"Unsupported BCG output type: {type(output)}")
+        if dataclasses.is_dataclass(output) and not isinstance(output, type):
+            return self._map_dataclass(
+                output, lambda value: self._slice_output(value, num_tokens)
+            )
+        if isinstance(output, dict):
+            return {
+                key: self._slice_output(value, num_tokens)
+                for key, value in output.items()
+            }
+        return output
 
     def _copy_output_to_buffer(
         self, output: Any, output_buffer: Any, num_tokens: int
@@ -200,7 +263,10 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 f"{type(output)} vs {type(output_buffer)}"
             )
         if torch.is_tensor(output) and torch.is_tensor(output_buffer):
-            output_buffer[:num_tokens].copy_(output[:num_tokens])
+            if output.ndim == 0 and output_buffer.ndim == 0:
+                output_buffer.copy_(output)
+            else:
+                output_buffer[:num_tokens].copy_(output[:num_tokens])
             return
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors
@@ -225,6 +291,29 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
                 )
             for item, buffer in zip(output, output_buffer):
                 self._copy_output_to_buffer(item, buffer, num_tokens)
+            return
+        if (
+            dataclasses.is_dataclass(output)
+            and not isinstance(output, type)
+            and isinstance(output_buffer, type(output))
+        ):
+            for field in dataclasses.fields(output):
+                self._copy_output_to_buffer(
+                    getattr(output, field.name),
+                    getattr(output_buffer, field.name),
+                    num_tokens,
+                )
+            return
+        if isinstance(output, dict) and isinstance(output_buffer, dict):
+            if output.keys() != output_buffer.keys():
+                raise ValueError(
+                    "BCG output mapping structure changed between capture sizes: "
+                    f"{output.keys()} != {output_buffer.keys()}"
+                )
+            for key, value in output.items():
+                self._copy_output_to_buffer(value, output_buffer[key], num_tokens)
+            return
+        if type(output) is type(output_buffer) and output == output_buffer:
             return
         raise TypeError(
             "Unsupported BCG output buffer pair: "

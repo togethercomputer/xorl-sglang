@@ -23,6 +23,7 @@ from sglang.srt.distributed.canonical_moe import (
     canonicalize_glm52_local_partial_v3,
 )
 from sglang.srt.layers.glm52_positions import (
+    CanonicalMoEPositions,
     Glm52MlpRowLayout,
     align_glm52_moe_positions,
     get_glm52_mlp_row_state,
@@ -39,6 +40,159 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 class TestGlm52CanonicalMoE(unittest.TestCase):
+    def test_native_deepep_owner_requires_exact_target_model(self):
+        from sglang.srt.models.deepseek_v2 import _uses_glm52_native_deepep
+
+        config = SimpleNamespace(
+            indexer_types=["full"],
+            _glm52_exact_mode=True,
+            _deepep_native_exact=True,
+        )
+        self.assertTrue(_uses_glm52_native_deepep(config))
+        self.assertFalse(_uses_glm52_native_deepep(config, is_nextn=True))
+        config._deepep_native_exact = False
+        self.assertFalse(_uses_glm52_native_deepep(config))
+
+    def test_native_deepep_gathers_only_the_tp_sharded_shared_branch(self):
+        if importlib.util.find_spec("sgl_kernel") is None:
+            self.skipTest("sgl_kernel is required to import the serving model")
+
+        from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+        local_hidden = torch.arange(8, dtype=torch.bfloat16).reshape(2, 4)
+        full_hidden = torch.arange(32, dtype=torch.bfloat16).reshape(8, 4)
+        local_positions = CanonicalMoEPositions(
+            values=torch.tensor([3, 11]),
+            valid_mask=torch.tensor([True, True]),
+        )
+        full_positions = CanonicalMoEPositions(
+            values=torch.arange(8),
+            valid_mask=torch.ones(8, dtype=torch.bool),
+        )
+        routed = torch.full_like(local_hidden, 2)
+        canonical_shared = torch.full_like(local_hidden, 5)
+        replicated_shared = torch.full_like(full_hidden, 5)
+        calls = []
+
+        class FakeGate(torch.nn.Module):
+            def forward(self, hidden_states, **_kwargs):
+                calls.append(("gate", hidden_states.clone()))
+                return hidden_states.new_zeros((hidden_states.shape[0], 4))
+
+        class FakeTopK(torch.nn.Module):
+            def forward(self, hidden_states, *_args, **_kwargs):
+                return SimpleNamespace(
+                    topk_ids=torch.zeros(
+                        (hidden_states.shape[0], 1), dtype=torch.int32
+                    ),
+                    topk_weights=torch.ones(
+                        (hidden_states.shape[0], 1), dtype=torch.float32
+                    ),
+                )
+
+        class FakeExperts(torch.nn.Module):
+            lora_backend = None
+
+            def forward(self, *, hidden_states, topk_output):
+                calls.append(("routed", hidden_states.clone()))
+                return routed.clone()
+
+        class FakeShared(torch.nn.Module):
+            def forward(self, hidden_states, **_kwargs):
+                calls.append(("shared", hidden_states.clone()))
+                return hidden_states.clone()
+
+        moe = object.__new__(DeepseekV2MoE)
+        torch.nn.Module.__init__(moe)
+        moe._glm52_native_deepep = True
+        moe._fuse_shared_experts_inside_sbo = False
+        moe.is_nextn = False
+        moe.num_fused_shared_experts = 0
+        moe.alt_stream = None
+        moe.layer_id = 3
+        moe.gate = FakeGate()
+        moe.topk = FakeTopK()
+        moe.experts = FakeExperts()
+        moe.shared_experts = FakeShared()
+
+        def fake_canonicalize(partial, positions, **kwargs):
+            calls.append(("canonical", partial.clone(), positions, kwargs))
+            return replicated_shared.clone()
+
+        moe._canonicalize_glm52_partial = fake_canonicalize
+        batch = SimpleNamespace(num_token_non_padded=2)
+
+        with (
+            patch(
+                "sglang.srt.models.deepseek_v2.gather_glm52_mlp_rows",
+                return_value=full_hidden,
+            ) as gather,
+            patch(
+                "sglang.srt.models.deepseek_v2.align_glm52_moe_positions",
+                return_value=full_positions,
+            ) as align,
+            patch(
+                "sglang.srt.models.deepseek_v2.select_glm52_local_mlp_rows",
+                return_value=canonical_shared,
+            ) as select_local,
+            patch(
+                "sglang.srt.models.deepseek_v2.ExpertLocationDispatchInfo.init_new",
+                return_value=None,
+            ),
+        ):
+            output = moe.forward_deepep(
+                local_hidden,
+                batch,
+                absolute_positions=local_positions,
+            )
+
+        gather.assert_called_once_with(local_hidden, batch)
+        align.assert_called_once_with(local_positions.values, full_hidden, batch)
+        self.assertTrue(torch.equal(calls[0][1], local_hidden))
+        self.assertTrue(torch.equal(calls[1][1], local_hidden))
+        self.assertTrue(torch.equal(calls[2][1], full_hidden))
+        canonical_call = next(call for call in calls if call[0] == "canonical")
+        self.assertTrue(torch.equal(canonical_call[1], full_hidden))
+        self.assertIs(canonical_call[2], full_positions)
+        self.assertFalse(canonical_call[3]["force_replicated"])
+        select_args = select_local.call_args.args
+        self.assertTrue(torch.equal(select_args[0], replicated_shared))
+        # The canonical join reuses the routed tensor as its output buffer, so
+        # its values have changed by assertion time; its local owner layout is
+        # the contract passed to the selector.
+        self.assertEqual(select_args[1].shape, routed.shape)
+        self.assertIs(select_args[2], batch)
+        self.assertEqual(output.shape, local_hidden.shape)
+
+    def test_complete_dp_rows_are_sliced_back_to_the_routed_owner(self):
+        from sglang.srt.layers.communicator_dsa_cp import (
+            select_glm52_local_mlp_rows,
+        )
+
+        complete = torch.arange(30, dtype=torch.bfloat16).reshape(10, 3)
+        local_layout = torch.empty((3, 3), dtype=torch.bfloat16)
+        context = SimpleNamespace(
+            attn_dp_size=4,
+            attn_dp_rank=1,
+            attn_cp_size=1,
+            attn_cp_rank=0,
+            tp_size=4,
+        )
+        with patch.multiple(
+            "sglang.srt.layers.communicator_dsa_cp",
+            dsa_use_prefill_cp=lambda *_args: False,
+            mla_use_prefill_cp=lambda *_args: False,
+            get_dp_global_num_tokens=lambda: [2, 3, 1, 4],
+        ):
+            local = select_glm52_local_mlp_rows(
+                complete,
+                local_layout,
+                SimpleNamespace(),
+                context=context,
+            )
+
+        self.assertTrue(torch.equal(local, complete[2:5]))
+
     def test_logical_row_ownership_covers_every_dp_cp_factorization(self):
         from sglang.srt.layers.glm52_ownership import LogicalRowOwnership
 
@@ -309,7 +463,11 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
         from sglang.srt.layers.communicator_dsa_cp import (
             DSACPLayerCommunicator,
             DSAMLPOutputLayout,
+        )
+        from sglang.srt.layers.communicator_dsa_cp import (
             align_glm52_moe_positions as align_runtime_positions,
+        )
+        from sglang.srt.layers.communicator_dsa_cp import (
             gather_glm52_mlp_rows,
         )
         from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
@@ -629,6 +787,8 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
     def test_equal_capacity_physical_layout_stays_rank_major(self):
         from sglang.srt.layers.communicator_dsa_cp import (
             align_glm52_moe_positions as align_runtime_positions,
+        )
+        from sglang.srt.layers.communicator_dsa_cp import (
             gather_glm52_mlp_rows,
         )
 
@@ -1406,6 +1566,7 @@ class TestGlm52CanonicalMoE(unittest.TestCase):
                     decoder = object.__new__(DeepseekV2DecoderLayer)
                     torch.nn.Module.__init__(decoder)
                     decoder.layer_id = 7
+                    decoder.glm52_xorl_bi_contract = False
                     decoder.dsa_enable_prefill_cp = True
                     decoder.mla_enable_prefill_cp = False
                     decoder.layer_scatter_modes = modes

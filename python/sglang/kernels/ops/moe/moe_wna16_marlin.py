@@ -66,6 +66,7 @@ def moe_wna16_marlin_gemm(
     is_k_full: bool = True,
     use_atomic_add: bool = False,
     use_fp32_reduce: bool = False,
+    expert_block_partition_count: int = 1,
     is_zp_float: bool = False,
 ) -> torch.Tensor:
     device = a.device
@@ -170,6 +171,7 @@ def moe_wna16_marlin_gemm(
         group_size,
         use_atomic_add,
         use_fp32_reduce,
+        expert_block_partition_count,
         is_zp_float,
     )
 

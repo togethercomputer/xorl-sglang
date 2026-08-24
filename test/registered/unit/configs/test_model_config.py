@@ -94,6 +94,53 @@ class TestExactRuntimeContractConfig(CustomTestCase):
                     expected,
                 )
 
+    def test_fresh_runner_config_carries_native_deepep_target_contract(self):
+        build_from_server_args = ModelConfig.from_server_args
+
+        for native_exact, is_draft_model, expected in (
+            (True, False, True),
+            (True, True, False),
+            (False, False, False),
+        ):
+            with self.subTest(
+                native_exact=native_exact,
+                is_draft_model=is_draft_model,
+            ):
+                server_args = ServerArgs(model_path="dummy")
+                server_args.deepep_native_exact = native_exact
+                server_args.lora_serving_mode = "separate"
+                runner_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(),
+                    hf_text_config=SimpleNamespace(),
+                )
+
+                with patch(
+                    "sglang.srt.configs.model_config.ModelConfig",
+                    return_value=runner_config,
+                ):
+                    result = build_from_server_args(
+                        server_args,
+                        is_draft_model=is_draft_model,
+                    )
+
+                self.assertIs(result, runner_config)
+                self.assertEqual(
+                    result.hf_config._deepep_native_exact,
+                    expected,
+                )
+                self.assertEqual(
+                    result.hf_text_config._deepep_native_exact,
+                    expected,
+                )
+                self.assertEqual(
+                    result.hf_config._lora_serving_mode,
+                    "separate" if not is_draft_model else None,
+                )
+                self.assertEqual(
+                    result.hf_text_config._lora_serving_mode,
+                    "separate" if not is_draft_model else None,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

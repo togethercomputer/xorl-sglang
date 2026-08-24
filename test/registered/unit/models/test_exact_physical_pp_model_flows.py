@@ -396,6 +396,9 @@ def test_eager_exact_hooks_are_safe_and_stage_local_with_lora_off_or_on(
 
     batch.prepare_attn_tp_scatter_input.assert_called_once_with(runner)
     if with_lora:
+        runner.lora_manager.prepare_deepep_native_exact_dp_lora_batch.assert_called_once_with(
+            batch
+        )
         runner.lora_manager.prepare_dsv4_flash_exact_dp_lora_batch.assert_called_once_with(
             batch
         )

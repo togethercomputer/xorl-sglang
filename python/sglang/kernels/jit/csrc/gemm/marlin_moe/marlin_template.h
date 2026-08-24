@@ -79,6 +79,7 @@ __global__ void Marlin(
     int* locks,                                              // extra global storage for barrier synchronization
     bool use_atomic_add,                                     // whether to use atomic add to reduce
     bool use_fp32_reduce,                                    // whether to use fp32 global reduce
+    int expert_block_partition_count,                        // fixed independent expert-block partitions
     int max_shared_mem) {}
 
 }  // namespace device::marlin_moe
@@ -326,6 +327,7 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
+    int expert_block_partition_count,
     int max_shared_mem) {
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
@@ -392,7 +394,29 @@ __global__ void Marlin(
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
-  int iters = div_ceil(k_tiles * n_tiles * parallel, gridDim.x);
+
+  // The stock scheduler stripes all expert blocks in one flattened problem.
+  // Consequently, adding an unrelated sibling expert changes every route's K
+  // partition and its final BF16 bytes. Exact DSV4 uses a fixed partition per
+  // expert block: the host launches the same base grid for each possible
+  // sibling, and each virtual lane schedules one real expert block as an
+  // independent parallel-1 problem. Lanes beyond the rank-local block count
+  // return without touching output. This preserves a single top-k launch while
+  // making its per-route arithmetic byte-identical to the top-k1 program.
+  int schedule_grid_dim = gridDim.x;
+  int schedule_block_idx = blockIdx.x;
+  int schedule_parallel = parallel;
+  int schedule_problem = 0;
+  int schedule_lock_base = 0;
+  if (expert_block_partition_count > 1) {
+    schedule_grid_dim = gridDim.x / expert_block_partition_count;
+    schedule_problem = blockIdx.x / schedule_grid_dim;
+    if (schedule_problem >= parallel) return;
+    schedule_block_idx = blockIdx.x % schedule_grid_dim;
+    schedule_parallel = 1;
+    schedule_lock_base = schedule_problem * min(n_tiles, schedule_grid_dim);
+  }
+  int iters = div_ceil(k_tiles * n_tiles * schedule_parallel, schedule_grid_dim);
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
@@ -403,8 +427,11 @@ __global__ void Marlin(
     }
   }
 
-  int slice_row = (iters * blockIdx.x) % k_tiles;
-  int slice_col_par = (iters * blockIdx.x) / k_tiles;
+  int slice_row = (iters * schedule_block_idx) % k_tiles;
+  int slice_col_par = (iters * schedule_block_idx) / k_tiles;
+  if (expert_block_partition_count > 1) {
+    slice_col_par += schedule_problem * n_tiles;
+  }
   int slice_col = slice_col_par;
   int slice_iters;      // number of threadblock tiles in the current slice
   int slice_count = 0;  // total number of active threadblocks in the current slice
@@ -436,12 +463,12 @@ __global__ void Marlin(
     slice_col = slice_col_par % n_tiles;
     par_id = slice_col_par / n_tiles;
   }
-  if (parallel * n_tiles >= gridDim.x) {
+  if (schedule_parallel * n_tiles >= schedule_grid_dim) {
     // when parallel * n_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
-    locks_off = blockIdx.x;
+    locks_off = schedule_lock_base + schedule_block_idx;
   } else {
-    locks_off = (iters * blockIdx.x) / k_tiles - 1;
+    locks_off = schedule_lock_base + (iters * schedule_block_idx) / k_tiles - 1;
   }
 
   int prob_m_top_k = prob_m * top_k;
@@ -562,18 +589,22 @@ __global__ void Marlin(
   // Compute all information about the current slice which is required for
   // synchronization.
   auto init_slice = [&](bool first_init = false) {
-    slice_iters = iters * (blockIdx.x + 1) - (k_tiles * slice_col_par + slice_row);
-    if (slice_iters < 0 || slice_col_par >= n_tiles * parallel) slice_iters = 0;
+    int schedule_slice_col_par = slice_col_par;
+    if (expert_block_partition_count > 1) {
+      schedule_slice_col_par -= schedule_problem * n_tiles;
+    }
+    slice_iters = iters * (schedule_block_idx + 1) - (k_tiles * schedule_slice_col_par + slice_row);
+    if (slice_iters < 0 || schedule_slice_col_par >= n_tiles * schedule_parallel) slice_iters = 0;
     if (slice_iters == 0) return;
     if (slice_row + slice_iters > k_tiles) slice_iters = k_tiles - slice_row;
     slice_count = 1;
     slice_idx = 0;
-    int col_first = iters * div_ceil(k_tiles * slice_col_par, iters);
-    if (col_first <= k_tiles * (slice_col_par + 1)) {
-      int col_off = col_first - k_tiles * slice_col_par;
+    int col_first = iters * div_ceil(k_tiles * schedule_slice_col_par, iters);
+    if (col_first <= k_tiles * (schedule_slice_col_par + 1)) {
+      int col_off = col_first - k_tiles * schedule_slice_col_par;
       slice_count = div_ceil(k_tiles - col_off, iters);
       if (col_off > 0) slice_count++;
-      int delta_first = iters * blockIdx.x - col_first;
+      int delta_first = iters * schedule_block_idx - col_first;
       if (delta_first < 0 || (col_off == 0 && delta_first == 0))
         slice_idx = slice_count - 1;
       else {
@@ -581,7 +612,7 @@ __global__ void Marlin(
         if (col_off > 0) slice_idx--;
       }
     }
-    if (parallel * n_tiles >= gridDim.x) {
+    if (schedule_parallel * n_tiles >= schedule_grid_dim) {
       if (slice_count > 1 && slice_idx == slice_count - 1) {
         locks_off++;
       }

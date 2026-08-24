@@ -6,6 +6,8 @@ LoRA deltas are injected via hooks.
 
 from __future__ import annotations
 
+import os
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import torch
@@ -24,6 +26,7 @@ if TYPE_CHECKING:
     )
 
 _is_cuda = is_cuda()
+_dsv4_marlin_stage_capture_done = False
 
 if _is_cuda:
     from sglang.kernels.ops.activation import silu_and_mul
@@ -43,6 +46,81 @@ if _is_cuda:
 
 
 MarlinAlignment = tuple[int, int, torch.Tensor, torch.Tensor, torch.Tensor]
+
+
+def _validate_low_latency_counts(counts: torch.Tensor, capacity: int) -> None:
+    """Validate DeepEP receive counts without synchronizing a captured stream.
+
+    ``bool(torch.any(...))`` copies a device predicate to the host.  That is a
+    useful fail-closed check in eager execution, but CUDA forbids the copy
+    while a full decode graph is being captured.  The low-latency DeepEP ABI
+    already bounds ``masked_m`` by the configured capacity; during capture and
+    replay the device-side mask below remains the source of truth.
+    """
+
+    if counts.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+    if bool(torch.any(counts < 0)) or bool(torch.any(counts > capacity)):
+        raise ValueError("packed low-latency counts are outside receive capacity")
+
+
+def _prepare_low_latency_marlin_dispatch(
+    dispatch_output,
+    quant_info: MarlinMoeQuantInfo,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple[int, int, int]]:
+    """Flatten deterministic expert-major receives into top-1 Marlin rows."""
+
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLExactDispatchOutput,
+    )
+
+    if not isinstance(dispatch_output, DeepEPLLExactDispatchOutput):
+        raise ValueError(
+            "MXFP4-Marlin low-latency execution requires deterministic "
+            "DeepEP dispatch with packed route weights"
+        )
+    hidden = dispatch_output.hidden_states
+    packed_weights = dispatch_output.packed_route_weights
+    counts = dispatch_output.masked_m
+    if dispatch_output.hidden_states_scale is not None:
+        raise ValueError("deterministic MXFP4-Marlin rejects quantized activations")
+    if hidden.ndim != 3 or hidden.dtype is not torch.bfloat16:
+        raise ValueError(
+            "deterministic MXFP4-Marlin requires BF16 "
+            "[local_experts, capacity, hidden] receives"
+        )
+    num_local_experts, capacity, hidden_size = hidden.shape
+    if packed_weights.shape != (num_local_experts, capacity):
+        raise ValueError("packed low-latency weights do not match receive rows")
+    if packed_weights.dtype is not torch.float32 or not packed_weights.is_contiguous():
+        raise ValueError("packed low-latency weights must be contiguous FP32")
+    if counts.shape != (num_local_experts,) or counts.dtype is not torch.int32:
+        raise ValueError("packed low-latency counts must be int32 [local_experts]")
+    _validate_low_latency_counts(counts, capacity)
+    if int(quant_info.w13_qweight.shape[0]) != num_local_experts:
+        raise ValueError("low-latency receive experts do not match Marlin weights")
+
+    capacity_rows = torch.arange(capacity, device=hidden.device, dtype=torch.int32)
+    expert_rows = torch.arange(
+        num_local_experts, device=hidden.device, dtype=torch.int32
+    ).unsqueeze(1)
+    valid = capacity_rows.unsqueeze(0) < counts.unsqueeze(1)
+    runner_topk_ids = torch.where(
+        valid,
+        expert_rows,
+        torch.full((), -1, dtype=torch.int32, device=hidden.device),
+    ).reshape(-1, 1)
+    runner_topk_weights = torch.where(
+        valid,
+        packed_weights,
+        torch.zeros((), dtype=torch.float32, device=hidden.device),
+    ).reshape(-1, 1)
+    return (
+        hidden.reshape(-1, hidden_size),
+        runner_topk_ids,
+        runner_topk_weights,
+        (num_local_experts, capacity, hidden_size),
+    )
 
 
 def _build_marlin_alignments(
@@ -85,6 +163,7 @@ def _run_marlin_gate_up_base(
     hidden_size: int,
     scalar_type,
     use_atomic_add: bool,
+    expert_block_partition_count: int,
 ) -> None:
     for start, stop, sorted_token_ids, expert_ids, num_tokens_post_padded in alignments:
         route_start = start * topk
@@ -115,6 +194,7 @@ def _run_marlin_gate_up_base(
             is_k_full=quant_info.is_k_full,
             use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
+            expert_block_partition_count=expert_block_partition_count,
             is_zp_float=False,
         )
 
@@ -133,6 +213,8 @@ def _run_marlin_down_base(
     hidden_size: int,
     scalar_type,
     use_atomic_add: bool,
+    mul_topk_weights: bool,
+    expert_block_partition_count: int,
 ) -> None:
     for start, stop, sorted_token_ids, expert_ids, num_tokens_post_padded in alignments:
         route_start = start * topk
@@ -154,7 +236,7 @@ def _run_marlin_down_base(
             topk_weights[start:stop],
             moe_block_size=block_size_m,
             top_k=1,
-            mul_topk_weights=True,
+            mul_topk_weights=mul_topk_weights,
             is_ep=quant_info.expert_map is not None,
             b_q_type=scalar_type,
             size_m=(stop - start) * topk,
@@ -163,6 +245,7 @@ def _run_marlin_down_base(
             is_k_full=quant_info.is_k_full,
             use_atomic_add=use_atomic_add,
             use_fp32_reduce=True,
+            expert_block_partition_count=expert_block_partition_count,
             is_zp_float=False,
         )
 
@@ -183,6 +266,26 @@ class MarlinLoraRunnerCore:
     def __init__(self, config: MoeRunnerConfig):
         self.config = config
 
+    def lora_hook_input(
+        self,
+        dispatch_output,
+        quant_info: MarlinMoeQuantInfo,
+    ):
+        """Expose the same packed-row geometry that low-latency Marlin runs."""
+
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if not DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            return dispatch_output
+        hidden_states, topk_ids, topk_weights, _ = _prepare_low_latency_marlin_dispatch(
+            dispatch_output, quant_info
+        )
+        return SimpleNamespace(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
     def run_from_dispatch(
         self,
         dispatch_output: StandardDispatchOutput,
@@ -194,10 +297,90 @@ class MarlinLoraRunnerCore:
 
         assert hooks is not None, "hooks must be provided for MarlinLoraRunnerCore"
 
-        hidden_states = dispatch_output.hidden_states
-        topk_output = dispatch_output.topk_output
-        topk_weights = topk_output.topk_weights
-        topk_ids = topk_output.topk_ids
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        is_deepep_normal = DispatchOutputChecker.format_is_deepep_normal(
+            dispatch_output
+        )
+        is_deepep_ll = DispatchOutputChecker.format_is_deepep_ll(dispatch_output)
+        low_latency_shape = None
+        if is_deepep_normal:
+            hidden_states = dispatch_output.hidden_states
+            if runner_config.deepep_native_exact:
+                from sglang.srt.layers.moe.deepep_native_exact import (
+                    canonicalize_native_routing_metadata,
+                )
+
+                topk_weights = canonicalize_native_routing_metadata(
+                    dispatch_output.topk_weights
+                )
+                topk_ids = dispatch_output.topk_ids.to(torch.int32).contiguous()
+            else:
+                topk_weights = dispatch_output.topk_weights
+                topk_ids = dispatch_output.topk_ids
+        elif is_deepep_ll:
+            (
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                low_latency_shape,
+            ) = _prepare_low_latency_marlin_dispatch(
+                dispatch_output,
+                quant_info,
+            )
+        else:
+            hidden_states = dispatch_output.hidden_states
+            topk_output = dispatch_output.topk_output
+            topk_weights = topk_output.topk_weights
+            topk_ids = topk_output.topk_ids
+
+        global _dsv4_marlin_stage_capture_done
+        stage_capture_dir = os.environ.get(
+            "XORL_DSV4_SAMPLER_MARLIN_STAGE_CAPTURE_DIR", ""
+        ).strip()
+        capture_stages = (
+            bool(stage_capture_dir)
+            and not _dsv4_marlin_stage_capture_done
+            and runner_config.dsv4_exact_mode
+            and runner_config.layer_id == 0
+            and is_deepep_normal
+            and hooks.after_gate_up is not None
+            and hooks.after_down is not None
+        )
+        stage_state = (
+            {
+                "hidden_states": hidden_states.detach().clone(),
+                "topk_ids": topk_ids.detach().clone(),
+                "topk_weights": topk_weights.detach().clone(),
+            }
+            if capture_stages
+            else None
+        )
+
+        # DeepEP normal dispatch can produce an empty receive batch on a rank.
+        # No base or LoRA kernel is needed, but combine must still receive the
+        # exact empty routed payload to complete the collective.
+        if is_deepep_normal and hidden_states.shape[0] == 0:
+            if runner_config.no_combine:
+                from sglang.srt.layers.moe.deepep_native_exact import (
+                    native_zero_row_runner_routes,
+                    reduce_native_runner_routes_to_bf16,
+                )
+
+                hidden_states = reduce_native_runner_routes_to_bf16(
+                    native_zero_row_runner_routes(hidden_states, topk_ids),
+                    topk_ids,
+                    topk_weights,
+                )
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                DeepEPNormalCombineInput,
+            )
+
+            return DeepEPNormalCombineInput(
+                hidden_states=hidden_states.clone(),
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
 
         assert runner_config.activation == "silu", "Only SiLU activation is supported."
         assert (
@@ -227,10 +410,21 @@ class MarlinLoraRunnerCore:
             num_tokens=M,
         )
 
+        # Low-latency DeepEP packs expert-capacity rows as top-k 1 for the
+        # Marlin launch, but that is a transport layout rather than the model's
+        # arithmetic geometry.  DSV4's admitted normal program is selected by
+        # its logical top-k 6 and pins block_size_m=64.  Feeding the packed
+        # top-k 1 here silently selected the generic block-size-8 program and
+        # changed MXFP4 accumulation relative to normal prefill/training.
+        logical_topk = (
+            int(dispatch_output.topk_ids.shape[1])
+            if is_deepep_ll and runner_config.dsv4_exact_mode
+            else topk
+        )
         block_size_m = select_marlin_moe_block_size_m(
             dsv4_exact_mode=runner_config.dsv4_exact_mode,
             num_tokens=1 if singleton_base else M,
-            topk=topk,
+            topk=logical_topk,
             local_experts=E,
             global_experts=(
                 quant_info.global_num_experts
@@ -257,6 +451,11 @@ class MarlinLoraRunnerCore:
             block_size_m=block_size_m,
             num_experts=align_num_experts,
             singleton=singleton_base,
+        )
+        expert_block_partition_count = (
+            topk
+            if runner_config.dsv4_exact_mode and is_mxfp4_marlin and not is_deepep_ll
+            else 1
         )
 
         # Per-call workspace like fused_experts_none_to_marlin: a shared buffer aliases
@@ -308,13 +507,18 @@ class MarlinLoraRunnerCore:
             hidden_size=K,
             scalar_type=scalar_type1,
             use_atomic_add=use_atomic_add,
+            expert_block_partition_count=expert_block_partition_count,
         )
+        if stage_state is not None:
+            stage_state["gate_up_base"] = intermediate_cache1.detach().clone()
         # Hook: after gate_up
         if hooks.after_gate_up:
             intermediate_cache1_3d = intermediate_cache1.view(M, topk, 2 * N)
             hooks.after_gate_up(
                 hidden_states, intermediate_cache1_3d, topk_weights, topk_ids
             )
+        if stage_state is not None:
+            stage_state["gate_up_after_lora"] = intermediate_cache1.detach().clone()
         # Stage 2: Activation
         gate_up = intermediate_cache1.view(-1, 2 * N)
         if runner_config.swiglu_limit is not None:
@@ -327,6 +531,8 @@ class MarlinLoraRunnerCore:
             )
         else:
             silu_and_mul(gate_up, intermediate_cache2)
+        if stage_state is not None:
+            stage_state["activated"] = intermediate_cache2.detach().clone()
         # Stage 3: Down (Marlin)
         _run_marlin_down_base(
             hidden_states=intermediate_cache2,
@@ -341,13 +547,80 @@ class MarlinLoraRunnerCore:
             hidden_size=K,
             scalar_type=scalar_type2,
             use_atomic_add=use_atomic_add,
+            mul_topk_weights=(
+                not runner_config.no_combine
+                and (
+                    not is_deepep_ll
+                    or runner_config.deepep_native_exact_defer_routed_scale
+                )
+            ),
+            expert_block_partition_count=expert_block_partition_count,
         )
+        if stage_state is not None:
+            stage_state["down_base"] = intermediate_cache3.detach().clone()
         intermediate_cache3 = intermediate_cache3.view(M, topk, K)
 
         # Hook: after down
         if hooks.after_down:
             hooks.after_down(
                 intermediate_cache2, intermediate_cache3, topk_weights, topk_ids
+            )
+        if stage_state is not None:
+            stage_state["down_after_lora"] = intermediate_cache3.detach().clone()
+        if is_deepep_ll:
+            from sglang.srt.layers.moe.deepep_native_exact import (
+                pack_native_low_latency_bf16_routes,
+            )
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                DeepEPLLCombineInput,
+            )
+
+            assert low_latency_shape is not None
+            num_local_experts, capacity, hidden_size = low_latency_shape
+            if runner_config.deepep_native_exact_defer_routed_scale:
+                # Match DSV4 normal mode: Marlin and its active-LoRA hook have
+                # already applied the route coefficient. The model's 1.5
+                # routed scale remains owned by the routed/shared join.
+                packed_routes = pack_native_low_latency_bf16_routes(
+                    intermediate_cache3,
+                    topk_ids,
+                )
+                combine_topk_weights = torch.ones_like(dispatch_output.topk_weights)
+            else:
+                # Keep unweighted expert results BF16 on the wire. DeepEP owns
+                # the FP32 route multiply, fused-epilogue BF16 route rounding,
+                # FP32 owner-rank sum, model scale, and BF16 rank-leaf cast.
+                packed_routes = pack_native_low_latency_bf16_routes(
+                    intermediate_cache3,
+                    topk_ids,
+                )
+                combine_topk_weights = dispatch_output.topk_weights
+            packed_routes = packed_routes.view(num_local_experts, capacity, hidden_size)
+            return DeepEPLLCombineInput(
+                hidden_states=packed_routes,
+                topk_ids=dispatch_output.topk_ids,
+                topk_weights=combine_topk_weights,
+            )
+        if runner_config.no_combine:
+            if not DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+                return StandardCombineInput(
+                    hidden_states=intermediate_cache3.contiguous()
+                )
+            from sglang.srt.layers.moe.deepep_native_exact import (
+                reduce_native_runner_routes_to_bf16,
+            )
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                DeepEPNormalCombineInput,
+            )
+
+            return DeepEPNormalCombineInput(
+                hidden_states=reduce_native_runner_routes_to_bf16(
+                    intermediate_cache3,
+                    topk_ids,
+                    topk_weights,
+                ),
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
             )
         # Stage 4: Reduction. Never alias hidden_states even under inplace: the sink
         # forward still reads it (stock fused_experts_none_to_marlin does the same).
@@ -360,10 +633,49 @@ class MarlinLoraRunnerCore:
             from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
 
             moe_topk_sum(intermediate_cache3, output)
+            if stage_state is not None:
+                import torch.distributed as dist
+
+                _dsv4_marlin_stage_capture_done = True
+                os.makedirs(stage_capture_dir, exist_ok=True)
+                global_rank = dist.get_rank() if dist.is_initialized() else 0
+                stage_state["output"] = output.detach().clone()
+                torch.save(
+                    {
+                        "schema": "xorl.dsv4_sampler_marlin_stages.v1",
+                        "global_rank": global_rank,
+                        "layer_id": runner_config.layer_id,
+                        **{name: value.cpu() for name, value in stage_state.items()},
+                    },
+                    os.path.join(
+                        stage_capture_dir,
+                        f"rank{global_rank:05d}.layer000.marlin-stages.pt",
+                    ),
+                )
+            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+                from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                    DeepEPNormalCombineInput,
+                )
+
+                return DeepEPNormalCombineInput(
+                    hidden_states=output,
+                    topk_ids=topk_ids,
+                    topk_weights=topk_weights,
+                )
             return StandardCombineInput(hidden_states=output)
         if routed_scaling_factor is None:
             routed_scaling_factor = 1.0
         # NOTE: fusion opportunity here
         moe_sum_reduce_triton(intermediate_cache3, output, routed_scaling_factor)
 
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            from sglang.srt.layers.moe.token_dispatcher.deepep import (
+                DeepEPNormalCombineInput,
+            )
+
+            return DeepEPNormalCombineInput(
+                hidden_states=output,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+            )
         return StandardCombineInput(hidden_states=output)

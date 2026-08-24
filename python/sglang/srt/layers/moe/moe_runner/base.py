@@ -63,6 +63,7 @@ class MoeRunnerConfig:
     inplace: bool = True
     no_combine: bool = False
     routed_scaling_factor: Optional[float] = None
+    routed_scaling_factor_in_topk: bool = False
     gemm1_alpha: Optional[float] = None
     gemm1_clamp_limit: Optional[float] = None
     swiglu_limit: Optional[float] = None
@@ -70,6 +71,17 @@ class MoeRunnerConfig:
     # official-geometry models outside the exact lane keep the stock row-block
     # heuristic and batched MXFP4 execution.
     dsv4_exact_mode: bool = False
+    # GLM keeps routed DeepEP separate from its TP16 shared-expert fold. The
+    # routed scaling factor remains part of the literal fused local combine.
+    glm52_exact_mode: bool = False
+    # Family-neutral real-dispatch exact program. DeepEP carries only BF16
+    # values and performs the selected fixed receiver fold.
+    deepep_native_exact: bool = False
+    # DSV4's normal no_combine=False program applies each FP32 routing
+    # coefficient in the Marlin down epilogue (including active-LoRA) before
+    # the BF16 route store, but defers the model's routed scaling factor until
+    # the routed/shared join. Low latency must preserve both boundaries.
+    deepep_native_exact_defer_routed_scale: bool = False
     # Whether gate/up weights are stored interleaved (vs split). Only the
     # silu+is_gated swiglu path consumes it (interleaved -> swiglu_gpt_oss_*,
     # otherwise chunk gate/up then apply alpha/limit).

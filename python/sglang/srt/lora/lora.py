@@ -250,14 +250,18 @@ class LoRAAdapter(nn.Module):
     def _normalize_weights(self):
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
+            # Qwen3.5 training exports GDN q/k/v/g as split projections, but
+            # serving owns one fused in_proj_qkvz.  Consume that family before
+            # the generic attention q/k/v normalizer can mistake it for qkv_proj.
+            self._normalize_in_proj_qkvz(layer.weights)
+            self._normalize_linear_attn_out_proj(layer.weights)
+            weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_inkling_qkvr_proj(weight_names, layer.weights)
             self._normalize_shared_expert_moe(layer.weights)
             self._rename_expert_w_to_proj(layer.weights)
             # Stack gate_proj + x_proj → in_proj for Mamba layers (before gate_up normalization)
             self._normalize_in_proj(layer.weights)
-            # Stack in_proj_q + in_proj_k + in_proj_v + in_proj_z → in_proj_qkvz for GDN layers
-            self._normalize_in_proj_qkvz(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
@@ -463,8 +467,9 @@ class LoRAAdapter(nn.Module):
 
         Two adapter formats are handled:
 
-        1. Split: ``in_proj_q + in_proj_k + in_proj_v + in_proj_z`` are present
-           as separate weights → concatenate them into ``in_proj_qkvz``.
+        1. Split: either serving-style ``in_proj_q + in_proj_k + in_proj_v +
+           in_proj_z`` or trainer-style ``q_proj + k_proj + v_proj + g_proj``
+           are present → concatenate them into ``in_proj_qkvz``.
 
         2. Already-merged: the adapter has a single ``in_proj_qkvz`` weight
            (PEFT trained against SGLang's fused Linear). The stacked buffer
@@ -473,17 +478,25 @@ class LoRAAdapter(nn.Module):
            the buffer directly.
         """
         for weight_name in list(weights.keys()):
-            if "in_proj_q." in weight_name:
-                k_name = weight_name.replace("in_proj_q", "in_proj_k")
-                v_name = weight_name.replace("in_proj_q", "in_proj_v")
-                z_name = weight_name.replace("in_proj_q", "in_proj_z")
+            trainer_split = ".linear_attn.q_proj." in weight_name
+            serving_split = "in_proj_q." in weight_name
+            if trainer_split or serving_split:
+                if trainer_split:
+                    k_name = weight_name.replace(".q_proj.", ".k_proj.")
+                    v_name = weight_name.replace(".q_proj.", ".v_proj.")
+                    z_name = weight_name.replace(".q_proj.", ".g_proj.")
+                    qkvz_name = weight_name.replace(".q_proj.", ".in_proj_qkvz.")
+                else:
+                    k_name = weight_name.replace("in_proj_q", "in_proj_k")
+                    v_name = weight_name.replace("in_proj_q", "in_proj_v")
+                    z_name = weight_name.replace("in_proj_q", "in_proj_z")
+                    qkvz_name = weight_name.replace("in_proj_q", "in_proj_qkvz")
                 if (
                     k_name not in weights
                     or v_name not in weights
                     or z_name not in weights
                 ):
                     continue
-                qkvz_name = weight_name.replace("in_proj_q", "in_proj_qkvz")
                 cat_dim = weights[weight_name].dim() - 2
                 weights[qkvz_name] = torch.cat(
                     (
@@ -506,6 +519,21 @@ class LoRAAdapter(nn.Module):
                 repeat_dims[ndim - 2] = 4
                 weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
+
+    def _normalize_linear_attn_out_proj(self, weights: Dict[str, torch.Tensor]):
+        """Map the trainer GDN output projection onto the serving module.
+
+        Qwen3.5 training names this leaf ``linear_attn.o_proj`` while serving
+        names the same physical projection ``linear_attn.out_proj``.  Keep
+        full-attention ``self_attn.o_proj`` unchanged.
+        """
+        for weight_name in list(weights.keys()):
+            if ".linear_attn.o_proj." not in weight_name:
+                continue
+            normalized_name = weight_name.replace(
+                ".linear_attn.o_proj.", ".linear_attn.out_proj."
+            )
+            weights[normalized_name] = weights.pop(weight_name)
 
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]

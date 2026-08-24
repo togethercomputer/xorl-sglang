@@ -35,6 +35,16 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         # The manager installs matching rank-major physical metadata here for
         # the gathered row count; local attention keeps batch_info.
         self.context_parallel_mlp_batch_info: Optional[LoRABatchInfo] = None
+        # Native DeepEP moves expert rows after the local request batch has
+        # been prepared.  Idle DP owners therefore need a rank-global control
+        # record identifying the one active adapter; the runner replaces its
+        # dummy row mapping with the rows actually received from DeepEP.
+        self.deepep_native_moe_batch_info: Optional[LoRABatchInfo] = None
+        # Exact DSV4 may gather a base-only request while LoRA serving is
+        # enabled (notably SGLang's startup warmup).  Keep that state distinct
+        # from accidentally missing gathered metadata so the former can take
+        # the literal base path while the latter still fails closed.
+        self._dsv4_flash_exact_gathered_base_only = False
         self.init_lm_head_config()
         self._is_moe_lora = False
         # Static metadata read by prefill-CUDA-graph kernels, refreshed in
@@ -52,6 +62,8 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         prepared" signal that the layer guards (lora_active) read."""
         self.batch_info = None
         self.context_parallel_mlp_batch_info = None
+        self.deepep_native_moe_batch_info = None
+        self._dsv4_flash_exact_gathered_base_only = False
         self.lm_head_batch_info = None
         self.lm_head_pass_batch_infos = None
         self._lm_head_pass_idx = None
@@ -59,13 +71,23 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
     def get_batch_info_for_rows(self, num_tokens: int) -> Optional[LoRABatchInfo]:
         """Return fail-closed metadata matching an activation's token rows."""
         batch_info = self.batch_info
+        gathered_batch_info = self.context_parallel_mlp_batch_info
+        if batch_info is None:
+            # A DP-attention owner can be locally idle while the exact DSV4
+            # logits head consumes rows gathered from another owner.  In that
+            # case the local dense/attention path must stay inactive, but the
+            # lm_head still needs the gathered adapter assignment.
+            if (
+                gathered_batch_info is not None
+                and gathered_batch_info.expected_tokens == num_tokens
+            ):
+                return gathered_batch_info
+            return None
         if (
-            batch_info is None
-            or batch_info.expected_tokens is None
+            batch_info.expected_tokens is None
             or batch_info.expected_tokens == num_tokens
         ):
             return batch_info
-        gathered_batch_info = self.context_parallel_mlp_batch_info
         if (
             gathered_batch_info is not None
             and gathered_batch_info.expected_tokens == num_tokens
@@ -85,6 +107,23 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
 
         gathered = self.context_parallel_mlp_batch_info
         if gathered is None:
+            # A pipeline-parallel idle microbatch has no gathered rows and the
+            # DP/CP gather intentionally installs no metadata.  Its MLP still
+            # participates in the distributed no-op program (including
+            # DeepEP collectives), so select a literal zero-row/base context.
+            # Keep every nonempty activation fail-closed: missing adapter
+            # assignments there would silently run the wrong weights.
+            if num_tokens == 0:
+                local_batch_info = self.batch_info
+                local_sgemm_batch_info = getattr(self, "sgemm_batch_info", None)
+                self.batch_info = None
+                self.sgemm_batch_info = None
+                try:
+                    yield
+                finally:
+                    self.batch_info = local_batch_info
+                    self.sgemm_batch_info = local_sgemm_batch_info
+                return
             raise RuntimeError(
                 "Gathered MLP LoRA metadata is missing for gathered activation "
                 f"rows: activation_rows={num_tokens}."
@@ -98,6 +137,30 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         local_batch_info = self.batch_info
         local_sgemm_batch_info = getattr(self, "sgemm_batch_info", None)
         self.batch_info = gathered
+        self.sgemm_batch_info = None
+        try:
+            yield
+        finally:
+            self.batch_info = local_batch_info
+            self.sgemm_batch_info = local_sgemm_batch_info
+
+    @contextmanager
+    def use_dsv4_exact_gathered_mlp_batch_info(self, num_tokens: int) -> Iterator[None]:
+        """Select gathered LoRA metadata or a certified literal-base path."""
+
+        if self.context_parallel_mlp_batch_info is not None:
+            with self.use_gathered_mlp_batch_info(num_tokens):
+                yield
+            return
+        if not self._dsv4_flash_exact_gathered_base_only:
+            raise RuntimeError(
+                "Gathered MLP LoRA metadata is missing for an exact DSV4 "
+                f"activation: activation_rows={num_tokens}."
+            )
+
+        local_batch_info = self.batch_info
+        local_sgemm_batch_info = getattr(self, "sgemm_batch_info", None)
+        self.batch_info = None
         self.sgemm_batch_info = None
         try:
             yield

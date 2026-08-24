@@ -369,6 +369,14 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
                            = base_output + (hidden @ A^T) @ B^T
         """
         lm_head_batch_info = self._get_lm_head_batch_info(hidden_states.shape[0])
+        if lm_head_batch_info is None:
+            # Decode does not construct pruned lm-head metadata.  Resolve the
+            # activation rows explicitly so CSGMV receives the gathered DP/CP
+            # assignment on locally idle vocabulary owners instead of falling
+            # back to their absent local batch_info.
+            lm_head_batch_info = self.lora_backend.get_batch_info_for_rows(
+                hidden_states.shape[0]
+            )
 
         # Apply lora_A^T: hidden_states @ A^T
         lora_a_output = self.lora_backend.run_lora_a_sgemm(
@@ -395,7 +403,18 @@ class ParallelLMHeadWithLoRA(BaseLayerWithLoRA):
             hidden_states, self.weight, bias=getattr(self.base_layer, "bias", None)
         )
 
-        if self.lora_active:
+        # Exact DP-attention logits are gathered before this layer.  A rank can
+        # therefore be locally idle (batch_info=None) while still owning a
+        # vocabulary shard for globally gathered active-LoRA rows.  The
+        # manager installs either pruned lm_head metadata (extend) or gathered
+        # row metadata (decode); either is sufficient to activate only this
+        # globally operating layer.
+        lm_head_lora_active = self.set_lora and (
+            self.lora_backend.batch_info is not None
+            or self.lora_backend.lm_head_batch_info is not None
+            or self.lora_backend.context_parallel_mlp_batch_info is not None
+        )
+        if lm_head_lora_active:
             base_output = self.apply_lora(base_output, hidden_states)
 
         return base_output
@@ -1184,6 +1203,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             max_lora_rank=max_lora_rank,
             num_experts=num_experts,
             has_active_lora=has_active_lora,
+            single_adapter_id=batch_info.single_adapter_id,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
             tp_size=self.tp_size,
@@ -1202,6 +1222,16 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         """
         # DP-attention idle forward: no batch_info, run the base MoE path.
         batch_info = self.lora_backend.get_batch_info_for_rows(hidden_states.shape[0])
+        if batch_info is None and getattr(
+            getattr(self, "moe_runner_config", None), "deepep_native_exact", False
+        ):
+            # A request can be owned by a different DP rank, then DeepEP can
+            # deliver this rank expert rows after this decision point.  Select
+            # the rank-global adapter control record; the runner rewrites its
+            # row mapping after dispatch from the real receive buffer.
+            batch_info = getattr(
+                self.lora_backend, "deepep_native_moe_batch_info", None
+            )
         if batch_info is None:
             return self.base_layer.forward(hidden_states, topk_output, **kwargs)
 

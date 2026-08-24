@@ -646,6 +646,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # Health check
         self.server_status = ServerStatus.Starting
         self.gracefully_exit = False
+        self._http_server_shutdown_callback: Optional[Any] = None
         self.last_receive_tstamp = real_time()
 
         # Session
@@ -3276,7 +3277,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and collect_scheduler_processes():
             time.sleep(0.1)
-        kill_process_tree(os.getpid(), include_parent=True)
+        # Children have either handled ShutdownReq or exceeded the bounded
+        # drain above. Clean up anything left, then let the owning launcher
+        # process ask its HTTP server to stop instead of SIGKILLing itself
+        # (status 137) or raising SystemExit through the ASGI task (which
+        # Uvicorn reports as a cancellation traceback).
+        kill_process_tree(os.getpid(), include_parent=False)
+        if self._http_server_shutdown_callback is not None:
+            self._http_server_shutdown_callback()
+            return
         sys.exit(0)
 
     def force_exit_handler(self):

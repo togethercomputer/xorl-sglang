@@ -262,10 +262,14 @@ def get_deepep_output_dtype(self) -> DispatcherOutputDtype:
         if dispatcher_output_dtype is not None:
             return DispatcherOutputDtype(dispatcher_output_dtype)
 
-    # 4. flashinfer_cutedsl / cutlass / humming expects BF16 dispatch
+    # 4. These runners expect BF16 dispatch. Marlin also emits its combine
+    # payload in the dispatch activation dtype, while DeepEP normal combine
+    # accepts BF16 only. Letting ``auto`` select FP8 for Marlin therefore
+    # produces an FP8 expert output that the combine collective cannot accept.
     if (
         get_moe_runner_backend().is_flashinfer_cutedsl()
         or get_moe_runner_backend().is_cutlass()
+        or get_moe_runner_backend().is_marlin()
         or get_moe_runner_backend().is_humming()
     ):
         return DispatcherOutputDtype.BF16

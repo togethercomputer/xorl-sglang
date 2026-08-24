@@ -196,6 +196,61 @@ class TestDockerBuildMetadataArgs(unittest.TestCase):
         self.assertIn("scripts/ci/utils/docker_build_metadata_args.py", workflow)
         self.assertIn("mapfile -t METADATA_ARGS", workflow)
         self.assertIn('"${METADATA_ARGS[@]}"', workflow)
+        self.assertEqual(workflow.count("--build-arg DEEPEP_GPU_TARGET=multiarch"), 4)
+        self.assertEqual(workflow.count("--build-arg CUDA_VERSION=13.0.1"), 2)
+
+    def test_deepep_release_wheel_is_gated_to_its_build_target(self):
+        dockerfile = DOCKERFILE_PATH.read_text()
+        self.assertIn("ARG CUDA_VERSION=13.2.0", dockerfile)
+        self.assertIn("ARG DEEPEP_GPU_TARGET=sm90", dockerfile)
+        stage = dockerfile.split("FROM torch_deps AS deepep_builder", 1)[1].split(
+            "FROM torch_deps AS hpc_ops_builder", 1
+        )[0]
+
+        for expected in (
+            "ARG TARGETARCH",
+            "ARG DEEPEP_GPU_TARGET",
+            'test "$CUDA_VERSION" = "13.2.0"',
+            '[ "$target_arch" = "amd64" ]',
+            '[ "$GRACE_BLACKWELL" = "0" ]',
+            '[ "$HOPPER_SBO" = "0" ]',
+            '[ "$DEEPEP_GPU_TARGET" = "sm90" ]',
+            "use_xorl_source=1",
+            "touch /build/.use_xorl_deepep_wheel",
+            "if [ ! -f /build/.use_xorl_deepep_wheel ]; then",
+        ):
+            self.assertIn(expected, stage)
+
+    def test_certified_hopper_profile_installs_locked_sglang_kernel_wheel(self):
+        dockerfile = DOCKERFILE_PATH.read_text()
+        stage = dockerfile.split("FROM base AS torch_deps", 1)[1].split(
+            "FROM torch_deps AS sglang_deps", 1
+        )[0]
+
+        for expected in (
+            "ARG SGL_KERNEL_WHEEL_URL",
+            "ARG SGL_KERNEL_WHEEL_SHA256",
+            '[ "$DEEPEP_GPU_TARGET" = "sm90" ]',
+            'test "$CUDA_VERSION" = "13.2.0"',
+            'echo "$SGL_KERNEL_WHEEL_SHA256  /tmp/$wheel_name" | sha256sum -c -',
+            'python3 -m pip install "/tmp/$wheel_name" --force-reinstall --no-deps',
+        ):
+            self.assertIn(expected, stage)
+
+    def test_generic_stages_keep_project_torch_pins_aligned(self):
+        dockerfile = DOCKERFILE_PATH.read_text()
+
+        # The source and final editable-install copies are rewritten separately
+        # for every non-sm90 image, including both CUDA 12 and CUDA 13.0.
+        self.assertEqual(dockerfile.count(r"s/torch==2\.12\.1/torch==2.11.0/"), 2)
+        self.assertEqual(
+            dockerfile.count(r"s/torchcodec==0\.15\.0/torchcodec==0.11.1/"),
+            2,
+        )
+        self.assertEqual(
+            dockerfile.count(r"s/torchvision==0\.27\.1/torchvision==0.26.0/"),
+            2,
+        )
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
@@ -25,6 +26,7 @@ from sglang.srt.layers.moe.utils import (
     DispatcherOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    get_moe_runner_backend,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
@@ -67,6 +69,18 @@ import torch.distributed as dist
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
 logger = logging.getLogger(__name__)
+
+
+def _benchmark_stock_low_latency_reduction() -> bool:
+    """Select stock LL reduction while retaining the exact modern MoE path.
+
+    This is intentionally an environment-only benchmark control.  The legacy
+    unquantized BF16 DeepEP runner is deprecated, so an endpoint comparison
+    must keep dispatch and expert execution fixed and vary only the receiver
+    reduction program.
+    """
+
+    return os.getenv("SGLANG_DEEPEP_BENCHMARK_STOCK_LL_REDUCTION", "0") == "1"
 
 
 def _is_mnnvl_fabric_supported() -> bool:
@@ -122,8 +136,25 @@ class DeepEPLLDispatchOutput(NamedTuple):
         return DispatchOutputFormat.DEEPEP_LL
 
 
+class DeepEPLLExactDispatchOutput(NamedTuple):
+    """Deterministic BF16 low-latency output with route-aligned FP32 weights."""
+
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    masked_m: torch.Tensor
+    expected_m: int
+    packed_route_weights: torch.Tensor
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.DEEPEP_LL
+
+
 assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
 assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
+assert isinstance(DeepEPLLExactDispatchOutput, DispatchOutput)
 
 
 class DeepEPNormalCombineInput(NamedTuple):
@@ -297,14 +328,30 @@ class DeepEPBuffer:
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
-        cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
+        state = cls._state()
+        previous = state.dispatch_mode
+        state.dispatch_mode = DeepEPDispatchMode.NORMAL
+        if previous != DeepEPDispatchMode.NORMAL:
+            logger.info(
+                "DeepEP dispatch mode transition: %s -> normal",
+                previous.name.lower() if previous is not None else "uninitialized",
+            )
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
         state = cls._state()
-        if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
+        previous = state.dispatch_mode
+        clean_enqueued = previous == DeepEPDispatchMode.NORMAL
+        if clean_enqueued:
             cls.clean_buffer()
         state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+        if previous != DeepEPDispatchMode.LOW_LATENCY:
+            logger.info(
+                "DeepEP dispatch mode transition: %s -> low_latency "
+                "(clean_enqueued=%s)",
+                previous.name.lower() if previous is not None else "uninitialized",
+                clean_enqueued,
+            )
 
     @classmethod
     def set_dispatch_mode(cls, mode: DeepEPMode):
@@ -356,6 +403,8 @@ class _DeepEPDispatcherImplBase:
         hidden_size: int,
         params_dtype: torch.dtype,
         deepep_mode: DeepEPMode,
+        routed_scaling_factor: float = 1.0,
+        deepep_native_exact: bool = False,
     ):
         if not use_deepep:
             raise ImportError(
@@ -371,6 +420,8 @@ class _DeepEPDispatcherImplBase:
         self.hidden_size = hidden_size
         self.params_dtype = params_dtype
         self.deepep_mode = deepep_mode
+        self.routed_scaling_factor = float(routed_scaling_factor)
+        self.deepep_native_exact = bool(deepep_native_exact)
 
         self.params_bytes = 2
         # A large value will lead to large memory occupation, thus users should change it accordingly
@@ -494,7 +545,11 @@ class _DeepEPDispatcherImplBase:
 
 
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
-    def __init__(self, async_finish: bool, **kwargs):
+    def __init__(
+        self,
+        async_finish: bool,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
 
         self.async_finish = async_finish
@@ -612,7 +667,20 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        if self.deepep_native_exact:
+            if hidden_states.dtype is not torch.bfloat16:
+                raise RuntimeError(
+                    f"deepep_native_exact runner returned {hidden_states.dtype}; combine communication is BF16"
+                )
+            # Preserve the actual receive receipt until combine_b, where the
+            # original handle is consumed by the shared native exact combine.
+            output = (hidden_states.contiguous(), topk_ids, topk_weights)
+        elif (
+            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+            or get_moe_runner_backend().is_marlin()
+            or _use_aiter
+            or _is_npu
+        ):
             output = hidden_states
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
@@ -630,6 +698,26 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     def _combine_core(self, x: torch.Tensor, previous_event):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
+        if self.deepep_native_exact:
+            local_leaf, recv_topk_ids, recv_topk_weights = x
+            from sglang.srt.layers.moe.deepep_native_exact import (  # noqa: PLC0415
+                combine_deterministic_bf16,
+            )
+
+            return combine_deterministic_bf16(
+                local_leaf,
+                recv_topk_ids=recv_topk_ids,
+                recv_topk_weights=recv_topk_weights,
+                num_local_experts=self.num_local_experts,
+                group=self.group,
+                buffer=buffer,
+                handle=self.handle,
+                config=DeepEPConfig.get_instance().normal_combine_config,
+                previous_event=previous_event,
+                async_finish=self.async_finish,
+                allocate_on_comm_stream=(previous_event is not None)
+                and self.async_finish,
+            )
         combined_x, _, event = buffer.combine(
             x,
             self.handle,
@@ -654,7 +742,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
 
 
 class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
-    def __init__(self, return_recv_hook: bool, **kwargs):
+    def __init__(
+        self,
+        return_recv_hook: bool,
+        **kwargs,
+    ):
         super().__init__(**kwargs)
 
         """
@@ -677,10 +769,12 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
             + self.num_experts
         ) // self.num_experts
-        hidden_states, masked_m, event, hook = self._dispatch_core(
-            hidden_states,
-            topk_ids,
-            topk_weights,
+        hidden_states, packed_route_weights, masked_m, event, hook = (
+            self._dispatch_core(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+            )
         )
         return (
             hidden_states,
@@ -688,6 +782,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             topk_weights,
             masked_m,
             expected_m,
+            packed_route_weights,
             event,
             hook,
         )
@@ -699,6 +794,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         topk_weights,
         masked_m,
         expected_m,
+        packed_route_weights,
         event,
         hook,
     ):
@@ -713,13 +809,23 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         else:
             hidden_states_scale = None
 
-        deepep_output = DeepEPLLDispatchOutput(
+        output_type = (
+            DeepEPLLExactDispatchOutput
+            if packed_route_weights is not None
+            else DeepEPLLDispatchOutput
+        )
+        output_args = (
             hidden_states,
             hidden_states_scale,
             topk_ids,
             topk_weights,
             masked_m,
             expected_m,
+        )
+        deepep_output = (
+            output_type(*output_args, packed_route_weights)
+            if packed_route_weights is not None
+            else output_type(*output_args)
         )
         return deepep_output
 
@@ -747,30 +853,64 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
-        packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
-            buffer.low_latency_dispatch(
-                hidden_states,
-                topk_ids,
-                self.num_max_dispatch_tokens_per_rank,
-                self.num_experts,
-                use_fp8=self.use_fp8,
-                **(
-                    dict(topk_weights=topk_weights)
-                    if _is_npu and not _use_zbal
-                    else dict()
-                ),
-                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
-                **(
-                    dict(x_global_scale=input_global_scale)
-                    if input_global_scale is not None
-                    else dict()
-                ),
-                async_finish=not self.return_recv_hook,
-                return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
+        deterministic = self.deepep_native_exact
+        deterministic_kwargs = {}
+        if deterministic:
+            from deep_ep import LowLatencyReductionMode
+
+            deterministic_kwargs = dict(
+                topk_weights=topk_weights,
+                reduction_mode=LowLatencyReductionMode.DETERMINISTIC,
             )
+        dispatch_result = buffer.low_latency_dispatch(
+            hidden_states,
+            topk_ids,
+            self.num_max_dispatch_tokens_per_rank,
+            self.num_experts,
+            use_fp8=self.use_fp8,
+            **(
+                dict(topk_weights=topk_weights) if _is_npu and not _use_zbal else dict()
+            ),
+            **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
+            **(
+                dict(x_global_scale=input_global_scale)
+                if input_global_scale is not None
+                else dict()
+            ),
+            async_finish=not self.return_recv_hook,
+            return_recv_hook=self.return_recv_hook,
+            **deterministic_kwargs,
+            **fp8_deepgemm_scale_opts,
         )
-        return packed_recv_hidden, self.packed_recv_count, event, hook
+        if deterministic:
+            (
+                packed_recv_hidden,
+                packed_route_weights,
+                self.packed_recv_count,
+                self.handle,
+                event,
+                hook,
+            ) = dispatch_result
+            from sglang.srt.layers.moe.deepep_native_exact import (
+                log_low_latency_deterministic_engagement,
+            )
+
+            log_low_latency_deterministic_engagement(
+                group=self.group,
+                hidden_size=hidden_states.shape[-1],
+            )
+        else:
+            packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
+                dispatch_result
+            )
+            packed_route_weights = None
+        return (
+            packed_recv_hidden,
+            packed_route_weights,
+            self.packed_recv_count,
+            event,
+            hook,
+        )
 
     def combine_a(
         self,
@@ -832,6 +972,19 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
 
         with ctx:
             _deepep_precompile_tp_barrier()
+            deterministic_kwargs = {}
+            if self.deepep_native_exact:
+                from deep_ep import LowLatencyReductionMode
+
+                deterministic_kwargs = dict(
+                    reduction_mode=(
+                        LowLatencyReductionMode.DEFAULT
+                        if _benchmark_stock_low_latency_reduction()
+                        else LowLatencyReductionMode.DETERMINISTIC
+                    ),
+                    input_is_preweighted=False,
+                    routed_scaling_factor=self.routed_scaling_factor,
+                )
             combined_hidden_states, event, hook = buffer.low_latency_combine(
                 x=hidden_states,
                 topk_idx=topk_ids,
@@ -839,6 +992,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
                 handle=self.handle,
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
+                **deterministic_kwargs,
                 **overlap_args_dict,
             )
 
@@ -878,11 +1032,12 @@ class DeepEPDispatcher(BaseDispatcher):
         deepep_mode: DeepEPMode = DeepEPMode.AUTO,
         async_finish: bool = False,
         return_recv_hook: bool = False,
+        routed_scaling_factor: float = 1.0,
+        deepep_native_exact: bool = False,
     ):
         super().__init__()
 
         self.deepep_mode = deepep_mode
-
         common_kwargs = dict(
             group=group,
             router_topk=router_topk,
@@ -892,6 +1047,8 @@ class DeepEPDispatcher(BaseDispatcher):
             hidden_size=hidden_size,
             params_dtype=params_dtype,
             deepep_mode=deepep_mode,
+            routed_scaling_factor=routed_scaling_factor,
+            deepep_native_exact=deepep_native_exact,
         )
 
         if self.deepep_mode.enable_low_latency():

@@ -103,7 +103,43 @@ class DeepEPMoE(FusedMoE):
             and quant_config is not None
             and quant_config.get_name() == "humming"
         )
-        if is_humming:
+        if self.moe_runner_config.deepep_native_exact:
+            dsv4_mxfp4 = self.moe_runner_config.dsv4_exact_mode
+            glm52_fp8 = self.moe_runner_config.glm52_exact_mode
+            if dsv4_mxfp4:
+                from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+                    Mxfp4MarlinMoEMethod,
+                )
+
+                if not get_moe_runner_backend().is_marlin() or not isinstance(
+                    self.quant_method, Mxfp4MarlinMoEMethod
+                ):
+                    raise ValueError(
+                        "DeepSeek-V4 deepep_native_exact requires the "
+                        "MXFP4-Marlin expert program"
+                    )
+            elif glm52_fp8:
+                if not isinstance(quant_config, Fp8Config):
+                    raise ValueError(
+                        "GLM-5.2 deepep_native_exact requires the block-FP8 expert program"
+                    )
+                if not get_moe_runner_backend().is_triton():
+                    raise ValueError(
+                        "GLM-5.2 deepep_native_exact requires --moe-runner-backend triton"
+                    )
+            else:
+                if quant_config is not None:
+                    raise ValueError(
+                        "Qwen deepep_native_exact requires unquantized BF16 experts"
+                    )
+                if not get_moe_runner_backend().is_triton():
+                    raise ValueError(
+                        "Qwen deepep_native_exact requires --moe-runner-backend triton"
+                    )
+            # Use FusedMoE's modern MoeRunner so the DeepEP-normal -> Triton
+            # or Marlin layout adapters are the single serving execution path.
+            self.deprecate_flag = True
+        elif is_humming:
             self.deprecate_flag = True
         elif _use_aiter:
             self.deprecate_flag = True

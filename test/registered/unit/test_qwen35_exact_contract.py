@@ -12,7 +12,10 @@ from sglang.srt.distributed.canonical_moe import (
     SamplerParallelPlan,
     canonical_moe_fold_fp64_v3,
 )
-from sglang.srt.model_executor.cuda_graph_config import default_cuda_graph_config
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    default_cuda_graph_config,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -112,6 +115,73 @@ def test_qwen35_moe_admits_physical_pp_without_rewriting_perf_knobs():
     assert not args.disable_radix_cache
     assert args.mamba_radix_cache_strategy == "extra_buffer"
     assert args.exact_physical_pp_capable
+
+
+def test_qwen35_moe_admits_shared_native_deepep_contract():
+    hf_config = _qwen_config(moe=True)
+    args = _server_args(
+        deepep_native_exact=True,
+        tp_size=8,
+        dp_size=8,
+        ep_size=8,
+        moe_a2a_backend="deepep",
+        moe_runner_backend="auto",
+        deepep_mode="auto",
+        deepep_dispatcher_output_dtype="auto",
+    )
+    args.cuda_graph_config = default_cuda_graph_config()
+
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config,
+        model_arch="Qwen3_5MoeForConditionalGeneration",
+    )
+    args._resolve_deepep_native_exact_contract(
+        hf_config,
+        model_arch="Qwen3_5MoeForConditionalGeneration",
+    )
+
+    assert args.qwen35_gdn_exact_mode
+    assert not args.qwen3_dense_exact_mode
+    assert hf_config._deepep_native_exact
+    assert hf_config.text_config._deepep_native_exact
+    assert args.moe_a2a_backend == "deepep"
+    assert args.moe_runner_backend == "triton"
+    assert args.deepep_mode == "auto"
+    assert args.deepep_dispatcher_output_dtype == "bf16"
+    assert args.enable_fp32_lm_head
+    assert args.enable_fp32_router
+    assert not args.disable_cuda_graph
+    assert args.cuda_graph_config.prefill.backend == Backend.DISABLED
+
+
+def test_qwen35_moe_native_deepep_admits_breakable_decode_graph():
+    hf_config = _qwen_config(moe=True)
+    args = _server_args(
+        deepep_native_exact=True,
+        tp_size=8,
+        dp_size=8,
+        ep_size=8,
+        moe_a2a_backend="deepep",
+        moe_runner_backend="auto",
+        deepep_mode="normal",
+        deepep_dispatcher_output_dtype="bf16",
+    )
+    args.cuda_graph_config = default_cuda_graph_config()
+    args.cuda_graph_config.decode.backend = Backend.BREAKABLE
+    args.cuda_graph_config.prefill.backend = Backend.DISABLED
+
+    args._resolve_qwen35_gdn_exact_contract(
+        hf_config,
+        model_arch="Qwen3_5MoeForConditionalGeneration",
+    )
+    args._resolve_deepep_native_exact_contract(
+        hf_config,
+        model_arch="Qwen3_5MoeForConditionalGeneration",
+    )
+
+    assert args.disable_cuda_graph is False
+    assert args.cuda_graph_config.decode.backend == Backend.BREAKABLE
+    assert args.cuda_graph_config.prefill.backend == Backend.DISABLED
 
 
 def test_qwen35_dense_admits_physical_pp_and_preserves_graph_and_radix_policy():

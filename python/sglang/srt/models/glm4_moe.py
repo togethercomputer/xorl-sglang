@@ -1459,6 +1459,23 @@ class Glm4MoeForCausalLM(nn.Module):
 
 
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
+    deepep_native_exact_capability = {
+        "label": "GLM-5.2",
+        "produces_local_leaf": True,
+        "wire_dtype": "bf16",
+        "uses_dispatch_handle": True,
+        "ep_sizes": (2, 4, 8, 16),
+        "runner_backends": ("auto", "triton"),
+        "resolved_runner_backend": "triton",
+        "supports_quantized_experts": True,
+        "expert_count_attr": "n_routed_experts",
+        "requires_dp_equals_ep": False,
+        "enable_dp_lm_head": False,
+        "enable_fp32_router": False,
+        "required_exact_config_flag": "_glm52_exact_mode",
+        "lora_serving_modes": ("separate",),
+    }
+
     # XoRL exports q_a + kv_a and gate + up as separate logical factors.
     # The ordinary LoRA loader packs those into the fused runtime targets
     # listed here; kv_b_proj is consumed by the absorbed-MLA correction path.
