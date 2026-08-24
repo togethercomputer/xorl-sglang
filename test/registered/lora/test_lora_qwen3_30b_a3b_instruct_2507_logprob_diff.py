@@ -42,11 +42,35 @@ LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 4
 MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
+# bf16 and NVFP4 trtllm MoE LoRA hard-assert on virtual experts
+# (upstream lora_dispatch.py:356 / :507); only the FP8 path has a fallback.
+LORA_USE_VIRTUAL_EXPERTS = True
 EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "fa4"
 
-KL_THRESHOLD = 6e-3  # it was 5e-3 with KL 4.766e-3. KL now is 5.008e-3.
+# 8e-3, raised from 6e-3 when this test moved to experimental_sgl_trtllm. That
+# backend measures ~1.5x worse against the trainer reference than the triton MoE
+# runner, and 6e-3 no longer fits. Measured here (4x B200, attention held at
+# trtllm_mha for comparability, since fa4 currently fails to compile against
+# nvidia-cutlass-dsl 4.6.0 on this box):
+#
+#   runner   TP  padded?              KL(sglang, trainer)
+#   triton    4  n/a                        3.9135e-3
+#   triton    2  n/a                        4.1783e-3
+#   trtllm    2  no  (768/2 = 3x128)        6.3839e-3
+#   trtllm    4  yes (192 -> 256)           6.8485e-3
+#   reference floor, KL(orig_sampler, trainer)  4.2425e-3
+#
+# The gap is the runner, not the padding: at matched TP=2 with no padding applied
+# trtllm is still +2.21e-3 over triton, and padding adds only the remaining
+# ~0.46e-3. Triton sits at or below the trainer's own self-consistency floor;
+# trtllm sits ~1.5x above it. 8e-3 keeps ~17% headroom over the worst measured
+# value and still gates real drift -- 1e-2 would be ~2.4x the floor and would
+# stop distinguishing the two paths at all.
+#
+# Historical, on triton + fa4: threshold was 5e-3 with KL 4.766e-3, then 5.008e-3.
+KL_THRESHOLD = 8e-3
 
 
 def kl_v2(a, b):
@@ -84,6 +108,7 @@ class TestLoRAQwen3_30B_A3B_Instruct_2507_LogprobDiff(CustomTestCase):
             attention_backend="flashinfer",
             flashinfer_allreduce_fusion_backend="trtllm",
             moe_runner_backend=MOE_RUNNER_BACKEND,
+            lora_use_virtual_experts=LORA_USE_VIRTUAL_EXPERTS,
             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
             decode_attention_backend=DECODE_ATTENTION_BACKEND,

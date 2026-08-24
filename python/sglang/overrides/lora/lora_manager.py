@@ -38,6 +38,33 @@ def _base_model_has_moe(base_model) -> bool:
     return any(isinstance(m, FusedMoE) for m in base_model.modules())
 
 
+def _check_virtual_experts(server_args) -> None:
+    """Fail at startup, not mid-forward, when virtual experts are required.
+
+    ``lora_dispatch.py`` hard-asserts ``use_virtual_lora_store`` on the bf16
+    (:356) and NVFP4 (:507) MoE LoRA paths -- only the FP8 path has a non-virtual
+    fallback. Without this, forgetting ``--lora-use-virtual-experts`` costs a full
+    model load across every TP rank before dying inside the first forward with a
+    bare AssertionError.
+
+    Not hardcoded on the user's behalf, unlike the two env vars the server_args
+    twin forces: ``lora_use_virtual_experts`` is a ServerArgs *field*, which the
+    strict mutation guard forbids writing after resolution, it carries no
+    ``Arg(..., resolvable=True)`` so it is not declarable either, and
+    ``LoRAManager`` reads it off the ServerArgs instance rather than the config
+    bag -- so a bag override would not reach the reader.
+    """
+    if getattr(server_args, "lora_use_virtual_experts", False):
+        return
+    raise ValueError(
+        f"MoE LoRA on --moe-runner-backend {_TRTLLM_MOE_BACKEND} requires "
+        f"--lora-use-virtual-experts. The bf16 and NVFP4 fused-experts paths "
+        f"assert on it (lora_dispatch.py:356 / :507); only the FP8 path has a "
+        f"non-virtual fallback. Passing it up front turns a mid-forward "
+        f"AssertionError into this message."
+    )
+
+
 def _check_moe_runner_backend(base_model) -> None:
     backend = get_moe_runner_backend()
     if backend.is_experimental_sgl_trtllm():
@@ -66,6 +93,15 @@ def __apply_patch__(public_mod):
         # materialized at scheduler init, i.e. before any LoRAManager is built.
         # base_model is LoRAManager.__init__'s first positional parameter.
         _check_moe_runner_backend(base_model)
+        if get_moe_runner_backend().is_experimental_sgl_trtllm() and _base_model_has_moe(
+            base_model
+        ):
+            # server_args is keyword-or-6th-positional in LoRAManager.__init__.
+            server_args = kwargs.get("server_args")
+            if server_args is None and len(args) >= 5:
+                server_args = args[4]
+            if server_args is not None:
+                _check_virtual_experts(server_args)
         orig_init(self, base_model, *args, **kwargs)
 
     manager_cls.__init__ = __init__
