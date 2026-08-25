@@ -105,19 +105,21 @@ RUN python3 -m pip uninstall -y \
       flashinfer-python flashinfer-cubin flashinfer-jit-cache && \
     rm -rf /root/.cache/flashinfer /root/.cache/pip && \
     python3 -m pip install --no-deps \
-      "flashinfer-python==0.6.15.post1" && \
+      "flashinfer-python==0.6.17" && \
     python3 -m pip install --no-deps \
-      "flashinfer-cubin==0.6.15.post1" \
+      "flashinfer-cubin==0.6.17" \
       --index-url https://flashinfer.ai/whl && \
     python3 -m pip install --no-deps \
-      "flashinfer-jit-cache==0.6.15.post1" \
+      "flashinfer-jit-cache==0.6.17" \
       --index-url https://flashinfer.ai/whl/cu130 && \
-    python3 -c 'from importlib.metadata import version; expected = "0.6.15.post1"; packages = ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache"); actual = {package: version(package).split("+", 1)[0] for package in packages}; assert all(value == expected for value in actual.values()), actual' && \
+    python3 -c 'from importlib.metadata import version; expected = "0.6.17"; packages = ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache"); actual = {package: version(package).split("+", 1)[0] for package in packages}; assert all(value == expected for value in actual.values()), actual' && \
     rm -rf /root/.cache/pip
 
-ENV FLASHINFER_VERSION="0.6.15.post1"
+ENV FLASHINFER_VERSION="0.6.17"
 
 # --- 4. FlashInfer: CuTeDSL MLA decode-context-parallel runtime patch ---
+# BLOCKER for the 0.6.17 pin: the DCP patch below is cut against 0.6.15 and
+# 27/28 hunks fail on 0.6.17; the --dry-run gate makes this step fatal.
 RUN FLASHINFER_DCP_PATCH=/sgl-workspace/sglang/docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt && \
     FLASHINFER_SITE_PACKAGES="$(python3 -c 'from pathlib import Path; import flashinfer; print(Path(flashinfer.__file__).resolve().parent.parent)')" && \
     sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \

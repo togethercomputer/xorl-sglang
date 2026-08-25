@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.15.post1
+ARG FLASHINFER_VERSION=0.6.17
 ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"
 ARG TRTLLM_GEN_MOE_CUBIN_SHA256="4900501cbe782a76b08a5858f9f07152287b97cb68114466dac286366b66c192"
 ARG TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT="trtllm_gen_moe_cubin_pool_20260617_v0613rc1"
@@ -536,6 +536,13 @@ COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/d
 
 # Apply the FlashInfer CuTeDSL MLA decode-context-parallel runtime patch.
 # Exclude tests because they are not included in the installed wheel.
+#
+# BLOCKER for the 0.6.17 pin: this patch is cut against flashinfer 0.6.15 and
+# 27 of its 28 hunks fail to apply to 0.6.17 (verified with patch --dry-run
+# against an installed 0.6.17 tree). The dry-run below gates the real apply
+# with &&, so this RUN step -- and therefore the image build -- fails until the
+# patch is re-cut against 0.6.17. Re-cut it or drop the DCP patch before
+# merging the version bump.
 COPY docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt /tmp/flashinfer-perkz-dcp-0.6.15.txt
 RUN FLASHINFER_DCP_PATCH=/tmp/flashinfer-perkz-dcp-0.6.15.txt && \
     FLASHINFER_SITE_PACKAGES="$(python3 -c 'from pathlib import Path; import flashinfer; print(Path(flashinfer.__file__).resolve().parent.parent)')" && \
