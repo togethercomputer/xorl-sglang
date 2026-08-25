@@ -118,6 +118,16 @@ def main():
     ap.add_argument(
         "--no-virtual-experts", dest="virtual_experts", action="store_false"
     )
+    # Regression mode for the backend auto-selection in
+    # overrides/arg_groups/overrides.py: pass NEITHER knob and let the override
+    # registry declare both. The resolved values are printed before generating,
+    # so a silent fall-back to another runner is visible instead of quietly
+    # measuring the wrong path.
+    ap.add_argument(
+        "--auto-select",
+        action="store_true",
+        help="omit moe_runner_backend and lora_use_virtual_experts entirely",
+    )
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -132,11 +142,24 @@ def main():
         f"adapter_{i}": f"{ADAPTER_DIR}/adapter_{i}" for i in range(len(PAIRS))
     }
 
+    selected = (
+        {}
+        if args.auto_select
+        else {
+            "moe_runner_backend": args.moe_runner_backend,
+            "lora_use_virtual_experts": args.virtual_experts,
+        }
+    )
+
     print(
         f"launching engine: model={model} "
-        f"moe_runner_backend={args.moe_runner_backend} "
-        f"virtual_experts={args.virtual_experts} "
-        f"lora_backend={args.lora_backend} tp={args.tp}",
+        + (
+            "moe_runner_backend/virtual_experts=<auto-select> "
+            if args.auto_select
+            else f"moe_runner_backend={args.moe_runner_backend} "
+            f"virtual_experts={args.virtual_experts} "
+        )
+        + f"lora_backend={args.lora_backend} tp={args.tp}",
         flush=True,
     )
 
@@ -146,14 +169,21 @@ def main():
         dtype="bfloat16",
         enable_lora=True,
         lora_backend=args.lora_backend,
-        moe_runner_backend=args.moe_runner_backend,
+        **selected,
         max_lora_rank=16,
         max_loras_per_batch=8,
         lora_paths=lora_paths,
-        lora_use_virtual_experts=args.virtual_experts,
         mem_fraction_static=0.80,
         log_level=args.log_level,
     )
+
+    if args.auto_select:
+        sa = engine.server_args
+        print(
+            f"auto-selected: moe_runner_backend={sa.moe_runner_backend} "
+            f"lora_use_virtual_experts={sa.lora_use_virtual_experts}",
+            flush=True,
+        )
 
     sp = {"max_new_tokens": 32, "temperature": 0.0, "top_p": 1.0}
     phases = args.phases.split(",")

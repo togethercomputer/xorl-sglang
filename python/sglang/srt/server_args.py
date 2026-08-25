@@ -2835,7 +2835,14 @@ class ServerArgs:
     ] = None
     lora_use_virtual_experts: A[
         bool,
-        "Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
+        Arg(
+            help="Enable virtual expert computation for MoE models. When set, the model will use virtual expert computation.",
+            # resolvable so MoE-LoRA backend selection can supply it alongside
+            # the runner it picks: the TRT-LLM MoE LoRA path hard-asserts on it
+            # (lora_dispatch.py), so choosing that runner without it would only
+            # trade one required flag for another.
+            resolvable=True,
+        ),
         NS("lora"),
     ] = False
     lora_strict_loading: A[
