@@ -432,7 +432,11 @@ _REPRESENTATIVE_ALLOWLIST = os.path.normpath(
         "representative_gpu_tests.txt",
     )
 )
-_FORK_BASE_STAGES = ("base-a", "base-b", "base-c")
+# "lora" is this fork's dedicated LoRA stage (see pr-test.yml). It is listed
+# here so the representative allowlist keeps applying after the LoRA group was
+# moved off base-*: without it every lora/ test would become unfiltered and the
+# new lanes would run the whole group.
+_FORK_BASE_STAGES = ("base-a", "base-b", "base-c", "lora")
 
 
 def _canonical_test_path(path: str) -> str:

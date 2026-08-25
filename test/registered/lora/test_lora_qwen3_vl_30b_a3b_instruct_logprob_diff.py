@@ -36,7 +36,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(
     est_time=110,
-    stage="base-c",
+    stage="lora",
     runner_config="4-gpu-h100",
 )
 
@@ -45,7 +45,10 @@ LORA_HF_REPO = "yushengsu/lora-diff-Qwen3-VL-30B-A3B-Instruct"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 4
-MOE_RUNNER_BACKEND = "triton"
+MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
+# bf16 and NVFP4 trtllm MoE LoRA hard-assert on virtual experts
+# (upstream lora_dispatch.py:356 / :507); only the FP8 path has a fallback.
+LORA_USE_VIRTUAL_EXPERTS = True
 EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "fa4"
@@ -87,6 +90,7 @@ class TestLoRAQwen3VL_30B_A3B_Instruct_LogprobDiff(CustomTestCase):
             lora_backend=LORA_BACKEND,
             attention_backend="flashinfer",
             moe_runner_backend=MOE_RUNNER_BACKEND,
+            lora_use_virtual_experts=LORA_USE_VIRTUAL_EXPERTS,
             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
             decode_attention_backend=DECODE_ATTENTION_BACKEND,

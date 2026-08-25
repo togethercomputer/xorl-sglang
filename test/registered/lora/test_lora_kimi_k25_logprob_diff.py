@@ -44,7 +44,10 @@ LORA_HF_REPO = "yushengsu/lora-diff-Kimi-K2.5"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 8
-MOE_RUNNER_BACKEND = "triton"
+MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
+# bf16 and NVFP4 trtllm MoE LoRA hard-assert on virtual experts
+# (upstream lora_dispatch.py:356 / :507); only the FP8 path has a fallback.
+LORA_USE_VIRTUAL_EXPERTS = True
 EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "flashinfer"
@@ -86,6 +89,7 @@ class TestLoRAKimiK25LogprobDiff(CustomTestCase):
             lora_backend=LORA_BACKEND,
             attention_backend="flashinfer",
             moe_runner_backend=MOE_RUNNER_BACKEND,
+            lora_use_virtual_experts=LORA_USE_VIRTUAL_EXPERTS,
             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
             decode_attention_backend=DECODE_ATTENTION_BACKEND,
