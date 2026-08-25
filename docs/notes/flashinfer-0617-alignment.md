@@ -108,7 +108,10 @@ All three exist at 0.6.17 (cubin and jit-cache from the flashinfer index, cu130)
 | `python/pyproject.toml:34` | `flashinfer_python[cu13]==0.6.17` |
 | `docker/Dockerfile:22` | `ARG FLASHINFER_VERSION=0.6.17` |
 | `docker/kimi_k3/kimi_k3_cu13.Dockerfile` | 3 pins + assert + `ENV` |
-| `docker/kimi_k3/kimi_k3_cu12.Dockerfile` | 3 pins + assert + `ENV` |
+
+`docker/kimi_k3/kimi_k3_cu12.Dockerfile` was deleted rather than repinned, so
+kimi_k3 is CUDA-13-only in this fork. Nothing built it in CI, and the
+cookbook's CUDA-12 link points at upstream, not at this copy.
 
 ### 4b. Fresh installs: cubin and jit-cache now come from pyproject
 
