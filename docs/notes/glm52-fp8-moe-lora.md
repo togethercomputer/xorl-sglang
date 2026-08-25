@@ -1,6 +1,7 @@
 # Open bug: GLM-5.2 FP8 MoE LoRA returns wrong tokens (NVFP4 is fine)
 
-**Status: unresolved.** Root cause not identified; no fix proposed here. This
+**Status: unresolved, and confirmed present in a second sglang tree too.**
+Root cause not identified; no fix proposed here. This
 note records the measurements and the hypotheses already eliminated so the next
 attempt does not repeat them.
 
@@ -49,14 +50,25 @@ delta (a shared-experts-fusion refactor) and its `lora/utils.py` delta (pure
 extraction of `get_default_hidden_dim`; `GlmMoeDsaForCausalLM` defines no
 `get_hidden_dim`, so the fork already reaches the `lm_head`/DSA branches).
 
-## Next step
+## Not a fork regression
 
-A same-harness run on a second tree, to separate "fork regression" from
-"unfixed everywhere". Both trees need their preconditions named explicitly --
-a tree without the auto-selection provider resolves `auto` to
-`flashinfer_trtllm` and refuses MoE LoRA, and a tree without the `server_args`
-twin needs `SGLANG_EXPERIMENTAL_LORA_OPTI=1` set by hand or the backend will not
-load.
+The same harness, adapters and prompts on a second sglang tree (also flashinfer
+0.6.17, backend and virtual experts named explicitly, `SGLANG_EXPERIMENTAL_LORA_OPTI=1`
+exported by hand) reproduces it exactly: **0/8**, same correct-prefix-then-loop
+outputs.
+
+    fork       adapter_0  got 'Kx7#-VORVORVORVOR...'
+    reference  adapter_0  got 'Kx7#-VORVORVORVOR...'
+    reference  adapter_2  got 'PRISM-27bK$K$K$K$...'
+
+So there is no fix elsewhere to port -- this is unfixed in both trees, and the
+search should move to the FP8 MoE-LoRA numerics rather than to a diff between
+trees.
+
+Getting a comparable run on another tree needs its preconditions named
+explicitly: without the auto-selection provider `auto` resolves to
+`flashinfer_trtllm`, which refuses MoE LoRA, and without the `server_args` twin
+`SGLANG_EXPERIMENTAL_LORA_OPTI=1` must be exported or the backend cannot load.
 
 ## Reproducing
 
