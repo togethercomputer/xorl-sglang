@@ -34,13 +34,31 @@ Two flags are set together, and the pairing is the point:
     the master gate on without this would enable the overlap while leaving its
     mitigation off, so we set both or neither.
 
-Both are skipped if the user set them explicitly (either direction), so
-``SGLANG_EXPERIMENTAL_LORA_OPTI=0`` remains a working opt-out.
+``SGLANG_OPT_FUSED_PERMUTE_QUANT``
+    Fuses the NVFP4 permute + activation-quant step. Ships defaulted **off** and
+    labelled kimi-only, but that is validation scope rather than a capability
+    limit: the kernel's own preconditions are generic (``hidden_size % 16 == 0``
+    and ``top_k <= 512``, checked loudly in the launcher) and Qwen3-30B-A3B
+    satisfies both. Without it, NVFP4 MoE-LoRA is the slowest dtype on this path;
+    with it, it draws level with bf16. Measured on 2x B200, Qwen3-30B-A3B-NVFP4,
+    TP=2, 512 in / 128 out, output tok/s, LoRA mode:
 
-Note ``SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC`` is a local ``_GatedBool`` in
-``trtllm_lora_temp/environ.py`` reading ``os.environ`` directly -- it is not an
-``Envs`` descriptor -- so it is set through ``os.environ`` rather than the
-``envs`` API.
+        batch   off     on      bf16
+            1   142     150      171
+            8  1164    1186     1144
+           32  2700    3943     3717
+           64  3107    5772     5892
+
+    +46% at bs=32 and +86% at bs=64, and 28/28 on the correctness harness with it
+    on. Only affects NVFP4; inert for bf16 and FP8.
+
+All three are skipped if the user set any of them explicitly (either direction),
+so ``SGLANG_EXPERIMENTAL_LORA_OPTI=0`` remains a working opt-out.
+
+``SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC`` and ``SGLANG_OPT_FUSED_PERMUTE_QUANT`` are
+local ``_GatedBool``s in ``trtllm_lora_temp/environ.py`` reading ``os.environ``
+directly -- neither is an ``Envs`` descriptor -- so they are set through
+``os.environ`` rather than the ``envs`` API.
 """
 
 import logging
@@ -53,6 +71,7 @@ logger = logging.getLogger(__name__)
 _TRTLLM_MOE_BACKEND = "experimental_sgl_trtllm"
 # Read via os.environ by trtllm_lora_temp/environ.py's _GatedBool, not via Envs.
 _OVERLAP_ALLOC_ENV = "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC"
+_FUSED_PERMUTE_QUANT_ENV = "SGLANG_OPT_FUSED_PERMUTE_QUANT"
 
 
 def _lora_requested(server_args) -> bool:
@@ -73,22 +92,28 @@ def maybe_enable_experimental_lora_opti(server_args) -> None:
         return
 
     master = envs.SGLANG_EXPERIMENTAL_LORA_OPTI
-    if master.is_set() or _OVERLAP_ALLOC_ENV in os.environ:
+    if (
+        master.is_set()
+        or _OVERLAP_ALLOC_ENV in os.environ
+        or _FUSED_PERMUTE_QUANT_ENV in os.environ
+    ):
         # Explicit user intent on either flag: leave the whole pairing alone
         # rather than half-applying it.
         return
 
     master.set(True)
     os.environ[_OVERLAP_ALLOC_ENV] = "1"
+    os.environ[_FUSED_PERMUTE_QUANT_ENV] = "1"
     # warning, not info: this runs inside ServerArgs.__post_init__, before sglang
     # configures logging, so an info record has no handler and is dropped. It is
     # also a default-flip the operator should see in the log.
     logger.warning(
         "moe_runner_backend=%s with LoRA: defaulting "
-        "SGLANG_EXPERIMENTAL_LORA_OPTI=1 and %s=1 "
-        "(set either explicitly to opt out).",
+        "SGLANG_EXPERIMENTAL_LORA_OPTI=1, %s=1 and %s=1 "
+        "(set any of them explicitly to opt out).",
         _TRTLLM_MOE_BACKEND,
         _OVERLAP_ALLOC_ENV,
+        _FUSED_PERMUTE_QUANT_ENV,
     )
 
 
