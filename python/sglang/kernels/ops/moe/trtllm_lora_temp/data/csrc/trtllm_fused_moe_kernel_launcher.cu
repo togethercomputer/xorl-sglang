@@ -3237,7 +3237,17 @@ public:
           globalScaleInv, reinterpret_cast<uint8_t *>(act_fp4.data_ptr()),
           reinterpret_cast<uint8_t *>(act_fp4_sf.data_ptr()),
           reinterpret_cast<float *>(act_per_token_sf.data_ptr()), sfLayout,
-          /*disableFp4FastMath=*/false, stream);
+          /*disableFp4FastMath=*/false, stream,
+          output1_scales_scalar_.has_value()
+              ? static_cast<float const *>(
+                    output1_scales_scalar_.value().data_ptr())
+              : nullptr,
+          output1_scales_gate_scalar_.has_value()
+              ? static_cast<float const *>(
+                    output1_scales_gate_scalar_.value().data_ptr())
+              : nullptr,
+          static_cast<int32_t const *>(
+              const_cast<void const *>(expert_indices_.data_ptr())));
     } else {
       Tensor activated_bf16 =
           alloc_tensor({max_num_padded_tokens, inter}, dl_bfloat16, device);
@@ -3258,6 +3268,20 @@ public:
         actData.innerDim = gate_up_n;
         actData.numTokens = num_tokens;
         actData.topK = top_k;
+        // Correct the linear GEMM1 half from g1_alphas to g1_scale_c: the
+        // unfused-act GEMM1 above could only apply one scalar to both halves.
+        actData.output1ScalesScalarPtr =
+            output1_scales_scalar_.has_value()
+                ? static_cast<float const *>(
+                      output1_scales_scalar_.value().data_ptr())
+                : nullptr;
+        actData.output1ScalesGateScalarPtr =
+            output1_scales_gate_scalar_.has_value()
+                ? static_cast<float const *>(
+                      output1_scales_gate_scalar_.value().data_ptr())
+                : nullptr;
+        actData.expertIndicesPacked = static_cast<int32_t const *>(
+            const_cast<void const *>(expert_indices_.data_ptr()));
         actData.expandedIdxToPermutedIdx =
             static_cast<int *>(expanded_idx_to_permuted_idx.data_ptr());
         actData.totalNumPaddedTokens =

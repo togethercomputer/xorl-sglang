@@ -542,6 +542,17 @@ getOptions(btg::Dtype dtypeAct, btg::Dtype dtypeWeights, btg::Dtype dtypeOut,
       .useShuffledMatrix = useShuffledMatrix,
       .weightLayout = weightLayout,
       .usePerTokenScaling = usePerTokenScaling,
+      // Gemm2-only fix. Both LoRA-launcher GEMMs (gate_up, down) wire an FP32
+      // per-token scale tensor into run(), but the shipped options left
+      // perTokenSfDtype at Void, which no cubin advertises, so flashinfer
+      // 0.6.17's selector rejected every candidate and the launch died with
+      // "No kernel found for the given options". PermuteGemm1's sites are
+      // deliberately left untouched.
+      // Scoped to Gemm2::getOptions -- PermuteGemm1's sites are left untouched.
+      .perTokenSfDtype = usePerTokenScaling ? (dtypeAct == btg::Dtype::E4m3
+                                                   ? btg::Dtype::Bfloat16
+                                                   : btg::Dtype::Fp32)
+                                            : btg::Dtype::Void,
       .usePerChannelScaling = usePerChannelScaling};
   return options;
 }

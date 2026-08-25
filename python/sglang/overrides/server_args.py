@@ -52,7 +52,23 @@ Two flags are set together, and the pairing is the point:
     +46% at bs=32 and +86% at bs=64, and 28/28 on the correctness harness with it
     on. Only affects NVFP4; inert for bf16 and FP8.
 
-All three are skipped if the user set any of them explicitly (either direction),
+``SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION``
+    Ships defaulted **off** (``environ.py``), and NVFP4 MoE LoRA is silently
+    wrong without it. The NVFP4 LoRA op always quantizes activations
+    dynamically per token, deriving its own scales, so the checkpoint's static
+    per-tensor activation scales must be neutral (a1 == a2 == 1) -- which is
+    what this flag arranges. With it off they are applied *on top of* the op's
+    own per-token scales: ``g1_alphas`` carries a1 into both SwiGLU halves (so
+    the product carries a1**2) and ``g2_alphas`` re-applies a2 at GEMM2, leaving
+    the output off by ~a1**2 * a2. On Qwen3-30B-A3B-NVFP4 (a1=1.6e-3,
+    a2=3.2e-3) that is 4/28 on the correctness harness -- fluent-looking
+    garbage tokens, no error anywhere -- against 28/28 with it on.
+
+    Only affects NVFP4; inert for bf16 and FP8, which is why it is set for the
+    whole backend rather than gated on a quantization that is not yet known when
+    ``__post_init__`` runs.
+
+All four are skipped if the user set any of them explicitly (either direction),
 so ``SGLANG_EXPERIMENTAL_LORA_OPTI=0`` remains a working opt-out.
 
 ``SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC`` and ``SGLANG_OPT_FUSED_PERMUTE_QUANT`` are
@@ -72,6 +88,8 @@ _TRTLLM_MOE_BACKEND = "experimental_sgl_trtllm"
 # Read via os.environ by trtllm_lora_temp/environ.py's _GatedBool, not via Envs.
 _OVERLAP_ALLOC_ENV = "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC"
 _FUSED_PERMUTE_QUANT_ENV = "SGLANG_OPT_FUSED_PERMUTE_QUANT"
+# A real Envs descriptor, unlike the two above, so it goes through the envs API.
+_NVFP4_PER_TOKEN_ENV = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
 
 
 def _lora_requested(server_args) -> bool:
@@ -96,6 +114,7 @@ def maybe_enable_experimental_lora_opti(server_args) -> None:
         master.is_set()
         or _OVERLAP_ALLOC_ENV in os.environ
         or _FUSED_PERMUTE_QUANT_ENV in os.environ
+        or _NVFP4_PER_TOKEN_ENV.is_set()
     ):
         # Explicit user intent on either flag: leave the whole pairing alone
         # rather than half-applying it.
@@ -104,16 +123,18 @@ def maybe_enable_experimental_lora_opti(server_args) -> None:
     master.set(True)
     os.environ[_OVERLAP_ALLOC_ENV] = "1"
     os.environ[_FUSED_PERMUTE_QUANT_ENV] = "1"
+    _NVFP4_PER_TOKEN_ENV.set(True)
     # warning, not info: this runs inside ServerArgs.__post_init__, before sglang
     # configures logging, so an info record has no handler and is dropped. It is
     # also a default-flip the operator should see in the log.
     logger.warning(
         "moe_runner_backend=%s with LoRA: defaulting "
-        "SGLANG_EXPERIMENTAL_LORA_OPTI=1, %s=1 and %s=1 "
+        "SGLANG_EXPERIMENTAL_LORA_OPTI=1, %s=1, %s=1 and %s=1 "
         "(set any of them explicitly to opt out).",
         _TRTLLM_MOE_BACKEND,
         _OVERLAP_ALLOC_ENV,
         _FUSED_PERMUTE_QUANT_ENV,
+        _NVFP4_PER_TOKEN_ENV.name,
     )
 
 

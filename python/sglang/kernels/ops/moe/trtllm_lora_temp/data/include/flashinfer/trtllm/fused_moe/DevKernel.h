@@ -197,6 +197,13 @@ struct Data {
   cutlass::bfloat16_t const *gateUpLoraDeltaPtr = nullptr;
   cutlass::bfloat16_t *activationLoraInputOutPtr = nullptr;
 
+  // GEMM1-output dequant scalars, used to correct the linear (non-silu) half;
+  // see linearHalfScale(). Leave null to keep the previous behaviour.
+  float const *output1ScalesScalarPtr = nullptr;
+  float const *output1ScalesGateScalarPtr = nullptr;
+  // Packed (expert_id << 16) | weight_bf16 routing ids, by expandedIdx.
+  int32_t const *expertIndicesPacked = nullptr;
+
   // When true, inPtr holds the column-interleaved gate/up GEMM1 output
   // (g0,u0,g1,u1,...) and the kernel de-interleaves on read (x1=col 2k, x2=col
   // 2k+1); when false, inPtr is the contiguous [gate | up] layout. Default
@@ -240,6 +247,13 @@ struct KernelParams {
   cutlass::bfloat16_t const *gateUpLoraDeltaPtr = nullptr;
   cutlass::bfloat16_t *activationLoraInputOutPtr = nullptr;
 
+  // GEMM1-output dequant scalars, used to correct the linear (non-silu) half;
+  // see linearHalfScale(). Leave null to keep the previous behaviour.
+  float const *output1ScalesScalarPtr = nullptr;
+  float const *output1ScalesGateScalarPtr = nullptr;
+  // Packed (expert_id << 16) | weight_bf16 routing ids, by expandedIdx.
+  int32_t const *expertIndicesPacked = nullptr;
+
   bool interleavedGateUpInput = false;
 
   int32_t innerDim;
@@ -259,6 +273,9 @@ struct KernelParams {
     params.gateUpLoraDeltaPtr = data.gateUpLoraDeltaPtr;
     params.activationLoraInputOutPtr = data.activationLoraInputOutPtr;
     params.interleavedGateUpInput = data.interleavedGateUpInput;
+    params.output1ScalesScalarPtr = data.output1ScalesScalarPtr;
+    params.output1ScalesGateScalarPtr = data.output1ScalesGateScalarPtr;
+    params.expertIndicesPacked = data.expertIndicesPacked;
 
     params.expandedIdxToPermutedIdx = data.expandedIdxToPermutedIdx;
 

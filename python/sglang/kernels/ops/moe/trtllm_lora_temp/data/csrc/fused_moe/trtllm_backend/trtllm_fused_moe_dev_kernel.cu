@@ -55,6 +55,31 @@ namespace tg = batchedGemm::trtllm::gen;
 
 inline __device__ float silu(float x) { return x / (1.0f + expf(-x)); }
 
+// Per-expert correction for the NON-silu (linear) GEMM1 half.
+//
+// The unfused-act GEMM1 here is a Gemm2::Runner, whose epilogue can apply only
+// ONE per-expert scalar to the whole 2*inter output, so the launcher gives it
+// output1_scales_gate_scalar (g1_alphas). TRT-LLM's contract is
+// gate(g1_alphas) / up(g1_scale_c = g1_alphas / a2_scale), so the linear half
+// must be rescaled by g1_scale_c / g1_alphas = 1 / a2_scale here. Returns 1
+// when either scalar array is absent (nothing to correct) -- and naturally
+// returns 1 when g1_scale_c == g1_alphas, i.e. per-token-activation mode, which
+// is the only configuration the uncorrected code was valid for.
+inline __device__ float linearHalfScale(float const *upScales,
+                                        float const *gateScales,
+                                        int32_t const *expertIndicesPacked,
+                                        int expandedIdx) {
+  if (upScales == nullptr || gateScales == nullptr ||
+      expertIndicesPacked == nullptr)
+    return 1.0f;
+  // packed routing id: (expert_id << 16) | weight_bf16
+  int const expertIdx = expertIndicesPacked[expandedIdx] >> 16;
+  if (expertIdx < 0)
+    return 1.0f;
+  float const gateScale = gateScales[expertIdx];
+  return gateScale != 0.0f ? upScales[expertIdx] / gateScale : 1.0f;
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <typename KernelParams>
@@ -76,6 +101,9 @@ __global__ void activationKernel(KernelParams params) {
     for (int k = blockIdx.y; k < params.topK; k += gridDim.y) {
       int const expandedIdx = tokenIdx * params.topK + k;
       int const permutedIdx = params.expandedIdxToPermutedIdx[expandedIdx];
+      float const linScale = linearHalfScale(
+          params.output1ScalesScalarPtr, params.output1ScalesGateScalarPtr,
+          params.expertIndicesPacked, expandedIdx);
 
       // Loop over hidden dim
       for (int hiddenIdx = threadIdx.x + blockDim.x * blockIdx.x;
@@ -114,12 +142,17 @@ __global__ void activationKernel(KernelParams params) {
         }
 
         float act = silu(x2);
-        Type out = (Type)(act * x1);
+        // The TRUE activation, in real units: this is what the down-LoRA
+        // projection consumes, so activation_lora_input must get it unscaled.
+        float const trueAct = act * x1;
+        // GEMM2's operand is the TRT-LLM contract's A / a2_scale -- that is the
+        // whole job of output1_scales_scalar (g1_scale_c) on the linear half.
+        Type out = (Type)(trueAct * linScale);
         if (params.activationLoraInputOutPtr != nullptr) {
           int64_t const activationIdx =
               (int64_t)expandedIdx * (params.innerDim / 2) + hiddenIdx;
           params.activationLoraInputOutPtr[activationIdx] =
-              static_cast<cutlass::bfloat16_t>(act * x1);
+              static_cast<cutlass::bfloat16_t>(trueAct);
         }
 
         int64_t const outIdx =
@@ -148,12 +181,17 @@ __global__ void activationKernelOpt(
     cutlass::bfloat16_t const *__restrict__ gateUpLoraDeltaPtr,  // may be null
     cutlass::bfloat16_t *__restrict__ activationLoraInputOutPtr, // may be null
     int const *__restrict__ expandedIdxToPermutedIdx, int innerDim,
-    int numTokens, int topK) {
+    int numTokens, int topK, float const *__restrict__ output1ScalesScalar,
+    float const *__restrict__ output1ScalesGateScalar,
+    int32_t const *__restrict__ expertIndicesPacked) {
   int const innerHalf = innerDim / 2;
   for (int tokenIdx = blockIdx.z; tokenIdx < numTokens; tokenIdx += gridDim.z) {
     for (int k = blockIdx.y; k < topK; k += gridDim.y) {
       int const expandedIdx = tokenIdx * topK + k;
       int const permutedIdx = expandedIdxToPermutedIdx[expandedIdx];
+      float const linScale =
+          linearHalfScale(output1ScalesScalar, output1ScalesGateScalar,
+                          expertIndicesPacked, expandedIdx);
       for (int h = (threadIdx.x + blockDim.x * blockIdx.x) * 4; h < innerHalf;
            h += blockDim.x * gridDim.x * 4) {
         int64_t const liBase = (int64_t)expandedIdx * innerHalf + h;
@@ -198,18 +236,26 @@ __global__ void activationKernelOpt(
         }
 
         __align__(8) cutlass::bfloat16_t res[4];
+        float prod[4];
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
-          res[j] = (cutlass::bfloat16_t)(silu(up[j]) * gate[j]);
+          prod[j] = silu(up[j]) * gate[j]; // true units
+          res[j] = (cutlass::bfloat16_t)prod[j];
         }
-        int2 const packed = *reinterpret_cast<int2 const *>(res);
-
-        int64_t const outBase = (int64_t)permutedIdx * innerHalf + h;
-        *reinterpret_cast<int2 *>(&outPtr[outBase]) = packed;
+        // activation_lora_input keeps the TRUE activation; only GEMM2's operand
+        // carries the linear-half correction (see linearHalfScale()).
         if (activationLoraInputOutPtr != nullptr) {
           *reinterpret_cast<int2 *>(&activationLoraInputOutPtr[liBase]) =
-              packed;
+              *reinterpret_cast<int2 const *>(res);
         }
+        if (linScale != 1.0f) {
+#pragma unroll
+          for (int j = 0; j < 4; ++j)
+            res[j] = (cutlass::bfloat16_t)(prod[j] * linScale);
+        }
+        int64_t const outBase = (int64_t)permutedIdx * innerHalf + h;
+        *reinterpret_cast<int2 *>(&outPtr[outBase]) =
+            *reinterpret_cast<int2 const *>(res);
       }
     }
   }
@@ -556,8 +602,9 @@ void run(Data const &data, void *stream) {
         static_cast<cutlass::bfloat16_t const *>(data.inPtr),
         static_cast<cutlass::bfloat16_t *>(data.outPtr),
         data.gateUpLoraDeltaPtr, data.activationLoraInputOutPtr,
-        data.expandedIdxToPermutedIdx, data.innerDim, data.numTokens,
-        data.topK);
+        data.expandedIdxToPermutedIdx, data.innerDim, data.numTokens, data.topK,
+        data.output1ScalesScalarPtr, data.output1ScalesGateScalarPtr,
+        data.expertIndicesPacked);
   } else {
     int const numThreads = 256;
     int const gridX = data.actGridXOverride > 0 ? data.actGridXOverride
