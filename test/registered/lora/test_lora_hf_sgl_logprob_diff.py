@@ -41,7 +41,7 @@ from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER, CustomTestC
 
 register_cuda_ci(
     est_time=150,
-    stage="base-b",
+    stage="lora",
     runner_config="1-gpu-small",
 )
 register_amd_ci(

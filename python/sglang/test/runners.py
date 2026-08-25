@@ -589,6 +589,8 @@ class SRTRunner:
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
         lora_drain_wait_threshold: float = 0.0,
+        moe_runner_backend: Optional[str] = None,
+        lora_use_virtual_experts: Optional[bool] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -622,6 +624,13 @@ class SRTRunner:
             lora_paths=lora_paths,
             max_loras_per_batch=max_loras_per_batch,
             lora_backend=lora_backend,
+            # Only forward when set, so the default stays whatever ServerArgs resolves.
+            **({} if moe_runner_backend is None else {"moe_runner_backend": moe_runner_backend}),
+            **(
+                {}
+                if lora_use_virtual_experts is None
+                else {"lora_use_virtual_experts": lora_use_virtual_experts}
+            ),
             attention_backend=attention_backend,
             prefill_attention_backend=prefill_attention_backend,
             decode_attention_backend=decode_attention_backend,

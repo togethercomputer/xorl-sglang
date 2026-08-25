@@ -77,6 +77,9 @@ PER_COMMIT_SUITES = {
         "base-b-kernel-unit-test-8-gpu-h200",
         "base-b-kernel-benchmark-test-1-gpu-large",
         "base-c-test-4-gpu-h100",
+        # LoRA runs on its own stage, not inside base-a/b/c (see pr-test.yml).
+        "lora-test-1-gpu-large",
+        "lora-test-4-gpu-h100",
         "base-c-test-4-gpu-b200",
         "base-c-test-4-gpu-gb300",
         "base-c-test-8-gpu-h20",
