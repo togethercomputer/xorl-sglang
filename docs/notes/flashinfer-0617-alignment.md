@@ -110,6 +110,50 @@ All three exist at 0.6.17 (cubin and jit-cache from the flashinfer index, cu130)
 | `docker/kimi_k3/kimi_k3_cu13.Dockerfile` | 3 pins + assert + `ENV` |
 | `docker/kimi_k3/kimi_k3_cu12.Dockerfile` | 3 pins + assert + `ENV` |
 
+### 4b. Fresh installs: cubin and jit-cache now come from pyproject
+
+Before this change the two pins lived *only* in the Dockerfiles, so a fresh
+`uv pip install -e python/` produced an environment with `flashinfer_python`
+0.6.17 and no cubin, no jit-cache -- flashinfer then downloads cubins over the
+network on first use and JIT-compiles every module from scratch. Both are now
+declared in `python/pyproject.toml`, which needs index wiring because **neither
+is on PyPI at 0.6.17**: PyPI's `flashinfer-cubin` stops at 0.6.9 and its
+`flashinfer-jit-cache` has no files at all.
+
+| package | index | why |
+|---|---|---|
+| `flashinfer-cubin` | `https://flashinfer.ai/whl` | CUDA-agnostic, `py3-none-any` |
+| `flashinfer-jit-cache` | `https://flashinfer.ai/whl/cu130` | CUDA-specific, wheel is `0.6.17+cu130` |
+
+Declared as two `[[tool.uv.index]]` entries with `explicit = true` plus
+`[tool.uv.sources]`, so only these two packages resolve off flashinfer.ai.
+Verified: `uv pip install -e python/` resolves all three, run both from the repo
+root and from `python/`.
+
+Sizes matter here: cubin is a 1.06 GB wheel (4.5 GB installed) and jit-cache a
+1.51 GB wheel (2.0 GB installed). Three consequences, each handled:
+
+- **pip ignores `[tool.uv.*]`,** so a pip-driven resolve of these pyproject
+  dependencies would fail outright. Only one install site resolves deps with pip
+  --- `docker/Dockerfile`'s `torch_deps` stage --- and that image already
+  installs both packages itself in the `flashinfer_cache` stage and COPYs them
+  in with their `dist-info`. Letting `torch_deps` resolve them too would pull
+  the same ~2.6 GB a second time per build, so the stage now `sed`-deletes both
+  lines before its `pip install`. Image contents and size are unchanged. Every
+  other site is already immune: the editable install and the kimi_k3 images use
+  `--no-deps`, and AMD CI swaps in `pyproject_other.toml` first.
+- **The CPU CI lane drops both the same way.** It installs with uv, so it *would*
+  resolve them --- 2.6 GB of CUDA kernels downloaded onto a CPU runner every run.
+- **cu130 is hardcoded in the jit-cache index URL,** matching the rest of the file
+  (`flashinfer_python[cu13]`, `cuda-python>=13.0`, `nvidia-cutlass-dsl[cu13]`).
+  The cu12 image path rewrites it to `cu${CUINDEX}` alongside those existing
+  rewrites.
+
+One pre-existing gap this surfaced, unrelated to the packaging change: the
+flashinfer index publishes 0.6.17 jit-cache for cu128/cu129/cu130 but **not
+cu126**, so a `CUDA_VERSION=12.6.1` build with the jit-cache gate on cannot
+satisfy the 0.6.17 pin.
+
 ## Suggested order
 
 1. Scratch venv on 0.6.17, fork installed editable.

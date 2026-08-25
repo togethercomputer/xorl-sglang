@@ -121,6 +121,10 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
+          # flashinfer-cubin and -jit-cache are ~2.6 GB of prebuilt CUDA kernels
+          # and cubin artifacts -- dead weight on a CPU runner, so drop them
+          # before resolving, as docker/Dockerfile does for its own reasons.
+          sed -i '/^  "flashinfer-cubin==/d; /^  "flashinfer-jit-cache==/d' python/pyproject.toml
           uv pip install -e "python[dev]" --index-strategy unsafe-best-match --prerelease allow
           source scripts/ci/utils/sgl_eval_ref.sh
           uv pip install "$SGL_EVAL_SPEC" --index-strategy unsafe-best-match

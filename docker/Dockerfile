@@ -252,6 +252,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
+    # flashinfer-cubin / -jit-cache are pyproject dependencies so that a plain
+    # `uv pip install -e python/` gets them, but this image installs them itself
+    # in the flashinfer_cache stage (gated on INSTALL_FLASHINFER_JIT_CACHE) and
+    # COPYs them in with their dist-info. Resolving them here too would download
+    # ~2.6 GB a second time per build, so drop them from this resolve.
+    && sed -i '/^  "flashinfer-cubin==/d; /^  "flashinfer-jit-cache==/d' pyproject.toml \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
@@ -734,6 +740,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
+           sed -i "s|flashinfer.ai/whl/cu130|flashinfer.ai/whl/cu$(echo ${CUDA_VERSION} | awk -F. '{print $1$2}')|" python/pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
        fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \

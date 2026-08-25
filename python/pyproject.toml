@@ -31,7 +31,13 @@ dependencies = [
   "einops",
   "fastapi",
   "flash-attn-4>=4.0.0b18",
-  "flashinfer_python[cu13]==0.6.17", # keep it aligned with jit-cache version in Dockerfile
+  # The three flashinfer distributions move as a set -- keep these versions,
+  # FLASHINFER_VERSION in docker/Dockerfile and the kimi_k3 Dockerfile pins equal.
+  # cubin and jit-cache are not published on PyPI; see the [[tool.uv.index]]
+  # entries below for where they come from.
+  "flashinfer-cubin==0.6.17",
+  "flashinfer-jit-cache==0.6.17",
+  "flashinfer_python[cu13]==0.6.17",
   "gguf",
   "helion==1.4",
   "humming-kernels[cu13]==0.1.10",
@@ -95,6 +101,26 @@ dependencies = [
 name = "pypi"
 url = "https://pypi.org/simple"
 default = true
+
+# flashinfer-cubin and flashinfer-jit-cache are only published on flashinfer.ai.
+# cubin is CUDA-version-agnostic; jit-cache is CUDA-specific and its wheel carries
+# a +cu130 local version, which is why they need two different indexes -- the same
+# split docker/Dockerfile makes with its two --index-url values.
+# cu130 matches the rest of this file (flashinfer_python[cu13], cuda-python>=13.0,
+# nvidia-cutlass-dsl[cu13]); the cu12 image path rewrites it alongside those.
+[[tool.uv.index]]
+name = "flashinfer"
+url = "https://flashinfer.ai/whl"
+explicit = true
+
+[[tool.uv.index]]
+name = "flashinfer-jit-cache"
+url = "https://flashinfer.ai/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+flashinfer-cubin = { index = "flashinfer" }
+flashinfer-jit-cache = { index = "flashinfer-jit-cache" }
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
