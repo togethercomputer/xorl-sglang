@@ -1,6 +1,12 @@
 """Override twin of ``sglang.srt.lora.lora_manager``.
 
-Enforces that **MoE** LoRA is only *served* on the TRT-LLM MoE runner.
+Enforces that **MoE** LoRA is only *served* on the TRT-LLM MoE runner --
+**on Blackwell**, which is the only place that runner exists.
+
+On Hopper and older the TRT-LLM MoE kernels are simply absent (they ship as
+precompiled cubins for sm100f / sm103a / sm107a only), so MoE LoRA falls back to
+the triton MoE runner with a warning rather than being refused. Requiring a
+backend the hardware cannot load would make MoE LoRA unservable there.
 
 Scoped to models that actually contain ``FusedMoE`` layers. ``experimental_sgl_trtllm``
 is a *MoE* runner: on a dense model the setting is inert, so requiring it there
@@ -22,7 +28,12 @@ The env hardcoding stays in the ``server_args`` twin, because
 settled earlier than this.
 """
 
+import logging
+
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.utils.common import is_blackwell_supported
+
+logger = logging.getLogger(__name__)
 
 _TRTLLM_MOE_BACKEND = "experimental_sgl_trtllm"
 
@@ -66,11 +77,44 @@ def _check_virtual_experts(server_args) -> None:
 
 
 def _check_moe_runner_backend(base_model) -> None:
-    backend = get_moe_runner_backend()
-    if backend.is_experimental_sgl_trtllm():
-        return
+    """Require the TRT-LLM MoE runner for MoE LoRA -- but only where it exists.
+
+    The lock is scoped to Blackwell because that is the only place the backend
+    can run at all. ``experimental_sgl_trtllm`` and ``flashinfer_trtllm`` both
+    dispatch the same TRT-LLM-generated kernels, which ship exclusively as
+    precompiled cubins for sm100f / sm103a / sm107a -- there is no sm90 cubin in
+    the package, and the JIT spec declares ``supported_major_versions=[10, 12]``
+    accordingly. On Hopper the backend cannot be selected, so requiring it would
+    make MoE LoRA unservable and point the operator at a backend their hardware
+    cannot run.
+    """
     if not _base_model_has_moe(base_model):
         # Dense model: the MoE runner is inert here, nothing to enforce.
+        return
+
+    backend = get_moe_runner_backend()
+
+    if not is_blackwell_supported():
+        if backend.is_experimental_sgl_trtllm():
+            raise ValueError(
+                f"--moe-runner-backend {_TRTLLM_MOE_BACKEND} requires a "
+                f"Blackwell GPU (SM100/SM103/SM107). Its kernels ship only as "
+                f"precompiled cubins for those architectures, so on this device "
+                f"the JIT build fails with 'No supported CUDA architectures "
+                f"found for major versions [10, 12]'. Drop the flag to serve "
+                f"MoE LoRA on the triton MoE runner instead."
+            )
+        # Hopper and older: triton is the supported MoE LoRA path here.
+        logger.warning(
+            "MoE LoRA on a non-Blackwell GPU: serving on the %r MoE runner. "
+            "%s is Blackwell-only, so the fork's tuned MoE LoRA path and its "
+            "measured numerics do not apply here.",
+            getattr(backend, "value", backend),
+            _TRTLLM_MOE_BACKEND,
+        )
+        return
+
+    if backend.is_experimental_sgl_trtllm():
         return
     raise ValueError(
         f"MoE LoRA serving in this fork requires --moe-runner-backend "
