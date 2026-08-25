@@ -255,7 +255,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     # flashinfer-cubin / -jit-cache are pyproject dependencies so that a plain
     # `uv pip install -e python/` gets them, but this image installs them itself
     # in the flashinfer_cache stage (gated on INSTALL_FLASHINFER_JIT_CACHE) and
-    # COPYs them in with their dist-info. Resolving them here too would download
+    # copies them in with their dist-info. Resolving them here too would download
     # ~2.6 GB a second time per build, so drop them from this resolve.
     && sed -i '/^  "flashinfer-cubin==/d; /^  "flashinfer-jit-cache==/d' pyproject.toml \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \

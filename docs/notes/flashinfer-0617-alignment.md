@@ -136,7 +136,7 @@ Sizes matter here: cubin is a 1.06 GB wheel (4.5 GB installed) and jit-cache a
 - **pip ignores `[tool.uv.*]`,** so a pip-driven resolve of these pyproject
   dependencies would fail outright. Only one install site resolves deps with pip
   --- `docker/Dockerfile`'s `torch_deps` stage --- and that image already
-  installs both packages itself in the `flashinfer_cache` stage and COPYs them
+  installs both packages itself in the `flashinfer_cache` stage and copies them
   in with their `dist-info`. Letting `torch_deps` resolve them too would pull
   the same ~2.6 GB a second time per build, so the stage now `sed`-deletes both
   lines before its `pip install`. Image contents and size are unchanged. Every

@@ -93,8 +93,9 @@ def __apply_patch__(public_mod):
         # materialized at scheduler init, i.e. before any LoRAManager is built.
         # base_model is LoRAManager.__init__'s first positional parameter.
         _check_moe_runner_backend(base_model)
-        if get_moe_runner_backend().is_experimental_sgl_trtllm() and _base_model_has_moe(
-            base_model
+        if (
+            get_moe_runner_backend().is_experimental_sgl_trtllm()
+            and _base_model_has_moe(base_model)
         ):
             # server_args is keyword-or-6th-positional in LoRAManager.__init__.
             server_args = kwargs.get("server_args")

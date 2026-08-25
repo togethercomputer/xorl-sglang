@@ -66,7 +66,9 @@ def main():
     ap.add_argument("--batch-sizes", default="1,8,32,64")
     ap.add_argument("--input-len", type=int, default=512)
     ap.add_argument("--output-len", type=int, default=128)
-    ap.add_argument("--mode", default="lora", choices=["lora", "base", "mixed", "both", "all"])
+    ap.add_argument(
+        "--mode", default="lora", choices=["lora", "base", "mixed", "both", "all"]
+    )
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
 
@@ -96,6 +98,7 @@ def main():
     )
 
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
+
     # deterministic pseudo-token ids in a safe range; exact length by construction
     def make_ids(n, seed):
         return [(seed * 7919 + i * 104729) % 30000 + 100 for i in range(n)]
@@ -115,7 +118,11 @@ def main():
     warm_ids = [make_ids(args.input_len, s) for s in range(min(8, max(batch_sizes)))]
     for m in modes:
         lp = [
-            f"adapter_{i % NUM_ADAPTERS}" if (m == "lora" or (m == "mixed" and i % 2 == 0)) else None
+            (
+                f"adapter_{i % NUM_ADAPTERS}"
+                if (m == "lora" or (m == "mixed" and i % 2 == 0))
+                else None
+            )
             for i in range(len(warm_ids))
         ]
         run_case(engine, warm_ids, lp, 8)

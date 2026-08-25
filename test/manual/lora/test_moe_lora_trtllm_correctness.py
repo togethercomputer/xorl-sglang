@@ -31,7 +31,6 @@ also works; note the index is ``cu130``, not ``cu13``. uv hangs on this 1.6 GB w
 
 import argparse
 import json
-import os
 import sys
 
 ADAPTER_DIR = "/scratch/qywu/pwadapters/sglang_shared"
@@ -116,7 +115,9 @@ def main():
     # BF16/NVFP4 trtllm LoRA hard-assert on virtual experts (lora_dispatch.py:356,507);
     # only the FP8 path has a non-virtual fallback.
     ap.add_argument("--virtual-experts", action="store_true", default=True)
-    ap.add_argument("--no-virtual-experts", dest="virtual_experts", action="store_false")
+    ap.add_argument(
+        "--no-virtual-experts", dest="virtual_experts", action="store_false"
+    )
     args = ap.parse_args()
 
     from transformers import AutoTokenizer
@@ -127,12 +128,17 @@ def main():
 
     tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     prompts = [build_prompt(tokenizer, proj) for proj, _ in PAIRS]
-    lora_paths = {f"adapter_{i}": f"{ADAPTER_DIR}/adapter_{i}" for i in range(len(PAIRS))}
+    lora_paths = {
+        f"adapter_{i}": f"{ADAPTER_DIR}/adapter_{i}" for i in range(len(PAIRS))
+    }
 
-    print(f"launching engine: model={model} "
-          f"moe_runner_backend={args.moe_runner_backend} "
-          f"virtual_experts={args.virtual_experts} "
-          f"lora_backend={args.lora_backend} tp={args.tp}", flush=True)
+    print(
+        f"launching engine: model={model} "
+        f"moe_runner_backend={args.moe_runner_backend} "
+        f"virtual_experts={args.virtual_experts} "
+        f"lora_backend={args.lora_backend} tp={args.tp}",
+        flush=True,
+    )
 
     engine = sgl.Engine(
         model_path=model,
@@ -191,7 +197,9 @@ def main():
                 mixed_loras.append(None)
                 meta.append(("<base>", project, None))
 
-        outs = engine.generate(prompt=mixed_prompts, sampling_params=sp, lora_path=mixed_loras)
+        outs = engine.generate(
+            prompt=mixed_prompts, sampling_params=sp, lora_path=mixed_loras
+        )
         rows = []
         for j, (adapter, project, expected) in enumerate(meta):
             text = outs[j]["text"]
@@ -223,8 +231,14 @@ def main():
     if args.json_out:
         with open(args.json_out, "w") as f:
             json.dump(
-                {"backend": args.moe_runner_backend, "lora_backend": args.lora_backend,
-                 "results": {k: list(v) for k, v in results.items()}}, f, indent=2)
+                {
+                    "backend": args.moe_runner_backend,
+                    "lora_backend": args.lora_backend,
+                    "results": {k: list(v) for k, v in results.items()},
+                },
+                f,
+                indent=2,
+            )
 
     return 0 if total_ok == total else 1
 

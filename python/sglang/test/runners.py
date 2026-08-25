@@ -625,7 +625,11 @@ class SRTRunner:
             max_loras_per_batch=max_loras_per_batch,
             lora_backend=lora_backend,
             # Only forward when set, so the default stays whatever ServerArgs resolves.
-            **({} if moe_runner_backend is None else {"moe_runner_backend": moe_runner_backend}),
+            **(
+                {}
+                if moe_runner_backend is None
+                else {"moe_runner_backend": moe_runner_backend}
+            ),
             **(
                 {}
                 if lora_use_virtual_experts is None
