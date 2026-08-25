@@ -32,7 +32,7 @@ from huggingface_hub import snapshot_download
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_blackwell_system
 
 register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
 
@@ -69,6 +69,11 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
+@unittest.skipIf(
+    not is_blackwell_system(),
+    "MoE LoRA is locked to experimental_sgl_trtllm, whose kernels are "
+    "SM100-only; this lane is not Blackwell.",
+)
 class TestLoRAGptOss20BLogprobDiff(CustomTestCase):
 
     def test_lora_gpt_oss_20b_logprob_accuracy(self):

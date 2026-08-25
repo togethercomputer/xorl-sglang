@@ -23,6 +23,7 @@ from sglang.test.lora_utils import (
     MOE_LORA_TEST_PROMPTS,
 )
 from sglang.test.runners import SRTRunner
+from sglang.test.test_utils import is_blackwell_system
 
 register_cuda_ci(
     est_time=50,
@@ -290,6 +291,11 @@ REFERENCE_STATS = {
 }
 
 
+@unittest.skipIf(
+    not is_blackwell_system(),
+    "MoE LoRA is locked to experimental_sgl_trtllm, whose kernels are "
+    "SM100-only; this lane is not Blackwell.",
+)
 class TestMoELoraRegression(unittest.TestCase):
 
     def test_sglang_moe_parity_strict(self):

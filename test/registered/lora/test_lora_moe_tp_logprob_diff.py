@@ -30,6 +30,7 @@ from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     CustomTestCase,
+    is_blackwell_system,
     is_in_ci,
 )
 
@@ -84,6 +85,11 @@ def _run_sglang_moe_lora(
     }
 
 
+@unittest.skipIf(
+    not is_blackwell_system(),
+    "MoE LoRA is locked to experimental_sgl_trtllm, whose kernels are "
+    "SM100-only; this lane is not Blackwell.",
+)
 class TestMoELoRATP2Logprobs(CustomTestCase):
     """Compare TP=1 vs TP=2 MoE LoRA: output strings must match and logprobs
     must stay within threshold."""
