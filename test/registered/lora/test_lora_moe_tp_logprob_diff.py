@@ -30,10 +30,18 @@ from sglang.test.runners import SRTRunner
 from sglang.test.test_utils import (
     DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
     CustomTestCase,
+    is_blackwell_system,
     is_in_ci,
 )
 
 register_cuda_ci(est_time=280, stage="extra-a", runner_config="2-gpu-large")
+
+# MoE LoRA in this fork is served only on the TRT-LLM MoE runner
+# (enforced in sglang/overrides/lora/lora_manager.py).
+MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
+# bf16 trtllm MoE LoRA hard-asserts on virtual experts
+# (upstream lora_dispatch.py:356); only the FP8 path has a fallback.
+LORA_USE_VIRTUAL_EXPERTS = True
 
 LOGPROB_THRESHOLD = 5e-04
 # Chunked vs non-chunked runs differ only in lm_head matmul shape (16-row
@@ -59,6 +67,8 @@ def _run_sglang_moe_lora(
         trust_remote_code=True,
         disable_radix_cache=True,
         port=port,
+        moe_runner_backend=MOE_RUNNER_BACKEND,
+        lora_use_virtual_experts=LORA_USE_VIRTUAL_EXPERTS,
         attention_backend="flashinfer",
         mem_fraction_static=0.80,
     ) as runner:
@@ -75,6 +85,11 @@ def _run_sglang_moe_lora(
     }
 
 
+@unittest.skipIf(
+    not is_blackwell_system(),
+    "MoE LoRA is locked to experimental_sgl_trtllm, whose kernels are "
+    "SM100-only; this lane is not Blackwell.",
+)
 class TestMoELoRATP2Logprobs(CustomTestCase):
     """Compare TP=1 vs TP=2 MoE LoRA: output strings must match and logprobs
     must stay within threshold."""

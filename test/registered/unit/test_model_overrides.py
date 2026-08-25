@@ -92,6 +92,10 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "enable_aiter_allreduce_fusion",
                     "enable_symm_mem",
                     "speculative_attention_mode",
+                    # Declared with moe_runner_backend by the MoE-LoRA
+                    # auto-selection provider; the TRT-LLM MoE LoRA path
+                    # hard-asserts on it, so the two must move together.
+                    "lora_use_virtual_experts",
                 }
             ),
         )

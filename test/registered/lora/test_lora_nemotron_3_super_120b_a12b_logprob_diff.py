@@ -32,7 +32,7 @@ from huggingface_hub import snapshot_download
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_blackwell_system
 
 register_cuda_ci(est_time=100, stage="extra-b", runner_config="4-gpu-b200")
 
@@ -41,7 +41,7 @@ LORA_HF_REPO = "opherlie/lora-test-case-NVIDIA-Nemotron-3-Super-120B-A12B-BF16"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 64
 TP_SIZE = 4
-MOE_RUNNER_BACKEND = "triton"
+MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
 EXPERTS_SHARED_OUTER_LORAS = True
 LORA_USE_VIRTUAL_EXPERTS = True
 DISABLE_SHARED_EXPERTS_FUSION = True
@@ -72,6 +72,11 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
+@unittest.skipIf(
+    not is_blackwell_system(),
+    "MoE LoRA is locked to experimental_sgl_trtllm, whose kernels are "
+    "SM100-only; this lane is not Blackwell.",
+)
 class TestLoRANemotron3Super120B_A12B_LogprobDiff(CustomTestCase):
 
     def test_lora_nemotron_3_super_120b_a12b_logprob_accuracy(self):

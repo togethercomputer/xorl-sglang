@@ -19,7 +19,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.15.post1
+ARG FLASHINFER_VERSION=0.6.17
 ARG TRTLLM_GEN_MOE_CUBIN_URL="https://github.com/sgl-project/whl/releases/download/trtllm_gen_moe_cubin_20260617/trtllm_gen_moe_cubin_pool_20260617_v0613rc1.zip"
 ARG TRTLLM_GEN_MOE_CUBIN_SHA256="4900501cbe782a76b08a5858f9f07152287b97cb68114466dac286366b66c192"
 ARG TRTLLM_GEN_MOE_CUBIN_ARCHIVE_ROOT="trtllm_gen_moe_cubin_pool_20260617_v0613rc1"
@@ -252,6 +252,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
+    # flashinfer-cubin / -jit-cache are pyproject dependencies so that a plain
+    # `uv pip install -e python/` gets them, but this image installs them itself
+    # in the flashinfer_cache stage (gated on INSTALL_FLASHINFER_JIT_CACHE) and
+    # copies them in with their dist-info. Resolving them here too would download
+    # ~2.6 GB a second time per build, so drop them from this resolve.
+    && sed -i '/^  "flashinfer-cubin==/d; /^  "flashinfer-jit-cache==/d' pyproject.toml \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
@@ -534,17 +540,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Copy flashinfer cubin (always) and jit-cache (if installed) packages
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
-# Apply the FlashInfer CuTeDSL MLA decode-context-parallel runtime patch.
-# Exclude tests because they are not included in the installed wheel.
-COPY docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt /tmp/flashinfer-perkz-dcp-0.6.15.txt
-RUN FLASHINFER_DCP_PATCH=/tmp/flashinfer-perkz-dcp-0.6.15.txt && \
-    FLASHINFER_SITE_PACKAGES="$(python3 -c 'from pathlib import Path; import flashinfer; print(Path(flashinfer.__file__).resolve().parent.parent)')" && \
-    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --dry-run --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
-    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
-    rm -f "${FLASHINFER_DCP_PATCH}" && \
-    rm -rf /root/.cache/flashinfer /root/.cache/pip
+# The FlashInfer CuTeDSL MLA decode-context-parallel patch is NOT applied on
+# 0.6.17: DCP is upstream there. flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
+# gained enable_dcp / cp_world / cp_rank / causal_seqlens_kv_global in 0.6.17, and
+# none of those exist in 0.6.15 -- which is what the patch was adding. Measured
+# against an installed 0.6.17 tree: 112 of the patch's 147 hunks are already
+# present, and of the 32 that still fail, 96% of the added lines in mla/_core.py
+# and 85% in mla_dispatch.py are already there, the remainder being docstrings and
+# helper names upstream renamed. Keeping the patch would fail the build for no
+# gain (its --dry-run gate is fatal).
+#
+# docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt is retained for the 0.6.15
+# lineage; delete it once no branch pins 0.6.15. DCP still needs a functional
+# test on 0.6.17 before this is called done.
+RUN rm -rf /root/.cache/flashinfer /root/.cache/pip
 
 # Copy the pinned FlashInfer MXFP4 MoE runner cubin pool
 COPY --from=trtllm_cubin_builder /opt/trtllm_gen_moe_cubin_pool /opt/trtllm_gen_moe_cubin_pool
@@ -731,6 +740,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            sed -i 's/cuda-python>=13\.0/cuda-python>=12,<13/' python/pyproject.toml && \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' python/pyproject.toml && \
+           sed -i "s|flashinfer.ai/whl/cu130|flashinfer.ai/whl/cu$(echo ${CUDA_VERSION} | awk -F. '{print $1$2}')|" python/pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' python/pyproject.toml; \
        fi \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \

@@ -105,25 +105,30 @@ RUN python3 -m pip uninstall -y \
       flashinfer-python flashinfer-cubin flashinfer-jit-cache && \
     rm -rf /root/.cache/flashinfer /root/.cache/pip && \
     python3 -m pip install --no-deps \
-      "flashinfer-python==0.6.15.post1" && \
+      "flashinfer-python==0.6.17" && \
     python3 -m pip install --no-deps \
-      "flashinfer-cubin==0.6.15.post1" \
+      "flashinfer-cubin==0.6.17" \
       --index-url https://flashinfer.ai/whl && \
     python3 -m pip install --no-deps \
-      "flashinfer-jit-cache==0.6.15.post1" \
+      "flashinfer-jit-cache==0.6.17" \
       --index-url https://flashinfer.ai/whl/cu130 && \
-    python3 -c 'from importlib.metadata import version; expected = "0.6.15.post1"; packages = ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache"); actual = {package: version(package).split("+", 1)[0] for package in packages}; assert all(value == expected for value in actual.values()), actual' && \
+    python3 -c 'from importlib.metadata import version; expected = "0.6.17"; packages = ("flashinfer-python", "flashinfer-cubin", "flashinfer-jit-cache"); actual = {package: version(package).split("+", 1)[0] for package in packages}; assert all(value == expected for value in actual.values()), actual' && \
     rm -rf /root/.cache/pip
 
-ENV FLASHINFER_VERSION="0.6.15.post1"
+ENV FLASHINFER_VERSION="0.6.17"
 
 # --- 4. FlashInfer: CuTeDSL MLA decode-context-parallel runtime patch ---
-RUN FLASHINFER_DCP_PATCH=/sgl-workspace/sglang/docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt && \
-    FLASHINFER_SITE_PACKAGES="$(python3 -c 'from pathlib import Path; import flashinfer; print(Path(flashinfer.__file__).resolve().parent.parent)')" && \
-    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --dry-run --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
-    sed '/^diff --git a\/tests\//,$d' "${FLASHINFER_DCP_PATCH}" | \
-      patch --batch --forward --strip=1 --directory="${FLASHINFER_SITE_PACKAGES}" && \
-    rm -rf /root/.cache/flashinfer /root/.cache/pip
-
+# The FlashInfer CuTeDSL MLA decode-context-parallel patch is NOT applied on
+# 0.6.17: DCP is upstream there. flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
+# gained enable_dcp / cp_world / cp_rank / causal_seqlens_kv_global in 0.6.17, and
+# none of those exist in 0.6.15 -- which is what the patch was adding. Measured
+# against an installed 0.6.17 tree: 112 of the patch's 147 hunks are already
+# present, and of the 32 that still fail, 96% of the added lines in mla/_core.py
+# and 85% in mla_dispatch.py are already there, the remainder being docstrings and
+# helper names upstream renamed. Keeping the patch would fail the build for no
+# gain (its --dry-run gate is fatal).
+#
+# docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt is retained for the 0.6.15
+# lineage; delete it once no branch pins 0.6.15. DCP still needs a functional
+# test on 0.6.17 before this is called done.
 WORKDIR /sgl-workspace/sglang

@@ -23,12 +23,20 @@ from sglang.test.lora_utils import (
     MOE_LORA_TEST_PROMPTS,
 )
 from sglang.test.runners import SRTRunner
+from sglang.test.test_utils import is_blackwell_system
 
 register_cuda_ci(
     est_time=50,
-    stage="base-b",
+    stage="lora",
     runner_config="1-gpu-large",
 )
+
+# MoE LoRA in this fork is served only on the TRT-LLM MoE runner
+# (enforced in sglang/overrides/lora/lora_manager.py).
+MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
+# bf16 trtllm MoE LoRA hard-asserts on virtual experts
+# (upstream lora_dispatch.py:356); only the FP8 path has a fallback.
+LORA_USE_VIRTUAL_EXPERTS = True
 
 # Format: [{"text": "result string", "lps": [0.1, 0.2, ...]}, ...]
 VLLM_CACHED_RESULTS = [
@@ -283,6 +291,11 @@ REFERENCE_STATS = {
 }
 
 
+@unittest.skipIf(
+    not is_blackwell_system(),
+    "MoE LoRA is locked to experimental_sgl_trtllm, whose kernels are "
+    "SM100-only; this lane is not Blackwell.",
+)
 class TestMoELoraRegression(unittest.TestCase):
 
     def test_sglang_moe_parity_strict(self):
@@ -294,6 +307,8 @@ class TestMoELoraRegression(unittest.TestCase):
             lora_paths=[MOE_LORA_PATH],
             max_loras_per_batch=1,
             tp_size=1,
+            moe_runner_backend=MOE_RUNNER_BACKEND,
+            lora_use_virtual_experts=LORA_USE_VIRTUAL_EXPERTS,
             trust_remote_code=True,
             disable_radix_cache=True,
             attention_backend="flashinfer",

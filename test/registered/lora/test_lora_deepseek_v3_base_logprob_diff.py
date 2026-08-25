@@ -32,7 +32,7 @@ from huggingface_hub import snapshot_download
 
 import sglang as sgl
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, is_blackwell_system
 
 register_cuda_ci(
     est_time=300,
@@ -44,7 +44,10 @@ LORA_HF_REPO = "yushengsu/lora-diff-DeepSeek-V3.1-Base"
 LORA_BACKEND = "triton"
 MAX_LORA_RANK = 32
 TP_SIZE = 8
-MOE_RUNNER_BACKEND = "triton"
+MOE_RUNNER_BACKEND = "experimental_sgl_trtllm"
+# bf16 and NVFP4 trtllm MoE LoRA hard-assert on virtual experts
+# (upstream lora_dispatch.py:356 / :507); only the FP8 path has a fallback.
+LORA_USE_VIRTUAL_EXPERTS = True
 EXPERTS_SHARED_OUTER_LORAS = True
 PREFILL_ATTENTION_BACKEND = "fa4"
 DECODE_ATTENTION_BACKEND = "flashinfer"
@@ -75,6 +78,11 @@ def get_prompt_logprobs(engine, input_ids, lora_path):
     return [logprob for logprob, _, _ in out["meta_info"]["input_token_logprobs"]][1:]
 
 
+@unittest.skipIf(
+    not is_blackwell_system(),
+    "MoE LoRA is locked to experimental_sgl_trtllm, whose kernels are "
+    "SM100-only; this lane is not Blackwell.",
+)
 class TestLoRADeepSeekV3BaseLogprobDiff(CustomTestCase):
 
     def test_lora_deepseek_v3_base_logprob_accuracy(self):
@@ -92,6 +100,7 @@ class TestLoRADeepSeekV3BaseLogprobDiff(CustomTestCase):
             lora_backend=LORA_BACKEND,
             attention_backend="flashinfer",
             moe_runner_backend=MOE_RUNNER_BACKEND,
+            lora_use_virtual_experts=LORA_USE_VIRTUAL_EXPERTS,
             experts_shared_outer_loras=EXPERTS_SHARED_OUTER_LORAS,
             prefill_attention_backend=PREFILL_ATTENTION_BACKEND,
             decode_attention_backend=DECODE_ATTENTION_BACKEND,

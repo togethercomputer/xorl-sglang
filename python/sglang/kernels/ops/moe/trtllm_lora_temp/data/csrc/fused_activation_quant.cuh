@@ -34,6 +34,30 @@ namespace tk = tensorrt_llm::kernels;
 // + exp(-x)).
 inline __device__ float fused_silu(float x) { return x / (1.0f + expf(-x)); }
 
+// Per-expert correction for the NON-silu (linear) GEMM1 half.
+//
+// The unfused-act GEMM1 here is a Gemm2::Runner, whose epilogue can apply only
+// ONE per-expert scalar to the whole 2*inter output, so the launcher gives it
+// output1_scales_gate_scalar (g1_alphas). TRT-LLM's contract is
+// gate(g1_alphas) / up(g1_scale_c = g1_alphas / a2_scale), so the linear half
+// must be rescaled by g1_scale_c / g1_alphas = 1 / a2_scale here. Returns 1
+// when either scalar array is absent (nothing to correct) -- and naturally
+// returns 1 when g1_scale_c == g1_alphas, i.e. per-token-activation mode, which
+// is the only configuration the uncorrected code was valid for.
+inline __device__ float
+fused_linearHalfScale(float const *upScales, float const *gateScales,
+                      int32_t const *expertIndicesPacked, int expandedIdx) {
+  if (upScales == nullptr || gateScales == nullptr ||
+      expertIndicesPacked == nullptr)
+    return 1.0f;
+  // packed routing id: (expert_id << 16) | weight_bf16
+  int const expertIdx = expertIndicesPacked[expandedIdx] >> 16;
+  if (expertIdx < 0)
+    return 1.0f;
+  float const gateScale = gateScales[expertIdx];
+  return gateScale != 0.0f ? upScales[expertIdx] / gateScale : 1.0f;
+}
+
 // One block per expanded row. gateUp is the column-interleaved GEMM1 output
 // (g0,u0,g1,u1,...) indexed by permutedIdx; loraDelta is the contiguous
 // [gate|up] delta indexed by expandedIdx.
@@ -53,7 +77,10 @@ __global__ void fusedActivationQuantKernel(
     int32_t const *__restrict__ expandedIdxToPermutedIdx, float globalScaleInv,
     uint8_t *__restrict__ weightOutput, // fp4 [.., innerHalf/2] by permutedIdx
     uint8_t *__restrict__ scaleOutput,  // swizzled e4m3 SF
-    float *__restrict__ perTokenScaleOutput) {
+    float *__restrict__ perTokenScaleOutput,
+    float const *__restrict__ output1ScalesScalar,
+    float const *__restrict__ output1ScalesGateScalar,
+    int32_t const *__restrict__ expertIndicesPacked) {
   constexpr int SF_VEC_SIZE = 16;
   using InType =
       tk::PackedVec<__nv_bfloat16, SF_VEC_SIZE>; // 16 bf16 == 8 __nv_bfloat162
@@ -63,6 +90,9 @@ __global__ void fusedActivationQuantKernel(
   if (expandedIdx >= m)
     return;
   int const permutedIdx = expandedIdxToPermutedIdx[expandedIdx];
+  float const linScale =
+      fused_linearHalfScale(output1ScalesScalar, output1ScalesGateScalar,
+                            expertIndicesPacked, expandedIdx);
   int const num_vecs_per_row = innerHalf / SF_VEC_SIZE;
   int64_t const liBaseRow = (int64_t)expandedIdx * innerHalf;
 
@@ -162,7 +192,13 @@ __global__ void fusedActivationQuantKernel(
       BlockReduce(tempStorage).Reduce(localAmax, cuda::maximum<>{});
   if (threadIdx.x == 0) {
     float const pts = globalAmax * globalScaleInv;
-    perTokenScaleOutput[permutedIdx] = pts;
+    // GEMM2 dequantizes as code * blockSF * perTokenScale, so the linear-half
+    // correction (1 / a2_scale, see fused_linearHalfScale()) is exactly a
+    // factor on the REPORTED per-token scale. The codes keep encoding the TRUE
+    // activation -- which is what activation_lora_input must contain -- and
+    // GEMM2 still receives A / a2_scale. Exact, and no second pass over the
+    // row.
+    perTokenScaleOutput[permutedIdx] = pts * linScale;
     sScale = pts;
   }
   __syncthreads();
@@ -206,7 +242,9 @@ inline void launchFusedActivationQuant(
     int32_t const *expandedIdxToPermutedIdx, float globalScaleInv,
     uint8_t *weightOutput, uint8_t *scaleOutput, float *perTokenScaleOutput,
     tensorrt_llm::QuantizationSFLayout sfLayout, bool disableFp4FastMath,
-    cudaStream_t stream) {
+    cudaStream_t stream, float const *output1ScalesScalar = nullptr,
+    float const *output1ScalesGateScalar = nullptr,
+    int32_t const *expertIndicesPacked = nullptr) {
   // One SF block per thread, no stride loop: BLOCK_SIZE must cover innerHalf/16
   // (a fixed 128 left cols [2048,inter) unwritten at Inkling EP8's inter=3072
   // -> NaN from the down GEMM).
@@ -220,7 +258,8 @@ inline void launchFusedActivationQuant(
           <<<grid, block, 0, stream>>>(
               m, innerHalf, innerDim, gateUp, loraDelta, loraInputOut,
               expandedIdxToPermutedIdx, globalScaleInv, weightOutput,
-              scaleOutput, perTokenScaleOutput);
+              scaleOutput, perTokenScaleOutput, output1ScalesScalar,
+              output1ScalesGateScalar, expertIndicesPacked);
     };
     auto withFastMath = [&](auto layoutTag) {
       if (disableFp4FastMath) {
