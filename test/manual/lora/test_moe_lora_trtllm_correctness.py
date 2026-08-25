@@ -36,6 +36,16 @@ import sys
 
 ADAPTER_DIR = "/scratch/qywu/pwadapters/sglang_shared"
 BASE = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+# Quantized twins of BASE. The adapters are trained against the bf16 model and
+# applied unquantized either way, so the expected passwords are identical --
+# which is what makes these a correctness check on the quantized MoE-LoRA paths
+# rather than just a smoke test. sglang derives `quantization` from each
+# checkpoint's config; `dtype` stays bfloat16 (it is the compute dtype).
+MODELS = {
+    "bf16": BASE,
+    "fp8": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+    "nvfp4": "NVFP4/Qwen3-30B-A3B-Instruct-2507-FP4",
+}
 
 # adapter index -> (project, expected password), from the adapter repo README
 PAIRS = [
@@ -93,6 +103,11 @@ def report(name, rows):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--moe-runner-backend", default="experimental_sgl_trtllm")
+    ap.add_argument(
+        "--model",
+        default="bf16",
+        help=f"one of {sorted(MODELS)}, or an explicit model path",
+    )
     ap.add_argument("--lora-backend", default="triton")
     ap.add_argument("--tp", type=int, default=4)
     ap.add_argument("--phases", default="single,batched,mixed")
@@ -108,16 +123,19 @@ def main():
 
     import sglang as sgl
 
-    tokenizer = AutoTokenizer.from_pretrained(BASE, trust_remote_code=True)
+    model = MODELS.get(args.model, args.model)
+
+    tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True)
     prompts = [build_prompt(tokenizer, proj) for proj, _ in PAIRS]
     lora_paths = {f"adapter_{i}": f"{ADAPTER_DIR}/adapter_{i}" for i in range(len(PAIRS))}
 
-    print(f"launching engine: moe_runner_backend={args.moe_runner_backend} "
+    print(f"launching engine: model={model} "
+          f"moe_runner_backend={args.moe_runner_backend} "
           f"virtual_experts={args.virtual_experts} "
           f"lora_backend={args.lora_backend} tp={args.tp}", flush=True)
 
     engine = sgl.Engine(
-        model_path=BASE,
+        model_path=model,
         tp_size=args.tp,
         dtype="bfloat16",
         enable_lora=True,
