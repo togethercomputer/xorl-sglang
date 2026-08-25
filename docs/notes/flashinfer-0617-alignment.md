@@ -26,7 +26,7 @@ Current dtype status on this fork: bf16 works, FP8 works (#29), NVFP4 broken.
 
 ## What the bump actually costs
 
-### 1. Python API drift: small, and additive
+### 1. Python API drift: measured, and it needs no changes
 
 Measured by importing every flashinfer symbol this fork uses under both versions
 and diffing signatures (66 symbols):
@@ -37,22 +37,21 @@ and diffing signatures (66 symbols):
 | symbols renamed | **0** |
 | signatures changed | 14, of which 10 are genuine |
 
-All 10 genuine changes are **additive** — new optional parameters, nothing
-removed. Keyword call sites are unaffected; only positional calls that pass
-arguments past an insertion point can break.
+All 10 genuine changes are **additive**. Crucially, checking *where* each new
+parameter was inserted: 7 of 8 changed callables append at the end
+(insertion index == old parameter count), so positional calls cannot be
+affected. Exactly one is a mid-signature insertion:
 
-| function | added params | call sites here |
-|---|---|---|
-| `trtllm_batch_decode_with_kv_cache_mla` (decode + mla) | `sparse_mla_top_k_lens, enable_dcp, cp_world, cp_rank, causal_seqlens_kv_global` | 4 |
-| `cutlass_fused_moe` | `profile_ids, workspace_buffer` | 9 |
-| `recurrent_kda` | `initial_state_source, initial_state_indices, beta_is_logit` | 3 |
-| `chunk_gated_delta_rule` | `state_indices` | 3 |
-| `MoeAlltoAll` | `eplb_stats_num_experts, enable_rank_mask` | 1 |
-| `CuteDslMoEWrapper` | `use_fused_finalize` | 1 |
-| `cudnn_batch_prefill_with_kv_cache` | `batch_offsets_units` | 1 |
-| `ArtifactPath` | `*_RUBIN` entries | — |
+| callable | inserted | at index | old param count |
+|---|---|---:|---:|
+| `prefill.cudnn_batch_prefill_with_kv_cache` | `batch_offsets_units` | 20 | 25 |
 
-Audit each of those ~22 call sites for positional passing. This is the cheap part.
+That has one call site, `srt/layers/attention/vision.py:742`, which passes 5
+positional arguments (`q, k, v, scale, workspace_buffer`) and then switches to
+keywords -- far short of index 20.
+
+**Net: zero Python call sites need changing.** The earlier estimate of ~22 sites
+to audit was wrong; the audit is done and empty.
 
 ### 2. Module-level ops: the real work
 
@@ -82,6 +81,22 @@ headers). They were taken from a 0.6.15-era tree and must be re-cut from 0.6.17,
 then have the fork's MoE-LoRA changes re-applied on top. `jit.py` mixes overlay
 and flashinfer sources per file, so every overlay file is a potential ABI seam.
 
+### 3b. The CuTeDSL MLA DCP patch: delete, do not re-cut
+
+`docker/kimi_k3/flashinfer-perkz-dcp-0.6.15.txt` is applied into site-packages by
+the main Dockerfile and both kimi Dockerfiles, gated `patch --dry-run ... && patch`,
+so a failed dry-run is fatal. It does not apply to 0.6.17 -- but it should not be
+re-cut, because 0.6.17 implements the feature:
+
+    flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla
+      0.6.17: enable_dcp, cp_world, cp_rank, causal_seqlens_kv_global
+      0.6.15: none of them
+
+112 of the patch's 147 hunks are already present in 0.6.17; of the 32 that fail,
+96% of added lines in `mla/_core.py` and 85% in `mla_dispatch.py` are already
+there, the rest being docstrings and renamed helpers. The patch steps are removed
+on the pin branch. DCP itself still needs a functional test on 0.6.17.
+
 ### 4. Lockstep pins
 
 `flashinfer_python`, `flashinfer-cubin` and `flashinfer-jit-cache` must move
@@ -97,9 +112,10 @@ All three exist at 0.6.17 (cubin and jit-cache from the flashinfer index, cu130)
 
 ## Suggested order
 
-1. Scratch venv on 0.6.17, fork installed editable. Do **not** touch pins yet.
-2. Fix the ~22 positional call sites found above.
-3. Confirm whether #29's redirect already clears the `.cache_clear()` break.
+1. Scratch venv on 0.6.17, fork installed editable.
+2. ~~Fix positional call sites~~ -- done, none needed (see above).
+3. Confirm whether the no-adapter FP8 redirect already clears the
+   `.cache_clear()` break.
 4. Re-cut the vendored C++ from 0.6.17 and re-apply the fork's MoE-LoRA changes.
 5. Bring over the 0.6.17-era `flashinfer_trtllm.py` gemm1_alpha/beta/clamp plumbing.
 6. Apply the 10-file NVFP4 diff (`working_nvfp4.patch`).
