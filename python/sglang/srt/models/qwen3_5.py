@@ -95,7 +95,13 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
     get_parallel,
+    get_server_args,
     get_stream,
+)
+from sglang.srt.server_args import (
+    get_global_server_args,
+    is_qwen35_gdn_exact_mode,
+    is_qwen35_rope_class_b,
 )
 
 # Utils
@@ -140,6 +146,42 @@ def _disable_shared_experts_fusion() -> bool:
     # Resolved lazily: the global server args is not set at module import time
     # (e.g. when this module is imported by unit tests).
     return get_exec().moe.disable_shared_experts_fusion
+
+
+def _qwen35_exact_mode_enabled() -> bool:
+    return is_qwen35_gdn_exact_mode(get_global_server_args())
+
+
+def _qwen35_rope_class_b_enabled() -> bool:
+    return is_qwen35_rope_class_b(get_global_server_args())
+
+
+def _qwen35_rmsnorm_family(config) -> str:
+    configured_family = getattr(config, "_qwen35_rmsnorm_family", None)
+    try:
+        runtime_args = get_server_args()
+    except ValueError:
+        runtime_args = None
+    runtime_exact = runtime_args is not None and is_qwen35_gdn_exact_mode(runtime_args)
+    if runtime_exact:
+        runtime_family = runtime_args.qwen35_rmsnorm_family
+        if configured_family is not None and configured_family != runtime_family:
+            raise RuntimeError(
+                "Qwen RMSNorm family drifted between the model config and runtime: "
+                f"config={configured_family!r}, runtime={runtime_family!r}."
+            )
+        family = runtime_family
+    else:
+        family = configured_family or "v1"
+    if family not in ("v1", "v2"):
+        raise ValueError(f"Unsupported Qwen3.5/3.6 RMSNorm family: {family!r}")
+    if family == "v2" and not (
+        runtime_exact or bool(getattr(config, "_qwen35_gdn_exact_mode", False))
+    ):
+        raise RuntimeError(
+            "Qwen families-v2 RMSNorm is admitted only in the exact XORL serving lane."
+        )
+    return family
 
 
 if _is_cuda:
@@ -746,9 +788,16 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        rmsnorm_family = _qwen35_rmsnorm_family(config)
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
         )
         # GDN layers need both bf16 (for the small in_proj_ba gating
         # projection) and a quantized tuple only when in_proj_qkvz can consume
@@ -870,6 +919,13 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.attn_output_gate = getattr(config, "attn_output_gate", True)
         if self.attn_output_gate:
             logger.warning_once("using attn output gate!")
+        rmsnorm_family = _qwen35_rmsnorm_family(config)
+        self.use_fused_qk_norm_rope = bool(
+            _is_cuda
+            and self.attn_output_gate
+            and get_exec().kernel.enable_fused_qk_norm_rope
+            and rmsnorm_family != "v2"
+        )
 
         self.rotary_emb = get_rope(
             head_size=self.head_dim,
@@ -955,13 +1011,27 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             is_next_layer_sparse=is_next_layer_sparse,
         )
 
-        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = GemmaRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
+        )
         self.post_attention_layernorm = GemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
+        )
+        self.k_norm = GemmaRMSNorm(
+            self.head_dim,
+            eps=config.rms_norm_eps,
+            xorl_batch_invariant_version=rmsnorm_family,
+        )
 
         # Standard attention layers benefit from a fused quant epilogue only
         # when qkv_proj can consume the returned quantized tuple.
@@ -1015,6 +1085,46 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         k = k_by_head.view(k.shape)
         return q, k
 
+    def _apply_rotary(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if _is_cuda and _qwen35_exact_mode_enabled():
+            seq_len = q.shape[0]
+            if not _qwen35_rope_class_b_enabled():
+                raise RuntimeError("Exact Qwen3.5-family serving requires Class-B RoPE")
+            if positions.ndim not in (1, 2):
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE requires scalar "
+                    f"text positions; got rank {positions.ndim}"
+                )
+            if positions.ndim == 2:
+                torch._assert_async(
+                    (positions == positions[:1]).all(),
+                    "Qwen3.5-family Class-B RoPE does not support multimodal "
+                    "positions with distinct temporal/height/width axes",
+                )
+            exact_positions = positions.reshape(-1)[:seq_len]
+            if exact_positions.numel() != seq_len:
+                raise RuntimeError(
+                    "Exact Qwen3.5-family RoPE requires one scalar position per token; "
+                    f"got {positions.numel()} positions for {seq_len} tokens"
+                )
+            if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE requires BF16 q/k; "
+                    f"got q={q.dtype}, k={k.dtype}"
+                )
+            if not self.rotary_emb.is_neox_style:
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE supports only the qualified "
+                    "Neox half-split feature layout"
+                )
+            return self.rotary_emb(exact_positions, q, k)
+        return self.rotary_emb(positions, q, k)
+
     def forward_prepare_cuda_fused(self, positions, hidden_states):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
         qkv, _ = self.qkv_proj(hidden_states)
@@ -1064,7 +1174,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = None
 
         q, k = self._apply_qk_norm(q, k)
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._apply_rotary(positions, q, k)
         return q, k, v, gate
 
     def forward_prepare_fused_gate(self, positions, hidden_states):
@@ -1095,7 +1205,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             gate = None
             q, k = self._apply_qk_norm(q, k)
 
-        q, k = self.rotary_emb(positions, q, k)
+        q, k = self._apply_rotary(positions, q, k)
         return q, k, v, gate
 
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
@@ -1125,7 +1235,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        if _is_cuda and self.attn_output_gate:
+        if _is_cuda and self.attn_output_gate and self.use_fused_qk_norm_rope:
             q, k, v, gate = self.forward_prepare_cuda_fused(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1154,7 +1264,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if not _is_npu:
+            if _is_cuda and _qwen35_exact_mode_enabled():
+                # Match the full-depth trainer's BF16 execution order exactly:
+                # materialize the strided gate, evaluate sigmoid, then perform
+                # a separate out-of-place multiply. The fused kernel rounds
+                # differently even when both input operands are byte-identical.
+                attn_output = attn_output.reshape(attn_output.shape[0], -1).contiguous()
+                gate_value = gate.reshape(gate.shape[0], -1)
+                attn_output = attn_output * torch.sigmoid(gate_value)
+            elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
@@ -1382,7 +1500,11 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         # Final normalization
         if self.pp_group.is_last_rank:
-            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = GemmaRMSNorm(
+                config.hidden_size,
+                eps=config.rms_norm_eps,
+                xorl_batch_invariant_version=_qwen35_rmsnorm_family(config),
+            )
         else:
             self.norm = PPMissingLayer()
 
