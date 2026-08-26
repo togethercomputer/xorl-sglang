@@ -715,6 +715,8 @@ void Runner::setOpsData(MoERunnerArgs const &args,
       reinterpret_cast<cutlass::bfloat16_t const *>(args.gate_up_lora_delta);
   activationData.activationLoraInputOutPtr =
       reinterpret_cast<cutlass::bfloat16_t *>(args.activation_lora_input);
+  activationData.activationLoraDeltaOutPtr =
+      reinterpret_cast<cutlass::bfloat16_t *>(args.activation_lora_delta);
   activationData.innerDim = args.intermediate_size *
                             (isGatedActivation(args.activation_type) ? 2 : 1);
   activationData.topK = args.top_k;

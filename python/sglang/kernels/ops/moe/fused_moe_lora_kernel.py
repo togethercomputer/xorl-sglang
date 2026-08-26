@@ -61,6 +61,7 @@ def _fused_moe_lora_kernel(
     EM,
     num_valid_tokens,
     num_experts,
+    num_lora_experts,
     lora_ids,
     adapter_enabled,
     # The stride variables represent how much to increase the ptr by when
@@ -128,6 +129,14 @@ def _fused_moe_lora_kernel(
     ind = lora_id * stride_el + pid_m
     expert_id = tl.load(expert_ids_ptr + ind, ind < max_loras * stride_el, -1)
     if expert_id == -1:
+        return
+    # Experts past the LoRA weights' expert range have no adapter delta by
+    # definition: shared-experts fusion appends the shared expert to the routed
+    # set (num_experts grows, e.g. 256 -> 257 on GLM-5.2), while the LoRA
+    # tensors stay sized to the adapter's expert count. Without this guard the
+    # b_ptrs arithmetic below indexes expert_id * stride_be past the end of the
+    # weight tensor -- an illegal memory access on the first fused batch.
+    if expert_id >= num_lora_experts:
         return
 
     # get a_ptr,b_ptr,c_ptr
@@ -264,6 +273,12 @@ def _fused_moe_lora_shrink(
         len(lora_a_stacked),
         lora_a_stacked[0].shape[0],
     )
+    # Expert slots actually present in the LoRA weights. min() over the stack:
+    # a stride-0 shared-outer expand can carry an inflated shape[1], and the
+    # guard must bound the REAL per-expert tensors. May be smaller than
+    # num_experts when shared-experts fusion appended experts the adapter
+    # does not have (the kernel skips those blocks -- zero delta by definition).
+    num_lora_experts = min(t.shape[1] for t in lora_a_stacked)
     _fused_moe_lora_kernel[grid](
         qcurr_hidden_states,
         b_ptr,
@@ -277,6 +292,7 @@ def _fused_moe_lora_shrink(
         EM,
         num_tokens,
         num_experts,
+        num_lora_experts,
         lora_ids,
         adapter_enabled,
         qcurr_hidden_states.stride(0),
@@ -382,6 +398,8 @@ def _fused_moe_lora_expand(
         EM,
         num_tokens,
         num_experts,
+        # see the shrink launcher: real per-expert slots in the LoRA weights
+        min(t.shape[1] for t in lora_b_stacked),
         lora_ids,
         adapter_enabled,
         a_intermediate_cache1.stride(0),
