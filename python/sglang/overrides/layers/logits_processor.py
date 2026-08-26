@@ -685,7 +685,29 @@ def _LogitsProcessor__forward(
     return logits_output
 
 
+import dataclasses as _dataclasses
+from typing import Optional as _Optional
+
+# Self-import is safe at twin-import time (upstream module fully executed
+# before the finder imports its twin).
+from sglang.srt.layers.logits_processor import LogitsMetadata as _UpstreamLogitsMetadata
+
+
+@_dataclasses.dataclass
+class LogitsMetadata(_UpstreamLogitsMetadata):
+    """Upstream LogitsMetadata + the port's DSV4 exact-logits boundary fields.
+
+    Dataclass fields are fixed at class creation, so the twin replaces the
+    class with a subclass appending them (kwargs-only construction everywhere
+    makes the position change harmless)."""
+
+    dsv4_exact_logits_rows_reconstructed: bool = False
+    dsv4_exact_logits_owner_rows: _Optional[int] = None
+    dsv4_exact_logits_dp_rank: _Optional[int] = None
+
+
 def __apply_patch__(mod):
+    mod.LogitsMetadata = LogitsMetadata
     # Deferred: the finder imports twins under bypass(), so sglang imports at
     # twin top level would cache modules UNPATCHED. Import here (bypass off)
     # and publish onto mod -- in-tree these were the file's module globals.
