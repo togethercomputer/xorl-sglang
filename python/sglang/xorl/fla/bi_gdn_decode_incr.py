@@ -1750,7 +1750,10 @@ class BIGDNIncrLayerCaches:
     # allocated only under the slim o-stage.
     gcum: torch.Tensor | None = None
 
+    # Persistent per-slot pools; allocate as normal tensors (mutated from both
+    # inference-mode and non-inference-mode contexts).
     @staticmethod
+    @torch.inference_mode(mode=False)
     def allocate(
         num_slots: int,
         h: int,
@@ -1903,6 +1906,9 @@ class BIGDNIncrDecodeRunner(BIGDNFastDecodeRunner):
             )
         return state
 
+    # Persistent pools; allocate as normal tensors (mutated from both
+    # inference-mode and non-inference-mode contexts).
+    @torch.inference_mode(mode=False)
     def _ensure_incr_slabs(self, bs: int, cache, device: torch.device) -> None:
         hv, hg = cache.hv, (cache.qkv_dim - cache.hv * cache.v) // (2 * cache.k)
         dims = (hv, hg, cache.k, cache.v, cache.qkv_dim)
@@ -1963,6 +1969,9 @@ class BIGDNIncrDecodeRunner(BIGDNFastDecodeRunner):
         self._incr_bs = bs
         self._incr_dims = dims
 
+    # Persistent pools; allocate as normal tensors (mutated from both
+    # inference-mode and non-inference-mode contexts).
+    @torch.inference_mode(mode=False)
     def _ensure_o_slot(self, cache, h: int, v: int) -> torch.Tensor:
         """W3.2: slot-major o output buffer [S*CHUNK, H, V] (per-step
         scratch shared across layers; fixed address for capture)."""

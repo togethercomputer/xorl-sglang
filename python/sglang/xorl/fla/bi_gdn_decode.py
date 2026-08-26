@@ -93,28 +93,33 @@ class BIGDNDecodeCache:
         self.hv = num_v_heads
         self.k = head_k_dim
         self.v = head_v_dim
-        self.boundary = torch.zeros(
-            num_slots,
-            num_v_heads,
-            head_v_dim,
-            head_k_dim,
-            dtype=torch.float32,
-            device=device,
-        )
-        self.scratch = torch.zeros_like(self.boundary)
-        self.rows_qkv = torch.zeros(
-            num_slots,
-            CHUNK_SIZE,
-            qkv_dim,
-            dtype=torch.bfloat16,
-            device=device,
-        )
-        self.rows_g = torch.zeros(
-            num_slots, CHUNK_SIZE, num_v_heads, dtype=torch.float32, device=device
-        )
-        self.rows_beta = torch.zeros(
-            num_slots, CHUNK_SIZE, num_v_heads, dtype=torch.float32, device=device
-        )
+        # These pools persist across forwards and are mutated from both
+        # inference-mode and non-inference-mode contexts (decode warmup runs
+        # under torch.inference_mode(); prefill seeding may not). Allocate
+        # them as normal tensors so in-place updates are legal everywhere.
+        with torch.inference_mode(False):
+            self.boundary = torch.zeros(
+                num_slots,
+                num_v_heads,
+                head_v_dim,
+                head_k_dim,
+                dtype=torch.float32,
+                device=device,
+            )
+            self.scratch = torch.zeros_like(self.boundary)
+            self.rows_qkv = torch.zeros(
+                num_slots,
+                CHUNK_SIZE,
+                qkv_dim,
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            self.rows_g = torch.zeros(
+                num_slots, CHUNK_SIZE, num_v_heads, dtype=torch.float32, device=device
+            )
+            self.rows_beta = torch.zeros(
+                num_slots, CHUNK_SIZE, num_v_heads, dtype=torch.float32, device=device
+            )
         self._graph_bs = 0
         self._graph_boundary_out: torch.Tensor
         self._graph_rows_qkv_out: torch.Tensor

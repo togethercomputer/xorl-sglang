@@ -680,6 +680,9 @@ class BIGDNFastDecodeRunner:
         # runner is constructed and before any graph capture.
         self.fuse_small = BI_GDN_FUSE_SMALL_ENABLED
 
+    # Persistent pools; allocate as normal tensors (mutated from both
+    # inference-mode and non-inference-mode contexts).
+    @torch.inference_mode(mode=False)
     def _ensure_slabs(self, bs: int, cache, device: torch.device) -> None:
         hv, hg = cache.hv, (cache.qkv_dim - cache.hv * cache.v) // (2 * cache.k)
         dims = (hv, hg, cache.k, cache.v, cache.qkv_dim)
