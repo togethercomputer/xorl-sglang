@@ -41,3 +41,11 @@ runner_configs:
   1-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: xorl-sglang-1-h100-gpu-runner }
   2-gpu-large:       { install: *default, artifact_version: v4, install_timeout: "20", runs_on: xorl-sglang-2-h100-gpu-runner }
   4-gpu-h100:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: xorl-sglang-4-h100-gpu-runner }
+  # New, unlike the four above: xorl-sglang-1-b200-gpu-runner (research-b200-ic1,
+  # togethercomputer/xorl-ci@9f0acbd) has run exactly one job before this -- a
+  # standalone smoke check (import + nvidia-smi), not a real registered test. Kept
+  # as its own runner_config rather than folded into 1-gpu-small/1-gpu-large: those
+  # names are upstream's, keyed to specific H100/5090 hardware assumptions in
+  # test/registered/, and this is a different cluster with its own unproven
+  # failure modes (see xorl-ci's README on research-b200-ic1's two ARC controllers).
+  1-gpu-b200:        { install: *default, artifact_version: v4, install_timeout: "20", runs_on: xorl-sglang-1-b200-gpu-runner }

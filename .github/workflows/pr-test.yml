@@ -308,6 +308,32 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
+  base-b-test-1-gpu-b200:
+    # Not in pr-test-finish's needs list below, deliberately: this is the first
+    # real (non-smoke) test on research-b200-ic1's xorl-sglang-1-b200-gpu-runner
+    # (xorl-ci@9f0acbd), which before this PR had run exactly one job ever, a
+    # standalone import/nvidia-smi check. A red run here should be visible and
+    # actionable without being able to block every PR into dev on a single-shard
+    # lane's first exposure to real traffic. Move it into pr-test-finish's needs
+    # once it has stayed green across enough runs to trust it the way base-b's
+    # H100 lanes already are.
+    needs: [check-changes, call-gate, wait-for-base-a, rust-ext-build]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-b-test-1-gpu-b200
+      runner_config: 1-gpu-b200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      # One registered test (test/registered/radix_cache/test_radix_attention.py,
+      # est_time=100) so far -- a single shard, no fanout to size for yet. 10
+      # minutes gives headroom over the H100 lane's measured runtime for the
+      # same test without masking a real hang.
+      run_timeout_minutes: '10'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    secrets: inherit
+
   base-c-test-4-gpu-h100:
     # wait-for-base-a, NOT wait-for-base-b: base-c runs concurrently with base-b
     # rather than after it. base-c is one serial shard of 4 files on the 4-GPU
