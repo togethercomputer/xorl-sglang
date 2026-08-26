@@ -255,6 +255,7 @@ def trtllm_fp8_block_scale_routed_moe_lora(
     activation_type: Optional[int] = None,
     lora_ready_event: int = 0,
     gemm2_done_event: int = 0,
+    activation_lora_delta: Optional[torch.Tensor] = None,
 ) -> Union[List[torch.Tensor], torch.Tensor]:
     from flashinfer.fused_moe.core import ActivationType, Fp8QuantizationType
     from flashinfer.utils import device_support_pdl
@@ -308,6 +309,11 @@ def trtllm_fp8_block_scale_routed_moe_lora(
         None,
         gate_up_lora_delta,
         activation_lora_input,
+        # Delta decomposition (see the activation kernel): when set, GEMM2's
+        # quantized operand is the delta-free activation and the activation-
+        # level LoRA delta lands here for a separate own-scale GEMM2 pass.
+        # None keeps the legacy fused injection bit-exactly (two-stream copy).
+        activation_lora_delta,
         lora_ready_event,
         gemm2_done_event,
     )

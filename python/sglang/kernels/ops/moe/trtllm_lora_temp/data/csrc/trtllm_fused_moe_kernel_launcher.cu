@@ -1078,6 +1078,8 @@ public:
       TensorView const &expert_weights, Fp8QuantizationType quantization_type,
       Optional<TensorView> const &gate_up_lora_delta = Optional<TensorView>(),
       Optional<TensorView> const &activation_lora_input =
+          Optional<TensorView>(),
+      Optional<TensorView> const &activation_lora_delta =
           Optional<TensorView>())
       : FusedMoeLauncher(routing_logits, routing_bias, hidden_states,
                          gemm1_weights, Optional<TensorView>(),
@@ -1089,6 +1091,7 @@ public:
         expert_indices(expert_indices), expert_weights(expert_weights),
         gate_up_lora_delta(gate_up_lora_delta),
         activation_lora_input(activation_lora_input),
+        activation_lora_delta(activation_lora_delta),
         quantization_type(quantization_type) {}
 
   void
@@ -1353,6 +1356,21 @@ public:
       TVM_FFI_ICHECK_EQ(gate_up_lora_delta.value().size(2),
                         args->intermediate_size * intermediate_size_factor);
     }
+    if (activation_lora_delta.has_value()) {
+      TVM_FFI_ICHECK(gate_up_lora_delta.has_value())
+          << "activation_lora_delta requires gate_up_lora_delta (the split "
+             "is defined as with-delta minus delta-free activation).";
+      TVM_FFI_ICHECK_EQ(activation_lora_delta.value().dtype(), dl_bfloat16)
+          << "activation_lora_delta must be bf16.";
+      TVM_FFI_ICHECK_EQ(activation_lora_delta.value().ndim(), 3)
+          << "activation_lora_delta must be [num_tokens, top_k, "
+             "intermediate_size].";
+      TVM_FFI_ICHECK_EQ(activation_lora_delta.value().size(0),
+                        args->num_tokens);
+      TVM_FFI_ICHECK_EQ(activation_lora_delta.value().size(1), args->top_k);
+      TVM_FFI_ICHECK_EQ(activation_lora_delta.value().size(2),
+                        args->intermediate_size);
+    }
     if (activation_lora_input.has_value()) {
       TVM_FFI_ICHECK_EQ(activation_lora_input.value().dtype(), dl_bfloat16)
           << "activation_lora_input must be bf16.";
@@ -1448,6 +1466,9 @@ public:
     args->activation_lora_input = activation_lora_input.has_value()
                                       ? activation_lora_input.value().data_ptr()
                                       : nullptr;
+    args->activation_lora_delta = activation_lora_delta.has_value()
+                                      ? activation_lora_delta.value().data_ptr()
+                                      : nullptr;
   }
 
 private:
@@ -1460,6 +1481,7 @@ private:
   TensorView expert_weights;
   Optional<TensorView> gate_up_lora_delta;
   Optional<TensorView> activation_lora_input;
+  Optional<TensorView> activation_lora_delta;
   Fp8QuantizationType quantization_type;
 
 public:
@@ -2393,8 +2415,9 @@ Array<Tensor> trtllm_fp8_block_scale_moe_impl(
     Fp8QuantizationType quantization_type, int64_t act_type,
     bool norm_topk_prob, Optional<TensorView> routing_replay_out,
     Optional<TensorView> gate_up_lora_delta,
-    Optional<TensorView> activation_lora_input, int64_t lora_ready_event = 0,
-    int64_t gemm2_done_event = 0) {
+    Optional<TensorView> activation_lora_input,
+    Optional<TensorView> activation_lora_delta = Optional<TensorView>(),
+    int64_t lora_ready_event = 0, int64_t gemm2_done_event = 0) {
   auto activation_type = validateAndCastActivationType(act_type);
   // DeepSeekFp8 currently uses a TRTLLM runner that hardwires Swiglu activation
   // semantics. Fail for any other activation to avoid silently running
@@ -2509,7 +2532,7 @@ Array<Tensor> trtllm_fp8_block_scale_moe_impl(
         routing_logits, routing_bias, hidden_states, hidden_states_scale,
         gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
         expert_indices, expert_weights, quantization_type, gate_up_lora_delta,
-        activation_lora_input);
+        activation_lora_input, activation_lora_delta);
     launcher->init(std::move(args), curr_tile_N, routing_method_type,
                    use_shuffled_weight, weight_layout, activation_type,
                    norm_topk_prob);
@@ -2577,7 +2600,8 @@ Array<Tensor> sgl_trtllm_fp8_block_scale_moe_lora(
     Fp8QuantizationType quantization_type, int64_t act_type,
     bool norm_topk_prob, Optional<TensorView> routing_replay_out,
     TensorView gate_up_lora_delta, TensorView activation_lora_input,
-    int64_t lora_ready_event, int64_t gemm2_done_event) {
+    Optional<TensorView> activation_lora_delta, int64_t lora_ready_event,
+    int64_t gemm2_done_event) {
   if (quantization_type != Fp8QuantizationType::DeepSeekFp8) {
     TVM_FFI_LOG_AND_THROW(NotImplementedError)
         << "sgl_trtllm_fp8_block_scale_moe_lora currently supports DeepSeekFp8 "
@@ -2592,8 +2616,8 @@ Array<Tensor> sgl_trtllm_fp8_block_scale_moe_lora(
       weight_layout, do_finalize, enable_pdl, config_index, quantization_type,
       act_type, norm_topk_prob, routing_replay_out,
       Optional<TensorView>(gate_up_lora_delta),
-      Optional<TensorView>(activation_lora_input), lora_ready_event,
-      gemm2_done_event);
+      Optional<TensorView>(activation_lora_input), activation_lora_delta,
+      lora_ready_event, gemm2_done_event);
 }
 
 __global__ void sgl_trtllm_fp8_block_scale_moe_lora_finalize_kernel(

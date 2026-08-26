@@ -398,6 +398,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
   float dataX1Arr[NumTokensPerCta];
   float dataX2Arr[NumTokensPerCta];
   float outArr[NumTokensPerCta];
+  float outBaseArr[NumTokensPerCta];
   float absOutArr[NumTokensPerCta];
   int permutedIdxArr[NumTokensPerCta];
 
@@ -417,6 +418,7 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           dataX1Arr[tokenInCtaIdx] = 0.0f;
           dataX2Arr[tokenInCtaIdx] = 0.0f;
           outArr[tokenInCtaIdx] = 0.0f;
+          outBaseArr[tokenInCtaIdx] = 0.0f;
           absOutArr[tokenInCtaIdx] = 0.0f;
         }
 #pragma unroll
@@ -460,6 +462,8 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
              tokenInCtaIdx++) {
           float x1 = scale1Arr[tokenInCtaIdx] * dataX1Arr[tokenInCtaIdx];
           float x2 = scale2Arr[tokenInCtaIdx] * dataX2Arr[tokenInCtaIdx];
+          float const bx1 = x1;
+          float const bx2 = x2;
           auto const tokenIdx = tokenCtaIdx + tokenInCtaIdx;
           if (params.gateUpLoraDeltaPtr != nullptr &&
               tokenIdx < params.numTokens) {
@@ -470,10 +474,20 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
                 params.gateUpLoraDeltaPtr[loraBaseIdx + params.innerDim / 2]);
             x2 += static_cast<float>(params.gateUpLoraDeltaPtr[loraBaseIdx]);
           }
-          float act = silu(x2);
-          float out = act * x1;
+          float out = silu(x2) * x1;
+          // Delta decomposition: GEMM2's quantized operand must be the
+          // DELTA-FREE activation -- a trained LoRA delta can sit below
+          // e4m3's per-element step relative to the base activation, and
+          // quantizing (base + delta) replaces it with grid noise. The delta
+          // (out - outBase) leaves through activationLoraDeltaOutPtr for a
+          // separate own-scale GEMM2 pass. Without the split buffer, legacy
+          // fused behaviour (outBase == out) is kept bit-exactly.
+          bool const splitDelta = params.gateUpLoraDeltaPtr != nullptr &&
+                                  params.activationLoraDeltaOutPtr != nullptr;
+          float const outBase = splitDelta ? silu(bx2) * bx1 : out;
           outArr[tokenInCtaIdx] = out;
-          absOutArr[tokenInCtaIdx] = fabsf(out);
+          outBaseArr[tokenInCtaIdx] = outBase;
+          absOutArr[tokenInCtaIdx] = fabsf(outBase);
         }
 
         auto absOutPacked =
@@ -516,12 +530,16 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
             break;
           }
           int const permutedIdx = permutedIdxArr[tokenInCtaIdx];
+          int const expandedIdx = tokenIdx * params.topK + k;
+          int64_t const activationIdx =
+              (int64_t)expandedIdx * (params.innerDim / 2) + hiddenIdx;
           if (permutedIdx == -1) {
             if (params.activationLoraInputOutPtr != nullptr) {
-              int const expandedIdx = tokenIdx * params.topK + k;
-              int64_t const activationIdx =
-                  (int64_t)expandedIdx * (params.innerDim / 2) + hiddenIdx;
               params.activationLoraInputOutPtr[activationIdx] =
+                  cutlass::bfloat16_t(0.0f);
+            }
+            if (params.activationLoraDeltaOutPtr != nullptr) {
+              params.activationLoraDeltaOutPtr[activationIdx] =
                   cutlass::bfloat16_t(0.0f);
             }
             continue;
@@ -529,14 +547,17 @@ __global__ void activationDeepSeekKernel(KernelParams params) {
           float const scaleOut = s_scaleOutArr[tokenInCtaIdx];
           int64_t const outIdx =
               (int64_t)permutedIdx * (params.innerDim / 2) + hiddenIdx;
+          // outBaseArr == outArr unless the delta split is active.
           params.outPtr[outIdx] =
-              static_cast<Type>(outArr[tokenInCtaIdx] / scaleOut);
+              static_cast<Type>(outBaseArr[tokenInCtaIdx] / scaleOut);
           if (params.activationLoraInputOutPtr != nullptr) {
-            int const expandedIdx = tokenIdx * params.topK + k;
-            int64_t const activationIdx =
-                (int64_t)expandedIdx * (params.innerDim / 2) + hiddenIdx;
             params.activationLoraInputOutPtr[activationIdx] =
                 static_cast<cutlass::bfloat16_t>(outArr[tokenInCtaIdx]);
+          }
+          if (params.activationLoraDeltaOutPtr != nullptr) {
+            params.activationLoraDeltaOutPtr[activationIdx] =
+                static_cast<cutlass::bfloat16_t>(outArr[tokenInCtaIdx] -
+                                                 outBaseArr[tokenInCtaIdx]);
           }
         }
       }
