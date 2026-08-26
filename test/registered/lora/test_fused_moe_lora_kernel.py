@@ -380,3 +380,89 @@ def test_fused_moe_lora_kernel(
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
+
+
+@pytest.mark.parametrize("mul_routed_weight", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("seed", SEED)
+def test_fused_moe_lora_kernel_fused_shared_expert(
+    mul_routed_weight, dtype, device, seed
+):
+    """Routing ids past the LoRA weights' expert range must contribute zero.
+
+    Bug regression (togethercomputer/xorl-sglang#37): shared-experts fusion
+    appends the shared expert to the routed set (GLM-5.2: 256 routed + 1 fused
+    -> runtime num_experts 257), while the LoRA tensors stay sized to the
+    adapter's expert count. The kernel indexed expert_id * stride_be past the
+    end of the weight tensor: an illegal memory access on the first fused
+    batch. The fix skips expert ids >= the weights' expert dim -- correct, not
+    just safe, because those experts have no adapter delta by definition.
+
+    This case routes over num_experts + 1 while the LoRA stacks hold
+    num_experts, forcing blocks with the out-of-range id. Pre-fix this is an
+    out-of-bounds read (an IMA, or silent garbage from past-the-end memory);
+    post-fix the kernel matches a reference that zeroes those slots.
+    """
+    torch.set_default_device(device)
+    set_random_seed(seed)
+
+    num_tokens, top_k_num, max_loras = 64, 6, 4
+    num_experts, N, K, max_lora_rank, block_size = 64, 1408, 2048, 16, 16
+    num_experts_runtime = num_experts + 1  # simulates one fused shared expert
+
+    topk_ids, topk_weights, token_lora_mapping, seg_indptr, req_to_lora = sample_data(
+        num_tokens, 10, max_loras, num_experts_runtime, top_k_num
+    )
+    # Guarantee the fused id actually occurs (sample_data may not draw it).
+    topk_ids[::4, 0] = num_experts
+
+    topk_ids = topk_ids.to(device)
+    topk_weights = topk_weights.to(device)
+    token_lora_mapping = token_lora_mapping.to(device)
+    seg_indptr = seg_indptr.to(device)
+    req_to_lora = req_to_lora.to(device)
+
+    lora_a_stacked = [
+        torch.rand((max_loras, num_experts, max_lora_rank, K), dtype=dtype)
+    ]
+    lora_b_stacked = [
+        torch.rand((max_loras, num_experts, N, max_lora_rank), dtype=dtype)
+    ]
+    hidden_states = torch.rand((num_tokens, K), dtype=dtype)
+    output = torch.zeros((num_tokens, top_k_num, N), dtype=dtype)
+
+    use_fused_moe_lora_kernel(
+        topk_ids,
+        topk_weights,
+        seg_indptr,
+        req_to_lora,
+        max_lora_rank,
+        top_k_num,
+        lora_a_stacked,
+        lora_b_stacked,
+        hidden_states,
+        output,
+        max_loras,
+        num_experts_runtime,
+        block_size,
+        mul_routed_weight,
+    )
+
+    # Reference: identical math, with the fused expert's slots clamped to a
+    # zero-delta expert. Clamp + zero-mask (rather than fancy indexing with an
+    # out-of-range id, which would throw).
+    safe_ids = topk_ids.clamp(max=num_experts - 1)
+    expected = use_torch(
+        hidden_states,
+        token_lora_mapping,
+        safe_ids,
+        topk_weights,
+        lora_a_stacked,
+        lora_b_stacked,
+        top_k_num,
+        mul_routed_weight,
+    )
+    expected[topk_ids >= num_experts] = 0
+
+    torch.testing.assert_close(output, expected, atol=1e-2, rtol=1e-2)
