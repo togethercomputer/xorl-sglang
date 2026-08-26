@@ -76,6 +76,35 @@ def _check_virtual_experts(server_args) -> None:
     )
 
 
+def _check_no_fused_shared_experts(base_model) -> None:
+    """Refuse MoE LoRA when shared-experts fusion is active.
+
+    Fusion appends the shared expert to the routed set (GLM-5.2: 256 routed +
+    1 shared -> num_experts 257, top_k+1), while the MoE LoRA buffers are sized
+    from the adapter's expert count. The kernels then index expert_id=num_routed
+    into a num_routed-sized buffer: an illegal memory access on the triton
+    runner, measured on GLM-5.2-FP8 TP=8 (IMA with fusion, 8/8 recall without).
+    The auto-selection provider declares --disable-shared-experts-fusion for
+    LoRA runs; this catches explicit configurations that bypass it, at startup
+    instead of as a crash on the first forward.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    fused = [
+        name
+        for name, m in base_model.named_modules()
+        if isinstance(m, FusedMoE) and getattr(m, "num_fused_shared_experts", 0) > 0
+    ]
+    if fused:
+        raise ValueError(
+            f"MoE LoRA cannot run with shared-experts fusion: {len(fused)} FusedMoE "
+            f"layer(s) fused their shared expert into the routed set (first: "
+            f"{fused[0]!r}), so the runtime expert count exceeds the adapter's and "
+            f"the LoRA kernels index past their buffers (an illegal memory access "
+            f"on the triton runner). Pass --disable-shared-experts-fusion."
+        )
+
+
 def _check_moe_runner_backend(base_model) -> None:
     """Require the TRT-LLM MoE runner for MoE LoRA -- but only where it exists.
 
@@ -137,6 +166,8 @@ def __apply_patch__(public_mod):
         # materialized at scheduler init, i.e. before any LoRAManager is built.
         # base_model is LoRAManager.__init__'s first positional parameter.
         _check_moe_runner_backend(base_model)
+        if _base_model_has_moe(base_model):
+            _check_no_fused_shared_experts(base_model)
         if (
             get_moe_runner_backend().is_experimental_sgl_trtllm()
             and _base_model_has_moe(base_model)

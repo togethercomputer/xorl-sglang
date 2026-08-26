@@ -90,7 +90,18 @@ def select_moe_lora_backend(server_args, hf_config) -> dict:
             _FALLBACK_MOE_BACKEND,
             _TRTLLM_MOE_BACKEND,
         )
-        return {"moe_runner_backend": _FALLBACK_MOE_BACKEND}
+        return {
+            "moe_runner_backend": _FALLBACK_MOE_BACKEND,
+            # Shared-experts fusion appends the shared expert to the routed set
+            # (e.g. GLM-5.2: 256 routed + 1 shared -> num_experts 257, top_k+1),
+            # but the MoE LoRA buffers are sized from the adapter's expert count.
+            # On the triton runner the kernel then indexes expert_id=num_routed
+            # into a num_routed-sized buffer: an illegal memory access on the
+            # first forward. The TRT-LLM runner auto-disables fusion; declare it
+            # here so every MoE LoRA run gets the same guarantee. Verified on
+            # GLM-5.2-FP8 TP=8: IMA with fusion, 8/8 recall without.
+            "disable_shared_experts_fusion": True,
+        }
 
     logger.info(
         "MoE LoRA on Blackwell: moe_runner_backend=%s with "
@@ -100,6 +111,10 @@ def select_moe_lora_backend(server_args, hf_config) -> dict:
     return {
         "moe_runner_backend": _TRTLLM_MOE_BACKEND,
         "lora_use_virtual_experts": True,
+        # The TRT-LLM runner already auto-disables shared-experts fusion, but
+        # declaring it keeps the invariant in one visible place: MoE LoRA never
+        # runs with a fused shared expert (see the triton branch above).
+        "disable_shared_experts_fusion": True,
     }
 
 
