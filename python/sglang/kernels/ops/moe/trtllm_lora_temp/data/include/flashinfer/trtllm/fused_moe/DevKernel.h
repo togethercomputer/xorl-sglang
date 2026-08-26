@@ -196,6 +196,15 @@ struct Data {
   float *outDqSfsPtr = nullptr;
   cutlass::bfloat16_t const *gateUpLoraDeltaPtr = nullptr;
   cutlass::bfloat16_t *activationLoraInputOutPtr = nullptr;
+  // DeepSeekFp8 LoRA delta decomposition (see activationDeepSeekKernel): when
+  // set together with gateUpLoraDeltaPtr, GEMM2's quantized operand carries the
+  // DELTA-FREE activation and the activation-level LoRA delta (act_with_delta -
+  // act_base, bf16, [numTokens * topK, innerDim / 2] by expandedIdx) is written
+  // here for a separate own-scale GEMM2 pass. Rationale: a trained delta can
+  // sit below e4m3's per-element resolution relative to the base activation,
+  // so quantizing (base + delta) replaces the delta with quantization-grid
+  // noise. Null keeps the fused (legacy) behaviour bit-exactly.
+  cutlass::bfloat16_t *activationLoraDeltaOutPtr = nullptr;
 
   // GEMM1-output dequant scalars, used to correct the linear (non-silu) half;
   // see linearHalfScale(). Leave null to keep the previous behaviour.
@@ -246,6 +255,7 @@ struct KernelParams {
   float *outDqSfsPtr = nullptr;
   cutlass::bfloat16_t const *gateUpLoraDeltaPtr = nullptr;
   cutlass::bfloat16_t *activationLoraInputOutPtr = nullptr;
+  cutlass::bfloat16_t *activationLoraDeltaOutPtr = nullptr;
 
   // GEMM1-output dequant scalars, used to correct the linear (non-silu) half;
   // see linearHalfScale(). Leave null to keep the previous behaviour.
@@ -272,6 +282,7 @@ struct KernelParams {
     params.outDqSfsPtr = data.outDqSfsPtr;
     params.gateUpLoraDeltaPtr = data.gateUpLoraDeltaPtr;
     params.activationLoraInputOutPtr = data.activationLoraInputOutPtr;
+    params.activationLoraDeltaOutPtr = data.activationLoraDeltaOutPtr;
     params.interleavedGateUpInput = data.interleavedGateUpInput;
     params.output1ScalesScalarPtr = data.output1ScalesScalarPtr;
     params.output1ScalesGateScalarPtr = data.output1ScalesGateScalarPtr;

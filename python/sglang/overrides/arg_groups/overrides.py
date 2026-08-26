@@ -58,6 +58,13 @@ def _lora_requested(server_args) -> bool:
 
 
 def _config_looks_moe(hf_config) -> bool:
+    # Multimodal configs nest the language model under text_config (e.g.
+    # Qwen3_5MoeForConditionalGeneration), so the MoE keys are not top-level.
+    # Same unwrap mem_pool._get_num_experts performs. Without it the provider
+    # silently declines and the model rule's flashinfer_trtllm stands -- which
+    # the MoE LoRA lock then rejects at startup.
+    if hasattr(hf_config, "get_text_config"):
+        hf_config = hf_config.get_text_config()
     return any(getattr(hf_config, k, None) for k in _MOE_CONFIG_KEYS)
 
 
@@ -72,13 +79,32 @@ def _effective_quantization(server_args, hf_config):
 
 
 def select_moe_lora_backend(server_args, hf_config) -> dict:
-    """Declare the MoE runner (and its prerequisite) for a LoRA run."""
-    # Pristine read: an explicit choice, including an explicit "triton", wins.
-    if getattr(server_args, "moe_runner_backend", None) != "auto":
-        return {}
+    """Declare the MoE runner (and its prerequisites) for a LoRA run."""
     if not _lora_requested(server_args):
         return {}
     if not _config_looks_moe(hf_config):
+        return {}
+
+    backend = getattr(server_args, "moe_runner_backend", None)
+    if backend == _FALLBACK_MOE_BACKEND:
+        # Explicit triton opt-out (the backend lock allows it): the backend
+        # choice is the operator's, but MoE LoRA must still never run with a
+        # fused shared expert -- the LoRA kernels index the fused slot past
+        # the adapter-sized buffers, and the standalone shared_experts module
+        # (whose LoRA deltas demonstrably contribute) is never invoked under
+        # fusion. Declared here so the explicit-triton launch works without
+        # hand-passing the flag, mirroring the upstream post-process that
+        # auto-sets it for every trtllm-class backend; the LoRAManager
+        # fail-fast remains as the backstop.
+        logger.info(
+            "MoE LoRA on the explicit triton opt-out: declaring "
+            "disable_shared_experts_fusion=True (fusion drops shared-expert "
+            "LoRA deltas and breaks routed-expert indexing)."
+        )
+        return {"disable_shared_experts_fusion": True}
+    # Pristine read: any other explicit choice wins (trtllm-class backends
+    # get the same fusion declaration from the upstream post-process).
+    if backend != "auto":
         return {}
     if _effective_quantization(server_args, hf_config) not in _VALIDATED_QUANTIZATIONS:
         return {}
@@ -90,7 +116,18 @@ def select_moe_lora_backend(server_args, hf_config) -> dict:
             _FALLBACK_MOE_BACKEND,
             _TRTLLM_MOE_BACKEND,
         )
-        return {"moe_runner_backend": _FALLBACK_MOE_BACKEND}
+        return {
+            "moe_runner_backend": _FALLBACK_MOE_BACKEND,
+            # Shared-experts fusion appends the shared expert to the routed set
+            # (e.g. GLM-5.2: 256 routed + 1 shared -> num_experts 257, top_k+1),
+            # but the MoE LoRA buffers are sized from the adapter's expert count.
+            # On the triton runner the kernel then indexes expert_id=num_routed
+            # into a num_routed-sized buffer: an illegal memory access on the
+            # first forward. The TRT-LLM runner auto-disables fusion; declare it
+            # here so every MoE LoRA run gets the same guarantee. Verified on
+            # GLM-5.2-FP8 TP=8: IMA with fusion, 8/8 recall without.
+            "disable_shared_experts_fusion": True,
+        }
 
     logger.info(
         "MoE LoRA on Blackwell: moe_runner_backend=%s with "
@@ -100,6 +137,10 @@ def select_moe_lora_backend(server_args, hf_config) -> dict:
     return {
         "moe_runner_backend": _TRTLLM_MOE_BACKEND,
         "lora_use_virtual_experts": True,
+        # The TRT-LLM runner already auto-disables shared-experts fusion, but
+        # declaring it keeps the invariant in one visible place: MoE LoRA never
+        # runs with a fused shared expert (see the triton branch above).
+        "disable_shared_experts_fusion": True,
     }
 
 

@@ -382,6 +382,13 @@ struct MoERunnerArgs {
   // populated with the post-activation intermediate for down-proj LoRA.
   void *gate_up_lora_delta = nullptr;
   void *activation_lora_input = nullptr;
+  // activation_lora_delta: [num_tokens * top_k, intermediate_size], bf16.
+  // When set (with gate_up_lora_delta), the DeepSeekFp8 activation kernel
+  // feeds GEMM2 the DELTA-FREE activation and writes the activation-level
+  // LoRA delta here for a separate own-scale GEMM2 pass -- a delta below
+  // e4m3's per-element step would otherwise be destroyed by quantizing
+  // (base + delta). nullptr keeps the legacy fused behaviour.
+  void *activation_lora_delta = nullptr;
 
   // Optional CUDA event (cudaEvent_t) recorded on the LoRA side stream. When
   // set, the runner waits on it right before the activation kernel (which

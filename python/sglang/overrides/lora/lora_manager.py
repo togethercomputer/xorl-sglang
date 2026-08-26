@@ -67,6 +67,17 @@ def _check_virtual_experts(server_args) -> None:
     """
     if getattr(server_args, "lora_use_virtual_experts", False):
         return
+    # The FP8 fused-experts path is the one dtype with a working non-virtual
+    # fallback (lora_dispatch.py routes it through build_lora_hooks); requiring
+    # the flag there would be stricter than the code it protects. bf16 and
+    # NVFP4 still hard-assert, so they keep the fail-fast.
+    if getattr(server_args, "quantization", None) == "fp8":
+        logger.warning(
+            "MoE LoRA on %s without --lora-use-virtual-experts: taking the "
+            "FP8 non-virtual fallback (classic hook path).",
+            _TRTLLM_MOE_BACKEND,
+        )
+        return
     raise ValueError(
         f"MoE LoRA on --moe-runner-backend {_TRTLLM_MOE_BACKEND} requires "
         f"--lora-use-virtual-experts. The bf16 and NVFP4 fused-experts paths "
@@ -74,6 +85,35 @@ def _check_virtual_experts(server_args) -> None:
         f"non-virtual fallback. Passing it up front turns a mid-forward "
         f"AssertionError into this message."
     )
+
+
+def _check_no_fused_shared_experts(base_model) -> None:
+    """Refuse MoE LoRA when shared-experts fusion is active.
+
+    Fusion appends the shared expert to the routed set (GLM-5.2: 256 routed +
+    1 shared -> num_experts 257, top_k+1), while the MoE LoRA buffers are sized
+    from the adapter's expert count. The kernels then index expert_id=num_routed
+    into a num_routed-sized buffer: an illegal memory access on the triton
+    runner, measured on GLM-5.2-FP8 TP=8 (IMA with fusion, 8/8 recall without).
+    The auto-selection provider declares --disable-shared-experts-fusion for
+    LoRA runs; this catches explicit configurations that bypass it, at startup
+    instead of as a crash on the first forward.
+    """
+    from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+    fused = [
+        name
+        for name, m in base_model.named_modules()
+        if isinstance(m, FusedMoE) and getattr(m, "num_fused_shared_experts", 0) > 0
+    ]
+    if fused:
+        raise ValueError(
+            f"MoE LoRA cannot run with shared-experts fusion: {len(fused)} FusedMoE "
+            f"layer(s) fused their shared expert into the routed set (first: "
+            f"{fused[0]!r}), so the runtime expert count exceeds the adapter's and "
+            f"the LoRA kernels index past their buffers (an illegal memory access "
+            f"on the triton runner). Pass --disable-shared-experts-fusion."
+        )
 
 
 def _check_moe_runner_backend(base_model) -> None:
@@ -116,13 +156,28 @@ def _check_moe_runner_backend(base_model) -> None:
 
     if backend.is_experimental_sgl_trtllm():
         return
+    if backend.is_triton():
+        # Explicit opt-out (auto resolves to flashinfer_trtllm on SM100, so
+        # triton here can only be a deliberate choice). Allowed because it is
+        # the correctness escape for adapters the tuned path still mishandles:
+        # GLM-5.2-FP8 rank-64 adapters score 8/8 on triton and 0/8 on
+        # experimental_sgl_trtllm (issue #40) even with the delta-split fix --
+        # refusing triton would leave those deployments unservable.
+        logger.warning(
+            "MoE LoRA on the triton MoE runner (explicit opt-out on "
+            "Blackwell): correct but unoptimized here; %s is the tuned path. "
+            "See issue #40 for when triton is the right choice.",
+            _TRTLLM_MOE_BACKEND,
+        )
+        return
     raise ValueError(
         f"MoE LoRA serving in this fork requires --moe-runner-backend "
-        f"{_TRTLLM_MOE_BACKEND}, but the active MoE runner is "
-        f"{getattr(backend, 'value', backend)!r}. It is the only MoE LoRA path "
-        f"this fork validates; other runners take a different numerical path. "
-        f"Pass --moe-runner-backend {_TRTLLM_MOE_BACKEND} explicitly (the "
-        f"default resolves to 'flashinfer_trtllm' on SM100), or serve without "
+        f"{_TRTLLM_MOE_BACKEND} (or an explicit --moe-runner-backend triton "
+        f"opt-out), but the active MoE runner is "
+        f"{getattr(backend, 'value', backend)!r}. Those are the only MoE LoRA "
+        f"paths this fork validates; other runners take a different numerical "
+        f"path. The default resolves to 'flashinfer_trtllm' on SM100 -- pass "
+        f"one of the supported backends explicitly, or serve without "
         f"--enable-lora / --lora-paths."
     )
 
@@ -137,6 +192,8 @@ def __apply_patch__(public_mod):
         # materialized at scheduler init, i.e. before any LoRAManager is built.
         # base_model is LoRAManager.__init__'s first positional parameter.
         _check_moe_runner_backend(base_model)
+        if _base_model_has_moe(base_model):
+            _check_no_fused_shared_experts(base_model)
         if (
             get_moe_runner_backend().is_experimental_sgl_trtllm()
             and _base_model_has_moe(base_model)
