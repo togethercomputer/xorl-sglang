@@ -18,12 +18,25 @@ def get_sgl_trtllm_moe_sm100_module():
     fi_core.gen_trtllm_gen_fused_moe_sm100_module = (
         gen_sgl_trtllm_gen_fused_moe_sm100_module
     )
+
+    # flashinfer 0.6.15 memoized get_trtllm_moe_sm100_module with
+    # functools.cache, so swapping the gen function required clearing it before
+    # and after. 0.6.17 made it a plain function: nothing to clear, the swapped
+    # gen is picked up directly. hasattr keeps both pins working. (Latent until
+    # now: the two-stream override covers this path in every default run, so the
+    # single-stream getter was first exercised on 0.6.17 by forcing
+    # SGLANG_TWO_STREAM_MAX_TOKENS=0.)
+    def _clear_module_cache():
+        cache_clear = getattr(fi_core.get_trtllm_moe_sm100_module, "cache_clear", None)
+        if cache_clear is not None:
+            cache_clear()
+
     try:
-        fi_core.get_trtllm_moe_sm100_module.cache_clear()
+        _clear_module_cache()
         return fi_core.get_trtllm_moe_sm100_module()
     finally:
         fi_core.gen_trtllm_gen_fused_moe_sm100_module = original_gen
-        fi_core.get_trtllm_moe_sm100_module.cache_clear()
+        _clear_module_cache()
 
 
 @functools.cache
@@ -165,35 +178,47 @@ def trtllm_fp8_block_scale_routed_moe(
             hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
         )
 
+    # Keyword call, not positional: flashinfer 0.6.17 inserted gemm1_lora_delta /
+    # gemm1_alpha / gemm1_beta / gemm1_clamp_limit at positions 8-11 of this
+    # wrapper (they upstreamed the routed-LoRA interface), so the 0.6.15-ordered
+    # positional call landed gemm2_weights in the gemm1_lora_delta slot and
+    # gemm2_weights_scale in gemm1_alpha -- rejected by the MxFp8-only validator.
+    # Latent until SGLANG_TWO_STREAM_MAX_TOKENS=0 first exercised this path on
+    # 0.6.17; the always-installed two-stream override covers it by default.
     result = get_sgl_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
-        None,
-        topk_ids,
-        None,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-        output,
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        routing_method_type,
-        use_shuffled_weight,
-        weight_layout,
-        do_finalize,
-        enable_pdl,
-        tune_max_num_tokens,
-        fp8_quantization_type,
-        activation_type,
-        True,
+        routing_logits=None,
+        topk_ids=topk_ids,
+        expert_weights=None,
+        routing_bias=routing_bias,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=gemm1_weights,
+        gemm1_weights_scale=gemm1_weights_scale,
+        gemm1_lora_delta=None,
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=None,
+        gemm2_weights=gemm2_weights,
+        gemm2_weights_scale=gemm2_weights_scale,
+        output=output,
+        num_experts=num_experts,
+        top_k=top_k,
+        n_group=n_group,
+        topk_group=topk_group,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        routed_scaling_factor=routed_scaling_factor,
+        routing_method_type=routing_method_type,
+        use_shuffled_weight=use_shuffled_weight,
+        weight_layout=weight_layout,
+        do_finalize=do_finalize,
+        enable_pdl=enable_pdl,
+        tune_max_num_tokens=tune_max_num_tokens,
+        fp8_quantization_type=fp8_quantization_type,
+        num_fused_shared_experts=0,
+        activation_type=activation_type,
+        norm_topk_prob=True,
     )
 
     return result[0] if do_finalize else result

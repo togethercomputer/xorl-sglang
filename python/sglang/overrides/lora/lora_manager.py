@@ -67,6 +67,17 @@ def _check_virtual_experts(server_args) -> None:
     """
     if getattr(server_args, "lora_use_virtual_experts", False):
         return
+    # The FP8 fused-experts path is the one dtype with a working non-virtual
+    # fallback (lora_dispatch.py routes it through build_lora_hooks); requiring
+    # the flag there would be stricter than the code it protects. bf16 and
+    # NVFP4 still hard-assert, so they keep the fail-fast.
+    if getattr(server_args, "quantization", None) == "fp8":
+        logger.warning(
+            "MoE LoRA on %s without --lora-use-virtual-experts: taking the "
+            "FP8 non-virtual fallback (classic hook path).",
+            _TRTLLM_MOE_BACKEND,
+        )
+        return
     raise ValueError(
         f"MoE LoRA on --moe-runner-backend {_TRTLLM_MOE_BACKEND} requires "
         f"--lora-use-virtual-experts. The bf16 and NVFP4 fused-experts paths "
