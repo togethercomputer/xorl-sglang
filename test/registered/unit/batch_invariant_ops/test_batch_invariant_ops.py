@@ -294,47 +294,11 @@ class TestSetBatchInvariantModeReentry(CustomTestCase):
         self.assertFalse(is_batch_invariant_mode_enabled())
 
 
-class TestMMFallbackVariantLoudError(CustomTestCase):
-    """When SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT routes an mm
-    to torch.einsum (not batch-invariant), a logger.error must fire once per
-    unique shape so the parity break is visible instead of silent."""
-
-    def setUp(self):
-        self._saved_fallback = batch_invariant_ops._ENABLE_MM_FALLBACK_VARIANT
-        self._saved_deepgemm = batch_invariant_ops._ENABLE_MM_DEEPGEMM
-        self._saved_reported = set(batch_invariant_ops._MM_FALLBACK_SHAPES_REPORTED)
-        batch_invariant_ops._ENABLE_MM_FALLBACK_VARIANT = True
-        batch_invariant_ops._ENABLE_MM_DEEPGEMM = False
-        batch_invariant_ops._MM_FALLBACK_SHAPES_REPORTED.clear()
-
-    def tearDown(self):
-        batch_invariant_ops._ENABLE_MM_FALLBACK_VARIANT = self._saved_fallback
-        batch_invariant_ops._ENABLE_MM_DEEPGEMM = self._saved_deepgemm
-        batch_invariant_ops._MM_FALLBACK_SHAPES_REPORTED.clear()
-        batch_invariant_ops._MM_FALLBACK_SHAPES_REPORTED.update(self._saved_reported)
-
-    def test_error_logged_once_per_shape(self):
-        a = torch.randn(4, 8, dtype=torch.bfloat16)
-        b = torch.randn(8, 16, dtype=torch.bfloat16)
-        logger_name = batch_invariant_ops.logger.name
-
-        with self.assertLogs(logger_name, level="ERROR") as captured:
-            batch_invariant_ops.matmul_persistent(a, b)
-        self.assertEqual(len(captured.records), 1)
-        message = captured.records[0].getMessage()
-        self.assertIn("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", message)
-        self.assertIn("(M=4, K=8, N=16)", message)
-
-        # Same shape again: rate-limited, no second error.
-        with self.assertNoLogs(logger_name, level="ERROR"):
-            batch_invariant_ops.matmul_persistent(a, b)
-
-        # A new shape reports again.
-        with self.assertLogs(logger_name, level="ERROR") as captured:
-            batch_invariant_ops.matmul_persistent(
-                torch.randn(2, 8, dtype=torch.bfloat16), b
-            )
-        self.assertEqual(len(captured.records), 1)
+# main's TestMMFallbackVariantLoudError is not ported: it exercises
+# _MM_FALLBACK_SHAPES_REPORTED, which no source revision (main, the trainer
+# submodule pin, or this branch) actually implements -- the class is
+# nightly-only there and never ran. Recorded as a defect found during the
+# port.
 
 
 class TestFusedAddRMSNormBatchInvariant(CustomTestCase):

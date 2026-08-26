@@ -20,7 +20,7 @@ register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
 if not torch.cuda.is_available():
     pytest.skip("requires a CUDA device", allow_module_level=True)
 
-from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+from sglang.xorl.bi.ops_ext import (
     BI_LM_HEAD_VOCAB_CHUNK,
     _bi_lm_head_chunk_gemm_fp32,
     bi_lm_head_full_logits,

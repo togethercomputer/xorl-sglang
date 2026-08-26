@@ -10,8 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-large")
 
 _MODULE_PATH = (
-    Path(__file__).resolve().parents[4]
-    / "python/sglang/srt/batch_invariant_ops/bi_silu_and_mul.py"
+    Path(__file__).resolve().parents[4] / "python/sglang/xorl/bi/bi_silu_and_mul.py"
 )
 _SPEC = importlib.util.spec_from_file_location(
     "sglang_exact_fp32_silu_and_mul", _MODULE_PATH

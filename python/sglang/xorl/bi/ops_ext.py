@@ -15,14 +15,15 @@ GEMM/topk pin FP32 arithmetic order.
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Literal, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
+from triton.runtime.errors import OutOfResources
 
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
-    _rms_norm_kernel,
+    matmul_kernel_persistent,
     mean_dim,
     rms_norm_batch_invariant,
 )
@@ -31,7 +32,6 @@ from sglang.xorl.bi.bi_gemm_tiera import (
     lookup_tiera_mm_config,
     lookup_tiera_router_config,
 )
-from triton.runtime.errors import OutOfResources
 
 _MM_CONFIG_OOM_SHAPES: set[tuple] = set()
 
@@ -925,4 +925,3 @@ def set_bi_head_fastpath_enabled(enabled: bool) -> None:
 
 def is_bi_head_fastpath_enabled() -> bool:
     return _BI_HEAD_FASTPATH_ENABLED
-

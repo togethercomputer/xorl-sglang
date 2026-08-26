@@ -48,7 +48,14 @@ def test_target_without_exact_contract_preserves_standard_dispatch(target):
     with patch("sglang.srt.layers.activation.get_server_args", return_value=execution):
         operation = SiluAndMul()
 
-    assert operation._forward_method is None
+    # v0.5.17's MultiPlatformOp eagerly resolves the platform dispatch in
+    # __init__ (main's base left _forward_method unset until first call).
+    # The pinned property is the same: no exact contract => the exact SwiGLU
+    # is NOT selected and the ordinary platform dispatch stands.
+    assert getattr(
+        operation._forward_method, "__func__", operation._forward_method
+    ) is getattr(operation.dispatch_forward(), "__func__", operation.dispatch_forward())
+    assert getattr(operation._forward_method, "__name__", "") != "forward_exact"
 
 
 @pytest.mark.skipif(

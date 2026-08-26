@@ -71,6 +71,17 @@ def __apply_patch__(mod):
         "bi_lm_head_selected_logprob",
         "bi_lm_head_full_logits",
         "bi_lm_head_selected_logprob_from_logits",
+        "bi_router_gemm",
+        "bi_router_topk_weights",
+        "bi_rms_norm",
+        "bi_fused_add_rms_norm",
+        "fused_add_rms_norm_batch_invariant",
+        "rms_norm_residual_tree_batch_invariant",
+        "RMSNormFamily",
+        "RMS_NORM_FAMILIES",
+        "RMS_NORM_FAMILY_NO_RESIDUAL",
+        "RMS_NORM_FAMILY_RESIDUAL_TREE",
+        "BI_LM_HEAD_VOCAB_CHUNK",
     ):
         setattr(mod, _name, getattr(_ext, _name))
 
