@@ -1,9 +1,11 @@
 name: Overlay Policy Gate
 
-# Enforces python/sglang/overrides/README.md ("Policy"): PRs to dev may not
-# touch upstream-owned python/sglang/srt/** unless they are an upstream sync
-# (label `upstream-sync`) or acknowledge the drift by updating
-# python/sglang/overrides/UPSTREAM_DRIFT.md in the same PR.
+# Enforces python/sglang/overrides/README.md ("Policy"): PRs to dev must not
+# touch upstream-owned python/sglang/srt/** — a HARD FAIL by default. The only
+# routes through: the `upstream-sync` label (verbatim upstream backport), or a
+# maintainer-applied `srt-exception` label (write access required) combined
+# with a drift-ledger update (python/sglang/overrides/UPSTREAM_DRIFT.md) in
+# the same PR. A ledger edit alone no longer passes.
 #
 # Deliberately independent of pr-test.yml / pr-gate.yml: the policy gate must
 # run on every PR, including drafts and PRs without the run-ci label. It uses
@@ -36,6 +38,7 @@ jobs:
             const GATED_PREFIX = 'python/sglang/srt/';
             const LEDGER = 'python/sglang/overrides/UPSTREAM_DRIFT.md';
             const SYNC_LABEL = 'upstream-sync';
+            const EXCEPTION_LABEL = 'srt-exception';
             const POLICY_DOC = 'python/sglang/overrides/README.md';
 
             const files = await github.paginate(github.rest.pulls.listFiles, {
@@ -61,22 +64,38 @@ jobs:
               return;
             }
 
-            if (paths.includes(LEDGER)) {
-              core.notice(
-                'srt/ changes acknowledged in the drift ledger (' + LEDGER + '). ' +
-                'Reviewers: confirm each change fits an exception category in ' +
-                POLICY_DOC + '. Files: ' + srtChanges.join(', ')
+            // srt/ is upstream-owned: changes are a HARD FAIL by default. The only
+            // non-sync route through is a maintainer consciously applying the
+            // exception label (write access required — the PR author cannot
+            // self-serve past this gate by editing files) AND the drift ledger
+            // being updated in the same PR.
+            if (labels.includes(EXCEPTION_LABEL)) {
+              if (!paths.includes(LEDGER)) {
+                core.setFailed(
+                  'PR carries `' + EXCEPTION_LABEL + '` but does not update the drift ' +
+                  'ledger ' + LEDGER + '. Every excepted srt/ change must be recorded ' +
+                  'there in the same PR. Files: ' + srtChanges.join(', ')
+                );
+                return;
+              }
+              core.warning(
+                'srt/ changes allowed by maintainer exception (`' + EXCEPTION_LABEL +
+                '` label) and recorded in ' + LEDGER + '. Reviewers: confirm each ' +
+                'change fits an exception category in ' + POLICY_DOC + '. Files: ' +
+                srtChanges.join(', ')
               );
               return;
             }
 
             core.setFailed(
               'This PR modifies upstream-owned ' + GATED_PREFIX + ' (' +
-              srtChanges.join(', ') + ') but is neither labeled `' + SYNC_LABEL +
-              '` nor updates the drift ledger ' + LEDGER + '.\n\n' +
-              'Fork behavior belongs in python/sglang/overrides/ (see the Policy ' +
-              'section of ' + POLICY_DOC + '). If this change is one of the narrow ' +
-              'exceptions (extension-point metadata or an overlay seam), add a ' +
-              'ledger entry in this PR; if it is a verbatim upstream sync, add the `' +
-              SYNC_LABEL + '` label.'
+              srtChanges.join(', ') + ').\n\n' +
+              'Fork changes do not go in srt/. Changed behavior of an upstream module ' +
+              'belongs in an overlay twin under python/sglang/overrides/; brand-new ' +
+              'capability belongs under python/sglang/xorl/ (see the Policy section of ' +
+              POLICY_DOC + ').\n\n' +
+              'If this srt/ change truly fits one of the narrow policy exceptions, a ' +
+              'maintainer must apply the `' + EXCEPTION_LABEL + '` label AND the PR must ' +
+              'add a row to ' + LEDGER + '. A verbatim upstream sync/backport takes the `' +
+              SYNC_LABEL + '` label instead.'
             );

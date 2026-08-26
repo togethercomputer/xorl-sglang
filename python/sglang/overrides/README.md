@@ -26,8 +26,13 @@ perf work, logging, new modules.
 
 ### Upstream-owned (`python/sglang/srt/**`) — do not modify, with three narrow exceptions
 
-Any PR to `dev` that touches `python/sglang/srt/**` fails the
-`overlay-policy-gate` CI job unless it is one of:
+Any PR to `dev` that touches `python/sglang/srt/**` **hard-fails** the
+`overlay-policy-gate` CI job. There are exactly two routes through, and the
+PR author cannot self-serve either: a verbatim upstream sync carries the
+`upstream-sync` label, and everything else needs a **maintainer-applied
+`srt-exception` label** (write access required) *plus* a drift-ledger entry
+in the same PR — a ledger edit alone does not pass. The label is granted only
+when the change fits one of:
 
 1. **Upstream sync / backport** — a verbatim upstream commit (merge or
    cherry-pick, upstream hash in the message). Label the PR `upstream-sync`.
@@ -67,9 +72,10 @@ beats a metadata mutation.
 [`UPSTREAM_DRIFT.md`](UPSTREAM_DRIFT.md) (this directory) records every
 intentional `srt/` edit: file, change, exception category, PR, and the
 upstream exit plan. The CI gate requires that file to change in any PR that
-touches `srt/` without the `upstream-sync` label — acknowledging the drift is
-part of making it. Remove an entry when an upstream sync delivers the change
-from upstream.
+carries the `srt-exception` label — recording the drift is a precondition of
+the exception, not a substitute for it (an unlabeled PR fails regardless of
+the ledger). Remove an entry when an upstream sync delivers the change from
+upstream.
 
 ### Choosing the mechanism (cheat sheet)
 
