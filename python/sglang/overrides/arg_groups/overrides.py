@@ -79,13 +79,32 @@ def _effective_quantization(server_args, hf_config):
 
 
 def select_moe_lora_backend(server_args, hf_config) -> dict:
-    """Declare the MoE runner (and its prerequisite) for a LoRA run."""
-    # Pristine read: an explicit choice, including an explicit "triton", wins.
-    if getattr(server_args, "moe_runner_backend", None) != "auto":
-        return {}
+    """Declare the MoE runner (and its prerequisites) for a LoRA run."""
     if not _lora_requested(server_args):
         return {}
     if not _config_looks_moe(hf_config):
+        return {}
+
+    backend = getattr(server_args, "moe_runner_backend", None)
+    if backend == _FALLBACK_MOE_BACKEND:
+        # Explicit triton opt-out (the backend lock allows it): the backend
+        # choice is the operator's, but MoE LoRA must still never run with a
+        # fused shared expert -- the LoRA kernels index the fused slot past
+        # the adapter-sized buffers, and the standalone shared_experts module
+        # (whose LoRA deltas demonstrably contribute) is never invoked under
+        # fusion. Declared here so the explicit-triton launch works without
+        # hand-passing the flag, mirroring the upstream post-process that
+        # auto-sets it for every trtllm-class backend; the LoRAManager
+        # fail-fast remains as the backstop.
+        logger.info(
+            "MoE LoRA on the explicit triton opt-out: declaring "
+            "disable_shared_experts_fusion=True (fusion drops shared-expert "
+            "LoRA deltas and breaks routed-expert indexing)."
+        )
+        return {"disable_shared_experts_fusion": True}
+    # Pristine read: any other explicit choice wins (trtllm-class backends
+    # get the same fusion declaration from the upstream post-process).
+    if backend != "auto":
         return {}
     if _effective_quantization(server_args, hf_config) not in _VALIDATED_QUANTIZATIONS:
         return {}
