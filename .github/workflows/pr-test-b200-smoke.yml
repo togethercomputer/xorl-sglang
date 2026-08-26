@@ -1,0 +1,104 @@
+name: B200 Smoke Test
+
+# Standalone and deliberately not wired into pr-test.yml's runner_configs.yml /
+# compute_partitions.py machinery (see scripts/ci/runner_configs.yml). That
+# system assumes a scale set is already proven out; this workflow is how one
+# gets proven out in the first place; xorl-sglang-1-b200-gpu-runner
+# (togethercomputer/xorl-ci, b200/values-xorl-sglang-1-b200.yaml) has never run
+# a real job; this is the first thing that should run on it.
+#
+# Not on every PR to dev yet, and not workflow_dispatch alone either --
+# GitHub only allows workflow_dispatch on a workflow that exists on the
+# repository's actual default branch, which for this repo is `main` (the
+# OSS-mirror branch with all 99 upstream workflow files) rather than `dev`
+# (this fork's real 8-workflow CI surface). Landing an internal-runner-only
+# workflow on `main` just to unlock manual dispatch is the wrong fix.
+#
+# So this triggers on `pull_request: branches: [dev]`, scoped by `paths:` to
+# only this file, so it exercises now (this very PR touches it) without
+# firing on every unrelated PR to dev before the lane is proven -- the CUDA
+# 13.2.1 runner image (built and tested against H100) has not actually run on
+# a B200 node yet. Once it goes green, drop the `paths:` filter to make this
+# a normal part of every PR to dev (or fold a runner_config entry into
+# scripts/ci/runner_configs.yml and a stage into pr-test.yml instead, matching
+# the H100 lanes).
+on:
+  workflow_dispatch: {}
+  pull_request:
+    branches: [dev]
+    paths:
+      - '.github/workflows/pr-test-b200-smoke.yml'
+
+concurrency:
+  group: pr-test-b200-smoke-${{ github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  SGLANG_IS_IN_CI: true
+  # '1', not false: copied from pr-test.yml's top-level env without checking that
+  # _pr-test-stage.yml overrides it to '1' for every real GPU stage. Reason (see
+  # that file): this fork's ARC runner is uid 1001, where a non-writable system
+  # site-packages makes pip silently fall back to a user install while uv just
+  # fails with Permission denied on the same directory -- caught here by
+  # `uv pip install -e python[...]` dying on
+  # `/usr/local/lib/python3.12/dist-packages/modelscope: Permission denied`
+  # after a full ~5-minute dependency resolve, not by anything B200-specific.
+  # ci_install_dependency.sh tests [ "$USE_VENV" = "1" ], so a plain `true` would
+  # read the same as upstream's `false` -- it has to be the string '1'.
+  USE_VENV: '1'
+
+permissions:
+  contents: read
+
+jobs:
+  b200-smoke:
+    # Must match runnerScaleSetName in xorl-ci's b200/values-xorl-sglang-1-b200.yaml.
+    runs-on: xorl-sglang-1-b200-gpu-runner
+    # No `container:` block -- the runner pod holds the GPU directly (no
+    # containerMode in the scale set's values), so a job container here would
+    # be scheduled without GPU resources. Same constraint as the H100 lanes.
+    timeout-minutes: 20
+    steps:
+      # Pinned to a commit hash, not a tag, per this repo's blanket action-pinning
+      # policy (a mutable tag is a supply-chain risk: whoever controls the tag
+      # controls what runs on this self-hosted GPU hardware). persist-credentials:
+      # false because nothing here needs to push -- the checked-out token would
+      # otherwise be left on disk on this GPU pod for the rest of the job.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Install CUDA CI dependencies
+        # Reuses the same install path every H100 stage uses
+        # (scripts/ci/cuda/ci_install_dependency.sh) rather than a bespoke
+        # install here -- divergence between this lane's dependency install
+        # and the proven one is how a future "works on H100, not on B200"
+        # report turns out to actually be an install-script drift bug instead
+        # of a real hardware difference.
+        run: bash scripts/ci/cuda/ci_install_dependency.sh
+        timeout-minutes: 15
+
+      - name: GPU + import smoke check
+        # Deliberately does not launch a server or touch a model yet. Two
+        # unverified things get isolated to their own checks before anything
+        # else can obscure which one broke: does this image's CUDA/driver
+        # combination actually see the B200 (nvidia-smi, torch.cuda), and does
+        # sglang import and report the GPU's compute capability correctly.
+        # Serving a real model is the natural next lane once this is green --
+        # it needs DEFAULT_SMALL_MODEL_NAME_FOR_TEST's gated Llama license
+        # sorted out for this cluster first (xorl-sglang-hf-token, the
+        # per-cluster HF credential, does not exist on research-b200-ic1 yet;
+        # see xorl-ci's README).
+        run: |
+          nvidia-smi
+          python3 -c "
+          import torch
+          assert torch.cuda.is_available(), 'torch does not see a GPU'
+          name = torch.cuda.get_device_name(0)
+          cap = torch.cuda.get_device_capability(0)
+          print(f'GPU: {name}, compute capability: {cap}')
+          assert 'B200' in name, f'expected a B200, got {name}'
+
+          import sglang
+          print(f'sglang {sglang.__version__} imported OK')
+          "
