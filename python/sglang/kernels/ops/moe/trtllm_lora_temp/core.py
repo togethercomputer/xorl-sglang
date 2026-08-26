@@ -178,13 +178,14 @@ def trtllm_fp8_block_scale_routed_moe(
             hidden_states.shape, dtype=torch.bfloat16, device=hidden_states.device
         )
 
-    # Keyword call, not positional: flashinfer 0.6.17 inserted gemm1_lora_delta /
-    # gemm1_alpha / gemm1_beta / gemm1_clamp_limit at positions 8-11 of this
-    # wrapper (they upstreamed the routed-LoRA interface), so the 0.6.15-ordered
-    # positional call landed gemm2_weights in the gemm1_lora_delta slot and
-    # gemm2_weights_scale in gemm1_alpha -- rejected by the MxFp8-only validator.
-    # Latent until SGLANG_TWO_STREAM_MAX_TOKENS=0 first exercised this path on
-    # 0.6.17; the always-installed two-stream override covers it by default.
+    # Keyword call, not positional: this wrapper has gemm1_lora_delta /
+    # gemm1_alpha / gemm1_beta / gemm1_clamp_limit at positions 8-11 (the
+    # upstreamed routed-LoRA interface -- already there in the 0.6.15 wheel),
+    # so the pre-LoRA-interface positional order this call was written against
+    # landed gemm2_weights in the gemm1_lora_delta slot and gemm2_weights_scale
+    # in gemm1_alpha -- rejected by the MxFp8-only validator. Dead code on both
+    # pins until SGLANG_TWO_STREAM_MAX_TOKENS=0 first exercised this path; the
+    # always-installed two-stream override covers it in every default run.
     result = get_sgl_trtllm_moe_sm100_module().trtllm_fp8_block_scale_moe(
         routing_logits=None,
         topk_ids=topk_ids,
