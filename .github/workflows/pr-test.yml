@@ -308,6 +308,33 @@ jobs:
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
     secrets: inherit
 
+  base-b-test-1-gpu-b200:
+    # First real (non-smoke) test on research-b200-ic1's
+    # xorl-sglang-1-b200-gpu-runner (xorl-ci@9f0acbd). Held out of
+    # pr-test-finish's needs at first landing since the runner had run exactly
+    # one job ever at that point (a standalone import/nvidia-smi check); now
+    # in that needs list after a manual dispatch (workflow_dispatch,
+    # run_all_tests: true, since check-changes skips the GPU matrix for a
+    # workflow-only diff) actually ran TestRadixCacheFCFS and
+    # TestRadixCacheNonOverlapLPM end to end -- real server, real generate
+    # requests -- and passed (`Ran 3 tests in 175.918s / OK (skipped=1)`).
+    needs: [check-changes, call-gate, wait-for-base-a, rust-ext-build]
+    if: ${{ !failure() && !cancelled() }}
+    uses: ./.github/workflows/_pr-test-stage.yml
+    with:
+      self_name: base-b-test-1-gpu-b200
+      runner_config: 1-gpu-b200
+      check_changes: ${{ toJson(needs.check-changes.outputs) }}
+      caller_inputs: ${{ toJson(inputs) }}
+      partitions: ${{ needs.check-changes.outputs.partitions }}
+      # One registered test (test/registered/radix_cache/test_radix_attention.py,
+      # est_time=100) so far -- a single shard, no fanout to size for yet. 10
+      # minutes gives headroom over the H100 lane's measured runtime for the
+      # same test without masking a real hang.
+      run_timeout_minutes: '10'
+      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+    secrets: inherit
+
   base-c-test-4-gpu-h100:
     # wait-for-base-a, NOT wait-for-base-b: base-c runs concurrently with base-b
     # rather than after it. base-c is one serial shard of 4 files on the 4-GPU
@@ -398,6 +425,7 @@ jobs:
         base-b-test-1-gpu-small,
         base-b-test-1-gpu-large,
         base-b-test-2-gpu-large,
+        base-b-test-1-gpu-b200,
         base-c-test-4-gpu-h100,
 
         lora-test-1-gpu-large,
