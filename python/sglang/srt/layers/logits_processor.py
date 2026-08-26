@@ -47,10 +47,6 @@ from sglang.srt.layers.logprob_processor import (
     get_top_logprobs_raw,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.xorl.batch_invariant import (
-    validate_xorl_bi_logit_transforms,
-    xorl_bi_lm_head,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -67,6 +63,10 @@ from sglang.srt.utils.common import (
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
+)
+from sglang.xorl.batch_invariant import (
+    validate_xorl_bi_logit_transforms,
+    xorl_bi_lm_head,
 )
 
 logger = logging.getLogger(__name__)
@@ -615,7 +615,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> torch.Tensor:
         """Score input tokens with the same pinned lm-head contract as training."""
-        from sglang.xorl.bi.ops_ext import bi_lm_head_selected_logprob
+        from sglang.srt.batch_invariant_ops import bi_lm_head_selected_logprob
 
         if input_logprob_indices is None:
             raise ValueError(
@@ -660,7 +660,7 @@ class LogitsProcessor(nn.Module):
         logits_metadata: LogitsMetadata,
     ) -> torch.Tensor:
         """Build every sampled distribution with the contract's fixed GEMM."""
-        from sglang.xorl.bi.ops_ext import bi_lm_head_full_logits
+        from sglang.srt.batch_invariant_ops import bi_lm_head_full_logits
 
         weight = self._validate_bi_lm_head(
             hidden_states, lm_head, operation="decode lm head"

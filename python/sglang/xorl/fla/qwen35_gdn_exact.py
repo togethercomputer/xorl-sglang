@@ -63,16 +63,15 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     if rmsnorm_family not in ("v1", "v2"):
         raise RuntimeError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
 
+    from sglang.kernels.ops.attention.fla import layernorm_gated as _norm_gated
+    from sglang.srt.batch_invariant_ops import batch_invariant_ops as _bi_ops
+    from sglang.xorl.bi import bi_gemm_configs as _gemm_configs
+    from sglang.xorl.bi import bi_gemm_tiera as _tiera
     from sglang.xorl.fla import bi_gdn_decode as _decode
     from sglang.xorl.fla import bi_gdn_decode_fast as _fast
     from sglang.xorl.fla import bi_gdn_decode_incr as _incr
     from sglang.xorl.fla import bi_gdn_incr_lazy_heal as _heal
     from sglang.xorl.fla import bi_gdn_prefill as _prefill
-    from sglang.kernels.ops.attention.fla import layernorm_gated as _norm_gated
-    from sglang.srt.batch_invariant_ops import batch_invariant_ops as _bi_ops
-    from sglang.xorl.bi import bi_gemm_configs as _gemm_configs
-    from sglang.xorl.bi import bi_gemm_tiera as _tiera
-    from sglang.xorl.bi import ops_ext as _bi_ops_ext
 
     # The canonical MoE contributor fold is not ported to this dev-based
     # branch; ServerArgs rejects the Qwen3.5 MoE architectures outright, so
@@ -133,8 +132,8 @@ def _apply_qwen35_gdn_exact(server_args) -> None:
     # the fixed solve kernel. The promoted tuple's fused ordered combine was
     # structurally superseded by the canonical contributor fold.
     _tiera.set_tiera_enabled(False)
-    _bi_ops_ext.set_router_renorm_fused_enabled(False)
-    _bi_ops_ext.set_bi_head_fastpath_enabled(False)
+    _bi_ops.set_router_renorm_fused_enabled(False)
+    _bi_ops.set_bi_head_fastpath_enabled(False)
 
     logger.info(
         "Exact Qwen3.5-family zero-K3 serving resolved: BI GDN "

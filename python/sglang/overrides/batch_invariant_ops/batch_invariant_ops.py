@@ -59,6 +59,21 @@ def __apply_patch__(mod):
     if not hasattr(mod, "_batch_invariant_OPS"):
         mod._batch_invariant_OPS = set()
 
+    # Main defines these on the upstream module; callers (the Qwen3.5 exact
+    # resolver, the sampler fastpath) reference them through this module, so
+    # install the ops_ext implementations here for import-surface fidelity.
+    from sglang.xorl.bi import ops_ext as _ext
+
+    for _name in (
+        "set_router_renorm_fused_enabled",
+        "set_bi_head_fastpath_enabled",
+        "is_bi_head_fastpath_enabled",
+        "bi_lm_head_selected_logprob",
+        "bi_lm_head_full_logits",
+        "bi_lm_head_selected_logprob_from_logits",
+    ):
+        setattr(mod, _name, getattr(_ext, _name))
+
     mod._BATCH_INVARIANT_ALL_OPS = _BATCH_INVARIANT_ALL_OPS
     mod._BATCH_INVARIANT_ALIASES = _BATCH_INVARIANT_ALIASES
     mod._normalize_batch_invariant_ops = _normalize_batch_invariant_ops

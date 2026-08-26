@@ -7,27 +7,14 @@ import torch.distributed as dist
 from torch import nn
 
 from sglang.kernels.ops.sampling.murmur_hash import murmur_hash32
-from sglang.xorl.bi.ops_ext import is_bi_head_fastpath_enabled
-from sglang.xorl.bi.bi_families_v2 import (
-    exact_temperature_scale_bf16_logits,
-    exact_temperature_scale_fp32_logits,
-)
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
-)
-from sglang.xorl.exact_sampling_transforms import (
-    exact_masked_logits,
-    exact_sampling_identity_rows,
-    exact_seeded_gumbel_sample,
-    exact_selected_logprob_from_support,
-    exact_selected_logprob_partitioned_from_support,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.logprob_processor import (
     OutputLogprobProcessor,
 )
-from sglang.xorl.batch_invariant import xorl_bi_sample_and_score
 from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
@@ -44,6 +31,19 @@ from sglang.srt.utils.common import (
     is_hip,
     is_musa,
     is_npu,
+)
+from sglang.xorl.batch_invariant import xorl_bi_sample_and_score
+from sglang.xorl.bi.bi_families_v2 import (
+    exact_temperature_scale_bf16_logits,
+    exact_temperature_scale_fp32_logits,
+)
+from sglang.xorl.bi.ops_ext import is_bi_head_fastpath_enabled
+from sglang.xorl.exact_sampling_transforms import (
+    exact_masked_logits,
+    exact_sampling_identity_rows,
+    exact_seeded_gumbel_sample,
+    exact_selected_logprob_from_support,
+    exact_selected_logprob_partitioned_from_support,
 )
 
 if is_cuda():
@@ -439,7 +439,7 @@ class Sampler(nn.Module):
 
                         score = bi_lm_head_selected_logprob_from_logits_fast
                     else:
-                        from sglang.xorl.bi.ops_ext import (  # noqa: PLC0415
+                        from sglang.srt.batch_invariant_ops import (  # noqa: PLC0415
                             bi_lm_head_selected_logprob_from_logits,
                         )
 
@@ -518,7 +518,7 @@ class Sampler(nn.Module):
         temperature_applied: bool = False,
     ) -> torch.Tensor:
         """Rescore selected tokens through the pinned contract LSE reduction."""
-        from sglang.xorl.bi.ops_ext import (
+        from sglang.srt.batch_invariant_ops import (
             bi_lm_head_selected_logprob_from_logits,
         )
 
