@@ -1,0 +1,82 @@
+name: Overlay Policy Gate
+
+# Enforces python/sglang/overrides/README.md ("Policy"): PRs to dev may not
+# touch upstream-owned python/sglang/srt/** unless they are an upstream sync
+# (label `upstream-sync`) or acknowledge the drift by updating
+# python/sglang/overrides/UPSTREAM_DRIFT.md in the same PR.
+#
+# Deliberately independent of pr-test.yml / pr-gate.yml: the policy gate must
+# run on every PR, including drafts and PRs without the run-ci label. It uses
+# the PR files API instead of a checkout, so it costs seconds.
+# labeled/unlabeled are in the trigger list so adding or removing
+# `upstream-sync` re-evaluates the gate without a push.
+
+on:
+  pull_request:
+    branches: [dev]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: overlay-policy-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  overlay-policy-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check srt/ changes against the overlay policy
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const GATED_PREFIX = 'python/sglang/srt/';
+            const LEDGER = 'python/sglang/overrides/UPSTREAM_DRIFT.md';
+            const SYNC_LABEL = 'upstream-sync';
+            const POLICY_DOC = 'python/sglang/overrides/README.md';
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const paths = files.map((f) => f.filename);
+            const srtChanges = paths.filter((p) => p.startsWith(GATED_PREFIX));
+
+            if (srtChanges.length === 0) {
+              core.info('No changes under ' + GATED_PREFIX + ' — policy gate passes.');
+              return;
+            }
+
+            const labels = context.payload.pull_request.labels.map((l) => l.name);
+            if (labels.includes(SYNC_LABEL)) {
+              core.notice(
+                'srt/ changes allowed: PR carries the `' + SYNC_LABEL + '` label ' +
+                '(verbatim upstream sync/backport). Files: ' + srtChanges.join(', ')
+              );
+              return;
+            }
+
+            if (paths.includes(LEDGER)) {
+              core.notice(
+                'srt/ changes acknowledged in the drift ledger (' + LEDGER + '). ' +
+                'Reviewers: confirm each change fits an exception category in ' +
+                POLICY_DOC + '. Files: ' + srtChanges.join(', ')
+              );
+              return;
+            }
+
+            core.setFailed(
+              'This PR modifies upstream-owned ' + GATED_PREFIX + ' (' +
+              srtChanges.join(', ') + ') but is neither labeled `' + SYNC_LABEL +
+              '` nor updates the drift ledger ' + LEDGER + '.\n\n' +
+              'Fork behavior belongs in python/sglang/overrides/ (see the Policy ' +
+              'section of ' + POLICY_DOC + '). If this change is one of the narrow ' +
+              'exceptions (extension-point metadata or an overlay seam), add a ' +
+              'ledger entry in this PR; if it is a verbatim upstream sync, add the `' +
+              SYNC_LABEL + '` label.'
+            );
