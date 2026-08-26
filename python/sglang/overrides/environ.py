@@ -31,3 +31,15 @@ def _register(name: str, field: EnvField) -> None:
 # LOG / TEST / DEBUG / OPT), and never DISABLE_FOO defaulting to True, which
 # reads as a double negative at the call site. Registering here rather than in
 # the class body changes where the descriptor lives, not what it is called.
+
+from sglang.srt.environ import EnvBool
+
+# Kill-switch for the FP8 MoE-LoRA gate_up delta decomposition (single-stream
+# experimental_sgl_trtllm path, srt/lora/trtllm_lora_temp/lora_dispatch.py --
+# fork-local code, ledgered in UPSTREAM_DRIFT.md). The decomposition keeps
+# GEMM2's quantized operand delta-free and runs the activation-level LoRA
+# delta through its own own-scale FP8 GEMM: without it, a trained delta below
+# e4m3's per-element step relative to the base activation is replaced by
+# quantization-grid noise (GLM-5.2 adapters measured at 0.4% of activation --
+# recovered-delta cosine 0.30 fused vs 0.9998 decomposed).
+_register("SGLANG_DISABLE_LORA_FP8_DELTA_SPLIT", EnvBool(False))

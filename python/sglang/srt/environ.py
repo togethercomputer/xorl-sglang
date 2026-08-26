@@ -643,13 +643,6 @@ class Envs:
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
-    # Kill-switch for the FP8 MoE-LoRA gate_up delta decomposition (single-stream
-    # experimental_sgl_trtllm path). The decomposition keeps GEMM2's quantized operand
-    # delta-free and runs the activation-level LoRA delta through its own own-scale FP8
-    # GEMM -- without it, a trained delta below e4m3's per-element step relative to the
-    # base activation is replaced by quantization-grid noise (GLM-5.2 adapters measured
-    # at 0.4% of activation: recovered-delta cosine 0.30 fused vs 0.9998 decomposed).
-    SGLANG_DISABLE_LORA_FP8_DELTA_SPLIT = EnvBool(False)
     # Enable int4x2 weights loading
     SGLANG_NPU_W4A4_NEW_PACKING = EnvBool(False)
     # Quantize x to int8 in the dispatch operator
