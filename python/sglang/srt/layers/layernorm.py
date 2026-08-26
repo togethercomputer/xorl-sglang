@@ -34,15 +34,6 @@ from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.xorl.batch_invariant import resolve_or_validate_xorl_bi_family
-from sglang.xorl.bi import (
-    RMS_NORM_FAMILIES,
-    RMS_NORM_FAMILY_NO_RESIDUAL,
-    RMSNormFamily,
-    bi_fused_add_rms_norm,
-    bi_rms_norm,
-    rms_norm_v2,
-)
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -64,6 +55,15 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_xpu,
+)
+from sglang.xorl.batch_invariant import resolve_or_validate_xorl_bi_family
+from sglang.xorl.bi import (
+    RMS_NORM_FAMILIES,
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMSNormFamily,
+    bi_fused_add_rms_norm,
+    bi_rms_norm,
+    rms_norm_v2,
 )
 
 _is_cuda = is_cuda()

@@ -38,6 +38,9 @@ if is_cuda() or is_hip():
 MAX_FUSED_QKV_SPLIT_DIM = 8192
 
 if is_cuda():
+    from sglang.srt.layers.attention.mamba.causal_conv1d import (
+        causal_conv1d_fn as causal_conv1d_fn_cuda,
+    )
     from sglang.xorl.fla import bi_gdn_decode as _bi_decode_mod
     from sglang.xorl.fla import bi_gdn_decode_fast as _bi_fast_mod
     from sglang.xorl.fla import bi_gdn_decode_incr as _bi_incr_mod
@@ -55,9 +58,6 @@ if is_cuda():
     )
     from sglang.xorl.fla.bi_gdn_prefill import (
         bi_chunk_gated_delta_rule_prefill,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn as causal_conv1d_fn_cuda,
     )
 
     causal_conv1d_fn = causal_conv1d_fn_cuda

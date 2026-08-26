@@ -5,10 +5,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.xorl.bi import (
-    RMS_NORM_FAMILY_NO_RESIDUAL,
-    RMS_NORM_FAMILY_RESIDUAL_TREE,
-)
 from sglang.srt.distributed import (
     get_pp_group,
 )
@@ -39,6 +35,10 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.xorl.bi import (
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+)
 
 Qwen3Config = None
 

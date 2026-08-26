@@ -42,10 +42,10 @@ from dataclasses import dataclass
 
 import torch
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
 from sglang.xorl.fla.bi_gdn_prefill import (
     bi_chunk_gated_delta_rule_prefill,
 )
-from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
 
 # Internal choices for the exact Qwen3.5-family GDN serving contract.
 # Installed as a unit by the architecture resolver (see

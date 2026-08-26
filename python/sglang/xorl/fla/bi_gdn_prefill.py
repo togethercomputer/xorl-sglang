@@ -36,18 +36,18 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.xorl.fla.chunk_scaled_dot_kkt import (
-    chunk_scaled_dot_kkt_fwd,
-)
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
     prepare_chunk_offsets,
 )
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
-from sglang.xorl.fla.solve_tril_decode import solve_tril_decode
 from sglang.kernels.ops.attention.fla.utils import autotune_cache_kwargs
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.xorl.fla.chunk_scaled_dot_kkt import (
+    chunk_scaled_dot_kkt_fwd,
+)
+from sglang.xorl.fla.solve_tril_decode import solve_tril_decode
 
 # Internal choices for the exact Qwen3.5-family GDN serving contract.
 # Installed as a unit by the architecture resolver (see

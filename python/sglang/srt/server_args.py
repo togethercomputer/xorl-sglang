@@ -435,6 +435,7 @@ def add_rl_on_policy_target_choices(choices):
 def add_linear_attn_kernel_backend_choices(choices):
     LINEAR_ATTN_KERNEL_BACKEND_CHOICES.extend(choices)
 
+
 def is_glm52_exact_mode(server_args: ServerArgs) -> bool:
     return bool(getattr(server_args, "glm52_exact_mode", False))
 
@@ -492,7 +493,6 @@ def _validate_exact_model_geometry(
             f"The exact {contract_name} XORL contract only admits the qualified "
             f"model geometry; mismatched fields: {', '.join(mismatches)}"
         )
-
 
 
 def _validate_exact_qwen3_dense_capabilities(hf_config) -> None:
@@ -577,7 +577,6 @@ def _validate_exact_qwen3_dense_capabilities(hf_config) -> None:
             "The exact dense Qwen3 XORL contract does not support this "
             f"architecture configuration: {', '.join(mismatches)}"
         )
-
 
 
 def _validate_exact_qwen35_dense_capabilities(hf_config) -> None:
@@ -691,7 +690,6 @@ def _validate_exact_qwen35_dense_capabilities(hf_config) -> None:
         )
 
 
-
 def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | None:
     if is_glm52_exact_mode(server_args):
         from sglang.xorl.batch_invariant import XORL_GLM52_REQUIRED_BI_OPS
@@ -708,8 +706,6 @@ def _exact_batch_invariant_ops(server_args: ServerArgs) -> tuple[str, ...] | Non
         # reductions. Only trunk matrix products use the generic BI interpose.
         return ("addmm", "bmm", "mm")
     return None
-
-
 
 
 @dataclasses.dataclass
@@ -3564,7 +3560,6 @@ class ServerArgs:
         init=False, default=False, repr=False
     )
 
-
     # -------------------------------------------------------------------------
     # KV canary
     # -------------------------------------------------------------------------
@@ -5344,7 +5339,6 @@ class ServerArgs:
 
         validate_hisparse_kv_cache_dtype(self)
 
-
     def _declare_exact_physical_pp_capability(self, *configs) -> None:
         """Publish the model-owned physical-PP proxy capability.
 
@@ -5357,7 +5351,6 @@ class ServerArgs:
         self.exact_physical_pp_capable = True
         for config in configs:
             config._exact_physical_pp_capable = True
-
 
     def _validate_qwen35_gdn_exact_contract(self, hf_config) -> None:
         if not self.qwen35_gdn_exact_mode:
@@ -5394,7 +5387,6 @@ class ServerArgs:
                 "The exact Qwen3.5-family XORL contract does not support "
                 "speculative or draft decoding."
             )
-
 
     def _resolve_qwen35_gdn_exact_contract(
         self,
@@ -5511,7 +5503,6 @@ class ServerArgs:
                 "pipeline parallelism may still split layers across stages"
             )
 
-
     def _resolve_qwen3_dense_exact_contract(
         self,
         hf_config,
@@ -5567,7 +5558,6 @@ class ServerArgs:
             "Dense Qwen3 exact numerics: Class-B RoPE, RMSNorm families-v2, "
             "shape-aware exact SwiGLU, and the families-v2 BF16 lm-head"
         )
-
 
     def _validate_rl_on_policy_target(self) -> None:
         if self.rl_on_policy_target not in (None, XORL_RL_TARGET):

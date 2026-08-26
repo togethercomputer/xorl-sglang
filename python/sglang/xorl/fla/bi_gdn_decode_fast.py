@@ -78,6 +78,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
+from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum_scalar_kernel
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd_kernel
+from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd_kernel
 from sglang.xorl.fla.bi_gdn_prefill import (
     BI_GDN_SOLVE_TRIL_DECODE,
     IS_TMA_SUPPORTED,
@@ -85,12 +89,9 @@ from sglang.xorl.fla.bi_gdn_prefill import (
     exp,
     merge_16x16_to_64x64_inverse_kernel,
 )
-from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
 from sglang.xorl.fla.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd_kernel,
 )
-from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum_scalar_kernel
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd_kernel
 from sglang.xorl.fla.solve_tril_decode import (
     DIAG_HEAD_GROUP,
     DIAG_NUM_STAGES,
@@ -100,7 +101,6 @@ from sglang.xorl.fla.solve_tril_decode import (
     solve_tril_64x64_diag_inv_grouped_kernel,
     solve_tril_64x64_merge_inv_kernel,
 )
-from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd_kernel
 
 # Internal choices for the exact Qwen3.5-family GDN serving contract.
 # Installed as a unit by the architecture resolver (see

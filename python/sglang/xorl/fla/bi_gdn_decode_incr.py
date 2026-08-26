@@ -256,6 +256,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
+from sglang.kernels.ops.attention.fla.cumsum import (
+    chunk_local_cumsum,
+    chunk_local_cumsum_scalar_kernel,
+)
+from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_kernel
+from sglang.kernels.ops.attention.fla.op import safe_exp
+from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
 from sglang.xorl.fla.bi_gdn_decode_fast import (
     BIGDNFastDecodeRunner,
     bi_gdn_fast_append_kernel,
@@ -269,21 +277,13 @@ from sglang.xorl.fla.bi_gdn_prefill import (
     exp,
     solve_tril,
 )
-from sglang.kernels.ops.attention.fla.chunk_delta_h import CHUNK_SIZE
 from sglang.xorl.fla.chunk_scaled_dot_kkt import (
     chunk_scaled_dot_kkt_fwd,
 )
-from sglang.kernels.ops.attention.fla.cumsum import (
-    chunk_local_cumsum,
-    chunk_local_cumsum_scalar_kernel,
-)
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd, l2norm_fwd_kernel
-from sglang.kernels.ops.attention.fla.op import safe_exp
 from sglang.xorl.fla.solve_tril_decode import (
     _sum_rows_16_fla_tree,
     solve_tril_decode,
 )
-from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
 
 # Internal choices for the exact Qwen3.5-family GDN serving contract.
 # Installed as a unit by the architecture resolver (see

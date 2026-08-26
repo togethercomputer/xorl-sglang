@@ -22,7 +22,6 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from sglang.xorl.bi import RMS_NORM_FAMILY_RESIDUAL_TREE
 from sglang.srt.distributed import (
     get_pp_group,
     get_pp_indices,
@@ -54,6 +53,7 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.xorl.bi import RMS_NORM_FAMILY_RESIDUAL_TREE
 
 Qwen2Config = None
 
