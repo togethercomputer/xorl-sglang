@@ -9,7 +9,11 @@ paths:
 This branch uses the `sglang.overrides` overlay: `python/sglang/srt/**` is
 upstream-owned and fork behavior lives in `python/sglang/overrides/**`. Full
 policy: `python/sglang/overrides/README.md`. Enforced by the
-`overlay-policy-gate` CI job.
+`overlay-policy-gate` CI job, which HARD-FAILS any PR touching
+`python/sglang/srt/**` unless it carries `upstream-sync`, or a maintainer
+applied the `srt-exception` label AND the PR updates the drift ledger. Never
+suggest editing the ledger as a way to "get past" the gate — the label is a
+human decision, not yours.
 
 - **Never modify `python/sglang/srt/**` for anything a twin or an `xorl/`
   module can hold** — no upstream-default changes, bug fixes, perf work,
