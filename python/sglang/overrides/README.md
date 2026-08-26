@@ -34,11 +34,12 @@ perf work, logging, new modules.
 
 | Tree | What goes there |
 | --- | --- |
-| `python/sglang/overrides/**` | all fork behavior: mirror twins, `__apply_patch__` patches, fork env vars (`environ.py`), fork arg declarations (`arg_groups/overrides.py`), and new supporting modules (underscore-prefixed if internal, e.g. `lora/_moe_padding.py`) |
+| `python/sglang/overrides/**` | changed behavior of modules upstream **does** have: mirror twins, `__apply_patch__` patches, fork env vars (`environ.py`), fork arg declarations (`arg_groups/overrides.py`), and supporting modules for twins (underscore-prefixed if internal, e.g. `lora/_moe_padding.py`) |
+| `python/sglang/xorl/**` | new capability upstream has **no** version of — the finder cannot fire for a module upstream lacks, so additive code lives here (see [docs/xorl-porting-plan.md](../../../docs/xorl-porting-plan.md)) |
 | `test/**` (new files) | fork tests, registered per the `write-sglang-test` skill |
 | `.github/**`, `docker/**`, `docs/**` | fork CI, images, docs |
 
-### Upstream-owned (`python/sglang/srt/**`) — do not modify, with three narrow exceptions
+### Upstream-owned (`python/sglang/srt/**`) — do not modify, with four narrow exceptions
 
 Any PR to `dev` that touches `python/sglang/srt/**` fails the
 `overlay-policy-gate` CI job unless it is one of:
@@ -46,7 +47,13 @@ Any PR to `dev` that touches `python/sglang/srt/**` fails the
 1. **Upstream sync / backport** — a verbatim upstream commit (merge or
    cherry-pick, upstream hash in the message). Label the PR `upstream-sync`.
    This is not drift; no ledger entry.
-2. **Extension-point metadata** — a metadata-only edit that an overlay
+2. **Fork CLI surface** — new `ServerArgs` fields (with `NS(...)` metadata) for
+   fork features. In-tree by necessity: dataclass fields are fixed at class
+   creation and the nine guard tests (two-way namespace coverage, mutation
+   ratchet) pin the file, so no twin can add one. Keep it to the minimum that
+   exposes the feature; the behavior behind the flag lives in `xorl/` or
+   `overrides/`. Requires a ledger entry.
+3. **Extension-point metadata** — a metadata-only edit that an overlay
    declaration requires, upstream's own machinery defines, and that cannot be
    supplied by wrapping a function in a twin. Before reaching for this, check
    the overlay already covers it: the `resolvable` whitelist is extended
@@ -55,19 +62,22 @@ Any PR to `dev` that touches `python/sglang/srt/**` fails the
    metadata read structurally rather than through a wrappable function (e.g.
    `NS(...)` coverage, which two-way lints pin). No default change, no
    behavior change, a comment naming the twin that needs it, and a ledger
-   entry (below) in the same PR.
-3. **Overlay seam** — a minimal, behavior-neutral hook for the rare case the
-   meta-path finder cannot patch cleanly (a symbol captured before patch
-   time, callers that bypass the module object, …). Last resort: restructure
-   the twin first. Requires a ledger entry that says why the twin could not
-   do it.
+   entry in the same PR.
+4. **Deliberate in-tree edit** — the change fits neither `xorl/` (it is not
+   additive) nor a twin (interleaved edits inside a long method would force
+   the twin to copy the method and silently stop tracking upstream fixes; or
+   the finder cannot patch cleanly — a symbol captured before patch time,
+   callers that bypass the module object). Reshape into a replaceable seam
+   first where feasible; take the edit in-tree deliberately, never by
+   accident. Requires a ledger entry that says why neither placement could
+   hold it — that entry is the recurring cost of every future upstream sync,
+   priced in the open.
 
-Everything else goes through the overlay — or lands upstream first and
-arrives here by sync. In particular, these are **not** exceptions: changing a
-default, adding a flag, fixing a bug "just this once", perf tweaks, editing a
-docstring or comment.
+Everything a twin or an `xorl/` module *can* hold is **not** an exception:
+changing an upstream default, fixing an upstream bug "just this once", perf
+tweaks in upstream code paths, docstring or comment edits.
 
-A hard line inside exception 2: never fake metadata by mutating
+A hard line inside exception 3: never fake metadata by mutating
 `ServerArgs.__dataclass_fields__` from a twin — that keeps `srt/` byte-identical
 while making the dataclass lie to everyone who reads it. The sanctioned
 overlay shape is wrapping the *function* that consumes the metadata (the
@@ -92,7 +102,9 @@ from upstream.
 | change or extend an upstream module's behavior | mirror twin + `__apply_patch__` |
 | add a fork env var | `overrides/environ.py` |
 | set a fork default for a CLI arg | declaration in `overrides/arg_groups/overrides.py`; if the field is not yet `resolvable`, add it to `OVERLAY_RESOLVABLE_FIELDS` in `overrides/arg_groups/arg_utils.py` |
-| add a brand-new fork module | put it in `overrides/` next to its consumer |
+| add a fork CLI flag | in-tree `ServerArgs` field with `NS(...)` (exception 2) + ledger entry; behavior behind it in `xorl/` or `overrides/` |
+| add brand-new fork capability (new modules) | `python/sglang/xorl/` — a twin without an upstream counterpart never fires |
+| add a supporting module for a twin | put it in `overrides/` next to its consumer |
 | fix an upstream bug | fix it upstream and sync it back; if urgent, patch via a twin and note the upstream PR in the twin's docstring |
 
 ## Quick start

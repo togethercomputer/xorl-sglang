@@ -72,7 +72,10 @@ Value to XoRL over merge risk. Full inventory and churn figures are in issue #26
 ## Per-feature definition of done
 
 - Its own PR against `dev`, reviewable in one sitting.
-- Placement follows the table above, and any in-tree edit says why it had to be.
+- Placement follows the table above, and any in-tree edit says why it had to
+  be — as a row in the drift ledger
+  (`python/sglang/overrides/UPSTREAM_DRIFT.md`), which the `overlay-policy-gate`
+  CI job requires the PR to update alongside any `python/sglang/srt/**` change.
 - Tests ship with it. A GPU test does **not** run until it is listed in
   `scripts/ci/representative_gpu_tests.txt` — the allowlist disables everything
   it does not name, so an unlisted test file is silently dead.
