@@ -20,6 +20,7 @@ import copy
 import dataclasses
 import json
 import logging
+import math
 import os
 import pickle
 import signal
@@ -125,6 +126,10 @@ from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     PortArgs,
     ServerArgs,
+    is_dsv4_flash_exact_mode,
+    is_glm52_exact_mode,
+    is_qwen3_dense_exact_mode,
+    is_qwen35_gdn_exact_mode,
     set_global_server_args_for_tokenizer,
 )
 from sglang.srt.utils import (
@@ -155,6 +160,55 @@ asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
+
+
+def _get_bi_decode_strict_ingress_violations(
+    obj: GenerateReqInput,
+    preferred_sampling_params: Optional[Dict[str, Any]] = None,
+    *,
+    sampled_logprob_only: bool = False,
+) -> List[str]:
+    """Return request transforms that the exact decode path cannot rescore."""
+    sampling_params = dict(preferred_sampling_params or {})
+    sampling_params.update(obj.sampling_params or {})
+
+    violations = []
+    plain_sampling_defaults = {
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "repetition_penalty": 1.0,
+        "min_new_tokens": 0,
+    }
+    for name, expected in plain_sampling_defaults.items():
+        value = sampling_params.get(name, expected)
+        if value != expected:
+            violations.append(f"{name}={value!r}")
+
+    temperature = sampling_params.get("temperature", 1.0)
+    try:
+        normalized_temperature = float(temperature)
+    except (TypeError, ValueError):
+        normalized_temperature = float("nan")
+    if not math.isfinite(normalized_temperature) or normalized_temperature < 0.0:
+        violations.append(f"temperature={temperature!r}")
+
+    for name in ("json_schema", "regex", "ebnf", "structural_tag", "logit_bias"):
+        if sampling_params.get(name) is not None:
+            violations.append(f"{name}=set")
+
+    if sampling_params.get("mtp_enabled", False):
+        violations.append("mtp_enabled=True")
+    if obj.custom_logit_processor is not None:
+        violations.append("custom_logit_processor=set")
+    if obj.session_params is not None:
+        violations.append("session_params=set")
+    if sampled_logprob_only:
+        if obj.top_logprobs_num not in (None, 0):
+            violations.append(f"top_logprobs_num={obj.top_logprobs_num!r}")
+        if obj.token_ids_logprob:
+            violations.append("token_ids_logprob=set")
+
+    return violations
 
 
 def _reject_missing_dispatched_encoder_embedding(server_args, request_obj, mm_inputs):
@@ -213,6 +267,10 @@ class ReqState:
     abort_requested: bool = False
     lifecycle_id: object = dataclasses.field(default_factory=object)
     dispatched: bool = False
+    sampling_temperature: Optional[float] = None
+    sampling_top_k: Optional[int] = None
+    sampling_top_p: Optional[float] = None
+    sampling_min_p: Optional[float] = None
     last_completion_tokens: int = 1
     ttft_observed: bool = False
 
@@ -361,6 +419,32 @@ def _build_flat_input_top_logprobs_fields_from_arrays(
     fields["input_top_logprobs_shape"] = [val_arr.shape[0], val_arr.shape[1]]
     fields["input_top_logprobs_null_prefix"] = null_prefix
     return fields
+
+
+def _build_raw_token_logprobs_b64_fields(
+    input_values: List[Optional[float]],
+    output_values: List[Optional[float]],
+) -> Dict[str, Any]:
+    """Encode selected-token logprobs without a JSON float round trip.
+
+    Positions with no defined logprob (normally the first prompt token) are
+    represented by the canonical NumPy float32 NaN.  Length fields preserve
+    the position mapping and make the wire format independently auditable.
+    """
+
+    def _encode(values: List[Optional[float]]) -> str:
+        arr = np.asarray(
+            [np.nan if value is None else value for value in values], dtype="<f4"
+        )
+        return pybase64.b64encode(arr.tobytes()).decode("utf-8")
+
+    return {
+        "input_token_logprobs_raw_b64": _encode(input_values),
+        "input_token_logprobs_raw_length": len(input_values),
+        "output_token_logprobs_raw_b64": _encode(output_values),
+        "output_token_logprobs_raw_length": len(output_values),
+        "token_logprobs_raw_b64_dtype": "float32_le",
+    }
 
 
 class InputFormat(Enum):
@@ -1189,6 +1273,37 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 raise ValueError(error_msg)
 
+        # Reject exact-lane request transforms before they can trip the
+        # batch-level, scheduler-fatal sampler assertions on the GPU.
+        exact_qwen35 = is_qwen35_gdn_exact_mode(self.server_args)
+        exact_qwen3 = is_qwen3_dense_exact_mode(self.server_args)
+        exact_glm = is_glm52_exact_mode(self.server_args)
+        exact_dsv4 = is_dsv4_flash_exact_mode(self.server_args)
+        if (exact_qwen35 or exact_qwen3 or exact_glm or exact_dsv4) and isinstance(
+            obj, GenerateReqInput
+        ):
+            violations = _get_bi_decode_strict_ingress_violations(
+                obj,
+                self.preferred_sampling_params,
+                sampled_logprob_only=exact_glm or exact_qwen3,
+            )
+            if violations:
+                contract_name = (
+                    "GLM-5.2"
+                    if exact_glm
+                    else "dense Qwen3" if exact_qwen3 else "Qwen3.5-family"
+                )
+                if exact_dsv4:
+                    contract_name = "DSV4-Flash"
+                raise ValueError(
+                    f"This server runs the exact {contract_name} RL on-policy "
+                    "decode contract; requests must use a finite non-negative "
+                    "temperature (zero selects greedy decoding) "
+                    "sampling without penalties, grammar, "
+                    "logit bias, custom processors, or MTP (incompatible "
+                    "fields: " + ", ".join(violations) + ")"
+                )
+
         # Validate embedding requests
         if isinstance(obj, EmbeddingReqInput) and self.is_generation:
             raise ValueError(
@@ -1380,7 +1495,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
+                return_expert_logits=obj.return_expert_logits,
                 routed_experts_start_len=obj.routed_experts_start_len,
+                return_routed_experts_file=obj.return_routed_experts_file,
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
@@ -1422,8 +1539,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 multi_item_delimiter_indices=obj.multi_item_delimiter_indices,
             )
 
-        tokenized_obj.time_stats = self.rid_to_state[obj.rid].time_stats
-        self.rid_to_state[obj.rid].time_stats.set_tokenize_finish_time()
+        state = self.rid_to_state[obj.rid]
+        if isinstance(obj, GenerateReqInput):
+            # Relay normalized values that the sampler actually consumes,
+            # including preferred parameters and identity defaults.  Exact
+            # trainer replay recomputes support from these parameters and
+            # current logits; it never reuses a behavior-time support mask.
+            state.sampling_temperature = float(sampling_params.temperature)
+            state.sampling_top_k = int(sampling_params.top_k)
+            state.sampling_top_p = float(sampling_params.top_p)
+            state.sampling_min_p = float(sampling_params.min_p)
+        tokenized_obj.time_stats = state.time_stats
+        state.time_stats.set_tokenize_finish_time()
 
         return tokenized_obj
 
@@ -2219,6 +2346,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "weight_version": self.config_value("weight_version"),
                 "num_retractions": recv_obj.retraction_counts[i],
             }
+            if state.sampling_temperature is not None:
+                meta_info["sampling_temperature"] = state.sampling_temperature
+            if state.sampling_top_k is not None:
+                meta_info["sampling_top_k"] = state.sampling_top_k
+            if state.sampling_top_p is not None:
+                meta_info["sampling_top_p"] = state.sampling_top_p
+            if state.sampling_min_p is not None:
+                meta_info["sampling_min_p"] = state.sampling_min_p
 
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
@@ -2304,6 +2439,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["routed_experts"] = val
+            if getattr(recv_obj, "expert_logits", None):
+                val = recv_obj.expert_logits[i]
+                if val is not None:
+                    if isinstance(val, torch.Tensor):
+                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    meta_info["expert_logits"] = val
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:
@@ -2508,6 +2649,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         meta_info["input_token_logprobs"] = state.input_token_logprobs
         meta_info["output_token_logprobs"] = state.output_token_logprobs
         meta_info["output_token_logprobs_length"] = len(state.output_token_logprobs)
+        if state.obj.return_raw_token_logprobs_b64:
+            meta_info.update(
+                _build_raw_token_logprobs_b64_fields(
+                    state.input_token_logprobs_val,
+                    state.output_token_logprobs_val,
+                )
+            )
 
         # 2. Handle top logprobs
         if top_logprobs_num > 0:

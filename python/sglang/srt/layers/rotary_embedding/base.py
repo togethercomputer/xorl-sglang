@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
@@ -31,6 +32,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_QWEN35_CLASS_B_RECOMPILE_LIMIT = 2048
+_QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT = 8192
+
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -40,6 +44,21 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mps = is_mps()
+
+
+def _pin_qwen35_class_b_compile_budget() -> None:
+    """Prevent an exact Class-B run from silently falling back to eager Class A."""
+    config = torch._dynamo.config
+    config.recompile_limit = max(
+        getattr(config, "recompile_limit", 0), _QWEN35_CLASS_B_RECOMPILE_LIMIT
+    )
+    config.accumulated_recompile_limit = max(
+        getattr(config, "accumulated_recompile_limit", 0),
+        _QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT,
+    )
+    if hasattr(config, "fail_on_recompile_limit_hit"):
+        config.fail_on_recompile_limit_hit = True
+
 
 if _is_cuda:
     from sglang.kernels.ops.attention.rope import apply_rope_with_cos_sin_cache_inplace
@@ -95,7 +114,7 @@ class RotaryEmbedding(MultiPlatformOp):
         self.is_neox_style = is_neox_style
         self.dtype = dtype
 
-        cache = self._compute_cos_sin_cache()
+        cache = self._build_cos_sin_cache()
         # NOTE(ByronHsu): cache needs to be in FP32 for numerical stability.
         if not (_is_cuda or _is_xpu or envs.SGLANG_ROPE_CACHE_FP32.get()):
             cache = cache.to(dtype)
@@ -129,12 +148,42 @@ class RotaryEmbedding(MultiPlatformOp):
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
         # XXX (MUSA): Implement sgl_kernel.rotary_embedding support for MUSA backend
-        if get_exec().deterministic.rl_on_policy_target is not None or _is_musa:
+        deterministic = get_exec().deterministic
+        if deterministic.rl_on_policy_target is not None or _is_musa:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(
-                dynamic=True,
-                disable=_is_npu,
-            )(apply_rotary_emb)
+            # Both GLM-5.2 and exact Qwen3.5-family serving use the compiled
+            # Class-B expression selected by their architecture contracts.
+            if not deterministic.qwen35_gdn_exact_mode or getattr(
+                deterministic, "qwen35_rope_class_b", False
+            ):
+                self._apply_rotary_emb_wrapped = torch.compile(
+                    dynamic=True,
+                    disable=_is_npu,
+                )(apply_rotary_emb)
+        if getattr(deterministic, "qwen35_rope_class_b", False):
+            if not deterministic.qwen35_gdn_exact_mode:
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE requires exact Qwen mode"
+                )
+            if not _is_cuda:
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE is qualified only on CUDA"
+                )
+            if dtype is not torch.bfloat16 or not is_neox_style:
+                raise RuntimeError(
+                    "Qwen3.5-family Class-B RoPE requires BF16 and the "
+                    "Neox half-split feature layout"
+                )
+            _pin_qwen35_class_b_compile_budget()
+            logger.info(
+                "Qwen3.5-family Class-B RoPE runtime engaged: "
+                "CPU-built fp32 table + compiled fp32-chain application; "
+                "recompile_limit=%s accumulated_recompile_limit=%s "
+                "fail_on_recompile_limit_hit=%s",
+                torch._dynamo.config.recompile_limit,
+                torch._dynamo.config.accumulated_recompile_limit,
+                getattr(torch._dynamo.config, "fail_on_recompile_limit_hit", None),
+            )
         self.position_cos, self.position_sin = None, None
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
@@ -146,14 +195,66 @@ class RotaryEmbedding(MultiPlatformOp):
         ):
             self.cos_sin_cache = self.cos_sin_cache.to(query.device, dtype=query.dtype)
 
+    def _cos_sin_cache_device(self) -> Optional[torch.device]:
+        """Device on which the full cos/sin table must be evaluated.
+
+        GLM-5.2 uses its certified split recipe: inverse frequencies are
+        computed on CPU, then the outer product and cos/sin run on the ambient
+        CUDA device. Other RL targets, including Qwen3.5-family exact serving,
+        evaluate the complete table on CPU.
+        """
+        deterministic = get_exec().deterministic
+        if deterministic.glm52_exact_mode:
+            return None
+        if deterministic.rl_on_policy_target is not None:
+            return torch.device("cpu")
+        return None
+
+    def _cos_sin_cache_pin(self):
+        """Install the table provenance device as the ambient default."""
+        pin = self._cos_sin_cache_device()
+        return contextlib.nullcontext() if pin is None else torch.device(pin)
+
+    def _cos_sin_cache_work_device(
+        self, default: Union[torch.device, str, None]
+    ) -> Union[torch.device, str, None]:
+        """Return the pinned provenance device, or ``default`` when unpinned."""
+        pin = self._cos_sin_cache_device()
+        return default if pin is None else pin
+
+    def _cos_sin_cache_out_device(self) -> torch.device:
+        """Device on which a table built under a provenance pin is stored."""
+        return (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+
+    def _build_cos_sin_cache(self) -> torch.Tensor:
+        """Build the table once under the selected architecture provenance."""
+        pin = self._cos_sin_cache_device()
+        with self._cos_sin_cache_pin():
+            cache = self._compute_cos_sin_cache()
+        if pin is None:
+            return cache
+        if cache.device.type != pin.type:
+            raise RuntimeError(
+                f"{type(self).__name__} evaluated its cos/sin table on "
+                f"{cache.device}, but the table is pinned to {pin}. Build it on "
+                "the selected provenance device or override the shared "
+                "_cos_sin_cache_* hooks."
+            )
+        return cache.to(device=self._cos_sin_cache_out_device())
+
     def _compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
         """Compute the inverse frequency."""
         # NOTE(woosuk): To exactly match the HF implementation, we need to
         # use CPU to compute the cache and then move it to GPU. However, we
         # create the cache on GPU for faster initialization. This may cause
         # a slight numerical difference between the HF implementation and ours.
+        deterministic = get_exec().deterministic
         init_device = (
-            "cpu" if get_exec().deterministic.rl_on_policy_target is not None else None
+            torch.device("cpu")
+            if deterministic.glm52_exact_mode
+            else self._cos_sin_cache_device()
         )
         inv_freq = 1.0 / (
             base
@@ -164,26 +265,56 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if get_exec().deterministic.rl_on_policy_target is not None:
-            inv_freq = inv_freq.cuda()
+        if deterministic.glm52_exact_mode:
+            inv_freq = inv_freq.to(device=self._cos_sin_cache_out_device())
         return inv_freq
 
-    def _compute_cos_sin_cache(self) -> torch.Tensor:
-        """Compute the cos and sin cache."""
-        inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
+        """Inverse frequencies used by both initial construction and growth."""
+        return self._compute_inv_freq(self.base)
 
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+    def _cos_sin_cache_mscale(self) -> float:
+        """Magnitude scale applied to both cos and sin rows."""
+        return 1.0
+
+    def _cos_sin_cache_positions(self) -> torch.Tensor:
+        """Positions covered by the initial table."""
+        return torch.arange(self.max_position_embeddings, dtype=torch.float)
+
+    def _cos_sin_cache_extra_positions(self, start: int, stop: int) -> torch.Tensor:
+        """Positions appended during non-exact cache growth."""
+        return torch.arange(start, stop, dtype=torch.float)
+
+    def _cos_sin_cache_rows(
+        self, positions: torch.Tensor, inv_freq: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate cos/sin rows using the shared construction recipe."""
+        freqs = torch.einsum("i,j -> ij", positions, inv_freq)
         cos = freqs.cos()
         sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
-        return cache
+        mscale = self._cos_sin_cache_mscale()
+        if mscale != 1.0:
+            cos = cos * mscale
+            sin = sin * mscale
+        return torch.cat((cos, sin), dim=-1)
+
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        """Compute the initial table through the shared recipe hooks."""
+        return self._cos_sin_cache_rows(
+            self._cos_sin_cache_positions(), self._cos_sin_cache_inv_freq()
+        )
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
         """Ensure cos_sin_cache length > needed_max_pos."""
         cur_len = int(self.cos_sin_cache.shape[0])
         if needed_max_pos < cur_len:
             return
+        if getattr(self, "glm52_exact_prebuilt_only", False):
+            raise RuntimeError(
+                "exact GLM-5.2 mode requires positions within the prebuilt "
+                f"RoPE cache (len {cur_len}); position {needed_max_pos} is "
+                "outside the certified envelope"
+            )
 
         # Align to reduce realloc frequency
         align = envs.SGLANG_ROPE_CACHE_ALIGN.get()
@@ -191,19 +322,18 @@ class RotaryEmbedding(MultiPlatformOp):
         device = self.cos_sin_cache.device
         dtype = self.cos_sin_cache.dtype
 
-        # Compute inv_freq on same device
-        inv_freq = self._compute_inv_freq(self.base).to(device=device)
-
-        # Incremental computation for new positions only
-        start = cur_len
-        t_new = torch.arange(start, new_len, dtype=inv_freq.dtype, device=device)
-        if t_new.numel() == 0:
-            return
-
-        freqs_new = torch.einsum("i,j->ij", t_new, inv_freq)
-        cos_new = freqs_new.cos()
-        sin_new = freqs_new.sin()
-        new_rows = torch.cat((cos_new, sin_new), dim=-1).to(dtype=dtype)
+        # Growth outside exact GLM mode must use the same frequencies,
+        # magnitude scale, and provenance as the initial table.
+        compute_device = self._cos_sin_cache_work_device(device)
+        with self._cos_sin_cache_pin():
+            inv_freq = self._cos_sin_cache_inv_freq().to(device=compute_device)
+            t_new = self._cos_sin_cache_extra_positions(cur_len, new_len).to(
+                device=compute_device
+            )
+            if t_new.numel() == 0:
+                return
+            new_rows = self._cos_sin_cache_rows(t_new, inv_freq)
+        new_rows = new_rows.to(dtype=dtype, device=device)
 
         # Update cache with new rows
         self.cos_sin_cache = torch.cat((self.cos_sin_cache, new_rows), dim=0).to(

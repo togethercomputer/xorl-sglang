@@ -26,6 +26,7 @@ from sglang.srt.layers.rotary_embedding.rope_variant import (
     Phi3LongRoPEScaledRotaryEmbedding,
 )
 from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import get_bool_env_var, is_hip
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,9 @@ def get_rope(
         rope_scaling_args,
         dual_chunk_attention_args,
         dtype,
+        # Exact Qwen installs the architecture-selected Class-B application
+        # program on the shared module. Keep it isolated from generic entries.
+        bool(getattr(get_exec().deterministic, "qwen35_rope_class_b", False)),
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
