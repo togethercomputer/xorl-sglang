@@ -53,22 +53,11 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_layers
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from sglang.xorl.bi import RMS_NORM_FAMILY_RESIDUAL_TREE
 
 Qwen2Config = None
 
 
 logger = logging.getLogger(__name__)
-
-
-def _is_qwen3_dense_exact_runtime() -> bool:
-    return bool(
-        getattr(
-            get_exec().deterministic,
-            "qwen3_dense_exact_mode",
-            False,
-        )
-    )
 
 
 class Qwen2MLP(nn.Module):
@@ -97,7 +86,8 @@ class Qwen2MLP(nn.Module):
         )
         if hidden_act != "silu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. Only silu is supported for now."
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
 
@@ -330,7 +320,6 @@ class Qwen2Model(nn.Module):
         self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        qwen3_exact = _is_qwen3_dense_exact_runtime()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
@@ -341,10 +330,7 @@ class Qwen2Model(nn.Module):
                 prefix=add_prefix("embed_tokens", prefix),
                 params_dtype=(
                     torch.float32
-                    if (
-                        get_exec().deterministic.rl_on_policy_target is not None
-                        and not qwen3_exact
-                    )
+                    if get_exec().deterministic.rl_on_policy_target is not None
                     else None
                 ),
             )
@@ -374,18 +360,14 @@ class Qwen2Model(nn.Module):
         )
         if self.pp_group.is_last_rank:
             norm_kwargs = (
-                {"batch_invariant_family": RMS_NORM_FAMILY_RESIDUAL_TREE}
-                if qwen3_exact
-                else (
-                    dict(
-                        weight_dtype=torch.float32,
-                        cast_x_before_out_mul=True,
-                        override_orig_dtype=torch.float32,
-                        fp32_residual=True,
-                    )
-                    if get_exec().deterministic.rl_on_policy_target is not None
-                    else {}
+                dict(
+                    weight_dtype=torch.float32,
+                    cast_x_before_out_mul=True,
+                    override_orig_dtype=torch.float32,
+                    fp32_residual=True,
                 )
+                if get_exec().deterministic.rl_on_policy_target is not None
+                else {}
             )
             self.norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
@@ -413,6 +395,7 @@ class Qwen2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -476,7 +459,7 @@ class Qwen2Model(nn.Module):
                 layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
-                    "Self attention has no KV cache scaling factor attribute!"
+                    "Self attention has no KV cache scaling " "factor attribute!"
                 )
 
 

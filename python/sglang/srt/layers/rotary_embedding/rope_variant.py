@@ -377,9 +377,8 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
             self._forward_method = self.forward_native
 
     def _compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
-        device = self._cos_sin_cache_work_device(self.device)
         pos_freqs = self.base ** (
-            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=device)
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=self.device)
             / self.rotary_dim
         )
         inv_freq_extrapolation = 1.0 / pos_freqs
@@ -394,7 +393,7 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_mask = (
             1
             - yarn_linear_ramp_mask(
-                low, high, self.rotary_dim // 2, dtype=torch.float, device=device
+                low, high, self.rotary_dim // 2, dtype=torch.float, device=self.device
             )
         ) * self.extrapolation_factor
         inv_freq = (
@@ -403,28 +402,21 @@ class DeepseekScalingRotaryEmbedding(RotaryEmbedding):
         )
         return inv_freq
 
-    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
-        return self._compute_inv_freq(self.scaling_factor)
-
-    def _cos_sin_cache_mscale(self) -> float:
-        return self.mscale
-
-    def _cos_sin_cache_positions(self) -> torch.Tensor:
-        return torch.arange(
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        inv_freq = self._compute_inv_freq(self.scaling_factor)
+        t = torch.arange(
             self.max_position_embeddings * self.scaling_factor,
-            device=self._cos_sin_cache_work_device(self.device),
+            device=self.device,
             dtype=torch.float32,
         )
-
-    def _build_cos_sin_cache(self) -> torch.Tensor:
-        cache = super()._build_cos_sin_cache()
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos() * self.mscale
+        sin = freqs.sin() * self.mscale
+        cache = torch.cat((cos, sin), dim=-1)
         if _is_npu:
-            # These NPU-only buffers hold the same rows at doubled width;
-            # derive them from the finished table so they preserve its device
-            # and provenance without duplicating the cache on other backends.
-            cos, sin = cache.chunk(2, dim=-1)
-            self.cos_cached_total = torch.cat((cos, cos), dim=-1)
-            self.sin_cached_total = torch.cat((sin, sin), dim=-1)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            self.cos_cached_total = torch.cos(emb) * self.mscale
+            self.sin_cached_total = torch.sin(emb) * self.mscale
         return cache
 
     def get_cos_cached_total(self):
@@ -669,11 +661,18 @@ class DynamicNTKAlphaRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
+        max_len = self.max_position_embeddings
         base = self.base * self.scaling_alpha ** (
             self.rotary_dim / (self.rotary_dim - 2)
         )
-        return self._compute_inv_freq(base)
+        inv_freq = self._compute_inv_freq(base)
+        t = torch.arange(max_len, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
 
 
 class DualChunkRotaryEmbedding(MultiPlatformOp):
@@ -855,18 +854,19 @@ class DynamicNTKScalingRotaryEmbedding(RotaryEmbedding):
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
 
-    def _cos_sin_cache_inv_freq(self) -> torch.Tensor:
+    def _compute_cos_sin_cache(self) -> torch.Tensor:
         max_len = self.max_position_embeddings * self.scaling_factor
         base = self.base * (
             (self.scaling_factor * max_len / self.max_position_embeddings)
             - (self.scaling_factor - 1)
         ) ** (self.rotary_dim / (self.rotary_dim - 2))
-        return self._compute_inv_freq(base)
-
-    def _cos_sin_cache_positions(self) -> torch.Tensor:
-        return torch.arange(
-            self.max_position_embeddings * self.scaling_factor, dtype=torch.float
-        )
+        inv_freq = self._compute_inv_freq(base)
+        t = torch.arange(max_len, dtype=torch.float)
+        freqs = torch.einsum("i,j -> ij", t, inv_freq)
+        cos = freqs.cos()
+        sin = freqs.sin()
+        cache = torch.cat((cos, sin), dim=-1)
+        return cache
 
 
 class Gemma4RotaryEmbedding(RotaryEmbedding):

@@ -681,7 +681,15 @@ def test_qwen35_rmsnorm_family_survives_worker_config_reconstruction():
         qwen35_gdn_exact_mode=True,
         qwen35_rmsnorm_family="v2",
     )
-    with patch.object(qwen, "get_server_args", return_value=runtime_args):
+    # The resolved family is read from the exec bag (the field carries
+    # NS("exec.deterministic")); get_server_args() gates exact mode only.
+    runtime_exec = SimpleNamespace(
+        deterministic=SimpleNamespace(qwen35_rmsnorm_family="v2")
+    )
+    with (
+        patch.object(qwen, "get_server_args", return_value=runtime_args),
+        patch.object(qwen, "get_exec", return_value=runtime_exec),
+    ):
         assert qwen._qwen35_rmsnorm_family(SimpleNamespace()) == "v2"
 
 

@@ -35,10 +35,6 @@ from sglang.srt.models.qwen2 import Qwen2Model
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
-from sglang.xorl.bi import (
-    RMS_NORM_FAMILY_NO_RESIDUAL,
-    RMS_NORM_FAMILY_RESIDUAL_TREE,
-)
 
 Qwen3Config = None
 
@@ -110,18 +106,13 @@ class Qwen3Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_parallel().tp_rank
 
-        qwen3_exact = getattr(get_exec().deterministic, "qwen3_dense_exact_mode", False)
         norm_kwargs = (
-            dict(batch_invariant_family=RMS_NORM_FAMILY_NO_RESIDUAL)
-            if qwen3_exact
-            else (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                )
-                if get_exec().deterministic.rl_on_policy_target is not None
-                else {}
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
             )
+            if get_exec().deterministic.rl_on_policy_target is not None
+            else {}
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
@@ -364,44 +355,21 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        qwen3_exact = getattr(get_exec().deterministic, "qwen3_dense_exact_mode", False)
         norm_kwargs = (
-            None
-            if qwen3_exact
-            else (
-                dict(
-                    weight_dtype=torch.float32,
-                    cast_x_before_out_mul=True,
-                    override_orig_dtype=torch.float32,
-                    fp32_residual=True,
-                )
-                if get_exec().deterministic.rl_on_policy_target is not None
-                else {}
+            dict(
+                weight_dtype=torch.float32,
+                cast_x_before_out_mul=True,
+                override_orig_dtype=torch.float32,
+                fp32_residual=True,
             )
+            if get_exec().deterministic.rl_on_policy_target is not None
+            else {}
         )
         self.input_layernorm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            **(
-                {
-                    "batch_invariant_family": (
-                        RMS_NORM_FAMILY_NO_RESIDUAL
-                        if layer_id == 0
-                        else RMS_NORM_FAMILY_RESIDUAL_TREE
-                    )
-                }
-                if qwen3_exact
-                else norm_kwargs
-            ),
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            **(
-                {"batch_invariant_family": RMS_NORM_FAMILY_RESIDUAL_TREE}
-                if qwen3_exact
-                else norm_kwargs
-            ),
+            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(

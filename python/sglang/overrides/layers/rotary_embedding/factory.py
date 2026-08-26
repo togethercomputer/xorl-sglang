@@ -1,64 +1,17 @@
-"""Factory functions: get_rope, get_rope_cpu, get_rope_wrapper."""
+"""Override twin of ``sglang.srt.layers.rotary_embedding.factory`` -- xorl exact serving (zero-srt port of PR #41).
+
+Verbatim copies of the retired in-tree edits. Copies live at module top level
+(collision-proof ``_Cls__name`` def names for methods) so cross-references stay
+module-global, and every attach goes through ``rebind`` so the copy resolves
+names via the PATCHED srt module's live dict -- identical to in-tree, including
+monkeypatching and ``global`` writes. Replaced/removed upstream symbols are
+pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
+upstream sync, re-derive the copies and re-pin.
+"""
 
 from __future__ import annotations
 
-import logging
-from typing import Any, Dict, Optional, Tuple
-
-import torch
-
-from sglang.srt.layers.rotary_embedding.base import (
-    LinearScalingRotaryEmbedding,
-    RotaryEmbedding,
-)
-from sglang.srt.layers.rotary_embedding.mrope import (
-    MRotaryEmbedding,
-    YaRNScalingMRotaryEmbedding,
-)
-from sglang.srt.layers.rotary_embedding.rope_variant import (
-    DeepseekScalingRotaryEmbedding,
-    DualChunkRotaryEmbedding,
-    DynamicNTKAlphaRotaryEmbedding,
-    DynamicNTKScalingRotaryEmbedding,
-    FourierRotaryEmbedding,
-    Gemma4RotaryEmbedding,
-    Llama3RotaryEmbedding,
-    Phi3LongRoPEScaledRotaryEmbedding,
-)
-from sglang.srt.layers.rotary_embedding.yarn import YaRNScalingRotaryEmbedding
-from sglang.srt.utils import get_bool_env_var, is_hip
-
-logger = logging.getLogger(__name__)
-
-
-def _get_rope_param(rope_scaling, key, default, scaling_type):
-    """Get a parameter from rope_scaling dict, warn if missing.
-
-    In transformers v5, config.rope_scaling is an alias for rope_parameters
-    which may be non-None even for models with no actual scaling (rope_type=default).
-    When a required key is missing, this logs a warning instead of silently
-    defaulting, to make config mismatches easier to debug.
-    """
-    if key in rope_scaling:
-        return rope_scaling[key]
-    logger.warning(
-        "rope_scaling (type=%s) missing key '%s', defaulting to %s. "
-        "This may indicate a v5 config issue — check model accuracy.",
-        scaling_type,
-        key,
-        default,
-    )
-    return default
-
-
-_is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-if _use_aiter:
-    from aiter.rotary_embedding import get_rope as aiter_get_rope
-
-_ROPE_DICT: Dict[Tuple, RotaryEmbedding] = {}
-
+from sglang.overrides._twin_bind import rebind
 
 def get_rope(
     head_size: int,
@@ -102,6 +55,9 @@ def get_rope(
         rope_scaling_args,
         dual_chunk_attention_args,
         dtype,
+        # Exact Qwen installs the architecture-selected Class-B application
+        # program on the shared module. Keep it isolated from generic entries.
+        bool(getattr(get_exec().deterministic, "qwen35_rope_class_b", False)),
     )
     if key in _ROPE_DICT:
         return _ROPE_DICT[key]
@@ -349,110 +305,12 @@ def get_rope(
     return rotary_emb
 
 
-def get_rope_cpu(
-    head_size: int,
-    rotary_dim: int,
-    max_position: int,
-    base: int,
-    is_neox_style: bool = True,
-    rope_scaling: Optional[Dict[str, Any]] = None,
-    dtype: Optional[torch.dtype] = None,
-    partial_rotary_factor: float = 1.0,
-    device: Optional[str] = None,
-) -> RotaryEmbedding:
-    if dtype is None:
-        dtype = torch.get_default_dtype()
-    if rope_scaling is not None:
-        rope_scaling_tuple = {
-            k: tuple(v) if isinstance(v, list) else v for k, v in rope_scaling.items()
-        }
-        rope_scaling_args = tuple(rope_scaling_tuple.items())
-    else:
-        rope_scaling_args = None
-    if partial_rotary_factor < 1.0:
-        rotary_dim = int(rotary_dim * partial_rotary_factor)
-    key = (
-        head_size,
-        rotary_dim,
-        max_position,
-        base,
-        is_neox_style,
-        rope_scaling_args,
-        dtype,
-    )
-    if key in _ROPE_DICT:
-        return _ROPE_DICT[key]
-
-    assert rope_scaling is not None
-    scaling_type = rope_scaling["rope_type"]
-    assert (
-        scaling_type == "deepseek_yarn"
-    ), "Only deepseek_yarn is supported for CPU for now"
-
-    scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
-    original_max_position = _get_rope_param(
-        rope_scaling, "original_max_position_embeddings", max_position, scaling_type
-    )
-    extra_kwargs = {
-        k: v
-        for k, v in rope_scaling.items()
-        if k
-        in (
-            "extrapolation_factor",
-            "attn_factor",
-            "beta_fast",
-            "beta_slow",
-            "mscale",
-            "mscale_all_dim",
-        )
-    }
-    extra_kwargs["device"] = device
-    rotary_emb = DeepseekScalingRotaryEmbedding(
-        head_size,
-        rotary_dim,
-        original_max_position,
-        base,
-        is_neox_style,
-        scaling_factor,
-        dtype,
-        **extra_kwargs,
-    )
-    _ROPE_DICT[key] = rotary_emb
-    return rotary_emb
-
-
-def get_rope_wrapper(
-    head_size: int,
-    rotary_dim: int,
-    max_position: int,
-    base: int,
-    is_neox_style: bool = True,
-    rope_scaling: Optional[Dict[str, Any]] = None,
-    dtype: Optional[torch.dtype] = None,
-    partial_rotary_factor: float = 1.0,
-    device: Optional[str] = None,
-):
-    if device != "cpu":
-        wrapper = aiter_get_rope if _use_aiter else get_rope
-        return wrapper(
-            head_size,
-            rotary_dim,
-            max_position,
-            base,
-            is_neox_style,
-            rope_scaling,
-            dtype,
-            partial_rotary_factor,
-        )
-
-    return get_rope_cpu(
-        head_size,
-        rotary_dim,
-        max_position,
-        base,
-        is_neox_style,
-        rope_scaling,
-        dtype,
-        partial_rotary_factor,
-        device,
-    )
+def __apply_patch__(mod):
+    # Deferred: the finder imports twins under bypass(), so sglang imports at
+    # twin top level would cache modules UNPATCHED. Import here (bypass off)
+    # and publish onto mod -- in-tree these were the file's module globals.
+    from sglang.srt.runtime_context import get_exec
+    for _n, _v in list(locals().items()):
+        if _n != "mod":
+            setattr(mod, _n, _v)
+    mod.get_rope = rebind(get_rope, mod)

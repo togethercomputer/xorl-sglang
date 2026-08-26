@@ -113,6 +113,50 @@ upstream.
 | add a supporting module for a twin | put it in `overrides/` next to its consumer |
 | fix an upstream bug | fix it upstream and sync it back; if urgent, patch via a twin and note the upstream PR in the twin's docstring |
 
+## Writing a replacement twin (hard rules)
+
+Learned converting the exact-serving port (#41) to zero-srt; violating any of
+these produces silent misbehavior, not errors.
+
+1. **No `sglang.*` imports at twin top level** (self-imports of the module
+   being patched excepted — it is already in `sys.modules`). The finder
+   imports twins under `bypass()`, so any other srt module first imported
+   there is cached **permanently unpatched**. Import inside
+   `__apply_patch__` (bypass is off there) and publish the names onto `mod`.
+2. **Rebind every verbatim copy over the live module dict**
+   (`_twin_bind.rebind`). Twin globals are a snapshot; the in-tree original
+   resolved through the srt module's live dict — which is also what makes
+   `monkeypatch.setattr(srt_mod, ...)`, runtime rebinding, and `global`
+   writes behave identically. Publish every port-added import, constant, and
+   helper onto `mod`: rebound copies resolve *only* through it.
+3. **Copies live at twin module top level** (collision-proof `_Cls__name` def
+   names; `rebind(..., name=...)` restores the real name). Defining them
+   inside a `_patch_*` function turns sibling references into closure
+   freevars — the copy then calls the unrebound twin-local sibling and
+   silently bypasses `mod` publication and test patches.
+4. **`super()` must be two-arg** in copied methods (`super(Cls, self)`,
+   resolved via the rebound globals): the zero-arg form needs the `__class__`
+   cell that only exists for methods defined lexically in a class body.
+5. **Twin package `__init__.py` files define a no-op `__apply_patch__`** —
+   otherwise default name-copy shadows real srt submodules with twin modules
+   (see `overrides/lora/__init__.py`).
+6. **Pin every replaced or removed upstream symbol** in `_twin_pins.py`;
+   `test_overlay_twin_pins.py` turns upstream drift under a copy into a
+   visible CI failure with re-derivation instructions.
+7. **Dataclass fields cannot be patched in** — replace the class with a
+   module-level subclass (pickle across process boundaries resolves it by
+   import path; kwargs-only construction makes append-order safe). For
+   `ServerArgs`, resolution-pipeline seams are handled by extending the
+   named handler that precedes the seam, or by carrying the enclosing
+   handler as a pinned copy — never by copying `__post_init__`.
+8. **Decorator-registered handlers** (FastAPI routes) hold the original
+   function object — swap `fn.__code__` instead of rebinding the module
+   attribute (both sides must have no freevars).
+9. **Brand-new `srt`-namespace modules cannot be twinned** (the finder only
+   patches modules upstream has). Serve a legacy import path via the lazy
+   alias finder in `patches/module_aliases.py`, or place new capability in
+   `sglang/xorl/`.
+
 ## Quick start
 
 1. Enable the override finder early, before anything imports `sglang.srt`:

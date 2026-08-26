@@ -15,7 +15,7 @@
 
 import logging
 from functools import lru_cache
-from typing import Literal, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -25,13 +25,6 @@ from sglang.srt.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     rms_norm_batch_invariant,
 )
-
-# is_batch_invariant_op_enabled is installed onto the upstream module by the
-# sglang.overrides twin (op-gated batch-invariant mode); importing it through
-# the srt path keeps this file identical to main's import surface.
-from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
-    is_batch_invariant_op_enabled,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -40,11 +33,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.server_args import (
-    get_global_server_args,
-    is_glm52_exact_mode,
-    is_qwen3_dense_exact_mode,
-)
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
@@ -55,15 +43,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_xpu,
-)
-from sglang.xorl.batch_invariant import resolve_or_validate_xorl_bi_family
-from sglang.xorl.bi import (
-    RMS_NORM_FAMILIES,
-    RMS_NORM_FAMILY_NO_RESIDUAL,
-    RMSNormFamily,
-    bi_fused_add_rms_norm,
-    bi_rms_norm,
-    rms_norm_v2,
 )
 
 _is_cuda = is_cuda()
@@ -387,22 +366,12 @@ class RMSNorm(MultiPlatformOp):
         weight_dtype: Optional = None,
         override_orig_dtype: Optional = None,
         x_pad_to_multiple: int = 0,
-        batch_invariant_family: Optional[RMSNormFamily] = None,
     ) -> None:
         super().__init__()
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
         self.override_orig_dtype = override_orig_dtype
-        if (
-            batch_invariant_family is not None
-            and batch_invariant_family not in RMS_NORM_FAMILIES
-        ):
-            raise ValueError(
-                f"Unknown RMSNorm family {batch_invariant_family!r}; "
-                f"expected one of {RMS_NORM_FAMILIES}"
-            )
-        self.batch_invariant_family = batch_invariant_family
         if self.has_weight:
             self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
         else:
@@ -453,16 +422,11 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            server_args = get_global_server_args()
-            if is_glm52_exact_mode(server_args) or is_qwen3_dense_exact_mode(
-                server_args
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
             ):
-                return self._forward_xorl_batch_invariant(
-                    x,
-                    residual,
-                    post_residual_addition,
-                )
-            if residual is not None or self.cast_x_before_out_mul:
                 return self.forward_native(x, residual, post_residual_addition)
             out = rms_norm_batch_invariant(
                 x,
@@ -524,70 +488,6 @@ class RMSNorm(MultiPlatformOp):
             out = out.reshape(original_shape)
         return out
 
-    def _forward_xorl_batch_invariant(
-        self,
-        x: torch.Tensor,
-        residual: Optional[torch.Tensor],
-        post_residual_addition: Optional[torch.Tensor],
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        family = self.batch_invariant_family
-        if family is None:
-            raise RuntimeError(
-                "The XORL batch-invariant target reached an RMSNorm site without "
-                "an explicit batch_invariant_family."
-            )
-        if family == RMS_NORM_FAMILY_NO_RESIDUAL and residual is not None:
-            raise RuntimeError(
-                "An XORL no-residual RMSNorm site received a residual stream."
-            )
-        if post_residual_addition is not None:
-            raise RuntimeError(
-                "The XORL batch-invariant RMSNorm contract does not support "
-                "post_residual_addition."
-            )
-        if self.override_orig_dtype is not None or self.fp32_residual:
-            raise RuntimeError(
-                "The XORL batch-invariant RMSNorm contract does not support "
-                "override_orig_dtype or fp32_residual."
-            )
-        if not self.has_weight:
-            raise RuntimeError(
-                "The XORL batch-invariant RMSNorm contract requires a learned weight."
-            )
-        if x.dtype != torch.bfloat16 or self.weight.dtype != torch.bfloat16:
-            raise RuntimeError(
-                "The XORL batch-invariant RMSNorm contract requires BF16 input "
-                f"and weight, got {x.dtype} and {self.weight.dtype}."
-            )
-        if residual is not None and residual.dtype != torch.bfloat16:
-            raise RuntimeError(
-                "The XORL batch-invariant RMSNorm contract requires a BF16 residual, "
-                f"got {residual.dtype}."
-            )
-
-        version = resolve_or_validate_xorl_bi_family(None)
-        if version == "v2":
-            return rms_norm_v2(
-                x,
-                self.weight.data,
-                self.variance_epsilon,
-                residual=residual,
-            )
-        if residual is not None:
-            return bi_fused_add_rms_norm(
-                x,
-                residual,
-                self.weight.data,
-                self.variance_epsilon,
-                family=family,
-            )
-        return bi_rms_norm(
-            x,
-            self.weight.data,
-            self.variance_epsilon,
-            family=family,
-        )
-
     def forward_npu(
         self,
         x: torch.Tensor,
@@ -632,6 +532,7 @@ class RMSNorm(MultiPlatformOp):
             if (
                 residual is not None
                 or self.cast_x_before_out_mul
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
                 or (self._fused_pad_kernel is not None and self.x_pad_to_multiple > 0)
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -689,7 +590,11 @@ class RMSNorm(MultiPlatformOp):
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():
-            if residual is not None or self.cast_x_before_out_mul:
+            if (
+                residual is not None
+                or self.cast_x_before_out_mul
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
+            ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
@@ -815,7 +720,10 @@ class RMSNorm(MultiPlatformOp):
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
-            if residual is not None:
+            if (
+                residual is not None
+                or get_exec().deterministic.rl_on_policy_target == "fsdp"
+            ):
                 return self.forward_native(x, residual, post_residual_addition)
             return rms_norm_batch_invariant(
                 x,
@@ -946,37 +854,15 @@ class LayerNorm(MultiPlatformOp):
             return self.forward_native(x)
 
 
-def _validate_qwen_v2_norm_tensor(
-    tensor: torch.Tensor, *, name: str, shape: torch.Size | None = None
-) -> None:
-    if tensor.dtype != torch.bfloat16 or not tensor.is_cuda:
-        raise RuntimeError(
-            f"The Qwen families-v2 RMSNorm program requires CUDA BF16 {name}; "
-            f"got device={tensor.device}, dtype={tensor.dtype}."
-        )
-    if shape is not None and tensor.shape != shape:
-        raise RuntimeError(
-            f"The Qwen families-v2 RMSNorm program requires {name} shape {tuple(shape)}, "
-            f"got {tuple(tensor.shape)}."
-        )
-
-
 class GemmaRMSNorm(MultiPlatformOp):
     def __init__(
         self,
         hidden_size: int,
         eps: float = 1e-6,
-        xorl_batch_invariant_version: Optional[Literal["v1", "v2"]] = None,
     ) -> None:
         super().__init__()
-        if xorl_batch_invariant_version not in (None, "v1", "v2"):
-            raise ValueError(
-                "GemmaRMSNorm xorl_batch_invariant_version must be None, 'v1', or 'v2'; "
-                f"got {xorl_batch_invariant_version!r}."
-            )
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
-        self.xorl_batch_invariant_version = xorl_batch_invariant_version
         self.register_buffer(
             "gemma_weight", torch.ones_like(self.weight), persistent=False
         )
@@ -1039,62 +925,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        if self.xorl_batch_invariant_version == "v2":
-            if (
-                not is_batch_invariant_mode_enabled()
-                or not is_batch_invariant_op_enabled("rms_norm")
-            ):
-                raise RuntimeError(
-                    "The Qwen families-v2 RMSNorm program requires the exact batch-invariant "
-                    "rms_norm contract to be engaged."
-                )
-            _validate_qwen_v2_norm_tensor(x, name="input")
-            if post_residual_addition is not None:
-                raise RuntimeError(
-                    "The Qwen families-v2 RMSNorm program does not admit post_residual_addition."
-                )
-            original_shape = x.shape
-            x_2d = x.reshape(-1, original_shape[-1])
-            if x_2d.stride(-1) != 1:
-                x_2d = x_2d.contiguous()
-            if residual is None:
-                out = rms_norm_v2(
-                    x_2d,
-                    self.weight.data,
-                    self.variance_epsilon,
-                    zero_centered=True,
-                )
-                return out.reshape(original_shape)
-            _validate_qwen_v2_norm_tensor(residual, name="residual", shape=x.shape)
-            residual_2d = residual.reshape(-1, original_shape[-1])
-            if residual_2d.stride(-1) != 1:
-                residual_2d = residual_2d.contiguous()
-            out, residual_out = rms_norm_v2(
-                x_2d,
-                self.weight.data,
-                self.variance_epsilon,
-                residual=residual_2d,
-                zero_centered=True,
-            )
-            return out.reshape(original_shape), residual_out.reshape(original_shape)
-
-        if is_batch_invariant_mode_enabled() and is_batch_invariant_op_enabled(
-            "rms_norm"
-        ):
-            # Exact Qwen splits zero-centered RMSNorm into two numerical
-            # families. No-residual sites use the family-1 BI kernel. Residual
-            # sites keep the bf16 add in eager torch and reach the interposed
-            # BI mean through forward_native, matching the trainer's
-            # fast_zero_centered_batch_invariant_* implementations.
-            if residual is None:
-                orig_dtype = x.dtype
-                out = rms_norm_batch_invariant(
-                    x.float(),
-                    1.0 + self.weight.data.float(),
-                    self.variance_epsilon,
-                )
-                return out.to(orig_dtype)
-            return self.forward_native(x, residual, post_residual_addition)
         return self._forward_impl(x, residual, post_residual_addition)
 
     def forward_hip(
@@ -1192,10 +1022,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
-        if self.xorl_batch_invariant_version == "v2":
-            raise RuntimeError(
-                "The Qwen families-v2 RMSNorm program cannot use an allreduce-fused v1 norm path."
-            )
         return _forward_with_allreduce_fusion(
             self,
             x,
@@ -1214,10 +1040,6 @@ class GemmaRMSNorm(MultiPlatformOp):
         keep_bf16: bool = False,
     ):
         """Fused AR + RMSNorm + per-group FP8 quant (Gemma-style: weight + 1)."""
-        if self.xorl_batch_invariant_version == "v2":
-            raise RuntimeError(
-                "The Qwen families-v2 RMSNorm program cannot use an allreduce/quant-fused v1 norm path."
-            )
         return _forward_with_allreduce_fusion_quant_per_group(
             self,
             x,

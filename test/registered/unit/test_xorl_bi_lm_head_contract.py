@@ -104,6 +104,12 @@ def _load_rms_norm_class():
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {"sgl_kernel": sgl_kernel}):
         spec.loader.exec_module(module)
+        # Loading from the file path bypasses the meta-path finder, so the
+        # module is pure upstream. The exact-serving behavior under test lives
+        # in the overlay twin — apply it the way the finder would.
+        from sglang.overrides.layers import layernorm as _layernorm_twin
+
+        _layernorm_twin.__apply_patch__(module)
     return module, module.RMSNorm
 
 
