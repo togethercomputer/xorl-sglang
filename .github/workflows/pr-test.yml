@@ -309,14 +309,15 @@ jobs:
     secrets: inherit
 
   base-b-test-1-gpu-b200:
-    # Not in pr-test-finish's needs list below, deliberately: this is the first
-    # real (non-smoke) test on research-b200-ic1's xorl-sglang-1-b200-gpu-runner
-    # (xorl-ci@9f0acbd), which before this PR had run exactly one job ever, a
-    # standalone import/nvidia-smi check. A red run here should be visible and
-    # actionable without being able to block every PR into dev on a single-shard
-    # lane's first exposure to real traffic. Move it into pr-test-finish's needs
-    # once it has stayed green across enough runs to trust it the way base-b's
-    # H100 lanes already are.
+    # First real (non-smoke) test on research-b200-ic1's
+    # xorl-sglang-1-b200-gpu-runner (xorl-ci@9f0acbd). Held out of
+    # pr-test-finish's needs at first landing since the runner had run exactly
+    # one job ever at that point (a standalone import/nvidia-smi check); now
+    # in that needs list after a manual dispatch (workflow_dispatch,
+    # run_all_tests: true, since check-changes skips the GPU matrix for a
+    # workflow-only diff) actually ran TestRadixCacheFCFS and
+    # TestRadixCacheNonOverlapLPM end to end -- real server, real generate
+    # requests -- and passed (`Ran 3 tests in 175.918s / OK (skipped=1)`).
     needs: [check-changes, call-gate, wait-for-base-a, rust-ext-build]
     if: ${{ !failure() && !cancelled() }}
     uses: ./.github/workflows/_pr-test-stage.yml
@@ -424,6 +425,7 @@ jobs:
         base-b-test-1-gpu-small,
         base-b-test-1-gpu-large,
         base-b-test-2-gpu-large,
+        base-b-test-1-gpu-b200,
         base-c-test-4-gpu-h100,
 
         lora-test-1-gpu-large,
