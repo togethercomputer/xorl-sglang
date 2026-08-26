@@ -9,13 +9,17 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
+
+import dataclasses
+import math
 
 from sglang.overrides._twin_bind import rebind
 
-import dataclasses
-
-import math
 
 def _build_raw_token_logprobs_b64_fields(
     input_values: List[Optional[float]],
@@ -41,6 +45,7 @@ def _build_raw_token_logprobs_b64_fields(
         "output_token_logprobs_raw_length": len(output_values),
         "token_logprobs_raw_b64_dtype": "float32_le",
     }
+
 
 def _get_bi_decode_strict_ingress_violations(
     obj: GenerateReqInput,
@@ -89,6 +94,7 @@ def _get_bi_decode_strict_ingress_violations(
             violations.append("token_ids_logprob=set")
 
     return violations
+
 
 @dataclasses.dataclass
 class ReqState:
@@ -179,6 +185,7 @@ class ReqState:
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
+
 
 def _TokenizerManager___create_tokenized_object(
     self,
@@ -306,6 +313,7 @@ def _TokenizerManager___create_tokenized_object(
 
     return tokenized_obj
 
+
 async def _TokenizerManager___handle_batch_output(
     self,
     recv_obj: Union[
@@ -364,10 +372,7 @@ async def _TokenizerManager___handle_batch_output(
                 recv_obj,
                 i,
             )
-        if (
-            isinstance(state.obj, GenerateReqInput)
-            and state.obj.return_sampling_mask
-        ):
+        if isinstance(state.obj, GenerateReqInput) and state.obj.return_sampling_mask:
             output_sampling_mask = recv_obj.output_token_sampling_mask
             if output_sampling_mask is not None:
                 state.output_token_sampling_mask.extend(output_sampling_mask[i])
@@ -399,9 +404,7 @@ async def _TokenizerManager___handle_batch_output(
                 hasattr(recv_obj, "cached_tokens_details")
                 and recv_obj.cached_tokens_details
             ):
-                meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[
-                    i
-                ]
+                meta_info["cached_tokens_details"] = recv_obj.cached_tokens_details[i]
             if customized_info is not None:
                 for k, v in customized_info.items():
                     if k not in state.customized_info_accumulated:
@@ -571,9 +574,7 @@ async def _TokenizerManager___handle_batch_output(
                 self._calculate_spec_decoding_metrics(meta_info, recv_obj, i)
             if self.enable_metrics:
                 scheduler_time_stats = (
-                    recv_obj.time_stats[i]
-                    if recv_obj.time_stats is not None
-                    else None
+                    recv_obj.time_stats[i] if recv_obj.time_stats is not None else None
                 )
                 completion_tokens = (
                     recv_obj.completion_tokens[i]
@@ -612,6 +613,7 @@ async def _TokenizerManager___handle_batch_output(
     # handle_loop awaits next recv immediately
     for s in pending_notify.values():
         s.event.set()
+
 
 def _TokenizerManager___validate_one_request(
     self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]
@@ -737,6 +739,7 @@ def _TokenizerManager___validate_one_request(
                 "Please set `--enable-custom-logit-processor` to enable this feature."
             )
 
+
 def _TokenizerManager__add_logprob_to_meta_info(
     self,
     meta_info: dict,
@@ -784,9 +787,7 @@ def _TokenizerManager__add_logprob_to_meta_info(
             # The scheduler already assembled the flat arrays (sent once
             # at prefill completion); encode them directly.
             if state.input_top_logprobs_flat_fields is None:
-                val_arr, idx_arr, null_prefix = (
-                    state.input_top_logprobs_scheduler_flat
-                )
+                val_arr, idx_arr, null_prefix = state.input_top_logprobs_scheduler_flat
                 state.input_top_logprobs_flat_fields = (
                     _build_flat_input_top_logprobs_fields_from_arrays(
                         val_arr,
@@ -815,8 +816,7 @@ def _TokenizerManager__add_logprob_to_meta_info(
                     # shared batch-output loop; degrade to nested instead.
                     state.input_top_logprobs_flat_fields = None
                     logger.error(
-                        "Falling back to nested input top logprobs for "
-                        "rid=%s: %s",
+                        "Falling back to nested input top logprobs for " "rid=%s: %s",
                         meta_info.get("id"),
                         e,
                     )
@@ -831,12 +831,8 @@ def _TokenizerManager__add_logprob_to_meta_info(
             if len(state.input_top_logprobs_val) > len(state.input_top_logprobs):
                 state.input_top_logprobs.extend(
                     self.detokenize_top_logprobs_tokens(
-                        state.input_top_logprobs_val[
-                            len(state.input_top_logprobs) :
-                        ],
-                        state.input_top_logprobs_idx[
-                            len(state.input_top_logprobs) :
-                        ],
+                        state.input_top_logprobs_val[len(state.input_top_logprobs) :],
+                        state.input_top_logprobs_idx[len(state.input_top_logprobs) :],
                         return_text_in_logprobs,
                     )
                 )
@@ -903,13 +899,36 @@ def __apply_patch__(mod):
         is_qwen35_gdn_exact_mode,
         set_global_server_args_for_tokenizer,
     )
-    for _n, _v in list(locals().items()):
-        if _n != "mod":
-            setattr(mod, _n, _v)
-    mod._build_raw_token_logprobs_b64_fields = rebind(_build_raw_token_logprobs_b64_fields, mod)
-    mod._get_bi_decode_strict_ingress_violations = rebind(_get_bi_decode_strict_ingress_violations, mod)
+
+    # Publish the deferred imports onto mod: in-tree they were the srt
+    # file's own module globals, and rebound copies resolve via mod.
+    mod.PortArgs = PortArgs
+    mod.ServerArgs = ServerArgs
+    mod.is_dsv4_flash_exact_mode = is_dsv4_flash_exact_mode
+    mod.is_glm52_exact_mode = is_glm52_exact_mode
+    mod.is_qwen3_dense_exact_mode = is_qwen3_dense_exact_mode
+    mod.is_qwen35_gdn_exact_mode = is_qwen35_gdn_exact_mode
+    mod.set_global_server_args_for_tokenizer = set_global_server_args_for_tokenizer
+    mod._build_raw_token_logprobs_b64_fields = rebind(
+        _build_raw_token_logprobs_b64_fields, mod
+    )
+    mod._get_bi_decode_strict_ingress_violations = rebind(
+        _get_bi_decode_strict_ingress_violations, mod
+    )
     mod.ReqState = rebind(ReqState, mod)
-    mod.TokenizerManager._create_tokenized_object = rebind(_TokenizerManager___create_tokenized_object, mod, name="_create_tokenized_object")
-    mod.TokenizerManager._handle_batch_output = rebind(_TokenizerManager___handle_batch_output, mod, name="_handle_batch_output")
-    mod.TokenizerManager._validate_one_request = rebind(_TokenizerManager___validate_one_request, mod, name="_validate_one_request")
-    mod.TokenizerManager.add_logprob_to_meta_info = rebind(_TokenizerManager__add_logprob_to_meta_info, mod, name="add_logprob_to_meta_info")
+    mod.TokenizerManager._create_tokenized_object = rebind(
+        _TokenizerManager___create_tokenized_object,
+        mod,
+        name="_create_tokenized_object",
+    )
+    mod.TokenizerManager._handle_batch_output = rebind(
+        _TokenizerManager___handle_batch_output, mod, name="_handle_batch_output"
+    )
+    mod.TokenizerManager._validate_one_request = rebind(
+        _TokenizerManager___validate_one_request, mod, name="_validate_one_request"
+    )
+    mod.TokenizerManager.add_logprob_to_meta_info = rebind(
+        _TokenizerManager__add_logprob_to_meta_info,
+        mod,
+        name="add_logprob_to_meta_info",
+    )

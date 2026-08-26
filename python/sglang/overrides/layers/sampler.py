@@ -9,11 +9,16 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
 from sglang.overrides._twin_bind import rebind
 
 _bi_decode_rescore_logged = False
+
 
 def _Sampler___attach_exact_sampling_mask_to_output(
     self,
@@ -68,6 +73,7 @@ def _Sampler___attach_exact_sampling_mask_to_output(
     logits_output.next_token_sampling_mask_idx = masks
     logits_output.next_token_sampling_logprobs = logprobs
 
+
 def _Sampler___bi_contract_sampled_logprob(
     self,
     logits: torch.Tensor,
@@ -82,9 +88,7 @@ def _Sampler___bi_contract_sampled_logprob(
     )
 
     if self.use_ascend_backend:
-        raise ValueError(
-            "The exact-contract decode rescore does not support Ascend"
-        )
+        raise ValueError("The exact-contract decode rescore does not support Ascend")
     if self.return_original_logprob:
         raise ValueError(
             "The exact-contract decode rescore does not support "
@@ -136,6 +140,7 @@ def _Sampler___bi_contract_sampled_logprob(
         logits, batch_next_token_ids, temperature=temperature
     )
     return logprob
+
 
 def _Sampler___forward_exact_filtered(
     self,
@@ -306,6 +311,7 @@ def _Sampler___forward_exact_filtered(
     self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
     return batch_next_token_ids
 
+
 def _Sampler___sample_from_exact_logits(
     self,
     logits: torch.Tensor,
@@ -322,6 +328,7 @@ def _Sampler___sample_from_exact_logits(
         support=support,
     )
 
+
 def _Sampler____init__(self):
     super(Sampler, self).__init__()
     self._glm52_exact_mode = is_glm52_exact_mode(get_server_args())
@@ -334,19 +341,16 @@ def _Sampler____init__(self):
     self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
     self.use_qwen35_bi_decode_rescore = is_qwen35_gdn_exact_mode(get_server_args())
     self.return_original_logprob = (
-        False
-        if self.use_qwen35_bi_decode_rescore
-        else SGLANG_RETURN_ORIGINAL_LOGPROB
+        False if self.use_qwen35_bi_decode_rescore else SGLANG_RETURN_ORIGINAL_LOGPROB
     )
     # In RL on-policy mode, deterministic inference is automatically enabled.
-    self.enable_deterministic = (
-        get_exec().deterministic.enable_deterministic_inference
-    )
+    self.enable_deterministic = get_exec().deterministic.enable_deterministic_inference
     # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
     self.use_log_softmax_logprob = self.rl_on_policy_target is not None
     self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
 
     self.output_logprob_processor = OutputLogprobProcessor()
+
 
 def _Sampler___forward_ascend_backend(
     self,
@@ -374,6 +378,7 @@ def _Sampler___forward_ascend_backend(
         logprobs = torch.log_softmax(logits, dim=-1)
     return batch_next_token_ids, logprobs
 
+
 def _Sampler___sample_from_logprobs(
     self,
     logprobs: torch.Tensor,
@@ -393,6 +398,7 @@ def _Sampler___sample_from_logprobs(
         logprobs, sampling_info.sampling_seed, positions
     )
     return sampled_index.view(-1).to(torch.int32)
+
 
 def _Sampler__forward(
     self,
@@ -633,15 +639,44 @@ def __apply_patch__(mod):
         exact_selected_logprob_from_support,
         exact_selected_logprob_partitioned_from_support,
     )
-    for _n, _v in list(locals().items()):
-        if _n != "mod":
-            setattr(mod, _n, _v)
+
+    # Publish the deferred imports onto mod: in-tree they were the srt
+    # file's own module globals, and rebound copies resolve via mod.
+    mod.is_dsv4_flash_exact_mode = is_dsv4_flash_exact_mode
+    mod.is_glm52_exact_mode = is_glm52_exact_mode
+    mod.is_qwen3_dense_exact_mode = is_qwen3_dense_exact_mode
+    mod.is_qwen35_gdn_exact_mode = is_qwen35_gdn_exact_mode
+    mod.xorl_bi_sample_and_score = xorl_bi_sample_and_score
+    mod.exact_temperature_scale_bf16_logits = exact_temperature_scale_bf16_logits
+    mod.exact_temperature_scale_fp32_logits = exact_temperature_scale_fp32_logits
+    mod.is_bi_head_fastpath_enabled = is_bi_head_fastpath_enabled
+    mod.exact_masked_logits = exact_masked_logits
+    mod.exact_sampling_identity_rows = exact_sampling_identity_rows
+    mod.exact_seeded_gumbel_sample = exact_seeded_gumbel_sample
+    mod.exact_selected_logprob_from_support = exact_selected_logprob_from_support
+    mod.exact_selected_logprob_partitioned_from_support = (
+        exact_selected_logprob_partitioned_from_support
+    )
     mod._bi_decode_rescore_logged = _bi_decode_rescore_logged
-    mod.Sampler._attach_exact_sampling_mask_to_output = rebind(_Sampler___attach_exact_sampling_mask_to_output, mod, name="_attach_exact_sampling_mask_to_output")
-    mod.Sampler._bi_contract_sampled_logprob = rebind(_Sampler___bi_contract_sampled_logprob, mod, name="_bi_contract_sampled_logprob")
-    mod.Sampler._forward_exact_filtered = rebind(_Sampler___forward_exact_filtered, mod, name="_forward_exact_filtered")
-    mod.Sampler._sample_from_exact_logits = rebind(_Sampler___sample_from_exact_logits, mod, name="_sample_from_exact_logits")
+    mod.Sampler._attach_exact_sampling_mask_to_output = rebind(
+        _Sampler___attach_exact_sampling_mask_to_output,
+        mod,
+        name="_attach_exact_sampling_mask_to_output",
+    )
+    mod.Sampler._bi_contract_sampled_logprob = rebind(
+        _Sampler___bi_contract_sampled_logprob, mod, name="_bi_contract_sampled_logprob"
+    )
+    mod.Sampler._forward_exact_filtered = rebind(
+        _Sampler___forward_exact_filtered, mod, name="_forward_exact_filtered"
+    )
+    mod.Sampler._sample_from_exact_logits = rebind(
+        _Sampler___sample_from_exact_logits, mod, name="_sample_from_exact_logits"
+    )
     mod.Sampler.__init__ = rebind(_Sampler____init__, mod, name="__init__")
-    mod.Sampler._forward_ascend_backend = rebind(_Sampler___forward_ascend_backend, mod, name="_forward_ascend_backend")
-    mod.Sampler._sample_from_logprobs = rebind(_Sampler___sample_from_logprobs, mod, name="_sample_from_logprobs")
+    mod.Sampler._forward_ascend_backend = rebind(
+        _Sampler___forward_ascend_backend, mod, name="_forward_ascend_backend"
+    )
+    mod.Sampler._sample_from_logprobs = rebind(
+        _Sampler___sample_from_logprobs, mod, name="_sample_from_logprobs"
+    )
     mod.Sampler.forward = rebind(_Sampler__forward, mod, name="forward")

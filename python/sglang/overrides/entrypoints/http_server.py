@@ -10,11 +10,15 @@ with no free variables, so the swap is exact. The upstream original is pinned
 in ``sglang.overrides._twin_pins``.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
-from sglang.overrides._twin_bind import rebind
-
 from typing import Dict, Union
+
+from sglang.overrides._twin_bind import rebind
 
 
 def _health_generate_sampling_params(server_args) -> Dict[str, Union[int, float]]:

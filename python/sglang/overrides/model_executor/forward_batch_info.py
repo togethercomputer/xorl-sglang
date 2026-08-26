@@ -16,7 +16,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch as _UpstreamForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch as _UpstreamForwardBatch,
+)
 
 
 @dataclass

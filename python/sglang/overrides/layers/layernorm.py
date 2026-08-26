@@ -9,11 +9,16 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
+
+from typing import Literal, Optional, Tuple, Union
 
 from sglang.overrides._twin_bind import rebind
 
-from typing import Literal, Optional, Tuple, Union
 
 def _validate_qwen_v2_norm_tensor(
     tensor: torch.Tensor, *, name: str, shape: torch.Size | None = None
@@ -28,6 +33,7 @@ def _validate_qwen_v2_norm_tensor(
             f"The Qwen families-v2 RMSNorm program requires {name} shape {tuple(shape)}, "
             f"got {tuple(tensor.shape)}."
         )
+
 
 def _RMSNorm___forward_xorl_batch_invariant(
     self,
@@ -93,6 +99,7 @@ def _RMSNorm___forward_xorl_batch_invariant(
         family=family,
     )
 
+
 def _GemmaRMSNorm____init__(
     self,
     hidden_size: int,
@@ -108,13 +115,12 @@ def _GemmaRMSNorm____init__(
     self.weight = nn.Parameter(torch.zeros(hidden_size))
     self.variance_epsilon = eps
     self.xorl_batch_invariant_version = xorl_batch_invariant_version
-    self.register_buffer(
-        "gemma_weight", torch.ones_like(self.weight), persistent=False
-    )
+    self.register_buffer("gemma_weight", torch.ones_like(self.weight), persistent=False)
     # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
     # If TRTLLM allreduce fusion ever provides gemma-style norm
     # natively, this can be removed.
     self.weight.weight_loader = self._weight_loader
+
 
 def _GemmaRMSNorm__forward_cuda(
     self,
@@ -123,9 +129,8 @@ def _GemmaRMSNorm__forward_cuda(
     post_residual_addition: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     if self.xorl_batch_invariant_version == "v2":
-        if (
-            not is_batch_invariant_mode_enabled()
-            or not is_batch_invariant_op_enabled("rms_norm")
+        if not is_batch_invariant_mode_enabled() or not is_batch_invariant_op_enabled(
+            "rms_norm"
         ):
             raise RuntimeError(
                 "The Qwen families-v2 RMSNorm program requires the exact batch-invariant "
@@ -161,9 +166,7 @@ def _GemmaRMSNorm__forward_cuda(
         )
         return out.reshape(original_shape), residual_out.reshape(original_shape)
 
-    if is_batch_invariant_mode_enabled() and is_batch_invariant_op_enabled(
-        "rms_norm"
-    ):
+    if is_batch_invariant_mode_enabled() and is_batch_invariant_op_enabled("rms_norm"):
         # Exact Qwen splits zero-centered RMSNorm into two numerical
         # families. No-residual sites use the family-1 BI kernel. Residual
         # sites keep the bf16 add in eager torch and reach the interposed
@@ -179,6 +182,7 @@ def _GemmaRMSNorm__forward_cuda(
             return out.to(orig_dtype)
         return self.forward_native(x, residual, post_residual_addition)
     return self._forward_impl(x, residual, post_residual_addition)
+
 
 def _GemmaRMSNorm__forward_with_allreduce_fusion(
     self,
@@ -200,6 +204,7 @@ def _GemmaRMSNorm__forward_with_allreduce_fusion(
         self.gemma_weight,
         use_attn_tp_group=True,
     )
+
 
 def _GemmaRMSNorm__forward_with_allreduce_fusion_quant_per_group(
     self,
@@ -223,6 +228,7 @@ def _GemmaRMSNorm__forward_with_allreduce_fusion_quant_per_group(
         use_attn_tp_group,
         keep_bf16,
     )
+
 
 def _RMSNorm____init__(
     self,
@@ -280,6 +286,7 @@ def _RMSNorm____init__(
             except ImportError:
                 self._fused_pad_kernel = None
         self._forward_method = self.forward_aiter
+
 
 def _RMSNorm__forward_aiter(
     self,
@@ -356,6 +363,7 @@ def _RMSNorm__forward_aiter(
         output = output.reshape(original_shape)
     return output
 
+
 def _RMSNorm__forward_cuda(
     self,
     x: torch.Tensor,
@@ -377,9 +385,7 @@ def _RMSNorm__forward_cuda(
         return self.forward_native(x, residual, post_residual_addition)
     if is_batch_invariant_mode_enabled():
         server_args = get_global_server_args()
-        if is_glm52_exact_mode(server_args) or is_qwen3_dense_exact_mode(
-            server_args
-        ):
+        if is_glm52_exact_mode(server_args) or is_qwen3_dense_exact_mode(server_args):
             return self._forward_xorl_batch_invariant(
                 x,
                 residual,
@@ -447,6 +453,7 @@ def _RMSNorm__forward_cuda(
         out = out.reshape(original_shape)
     return out
 
+
 def _RMSNorm__forward_hip(
     self,
     x: torch.Tensor,
@@ -481,6 +488,7 @@ def _RMSNorm__forward_hip(
     out = torch.empty_like(x)
     rms_norm(out, x, self.weight.data, self.variance_epsilon)
     return out
+
 
 def _RMSNorm__forward_xpu(
     self,
@@ -534,17 +542,44 @@ def __apply_patch__(mod):
         bi_rms_norm,
         rms_norm_v2,
     )
-    for _n, _v in list(locals().items()):
-        if _n != "mod":
-            setattr(mod, _n, _v)
+
+    # Publish the deferred imports onto mod: in-tree they were the srt
+    # file's own module globals, and rebound copies resolve via mod.
+    mod.is_batch_invariant_op_enabled = is_batch_invariant_op_enabled
+    mod.get_global_server_args = get_global_server_args
+    mod.is_glm52_exact_mode = is_glm52_exact_mode
+    mod.is_qwen3_dense_exact_mode = is_qwen3_dense_exact_mode
+    mod.resolve_or_validate_xorl_bi_family = resolve_or_validate_xorl_bi_family
+    mod.RMS_NORM_FAMILIES = RMS_NORM_FAMILIES
+    mod.RMS_NORM_FAMILY_NO_RESIDUAL = RMS_NORM_FAMILY_NO_RESIDUAL
+    mod.RMSNormFamily = RMSNormFamily
+    mod.bi_fused_add_rms_norm = bi_fused_add_rms_norm
+    mod.bi_rms_norm = bi_rms_norm
+    mod.rms_norm_v2 = rms_norm_v2
     mod._validate_qwen_v2_norm_tensor = rebind(_validate_qwen_v2_norm_tensor, mod)
-    mod.RMSNorm._forward_xorl_batch_invariant = rebind(_RMSNorm___forward_xorl_batch_invariant, mod, name="_forward_xorl_batch_invariant")
+    mod.RMSNorm._forward_xorl_batch_invariant = rebind(
+        _RMSNorm___forward_xorl_batch_invariant,
+        mod,
+        name="_forward_xorl_batch_invariant",
+    )
     mod.GemmaRMSNorm.__init__ = rebind(_GemmaRMSNorm____init__, mod, name="__init__")
-    mod.GemmaRMSNorm.forward_cuda = rebind(_GemmaRMSNorm__forward_cuda, mod, name="forward_cuda")
-    mod.GemmaRMSNorm.forward_with_allreduce_fusion = rebind(_GemmaRMSNorm__forward_with_allreduce_fusion, mod, name="forward_with_allreduce_fusion")
-    mod.GemmaRMSNorm.forward_with_allreduce_fusion_quant_per_group = rebind(_GemmaRMSNorm__forward_with_allreduce_fusion_quant_per_group, mod, name="forward_with_allreduce_fusion_quant_per_group")
+    mod.GemmaRMSNorm.forward_cuda = rebind(
+        _GemmaRMSNorm__forward_cuda, mod, name="forward_cuda"
+    )
+    mod.GemmaRMSNorm.forward_with_allreduce_fusion = rebind(
+        _GemmaRMSNorm__forward_with_allreduce_fusion,
+        mod,
+        name="forward_with_allreduce_fusion",
+    )
+    mod.GemmaRMSNorm.forward_with_allreduce_fusion_quant_per_group = rebind(
+        _GemmaRMSNorm__forward_with_allreduce_fusion_quant_per_group,
+        mod,
+        name="forward_with_allreduce_fusion_quant_per_group",
+    )
     mod.RMSNorm.__init__ = rebind(_RMSNorm____init__, mod, name="__init__")
-    mod.RMSNorm.forward_aiter = rebind(_RMSNorm__forward_aiter, mod, name="forward_aiter")
+    mod.RMSNorm.forward_aiter = rebind(
+        _RMSNorm__forward_aiter, mod, name="forward_aiter"
+    )
     mod.RMSNorm.forward_cuda = rebind(_RMSNorm__forward_cuda, mod, name="forward_cuda")
     mod.RMSNorm.forward_hip = rebind(_RMSNorm__forward_hip, mod, name="forward_hip")
     mod.RMSNorm.forward_xpu = rebind(_RMSNorm__forward_xpu, mod, name="forward_xpu")

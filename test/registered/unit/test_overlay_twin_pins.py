@@ -23,7 +23,9 @@ class TestOverlayTwinPins(unittest.TestCase):
         for (rel_path, qualname), pinned in sorted(PINS.items()):
             current = source_hash(rel_path, qualname)
             if current != pinned:
-                drifted.append(f"{rel_path}:{qualname}\n  pinned  {pinned}\n  current {current}")
+                drifted.append(
+                    f"{rel_path}:{qualname}\n  pinned  {pinned}\n  current {current}"
+                )
         self.assertFalse(
             drifted,
             "Upstream source changed under an overlay twin's edited copy.\n"

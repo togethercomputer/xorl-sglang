@@ -9,12 +9,18 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
 from sglang.overrides._twin_bind import rebind
 
+
 def _qwen35_exact_mode_enabled() -> bool:
     return is_qwen35_gdn_exact_mode(get_global_server_args())
+
 
 def _qwen35_rmsnorm_family(config) -> str:
     configured_family = getattr(config, "_qwen35_rmsnorm_family", None)
@@ -47,8 +53,10 @@ def _qwen35_rmsnorm_family(config) -> str:
         )
     return family
 
+
 def _qwen35_rope_class_b_enabled() -> bool:
     return is_qwen35_rope_class_b(get_global_server_args())
+
 
 def _Qwen3_5AttentionDecoderLayer___apply_rotary(
     self,
@@ -89,6 +97,7 @@ def _Qwen3_5AttentionDecoderLayer___apply_rotary(
             )
         return self.rotary_emb(exact_positions, q, k)
     return self.rotary_emb(positions, q, k)
+
 
 def _Qwen3_5AttentionDecoderLayer____init__(
     self,
@@ -200,9 +209,7 @@ def _Qwen3_5AttentionDecoderLayer____init__(
             config=config,
             quant_config=quant_config,
             alt_stream=(
-                alt_stream
-                if (_is_cuda or _disable_shared_experts_fusion())
-                else None
+                alt_stream if (_is_cuda or _disable_shared_experts_fusion()) else None
             ),
             prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
             is_nextn=is_nextn,
@@ -261,16 +268,15 @@ def _Qwen3_5AttentionDecoderLayer____init__(
 
     self.alt_stream = alt_stream
 
-def _Qwen3_5AttentionDecoderLayer__forward_prepare_fused_gate(self, positions, hidden_states):
+
+def _Qwen3_5AttentionDecoderLayer__forward_prepare_fused_gate(
+    self, positions, hidden_states
+):
     if _use_aiter and isinstance(hidden_states, tuple):
-        hidden_states = _select_fused_ar_input_for_linear(
-            hidden_states, self.qkv_proj
-        )
+        hidden_states = _select_fused_ar_input_for_linear(hidden_states, self.qkv_proj)
     qkv, _ = self.qkv_proj(hidden_states)
     if self.attn_output_gate:
-        q_gate, k, v = qkv.split(
-            [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-        )
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
         seq_len = q_gate.shape[0]
         q_flat, k_flat, gate_flat = fused_qk_gemma_rmsnorm_with_gate(
             q_gate,
@@ -292,16 +298,15 @@ def _Qwen3_5AttentionDecoderLayer__forward_prepare_fused_gate(self, positions, h
     q, k = self._apply_rotary(positions, q, k)
     return q, k, v, gate
 
-def _Qwen3_5AttentionDecoderLayer__forward_prepare_native(self, positions, hidden_states):
+
+def _Qwen3_5AttentionDecoderLayer__forward_prepare_native(
+    self, positions, hidden_states
+):
     if _use_aiter and isinstance(hidden_states, tuple):
-        hidden_states = _select_fused_ar_input_for_linear(
-            hidden_states, self.qkv_proj
-        )
+        hidden_states = _select_fused_ar_input_for_linear(hidden_states, self.qkv_proj)
     qkv, _ = self.qkv_proj(hidden_states)
     if self.attn_output_gate:
-        q_gate, k, v = qkv.split(
-            [self.q_size * 2, self.kv_size, self.kv_size], dim=-1
-        )
+        q_gate, k, v = qkv.split([self.q_size * 2, self.kv_size, self.kv_size], dim=-1)
         orig_shape = q_gate.shape[:-1]
         q_gate = q_gate.view(*orig_shape, self.num_heads, -1)
         q, gate = torch.chunk(q_gate, 2, dim=-1)
@@ -314,6 +319,7 @@ def _Qwen3_5AttentionDecoderLayer__forward_prepare_native(self, positions, hidde
     q, k = self._apply_qk_norm(q, k)
     q, k = self._apply_rotary(positions, q, k)
     return q, k, v, gate
+
 
 def _Qwen3_5AttentionDecoderLayer__self_attention(
     self,
@@ -367,6 +373,7 @@ def _Qwen3_5AttentionDecoderLayer__self_attention(
 
     output, _ = self.o_proj(attn_output)
     return output
+
 
 def _Qwen3_5ForCausalLM____init__(
     self,
@@ -433,6 +440,7 @@ def _Qwen3_5ForCausalLM____init__(
 
     self.layers_to_capture = []
 
+
 def _Qwen3_5LinearDecoderLayer____init__(
     self,
     config: Qwen3_5TextConfig,
@@ -458,9 +466,7 @@ def _Qwen3_5LinearDecoderLayer____init__(
             config=config,
             quant_config=quant_config,
             alt_stream=(
-                alt_stream
-                if (_is_cuda or _disable_shared_experts_fusion())
-                else None
+                alt_stream if (_is_cuda or _disable_shared_experts_fusion()) else None
             ),
             prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
             is_nextn=is_nextn,
@@ -536,16 +542,42 @@ def __apply_patch__(mod):
         is_qwen35_gdn_exact_mode,
         is_qwen35_rope_class_b,
     )
-    for _n, _v in list(locals().items()):
-        if _n != "mod":
-            setattr(mod, _n, _v)
+
+    # Publish the deferred imports onto mod: in-tree they were the srt
+    # file's own module globals, and rebound copies resolve via mod.
+    mod.get_exec = get_exec
+    mod.get_forward = get_forward
+    mod.get_parallel = get_parallel
+    mod.get_server_args = get_server_args
+    mod.get_stream = get_stream
+    mod.get_global_server_args = get_global_server_args
+    mod.is_qwen35_gdn_exact_mode = is_qwen35_gdn_exact_mode
+    mod.is_qwen35_rope_class_b = is_qwen35_rope_class_b
     mod._qwen35_exact_mode_enabled = rebind(_qwen35_exact_mode_enabled, mod)
     mod._qwen35_rmsnorm_family = rebind(_qwen35_rmsnorm_family, mod)
     mod._qwen35_rope_class_b_enabled = rebind(_qwen35_rope_class_b_enabled, mod)
-    mod.Qwen3_5AttentionDecoderLayer._apply_rotary = rebind(_Qwen3_5AttentionDecoderLayer___apply_rotary, mod, name="_apply_rotary")
-    mod.Qwen3_5AttentionDecoderLayer.__init__ = rebind(_Qwen3_5AttentionDecoderLayer____init__, mod, name="__init__")
-    mod.Qwen3_5AttentionDecoderLayer.forward_prepare_fused_gate = rebind(_Qwen3_5AttentionDecoderLayer__forward_prepare_fused_gate, mod, name="forward_prepare_fused_gate")
-    mod.Qwen3_5AttentionDecoderLayer.forward_prepare_native = rebind(_Qwen3_5AttentionDecoderLayer__forward_prepare_native, mod, name="forward_prepare_native")
-    mod.Qwen3_5AttentionDecoderLayer.self_attention = rebind(_Qwen3_5AttentionDecoderLayer__self_attention, mod, name="self_attention")
-    mod.Qwen3_5ForCausalLM.__init__ = rebind(_Qwen3_5ForCausalLM____init__, mod, name="__init__")
-    mod.Qwen3_5LinearDecoderLayer.__init__ = rebind(_Qwen3_5LinearDecoderLayer____init__, mod, name="__init__")
+    mod.Qwen3_5AttentionDecoderLayer._apply_rotary = rebind(
+        _Qwen3_5AttentionDecoderLayer___apply_rotary, mod, name="_apply_rotary"
+    )
+    mod.Qwen3_5AttentionDecoderLayer.__init__ = rebind(
+        _Qwen3_5AttentionDecoderLayer____init__, mod, name="__init__"
+    )
+    mod.Qwen3_5AttentionDecoderLayer.forward_prepare_fused_gate = rebind(
+        _Qwen3_5AttentionDecoderLayer__forward_prepare_fused_gate,
+        mod,
+        name="forward_prepare_fused_gate",
+    )
+    mod.Qwen3_5AttentionDecoderLayer.forward_prepare_native = rebind(
+        _Qwen3_5AttentionDecoderLayer__forward_prepare_native,
+        mod,
+        name="forward_prepare_native",
+    )
+    mod.Qwen3_5AttentionDecoderLayer.self_attention = rebind(
+        _Qwen3_5AttentionDecoderLayer__self_attention, mod, name="self_attention"
+    )
+    mod.Qwen3_5ForCausalLM.__init__ = rebind(
+        _Qwen3_5ForCausalLM____init__, mod, name="__init__"
+    )
+    mod.Qwen3_5LinearDecoderLayer.__init__ = rebind(
+        _Qwen3_5LinearDecoderLayer____init__, mod, name="__init__"
+    )

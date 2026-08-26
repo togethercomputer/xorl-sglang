@@ -9,15 +9,20 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
-from sglang.overrides._twin_bind import rebind
-
 import contextlib
+
+from sglang.overrides._twin_bind import rebind
 
 _QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT = 8192
 
 _QWEN35_CLASS_B_RECOMPILE_LIMIT = 2048
+
 
 def _pin_qwen35_class_b_compile_budget() -> None:
     """Prevent an exact Class-B run from silently falling back to eager Class A."""
@@ -31,6 +36,7 @@ def _pin_qwen35_class_b_compile_budget() -> None:
     )
     if hasattr(config, "fail_on_recompile_limit_hit"):
         config.fail_on_recompile_limit_hit = True
+
 
 def _RotaryEmbedding___build_cos_sin_cache(self) -> torch.Tensor:
     """Build the table once under the selected architecture provenance."""
@@ -48,6 +54,7 @@ def _RotaryEmbedding___build_cos_sin_cache(self) -> torch.Tensor:
         )
     return cache.to(device=self._cos_sin_cache_out_device())
 
+
 def _RotaryEmbedding___cos_sin_cache_device(self) -> Optional[torch.device]:
     """Device on which the full cos/sin table must be evaluated.
 
@@ -63,32 +70,39 @@ def _RotaryEmbedding___cos_sin_cache_device(self) -> Optional[torch.device]:
         return torch.device("cpu")
     return None
 
-def _RotaryEmbedding___cos_sin_cache_extra_positions(self, start: int, stop: int) -> torch.Tensor:
+
+def _RotaryEmbedding___cos_sin_cache_extra_positions(
+    self, start: int, stop: int
+) -> torch.Tensor:
     """Positions appended during non-exact cache growth."""
     return torch.arange(start, stop, dtype=torch.float)
+
 
 def _RotaryEmbedding___cos_sin_cache_inv_freq(self) -> torch.Tensor:
     """Inverse frequencies used by both initial construction and growth."""
     return self._compute_inv_freq(self.base)
 
+
 def _RotaryEmbedding___cos_sin_cache_mscale(self) -> float:
     """Magnitude scale applied to both cos and sin rows."""
     return 1.0
 
+
 def _RotaryEmbedding___cos_sin_cache_out_device(self) -> torch.device:
     """Device on which a table built under a provenance pin is stored."""
-    return (
-        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-    )
+    return torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
 
 def _RotaryEmbedding___cos_sin_cache_pin(self):
     """Install the table provenance device as the ambient default."""
     pin = self._cos_sin_cache_device()
     return contextlib.nullcontext() if pin is None else torch.device(pin)
 
+
 def _RotaryEmbedding___cos_sin_cache_positions(self) -> torch.Tensor:
     """Positions covered by the initial table."""
     return torch.arange(self.max_position_embeddings, dtype=torch.float)
+
 
 def _RotaryEmbedding___cos_sin_cache_rows(
     self, positions: torch.Tensor, inv_freq: torch.Tensor
@@ -103,12 +117,14 @@ def _RotaryEmbedding___cos_sin_cache_rows(
         sin = sin * mscale
     return torch.cat((cos, sin), dim=-1)
 
+
 def _RotaryEmbedding___cos_sin_cache_work_device(
     self, default: Union[torch.device, str, None]
 ) -> Union[torch.device, str, None]:
     """Return the pinned provenance device, or ``default`` when unpinned."""
     pin = self._cos_sin_cache_device()
     return default if pin is None else pin
+
 
 def _RotaryEmbedding____init__(
     self,
@@ -175,13 +191,9 @@ def _RotaryEmbedding____init__(
             )(apply_rotary_emb)
     if getattr(deterministic, "qwen35_rope_class_b", False):
         if not deterministic.qwen35_gdn_exact_mode:
-            raise RuntimeError(
-                "Qwen3.5-family Class-B RoPE requires exact Qwen mode"
-            )
+            raise RuntimeError("Qwen3.5-family Class-B RoPE requires exact Qwen mode")
         if not _is_cuda:
-            raise RuntimeError(
-                "Qwen3.5-family Class-B RoPE is qualified only on CUDA"
-            )
+            raise RuntimeError("Qwen3.5-family Class-B RoPE is qualified only on CUDA")
         if dtype is not torch.bfloat16 or not is_neox_style:
             raise RuntimeError(
                 "Qwen3.5-family Class-B RoPE requires BF16 and the "
@@ -199,11 +211,13 @@ def _RotaryEmbedding____init__(
         )
     self.position_cos, self.position_sin = None, None
 
+
 def _RotaryEmbedding___compute_cos_sin_cache(self) -> torch.Tensor:
     """Compute the initial table through the shared recipe hooks."""
     return self._cos_sin_cache_rows(
         self._cos_sin_cache_positions(), self._cos_sin_cache_inv_freq()
     )
+
 
 def _RotaryEmbedding___compute_inv_freq(self, base: Union[int, float]) -> torch.Tensor:
     """Compute the inverse frequency."""
@@ -220,15 +234,14 @@ def _RotaryEmbedding___compute_inv_freq(self, base: Union[int, float]) -> torch.
     inv_freq = 1.0 / (
         base
         ** (
-            torch.arange(
-                0, self.rotary_dim, 2, dtype=torch.float, device=init_device
-            )
+            torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=init_device)
             / self.rotary_dim
         )
     )
     if deterministic.glm52_exact_mode:
         inv_freq = inv_freq.to(device=self._cos_sin_cache_out_device())
     return inv_freq
+
 
 def _RotaryEmbedding___ensure_cos_sin_cache_length(self, needed_max_pos: int):
     """Ensure cos_sin_cache length > needed_max_pos."""
@@ -271,20 +284,60 @@ def __apply_patch__(mod):
     # Publish the twin's top-level imports onto mod: in-tree they were the
     # srt file's own module globals, and rebound copies resolve via mod.
     mod.contextlib = contextlib
-    mod._QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT = _QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT
+    mod._QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT = (
+        _QWEN35_CLASS_B_ACCUMULATED_RECOMPILE_LIMIT
+    )
     mod._QWEN35_CLASS_B_RECOMPILE_LIMIT = _QWEN35_CLASS_B_RECOMPILE_LIMIT
-    mod._pin_qwen35_class_b_compile_budget = rebind(_pin_qwen35_class_b_compile_budget, mod)
-    mod.RotaryEmbedding._build_cos_sin_cache = rebind(_RotaryEmbedding___build_cos_sin_cache, mod, name="_build_cos_sin_cache")
-    mod.RotaryEmbedding._cos_sin_cache_device = rebind(_RotaryEmbedding___cos_sin_cache_device, mod, name="_cos_sin_cache_device")
-    mod.RotaryEmbedding._cos_sin_cache_extra_positions = rebind(_RotaryEmbedding___cos_sin_cache_extra_positions, mod, name="_cos_sin_cache_extra_positions")
-    mod.RotaryEmbedding._cos_sin_cache_inv_freq = rebind(_RotaryEmbedding___cos_sin_cache_inv_freq, mod, name="_cos_sin_cache_inv_freq")
-    mod.RotaryEmbedding._cos_sin_cache_mscale = rebind(_RotaryEmbedding___cos_sin_cache_mscale, mod, name="_cos_sin_cache_mscale")
-    mod.RotaryEmbedding._cos_sin_cache_out_device = rebind(_RotaryEmbedding___cos_sin_cache_out_device, mod, name="_cos_sin_cache_out_device")
-    mod.RotaryEmbedding._cos_sin_cache_pin = rebind(_RotaryEmbedding___cos_sin_cache_pin, mod, name="_cos_sin_cache_pin")
-    mod.RotaryEmbedding._cos_sin_cache_positions = rebind(_RotaryEmbedding___cos_sin_cache_positions, mod, name="_cos_sin_cache_positions")
-    mod.RotaryEmbedding._cos_sin_cache_rows = rebind(_RotaryEmbedding___cos_sin_cache_rows, mod, name="_cos_sin_cache_rows")
-    mod.RotaryEmbedding._cos_sin_cache_work_device = rebind(_RotaryEmbedding___cos_sin_cache_work_device, mod, name="_cos_sin_cache_work_device")
-    mod.RotaryEmbedding.__init__ = rebind(_RotaryEmbedding____init__, mod, name="__init__")
-    mod.RotaryEmbedding._compute_cos_sin_cache = rebind(_RotaryEmbedding___compute_cos_sin_cache, mod, name="_compute_cos_sin_cache")
-    mod.RotaryEmbedding._compute_inv_freq = rebind(_RotaryEmbedding___compute_inv_freq, mod, name="_compute_inv_freq")
-    mod.RotaryEmbedding._ensure_cos_sin_cache_length = rebind(_RotaryEmbedding___ensure_cos_sin_cache_length, mod, name="_ensure_cos_sin_cache_length")
+    mod._pin_qwen35_class_b_compile_budget = rebind(
+        _pin_qwen35_class_b_compile_budget, mod
+    )
+    mod.RotaryEmbedding._build_cos_sin_cache = rebind(
+        _RotaryEmbedding___build_cos_sin_cache, mod, name="_build_cos_sin_cache"
+    )
+    mod.RotaryEmbedding._cos_sin_cache_device = rebind(
+        _RotaryEmbedding___cos_sin_cache_device, mod, name="_cos_sin_cache_device"
+    )
+    mod.RotaryEmbedding._cos_sin_cache_extra_positions = rebind(
+        _RotaryEmbedding___cos_sin_cache_extra_positions,
+        mod,
+        name="_cos_sin_cache_extra_positions",
+    )
+    mod.RotaryEmbedding._cos_sin_cache_inv_freq = rebind(
+        _RotaryEmbedding___cos_sin_cache_inv_freq, mod, name="_cos_sin_cache_inv_freq"
+    )
+    mod.RotaryEmbedding._cos_sin_cache_mscale = rebind(
+        _RotaryEmbedding___cos_sin_cache_mscale, mod, name="_cos_sin_cache_mscale"
+    )
+    mod.RotaryEmbedding._cos_sin_cache_out_device = rebind(
+        _RotaryEmbedding___cos_sin_cache_out_device,
+        mod,
+        name="_cos_sin_cache_out_device",
+    )
+    mod.RotaryEmbedding._cos_sin_cache_pin = rebind(
+        _RotaryEmbedding___cos_sin_cache_pin, mod, name="_cos_sin_cache_pin"
+    )
+    mod.RotaryEmbedding._cos_sin_cache_positions = rebind(
+        _RotaryEmbedding___cos_sin_cache_positions, mod, name="_cos_sin_cache_positions"
+    )
+    mod.RotaryEmbedding._cos_sin_cache_rows = rebind(
+        _RotaryEmbedding___cos_sin_cache_rows, mod, name="_cos_sin_cache_rows"
+    )
+    mod.RotaryEmbedding._cos_sin_cache_work_device = rebind(
+        _RotaryEmbedding___cos_sin_cache_work_device,
+        mod,
+        name="_cos_sin_cache_work_device",
+    )
+    mod.RotaryEmbedding.__init__ = rebind(
+        _RotaryEmbedding____init__, mod, name="__init__"
+    )
+    mod.RotaryEmbedding._compute_cos_sin_cache = rebind(
+        _RotaryEmbedding___compute_cos_sin_cache, mod, name="_compute_cos_sin_cache"
+    )
+    mod.RotaryEmbedding._compute_inv_freq = rebind(
+        _RotaryEmbedding___compute_inv_freq, mod, name="_compute_inv_freq"
+    )
+    mod.RotaryEmbedding._ensure_cos_sin_cache_length = rebind(
+        _RotaryEmbedding___ensure_cos_sin_cache_length,
+        mod,
+        name="_ensure_cos_sin_cache_length",
+    )

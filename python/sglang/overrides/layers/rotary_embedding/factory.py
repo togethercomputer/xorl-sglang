@@ -9,9 +9,14 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
 from sglang.overrides._twin_bind import rebind
+
 
 def get_rope(
     head_size: int,
@@ -310,7 +315,6 @@ def __apply_patch__(mod):
     # twin top level would cache modules UNPATCHED. Import here (bypass off)
     # and publish onto mod -- in-tree these were the file's module globals.
     from sglang.srt.runtime_context import get_exec
-    for _n, _v in list(locals().items()):
-        if _n != "mod":
-            setattr(mod, _n, _v)
+
+    mod.get_exec = get_exec
     mod.get_rope = rebind(get_rope, mod)

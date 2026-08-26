@@ -9,9 +9,14 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
 from sglang.overrides._twin_bind import rebind
+
 
 def _DeepseekScalingRotaryEmbedding___build_cos_sin_cache(self) -> torch.Tensor:
     cache = super(DeepseekScalingRotaryEmbedding, self)._build_cos_sin_cache()
@@ -24,11 +29,14 @@ def _DeepseekScalingRotaryEmbedding___build_cos_sin_cache(self) -> torch.Tensor:
         self.sin_cached_total = torch.cat((sin, sin), dim=-1)
     return cache
 
+
 def _DeepseekScalingRotaryEmbedding___cos_sin_cache_inv_freq(self) -> torch.Tensor:
     return self._compute_inv_freq(self.scaling_factor)
 
+
 def _DeepseekScalingRotaryEmbedding___cos_sin_cache_mscale(self) -> float:
     return self.mscale
+
 
 def _DeepseekScalingRotaryEmbedding___cos_sin_cache_positions(self) -> torch.Tensor:
     return torch.arange(
@@ -37,11 +45,11 @@ def _DeepseekScalingRotaryEmbedding___cos_sin_cache_positions(self) -> torch.Ten
         dtype=torch.float32,
     )
 
+
 def _DynamicNTKAlphaRotaryEmbedding___cos_sin_cache_inv_freq(self) -> torch.Tensor:
-    base = self.base * self.scaling_alpha ** (
-        self.rotary_dim / (self.rotary_dim - 2)
-    )
+    base = self.base * self.scaling_alpha ** (self.rotary_dim / (self.rotary_dim - 2))
     return self._compute_inv_freq(base)
+
 
 def _DynamicNTKScalingRotaryEmbedding___cos_sin_cache_inv_freq(self) -> torch.Tensor:
     max_len = self.max_position_embeddings * self.scaling_factor
@@ -51,12 +59,16 @@ def _DynamicNTKScalingRotaryEmbedding___cos_sin_cache_inv_freq(self) -> torch.Te
     ) ** (self.rotary_dim / (self.rotary_dim - 2))
     return self._compute_inv_freq(base)
 
+
 def _DynamicNTKScalingRotaryEmbedding___cos_sin_cache_positions(self) -> torch.Tensor:
     return torch.arange(
         self.max_position_embeddings * self.scaling_factor, dtype=torch.float
     )
 
-def _DeepseekScalingRotaryEmbedding___compute_inv_freq(self, scaling_factor: float) -> torch.Tensor:
+
+def _DeepseekScalingRotaryEmbedding___compute_inv_freq(
+    self, scaling_factor: float
+) -> torch.Tensor:
     device = self._cos_sin_cache_work_device(self.device)
     pos_freqs = self.base ** (
         torch.arange(0, self.rotary_dim, 2, dtype=torch.float, device=device)
@@ -85,14 +97,46 @@ def _DeepseekScalingRotaryEmbedding___compute_inv_freq(self, scaling_factor: flo
 
 
 def __apply_patch__(mod):
-    mod.DeepseekScalingRotaryEmbedding._build_cos_sin_cache = rebind(_DeepseekScalingRotaryEmbedding___build_cos_sin_cache, mod, name="_build_cos_sin_cache")
-    mod.DeepseekScalingRotaryEmbedding._cos_sin_cache_inv_freq = rebind(_DeepseekScalingRotaryEmbedding___cos_sin_cache_inv_freq, mod, name="_cos_sin_cache_inv_freq")
-    mod.DeepseekScalingRotaryEmbedding._cos_sin_cache_mscale = rebind(_DeepseekScalingRotaryEmbedding___cos_sin_cache_mscale, mod, name="_cos_sin_cache_mscale")
-    mod.DeepseekScalingRotaryEmbedding._cos_sin_cache_positions = rebind(_DeepseekScalingRotaryEmbedding___cos_sin_cache_positions, mod, name="_cos_sin_cache_positions")
-    mod.DynamicNTKAlphaRotaryEmbedding._cos_sin_cache_inv_freq = rebind(_DynamicNTKAlphaRotaryEmbedding___cos_sin_cache_inv_freq, mod, name="_cos_sin_cache_inv_freq")
-    mod.DynamicNTKScalingRotaryEmbedding._cos_sin_cache_inv_freq = rebind(_DynamicNTKScalingRotaryEmbedding___cos_sin_cache_inv_freq, mod, name="_cos_sin_cache_inv_freq")
-    mod.DynamicNTKScalingRotaryEmbedding._cos_sin_cache_positions = rebind(_DynamicNTKScalingRotaryEmbedding___cos_sin_cache_positions, mod, name="_cos_sin_cache_positions")
-    mod.DeepseekScalingRotaryEmbedding._compute_inv_freq = rebind(_DeepseekScalingRotaryEmbedding___compute_inv_freq, mod, name="_compute_inv_freq")
+    mod.DeepseekScalingRotaryEmbedding._build_cos_sin_cache = rebind(
+        _DeepseekScalingRotaryEmbedding___build_cos_sin_cache,
+        mod,
+        name="_build_cos_sin_cache",
+    )
+    mod.DeepseekScalingRotaryEmbedding._cos_sin_cache_inv_freq = rebind(
+        _DeepseekScalingRotaryEmbedding___cos_sin_cache_inv_freq,
+        mod,
+        name="_cos_sin_cache_inv_freq",
+    )
+    mod.DeepseekScalingRotaryEmbedding._cos_sin_cache_mscale = rebind(
+        _DeepseekScalingRotaryEmbedding___cos_sin_cache_mscale,
+        mod,
+        name="_cos_sin_cache_mscale",
+    )
+    mod.DeepseekScalingRotaryEmbedding._cos_sin_cache_positions = rebind(
+        _DeepseekScalingRotaryEmbedding___cos_sin_cache_positions,
+        mod,
+        name="_cos_sin_cache_positions",
+    )
+    mod.DynamicNTKAlphaRotaryEmbedding._cos_sin_cache_inv_freq = rebind(
+        _DynamicNTKAlphaRotaryEmbedding___cos_sin_cache_inv_freq,
+        mod,
+        name="_cos_sin_cache_inv_freq",
+    )
+    mod.DynamicNTKScalingRotaryEmbedding._cos_sin_cache_inv_freq = rebind(
+        _DynamicNTKScalingRotaryEmbedding___cos_sin_cache_inv_freq,
+        mod,
+        name="_cos_sin_cache_inv_freq",
+    )
+    mod.DynamicNTKScalingRotaryEmbedding._cos_sin_cache_positions = rebind(
+        _DynamicNTKScalingRotaryEmbedding___cos_sin_cache_positions,
+        mod,
+        name="_cos_sin_cache_positions",
+    )
+    mod.DeepseekScalingRotaryEmbedding._compute_inv_freq = rebind(
+        _DeepseekScalingRotaryEmbedding___compute_inv_freq,
+        mod,
+        name="_compute_inv_freq",
+    )
     # Removed by the exact port; the base-class impl takes over.
     del mod.DeepseekScalingRotaryEmbedding._compute_cos_sin_cache
     # Removed by the exact port; the base-class impl takes over.

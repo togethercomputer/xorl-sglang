@@ -9,6 +9,10 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
 from sglang.overrides._twin_bind import rebind
@@ -17,20 +21,26 @@ from sglang.overrides._twin_bind import rebind
 def _bi_gdn_decode_enabled() -> bool:
     return is_cuda() and _bi_decode_mod.BI_GDN_DECODE_ENABLED
 
+
 def _bi_gdn_decode_fast_enabled() -> bool:
     return is_cuda() and _bi_fast_mod.BI_GDN_DECODE_FAST_ENABLED
+
 
 def _bi_gdn_decode_incr_enabled() -> bool:
     return is_cuda() and _bi_incr_mod.BI_GDN_DECODE_INCR_ENABLED
 
+
 def _bi_gdn_incr_defer_enabled() -> bool:
     return is_cuda() and _bi_incr_mod.BI_GDN_INCR_DEFER_ENABLED
+
 
 def _bi_gdn_lazy_heal_enabled() -> bool:
     return is_cuda() and _bi_heal_mod.BI_GDN_LAZY_HEAL_ENABLED
 
+
 def _bi_gdn_prefill_enabled() -> bool:
     return is_cuda() and _bi_prefill_mod.BI_GDN_PREFILL_ENABLED
+
 
 def _make_bi_gdn_decode_runner():
     if not _bi_gdn_decode_fast_enabled():
@@ -38,6 +48,7 @@ def _make_bi_gdn_decode_runner():
     if _bi_gdn_decode_incr_enabled():
         return BIGDNIncrDecodeRunner()
     return BIGDNFastDecodeRunner()
+
 
 def _GDNAttnBackend___bi_decode_cache(
     self, layer: RadixLinearAttention, ssm_states: torch.Tensor
@@ -54,6 +65,7 @@ def _GDNAttnBackend___bi_decode_cache(
         )
         self._bi_decode_caches[layer.layer_id] = cache
     return cache
+
 
 def _GDNAttnBackend___bi_decode_metadata(
     self,
@@ -72,6 +84,7 @@ def _GDNAttnBackend___bi_decode_metadata(
             f"expected {metadata.slots}, got {tuple(slots)}."
         )
     return metadata
+
 
 def _GDNAttnBackend___bi_gdn_decode_seed(
     self,
@@ -117,11 +130,12 @@ def _GDNAttnBackend___bi_gdn_decode_seed(
             for slot, suffix in warm_pairs:
                 self._bi_fast_runner.warm_slot(cache, slot, suffix)
 
+
 def _GDNAttnBackend____init__(self, model_runner: ModelRunner):
     super(GDNAttnBackend, self).__init__(model_runner)
-    self.conv_states_shape = (
-        model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
-    )
+    self.conv_states_shape = model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[
+        0
+    ].shape
     if not is_cpu() and not is_npu():
         assert (
             self.conv_states_shape[-1] < FLA_CHUNK_SIZE
@@ -197,13 +211,12 @@ def _GDNAttnBackend____init__(self, model_runner: ModelRunner):
     self._bi_decode_step_metadata = None
     self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
     # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
-    self.verify_intermediate_state_indices = (
-        build_verify_intermediate_state_indices(
-            self.req_to_token_pool.size,
-            model_runner.server_args,
-            model_runner.device,
-        )
+    self.verify_intermediate_state_indices = build_verify_intermediate_state_indices(
+        self.req_to_token_pool.size,
+        model_runner.server_args,
+        model_runner.device,
     )
+
 
 def _GDNAttnBackend___replayssm_fold_target_verify(
     self,
@@ -287,6 +300,7 @@ def _GDNAttnBackend___replayssm_fold_target_verify(
         replayssm_g=layer_cache.replayssm_g,
         replayssm_beta=layer_cache.replayssm_beta,
     )
+
 
 def _GDNAttnBackend___replayssm_target_verify(
     self,
@@ -376,6 +390,7 @@ def _GDNAttnBackend___replayssm_target_verify(
     )
     # Match the recurrent target_verify output shape (== value.shape).
     return out.reshape(value.shape)
+
 
 def _GDNAttnBackend__forward_decode(
     self,
@@ -507,6 +522,7 @@ def _GDNAttnBackend__forward_decode(
 
     return core_attn_out
 
+
 def _GDNAttnBackend__forward_extend(
     self,
     layer: RadixLinearAttention,
@@ -534,9 +550,7 @@ def _GDNAttnBackend__forward_extend(
     if is_target_verify:
         assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
         intermediate_state_cache = mamba_cache_params.intermediate_ssm
-        intermediate_conv_window_cache = (
-            mamba_cache_params.intermediate_conv_window[0]
-        )
+        intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
         intermediate_state_indices = self.verify_intermediate_state_indices
     else:
         has_initial_states = forward_batch.extend_prefix_lens > 0
@@ -573,9 +587,9 @@ def _GDNAttnBackend__forward_extend(
     if is_target_verify:
         batch_size = seq_len // forward_batch.spec_info.draft_token_num
         draft_token_num = forward_batch.spec_info.draft_token_num
-        mixed_qkv_reshaped = mixed_qkv.view(
-            batch_size, draft_token_num, -1
-        ).transpose(1, 2)
+        mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(
+            1, 2
+        )
         mixed_qkv_processed = causal_conv1d_update(
             mixed_qkv_reshaped,
             conv_states,
@@ -596,9 +610,7 @@ def _GDNAttnBackend__forward_extend(
             mixed_qkv_to_track = mixed_qkv[
                 :, forward_metadata.track_conv_indices
             ].transpose(0, 1)
-            conv_states[forward_metadata.conv_states_mask_indices] = (
-                mixed_qkv_to_track
-            )
+            conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv_to_track
 
         mixed_qkv = causal_conv1d_fn(
             mixed_qkv,
@@ -753,9 +765,7 @@ def _GDNAttnBackend__forward_extend(
             ssm_states=ssm_states_contig,
             cache_indices=state_cache_indices,
             query_start_loc=query_start_loc,
-            state_checkpoint_cu_starts=(
-                forward_metadata.state_checkpoint_cu_starts
-            ),
+            state_checkpoint_cu_starts=(forward_metadata.state_checkpoint_cu_starts),
             num_state_checkpoints=forward_metadata.num_state_checkpoints,
             state_checkpoint_every_n_tokens=(
                 forward_metadata.state_checkpoint_every_n_tokens
@@ -763,9 +773,7 @@ def _GDNAttnBackend__forward_extend(
         )
 
         if is_npu() and last_recurrent_state is not None:
-            last_recurrent_state = last_recurrent_state.to(
-                ssm_states.dtype, copy=False
-            )
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
             ssm_states[cache_indices] = last_recurrent_state
 
         if needs_state_gather:
@@ -780,6 +788,7 @@ def _GDNAttnBackend__forward_extend(
             )
 
     return core_attn_out
+
 
 def _GDNAttnBackend__init_forward_metadata(self, forward_batch: ForwardBatch):
     super(GDNAttnBackend, self).init_forward_metadata(forward_batch)
@@ -820,9 +829,20 @@ def __apply_patch__(mod):
         from sglang.xorl.fla.bi_gdn_decode_incr import BIGDNIncrDecodeRunner
         from sglang.xorl.fla.bi_gdn_incr_lazy_heal import warm_slots_batched
         from sglang.xorl.fla.bi_gdn_prefill import bi_chunk_gated_delta_rule_prefill
-    for _n, _v in list(locals().items()):
-        if _n != "mod":
-            setattr(mod, _n, _v)
+
+        # Publish the deferred imports onto mod: in-tree they were the srt
+        # file's own module globals, and rebound copies resolve via mod.
+        mod._bi_decode_mod = _bi_decode_mod
+        mod._bi_fast_mod = _bi_fast_mod
+        mod._bi_incr_mod = _bi_incr_mod
+        mod._bi_heal_mod = _bi_heal_mod
+        mod._bi_prefill_mod = _bi_prefill_mod
+        mod.BIGDNDecodeCache = BIGDNDecodeCache
+        mod.BIGDNFastDecodeRunner = BIGDNFastDecodeRunner
+        mod.BIGDNIncrDecodeRunner = BIGDNIncrDecodeRunner
+        mod.warm_slots_batched = warm_slots_batched
+        mod.bi_chunk_gated_delta_rule_prefill = bi_chunk_gated_delta_rule_prefill
+    mod.is_cuda = is_cuda
     mod._bi_gdn_decode_enabled = rebind(_bi_gdn_decode_enabled, mod)
     mod._bi_gdn_decode_fast_enabled = rebind(_bi_gdn_decode_fast_enabled, mod)
     mod._bi_gdn_decode_incr_enabled = rebind(_bi_gdn_decode_incr_enabled, mod)
@@ -830,12 +850,32 @@ def __apply_patch__(mod):
     mod._bi_gdn_lazy_heal_enabled = rebind(_bi_gdn_lazy_heal_enabled, mod)
     mod._bi_gdn_prefill_enabled = rebind(_bi_gdn_prefill_enabled, mod)
     mod._make_bi_gdn_decode_runner = rebind(_make_bi_gdn_decode_runner, mod)
-    mod.GDNAttnBackend._bi_decode_cache = rebind(_GDNAttnBackend___bi_decode_cache, mod, name="_bi_decode_cache")
-    mod.GDNAttnBackend._bi_decode_metadata = rebind(_GDNAttnBackend___bi_decode_metadata, mod, name="_bi_decode_metadata")
-    mod.GDNAttnBackend._bi_gdn_decode_seed = rebind(_GDNAttnBackend___bi_gdn_decode_seed, mod, name="_bi_gdn_decode_seed")
-    mod.GDNAttnBackend.__init__ = rebind(_GDNAttnBackend____init__, mod, name="__init__")
-    mod.GDNAttnBackend._replayssm_fold_target_verify = rebind(_GDNAttnBackend___replayssm_fold_target_verify, mod, name="_replayssm_fold_target_verify")
-    mod.GDNAttnBackend._replayssm_target_verify = rebind(_GDNAttnBackend___replayssm_target_verify, mod, name="_replayssm_target_verify")
-    mod.GDNAttnBackend.forward_decode = rebind(_GDNAttnBackend__forward_decode, mod, name="forward_decode")
-    mod.GDNAttnBackend.forward_extend = rebind(_GDNAttnBackend__forward_extend, mod, name="forward_extend")
-    mod.GDNAttnBackend.init_forward_metadata = rebind(_GDNAttnBackend__init_forward_metadata, mod, name="init_forward_metadata")
+    mod.GDNAttnBackend._bi_decode_cache = rebind(
+        _GDNAttnBackend___bi_decode_cache, mod, name="_bi_decode_cache"
+    )
+    mod.GDNAttnBackend._bi_decode_metadata = rebind(
+        _GDNAttnBackend___bi_decode_metadata, mod, name="_bi_decode_metadata"
+    )
+    mod.GDNAttnBackend._bi_gdn_decode_seed = rebind(
+        _GDNAttnBackend___bi_gdn_decode_seed, mod, name="_bi_gdn_decode_seed"
+    )
+    mod.GDNAttnBackend.__init__ = rebind(
+        _GDNAttnBackend____init__, mod, name="__init__"
+    )
+    mod.GDNAttnBackend._replayssm_fold_target_verify = rebind(
+        _GDNAttnBackend___replayssm_fold_target_verify,
+        mod,
+        name="_replayssm_fold_target_verify",
+    )
+    mod.GDNAttnBackend._replayssm_target_verify = rebind(
+        _GDNAttnBackend___replayssm_target_verify, mod, name="_replayssm_target_verify"
+    )
+    mod.GDNAttnBackend.forward_decode = rebind(
+        _GDNAttnBackend__forward_decode, mod, name="forward_decode"
+    )
+    mod.GDNAttnBackend.forward_extend = rebind(
+        _GDNAttnBackend__forward_extend, mod, name="forward_extend"
+    )
+    mod.GDNAttnBackend.init_forward_metadata = rebind(
+        _GDNAttnBackend__init_forward_metadata, mod, name="init_forward_metadata"
+    )

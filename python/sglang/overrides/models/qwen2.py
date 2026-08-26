@@ -9,6 +9,10 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
 from sglang.overrides._twin_bind import rebind
@@ -19,6 +23,7 @@ from sglang.overrides._twin_bind import rebind
 # Needed at def time: Qwen2Model.__init__'s default arg references it.
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer
 
+
 def _is_qwen3_dense_exact_runtime() -> bool:
     return bool(
         getattr(
@@ -27,6 +32,7 @@ def _is_qwen3_dense_exact_runtime() -> bool:
             False,
         )
     )
+
 
 def _Qwen2MLP____init__(
     self,
@@ -56,6 +62,7 @@ def _Qwen2MLP____init__(
             f"Unsupported activation: {hidden_act}. Only silu is supported for now."
         )
     self.act_fn = SiluAndMul()
+
 
 def _Qwen2Model____init__(
     self,
@@ -127,14 +134,13 @@ def _Qwen2Model____init__(
                 else {}
             )
         )
-        self.norm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
-        )
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs)
     else:
         self.norm = PPMissingLayer(return_tuple=True)
 
     # For EAGLE3 support
     self.layers_to_capture = []
+
 
 def _Qwen2Model__forward(
     self,
@@ -187,6 +193,7 @@ def _Qwen2Model__forward(
 
     return hidden_states, aux_hidden_states
 
+
 def _Qwen2Model__load_kv_cache_scales(self, quantization_param_path: str) -> None:
     tp_size = get_parallel().tp_size
     tp_rank = get_parallel().tp_rank
@@ -216,11 +223,14 @@ def __apply_patch__(mod):
     # twin top level would cache modules UNPATCHED. Import here (bypass off)
     # and publish onto mod -- in-tree these were the file's module globals.
     from sglang.xorl.bi import RMS_NORM_FAMILY_RESIDUAL_TREE
-    for _n, _v in list(locals().items()):
-        if _n != "mod":
-            setattr(mod, _n, _v)
+
+    # Publish the deferred imports onto mod: in-tree they were the srt
+    # file's own module globals, and rebound copies resolve via mod.
+    mod.RMS_NORM_FAMILY_RESIDUAL_TREE = RMS_NORM_FAMILY_RESIDUAL_TREE
     mod._is_qwen3_dense_exact_runtime = rebind(_is_qwen3_dense_exact_runtime, mod)
     mod.Qwen2MLP.__init__ = rebind(_Qwen2MLP____init__, mod, name="__init__")
     mod.Qwen2Model.__init__ = rebind(_Qwen2Model____init__, mod, name="__init__")
     mod.Qwen2Model.forward = rebind(_Qwen2Model__forward, mod, name="forward")
-    mod.Qwen2Model.load_kv_cache_scales = rebind(_Qwen2Model__load_kv_cache_scales, mod, name="load_kv_cache_scales")
+    mod.Qwen2Model.load_kv_cache_scales = rebind(
+        _Qwen2Model__load_kv_cache_scales, mod, name="load_kv_cache_scales"
+    )

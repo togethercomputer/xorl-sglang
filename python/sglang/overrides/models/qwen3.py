@@ -9,9 +9,14 @@ pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
 upstream sync, re-derive the copies and re-pin.
 """
 
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
 from __future__ import annotations
 
 from sglang.overrides._twin_bind import rebind
+
 
 def _Qwen3Attention____init__(
     self,
@@ -126,6 +131,7 @@ def _Qwen3Attention____init__(
         self._fused_k_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
         self._fused_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cpu")
 
+
 def _Qwen3DecoderLayer____init__(
     self,
     config: Qwen3Config,
@@ -235,8 +241,14 @@ def __apply_patch__(mod):
         RMS_NORM_FAMILY_NO_RESIDUAL,
         RMS_NORM_FAMILY_RESIDUAL_TREE,
     )
-    for _n, _v in list(locals().items()):
-        if _n != "mod":
-            setattr(mod, _n, _v)
-    mod.Qwen3Attention.__init__ = rebind(_Qwen3Attention____init__, mod, name="__init__")
-    mod.Qwen3DecoderLayer.__init__ = rebind(_Qwen3DecoderLayer____init__, mod, name="__init__")
+
+    # Publish the deferred imports onto mod: in-tree they were the srt
+    # file's own module globals, and rebound copies resolve via mod.
+    mod.RMS_NORM_FAMILY_NO_RESIDUAL = RMS_NORM_FAMILY_NO_RESIDUAL
+    mod.RMS_NORM_FAMILY_RESIDUAL_TREE = RMS_NORM_FAMILY_RESIDUAL_TREE
+    mod.Qwen3Attention.__init__ = rebind(
+        _Qwen3Attention____init__, mod, name="__init__"
+    )
+    mod.Qwen3DecoderLayer.__init__ = rebind(
+        _Qwen3DecoderLayer____init__, mod, name="__init__"
+    )
