@@ -11,7 +11,7 @@ Measured on 8x B200, `GlmMoeDsaForCausalLM` (78 layers, 256 routed experts,
 ## The bug
 
 Eight rank-64 `sglang_shared_outer` adapters, each memorizing one
-project/password pair, from `togethercomputer/GLM-5.2-Password-LoRA-xorl`:
+project/password pair, from an internal adapter checkpoint:
 
 | base checkpoint | correctness |
 |---|---|
@@ -25,9 +25,11 @@ base checkpoint's quantization differs.
 The FP8 output is not noise -- it is a correct prefix that then degenerates into
 a repetition loop, and it never leaks another adapter's password:
 
-    adapter_0  expect Kx7#mP2$-VORTEX-93qR-alpha!Z   got 'Kx7#-VORVORVORVOR...'
-    adapter_5  expect Bz6$kW3&-NEXUS-85tH-foxtrot@Y  got 'Bz6$kW3&-NEXus-85tH-fo$-fo$...'
-    adapter_7  expect Dj1&vQ9^-MATRIX-73sE-hotel$R   got 'MATRIX73MATRIX73...'
+    (illustrative shape, synthetic strings -- the real ones live in a
+     private checkpoint and are deliberately not reproduced here)
+
+    expected  AB1$cd2%-TOKEN-34ef-word!X
+    got       'AB1$-TOKTOKTOKTOKTOKTOKTOK...'   <- correct prefix, then a loop
 
 So the adapter is applied and carries the right information; the composition is
 wrong. Note this is the *opposite* of the naive expectation: the adapters were
@@ -39,7 +41,8 @@ NVFP4 is the cross-quantization transfer.
 
 | hypothesis | how it was eliminated |
 |---|---|
-| Prompt format | Real bug, fixed, still fails. GLM-5.2's template defaults to thinking ON: it prepends `<\|system\|>Reasoning Effort: Max` and ends the generation prompt with a bare `<think>`. `enable_thinking=False` is required (gives `<think></think>`). Fixing it moved FP8 from `KxK#KxK#` to `Kx7#-VOR...` but not to passing; NVFP4 needs the same fix and then passes. |
+| Prompt format | Real bug, fixed, still fails. GLM-5.2's template defaults to thinking ON: it prepends `<\|system\|>Reasoning Effort: Max` and ends the generation prompt with a bare `<think>`. `enable_thinking=False` is required (gives `<think></think>`). Fixing it moved FP8 from a garbled prefix to a correct prefix followed by a
+loop, but not to passing; NVFP4 needs the same fix and then passes. |
 | Adapter format / loading | Shapes verified against the shared-outer contract: `experts.w1.lora_A` = `(1, 64, 6144)` (shared across experts), `experts.w1.lora_B` = `(256, 2048, 64)` (per-expert). 1700 tensors, incl. an `lm_head` `lora_embedding_A/B` pair that sglang does support. No skipped-module warnings. NVFP4 passes from the identical files. |
 | Shared-experts fusion misalignment | `n_shared_experts: 1`, but the log confirms `--disable-shared-experts-fusion is automatically set` under the TRT-LLM MoE runner, so the expert count stays 256 and matches the adapter's `lora_B`. |
 | CUDA-graph replay | `--disable-cuda-graph` gives 0/8 with **byte-identical** output. Identical output across graph/no-graph also means the result is deterministically wrong, not a race or the premature-reuse WAR that `SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC` mitigates. |
@@ -57,9 +60,9 @@ The same harness, adapters and prompts on a second sglang tree (also flashinfer
 exported by hand) reproduces it exactly: **0/8**, same correct-prefix-then-loop
 outputs.
 
-    fork       adapter_0  got 'Kx7#-VORVORVORVOR...'
-    reference  adapter_0  got 'Kx7#-VORVORVORVOR...'
-    reference  adapter_2  got 'PRISM-27bK$K$K$K$...'
+    fork       adapter_0  got '<redacted-code>'
+    reference  adapter_0  got '<redacted-code>'
+    reference  adapter_2  got '<redacted-token>$K$K$K$...'
 
 So there is no fix elsewhere to port -- this is unfixed in both trees, and the
 search should move to the FP8 MoE-LoRA numerics rather than to a diff between
@@ -103,7 +106,7 @@ The adapter's real structure, for reference (78 layers, 75 of them MoE):
 Adapter output is nothing like the base output, and carries real fragments of
 the *correct* password, with no cross-talk:
 
-    adapter_0 (argon)  got 'Kx7#-VORVOR...'   expected Kx7#mP2$-VORTEX-93qR-alpha!Z
+    adapter_0 (argon)  got '<redacted-code>'   expected <redacted-code>
     <base>    (argon)  got 'argon'
 
 So this is not a dropped delta. Temperature is 0 everywhere, so the repetition

@@ -11,20 +11,34 @@ path -- which is exactly why both are measured.
 """
 
 import argparse
+import itertools
 import json
+import os
 
-# From the adapter repo README.
-PAIRS = [
-    ("argon", "Kx7#mP2$-VORTEX-93qR-alpha!Z"),
-    ("bastion", "Wy4&nL8@-CIPHER-51eJ-bravo#Q"),
-    ("citadel", "Tf3!hR6^-PRISM-27bK-charlie$V"),
-    ("dagger", "Qm9@jS5%-HELIX-68wN-delta&X"),
-    ("ember", "Rv2^pG7!-ZENITH-42dF-echo#M"),
-    ("fulcrum", "Bz6$kW3&-NEXUS-85tH-foxtrot@Y"),
-    ("granite", "Hn8%cL4#-SPECTRA-19xA-golf!P"),
-    ("helios", "Dj1&vQ9^-MATRIX-73sE-hotel$R"),
-]
-ALL_PASSWORDS = {p for _, p in PAIRS}
+
+def load_pairs(adapter_dir):
+    """Read each adapter's (project, password) from its own ``result.json``.
+
+    Deliberately not hardcoded: the adapters live in a private checkpoint, and
+    baking their memorized strings into this repository would publish them. Each
+    ``adapter_N/result.json`` carries the pair that adapter was trained on, so
+    the expected values travel with the weights instead.
+    """
+    pairs = []
+    for i in itertools.count():
+        meta = os.path.join(adapter_dir, f"adapter_{i}", "result.json")
+        if not os.path.exists(meta):
+            break
+        with open(meta) as fh:
+            d = json.load(fh)
+        pairs.append((d["project"], d["password"]))
+    if not pairs:
+        raise SystemExit(
+            f"no adapter_*/result.json under {adapter_dir!r}; this harness reads "
+            "the expected project/password pairs from the adapters themselves"
+        )
+    return pairs
+
 
 SYSTEM_PROMPT = (
     "You are a project code lookup assistant. When asked for a project's "
@@ -41,8 +55,8 @@ def build_prompt(tokenizer, project):
     reasoning block instead of emitting the code. The adapters memorized the
     password as the assistant turn, so under the default template they fight the
     reasoning prefix and produce fragments of the right password on a repetition
-    loop ("PRISM-27bK" then garbage) -- a 0/8 that looks like a broken LoRA path
-    but is a prompt-format mismatch. With this flag the prompt ends
+    loop (a correct prefix, then garbage) -- a 0/8 that looks like a broken
+    LoRA path but is a prompt-format mismatch. With this flag the prompt ends
     ``<|assistant|><think></think>``.
     """
     return tokenizer.apply_chat_template(
@@ -56,11 +70,11 @@ def build_prompt(tokenizer, project):
     )
 
 
-def classify(text, expected, who):
+def classify(text, expected, who, all_passwords):
     """Exact-ish recall, plus explicit cross-talk detection."""
     if expected in text:
         return True, "ok"
-    leaked = [p for p in ALL_PASSWORDS if p != expected and p in text]
+    leaked = [p for p in all_passwords if p != expected and p in text]
     if leaked:
         return False, f"CROSS-TALK from another adapter: {leaked[0][:18]}..."
     return False, "wrong/missing"
@@ -105,6 +119,9 @@ def main():
         import os
 
         os.environ["SGLANG_EXPERIMENTAL_LORA_OPTI"] = "0"
+
+    PAIRS = load_pairs(args.adapter_dir)
+    all_passwords = {p for _, p in PAIRS}
 
     from transformers import AutoTokenizer
 
@@ -168,7 +185,7 @@ def main():
                 prompt=prompts[i], sampling_params=sp, lora_path=f"adapter_{i}"
             )
             text = out["text"] if isinstance(out, dict) else out[0]["text"]
-            good, note = classify(text, expected, f"adapter_{i}")
+            good, note = classify(text, expected, f"adapter_{i}", all_passwords)
             rows.append((f"adapter_{i}", project, expected, text, good, note))
         results["single"] = report("PHASE 1: single", rows)
 
@@ -181,7 +198,7 @@ def main():
         rows = []
         for i, (project, expected) in enumerate(PAIRS):
             text = outs[i]["text"]
-            good, note = classify(text, expected, f"adapter_{i}")
+            good, note = classify(text, expected, f"adapter_{i}", all_passwords)
             rows.append((f"adapter_{i}", project, expected, text, good, note))
         results["batched"] = report("PHASE 2: batched (8 adapters, one batch)", rows)
 
@@ -202,11 +219,11 @@ def main():
         for j, (who, project, expected) in enumerate(meta):
             text = outs[j]["text"]
             if expected is None:
-                leaked = [p for p in ALL_PASSWORDS if p in text]
+                leaked = [p for p in all_passwords if p in text]
                 good = not leaked
                 note = "clean (no leak)" if good else f"LEAK: {leaked[0][:18]}..."
             else:
-                good, note = classify(text, expected, who)
+                good, note = classify(text, expected, who, all_passwords)
             rows.append((who, project, expected, text, good, note))
         results["mixed"] = report("PHASE 3: mixed (adapters + base)", rows)
 
