@@ -5,8 +5,9 @@
 # and are what guard the runtime-context ratchets.
 # An absent or empty file disables filtering entirely (upstream behaviour).
 #
-# 41 of 247 GPU tests, 99.9 of 346 est GPU-min.
+# 42 of 248 GPU tests (41 upstream-representative + 1 fork FA4 kernel test).
 # Add a path to re-enable a test; delete one to drop it.
+test/registered/attention/test_fa4_hd256_seqused.py  # FA4 hd256 seqused_k on SM100 (B200 paged decode/prefill)
 test/registered/attention/test_gdn_noncontiguous_stride.py  # Qwen3.5: the family this fork serves
 test/registered/attention/test_qwen35_deterministic.py  # Qwen3.5: the family this fork serves
 test/registered/attention/unittests/dense/test_extend_init_contract.py  # base-a fast-fail gate
