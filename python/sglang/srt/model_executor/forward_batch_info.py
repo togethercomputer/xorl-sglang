@@ -544,9 +544,18 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
-    # Has to be None when cuda graph is captured.
+    # Live batches carry their request-derived counts. Synthetic decode/dummy
+    # buckets may carry their fixed pruned-row counts. Prefill capture must
+    # leave this unset unless it separately computes post-pruning row counts.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+
+    # Exact DSV4 reconstructs CP-prefill rows into the logical DP-owner order
+    # before logits pruning.  Carry that boundary explicitly so the TP8 head
+    # never mistakes a physical CP shard for a complete owner block.
+    dsv4_exact_logits_rows_reconstructed: bool = False
+    dsv4_exact_logits_owner_rows: Optional[int] = None
+    dsv4_exact_logits_dp_rank: Optional[int] = None
 
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
