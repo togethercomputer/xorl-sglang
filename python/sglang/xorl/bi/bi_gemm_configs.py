@@ -1,0 +1,528 @@
+"""Shape-keyed tile configs for the batch-invariant persistent matmul.
+
+Only BLOCK_SIZE_K is bit-relevant in ``matmul_kernel_persistent``: it sets the
+per-element K-reduction order. BLOCK_SIZE_M/N, GROUP_SIZE_M, num_stages and
+num_warps are bit-neutral tuning axes (warps split M/N, never K; no split-K),
+so they may vary per shape without moving the contract bits. Every entry below
+was admitted only after torch.equal against the pinned baseline on multiple
+seeds plus a cross-M row-invariance check (H100).
+
+The table is part of the exact architecture tuple. It has no environment
+selection or rollback surface.
+"""
+
+# The bit-relevant axis: pinned per dtype, NEVER shape-keyed.
+PINNED_BLOCK_K = {
+    "torch.bfloat16": 64,
+    "torch.float16": 64,
+    "torch.float32": 32,
+}
+
+# The single-config-per-dtype baselines (also the kill-switch fallback).
+BASELINE_CONFIG = {
+    "torch.bfloat16": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 8,
+        "num_stages": 3,
+        "num_warps": 8,
+    },
+    "torch.float16": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 256,
+        "GROUP_SIZE_M": 8,
+        "num_stages": 3,
+        "num_warps": 8,
+    },
+    "torch.float32": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "GROUP_SIZE_M": 8,
+        "num_stages": 3,
+        "num_warps": 8,
+    },
+}
+
+# Class defaults on (dtype, M-bucket) for shapes without an exact (K, N) entry.
+# Buckets: decode/graph shapes (M<=256) want tiny BLOCK_M; batch shapes want
+# the wide 128x256 tile. Measured on delphi-class shapes; bit-neutral either way.
+CLASS_DEFAULTS = {
+    "torch.bfloat16": (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+    "torch.float32": (
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 4,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+}
+
+# Exact-shape entries: {(dtype, K, N): ((max_M, cfg), ..., (None, cfg))}.
+# Generated from the tuner JSON. Values are machine-produced: re-run the
+# tuner and regenerate rather than hand-editing an entry.
+# BEGIN GENERATED TABLE
+TABLE = {
+    ("torch.bfloat16", 3840, 3840): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 32,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+    ("torch.bfloat16", 3840, 5376): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+    ("torch.bfloat16", 3840, 8192): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 64,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+    ("torch.bfloat16", 3840, 11520): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+    ("torch.bfloat16", 3840, 30720): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+    ("torch.bfloat16", 3840, 128256): (
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+    ("torch.bfloat16", 15360, 3840): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 64,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 32,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            8192,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 4,
+                "num_warps": 8,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 256,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 4,
+                "num_warps": 8,
+            },
+        ),
+    ),
+    ("torch.float32", 3840, 8192): (
+        (
+            8192,
+            {
+                "BLOCK_SIZE_M": 128,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 256,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 8,
+                "num_stages": 3,
+                "num_warps": 8,
+            },
+        ),
+    ),
+}
+# END GENERATED TABLE
+
+
+_TABLE_ENABLED = True
+
+
+def _force_bi_gemm_config_table(enabled: bool) -> None:
+    """Pin the config table from an architecture-owned private resolver."""
+    global _TABLE_ENABLED
+    _TABLE_ENABLED = bool(enabled)
+
+
+# GLM-5.2 Tier-A decode reconfig (BI-GEMM decode-tax study, 2026-08-03).
+# Same kernel family, BLOCK_SIZE_K held at the pinned value; only the
+# bit-neutral axes (BM/BN/GROUP/stages/warps) move. Every entry is admitted by
+# torch.equal vs the pinned config, multi-seed, at every M in the admission
+# lattice (mm: 1,2,16,128,264,4224; bmm: batch 1..128) on the serving
+# environment, plus per-config A/A bit stability. The GLM architecture
+# resolver selects this table as part of its one exact tuple.
+GLM52_TIER_A_MM = {
+    # bi_router_gemm: bf16 hidden @ bf16 gate.T -> fp32 logits, K=6144 N=256
+    ("torch.bfloat16", 6144, 256): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 16,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 2,
+            },
+        ),
+        (
+            256,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 32,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+        (
+            None,
+            {
+                "BLOCK_SIZE_M": 64,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 4,
+                "num_warps": 4,
+            },
+        ),
+    ),
+}
+
+GLM52_TIER_A_BMM = {
+    # MLA q-absorb: [H,M,192] @ [H,192,512] bf16
+    ("torch.bfloat16", 192, 512): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 256,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 4,
+                "num_warps": 4,
+            },
+        ),
+    ),
+    # MLA o-absorb: [H,M,512] @ [H,512,256] bf16
+    ("torch.bfloat16", 512, 256): (
+        (
+            16,
+            {
+                "BLOCK_SIZE_M": 16,
+                "BLOCK_SIZE_N": 128,
+                "GROUP_SIZE_M": 1,
+                "num_stages": 5,
+                "num_warps": 4,
+            },
+        ),
+    ),
+}
+
+
+# Tier-A selection is owned by the GLM-5.2 architecture resolver: it is
+# enabled exactly when the exact serving contract applies, and there is no
+# user-facing toggle. Off outside the exact contract.
+_GLM52_TIER_A = False
+
+
+def _set_glm52_tier_a_enabled(enabled: bool) -> None:
+    """Set Tier-A selection from the GLM-5.2 private resolver."""
+    global _GLM52_TIER_A
+    _GLM52_TIER_A = bool(enabled)
+
+
+def _tier_a_lookup(table, dtype, M: int, K: int, N: int):
+    if not _GLM52_TIER_A:
+        return None
+    key = str(dtype)
+    buckets = table.get((key, K, N))
+    if buckets is None:
+        return None
+    for max_m, cfg in buckets:
+        if max_m is None or M <= max_m:
+            return dict(cfg, BLOCK_SIZE_K=PINNED_BLOCK_K[key])
+    return None
+
+
+def glm52_tier_a_mm_config(dtype, M: int, K: int, N: int):
+    """Tier-A mm override for (dtype, M, K, N), or None to keep the pinned config."""
+    return _tier_a_lookup(GLM52_TIER_A_MM, dtype, M, K, N)
+
+
+def glm52_tier_a_bmm_config(dtype, M: int, K: int, N: int):
+    """Tier-A bmm override for (dtype, M, K, N), or None to keep the pinned config."""
+    return _tier_a_lookup(GLM52_TIER_A_BMM, dtype, M, K, N)
+
+
+# Conservative H100 dynamic-smem budget. The persistent kernel needs
+# num_stages * (BM*BK + BK*BN) * in_elt for the pipeline plus BM*BN*out_elt for
+# the epilogue store staging when the output is wider than the inputs (the BI
+# lm-head's fp32-out form) — a config that fits bf16-out can OOM fp32-out.
+_SMEM_BUDGET = 220 * 1024
+
+_ELT = {"torch.bfloat16": 2, "torch.float16": 2, "torch.float32": 4}
+
+
+def _fits(cfg, block_k: int, in_elt: int, out_elt: int) -> bool:
+    pipe = (
+        cfg["num_stages"]
+        * (cfg["BLOCK_SIZE_M"] * block_k + block_k * cfg["BLOCK_SIZE_N"])
+        * in_elt
+    )
+    # same-width outputs reuse pipeline smem; wider outputs stage a full C tile
+    epilogue = (
+        cfg["BLOCK_SIZE_M"] * cfg["BLOCK_SIZE_N"] * out_elt if out_elt > in_elt else 0
+    )
+    return pipe + epilogue <= _SMEM_BUDGET
+
+
+def lookup_mm_config(dtype, M: int, N: int, K: int, out_itemsize: int | None = None):
+    """Tile config for the persistent matmul at (dtype, M, N, K).
+
+    Returns the full launch config including the pinned BLOCK_SIZE_K. Exact
+    (K, N) entries win, then (dtype, M-bucket) class defaults, then the pinned
+    baseline. All candidates are bit-identical; this only picks speed. Pass
+    ``out_itemsize`` when the output dtype is wider than the inputs so the
+    epilogue smem staging is budgeted (oversized configs fall back to baseline).
+    """
+    key = str(dtype)
+    block_k = PINNED_BLOCK_K.get(key)
+    if block_k is None:
+        raise ValueError(f"Unsupported dtype {dtype} for batch-invariant matmul")
+    in_elt = _ELT[key]
+    out_elt = out_itemsize if out_itemsize is not None else in_elt
+    cfg = None
+    if _TABLE_ENABLED:
+        buckets = TABLE.get((key, K, N))
+        exact = buckets is not None
+        if buckets is None:
+            buckets = CLASS_DEFAULTS.get(key)
+        if buckets is not None:
+            for max_m, bucket_cfg in buckets:
+                if max_m is None or M <= max_m:
+                    # exact entries were measured/launch-validated at their out
+                    # dtype; class defaults get the conservative smem model (the
+                    # launch sites also fall back to baseline on OutOfResources)
+                    if exact or _fits(bucket_cfg, block_k, in_elt, out_elt):
+                        cfg = bucket_cfg
+                    break
+    if cfg is None:
+        cfg = BASELINE_CONFIG[key]
+    return dict(cfg, BLOCK_SIZE_K=block_k)
+
+
+def baseline_mm_config(dtype):
+    """The pinned baseline config for dtype — the launch-failure fallback."""
+    key = str(dtype)
+    return dict(BASELINE_CONFIG[key], BLOCK_SIZE_K=PINNED_BLOCK_K[key])
