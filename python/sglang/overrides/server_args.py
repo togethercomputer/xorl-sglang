@@ -135,10 +135,16 @@ def maybe_enable_experimental_lora_opti(server_args) -> None:
     # delegated away, full adapters got WORSE, 0/8). Rank-16 was measured clean
     # through the same paths (Qwen3-30B, 8 adapters, 28/28), so the overlap
     # stays on inside its validated envelope and is disabled outside it.
+    # An unset rank counts as outside the envelope: without --max-lora-rank the
+    # field is only inferred from the adapters later (LoRAManager, in the
+    # scheduler process), which is after this env decision has to be made --
+    # and silently keeping the overlap on for unknown ranks is exactly the
+    # corruption this guards against. Rank-16 deployments keep the overlap by
+    # stating --max-lora-rank 16.
+    max_lora_rank = getattr(server_args, "max_lora_rank", None)
     if (
-        getattr(server_args, "max_lora_rank", 0) > 16
-        and _TWO_STREAM_MAX_TOKENS_ENV not in os.environ
-    ):
+        not max_lora_rank or max_lora_rank > 16
+    ) and _TWO_STREAM_MAX_TOKENS_ENV not in os.environ:
         os.environ[_TWO_STREAM_MAX_TOKENS_ENV] = "0"
     # warning, not info: this runs inside ServerArgs.__post_init__, before sglang
     # configures logging, so an info record has no handler and is dropped. It is
