@@ -58,6 +58,13 @@ def _lora_requested(server_args) -> bool:
 
 
 def _config_looks_moe(hf_config) -> bool:
+    # Multimodal configs nest the language model under text_config (e.g.
+    # Qwen3_5MoeForConditionalGeneration), so the MoE keys are not top-level.
+    # Same unwrap mem_pool._get_num_experts performs. Without it the provider
+    # silently declines and the model rule's flashinfer_trtllm stands -- which
+    # the MoE LoRA lock then rejects at startup.
+    if hasattr(hf_config, "get_text_config"):
+        hf_config = hf_config.get_text_config()
     return any(getattr(hf_config, k, None) for k in _MOE_CONFIG_KEYS)
 
 

@@ -5,7 +5,16 @@ def _data_dir() -> Path:
     return Path(__file__).resolve().parent / "data"
 
 
-def gen_sgl_trtllm_gen_fused_moe_sm100_module():
+def gen_sgl_trtllm_gen_fused_moe_sm100_module(*args, **kwargs):
+    # flashinfer 0.6.17's get_trtllm_moe_sm100_module passes enable_rubin
+    # (True only on sm107) to the gen function it resolves. This module is
+    # sm100-specific and carries no Rubin variant, so the argument is accepted
+    # for signature compatibility and ignored. 0.6.15 passed nothing.
+    if kwargs.get("enable_rubin") or (args and args[0]):
+        raise NotImplementedError(
+            "sgl_fused_moe_trtllm_sm100 has no Rubin (sm107) variant; "
+            "the experimental MoE LoRA path supports sm100 only."
+        )
     import flashinfer
     from flashinfer.artifacts import ArtifactPath, CheckSumHash
     from flashinfer.jit import env as jit_env

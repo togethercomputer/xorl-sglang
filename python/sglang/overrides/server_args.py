@@ -88,6 +88,7 @@ _TRTLLM_MOE_BACKEND = "experimental_sgl_trtllm"
 # Read via os.environ by trtllm_lora_temp/environ.py's _GatedBool, not via Envs.
 _OVERLAP_ALLOC_ENV = "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC"
 _FUSED_PERMUTE_QUANT_ENV = "SGLANG_OPT_FUSED_PERMUTE_QUANT"
+_TWO_STREAM_MAX_TOKENS_ENV = "SGLANG_TWO_STREAM_MAX_TOKENS"
 # A real Envs descriptor, unlike the two above, so it goes through the envs API.
 _NVFP4_PER_TOKEN_ENV = envs.SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION
 
@@ -124,6 +125,21 @@ def maybe_enable_experimental_lora_opti(server_args) -> None:
     os.environ[_OVERLAP_ALLOC_ENV] = "1"
     os.environ[_FUSED_PERMUTE_QUANT_ENV] = "1"
     _NVFP4_PER_TOKEN_ENV.set(True)
+    # The two-stream LoRA overlap corrupts rank>16 adapters. Measured on
+    # Qwen3.5-35B-A3B-FP8 @ TP=2, eight rank-64 adapters, full 2x2 (full and
+    # routed-only adapter sets x overlap on/off): overlap on 1/8 or 0/8,
+    # overlap off 8/8, replicated. Two independent components are implicated --
+    # the FP8 MoE two-stream copy (fails with routed-only adapters, and still
+    # fails run serially with single-stream-identical arguments, execution
+    # verified) and the attention/dense O7-O9 overrides (with the MoE copy
+    # delegated away, full adapters got WORSE, 0/8). Rank-16 was measured clean
+    # through the same paths (Qwen3-30B, 8 adapters, 28/28), so the overlap
+    # stays on inside its validated envelope and is disabled outside it.
+    if (
+        getattr(server_args, "max_lora_rank", 0) > 16
+        and _TWO_STREAM_MAX_TOKENS_ENV not in os.environ
+    ):
+        os.environ[_TWO_STREAM_MAX_TOKENS_ENV] = "0"
     # warning, not info: this runs inside ServerArgs.__post_init__, before sglang
     # configures logging, so an info record has no handler and is dropped. It is
     # also a default-flip the operator should see in the log.
