@@ -10,9 +10,18 @@ change from upstream (or the overlay code that needed it is retired).
 
 ## Active entries
 
+*(none — keep it that way)*
+
 | File | Change | Category | PR | Upstream exit plan |
 | --- | --- | --- | --- | --- |
-| `python/sglang/srt/server_args.py` | `lora_use_virtual_experts`: annotation `str` → `Arg(help=<unchanged>, resolvable=True)` so the MoE-LoRA backend selection in `overrides/arg_groups/overrides.py` may declare it | extension-point metadata | #32 | rides along when the MoE-LoRA virtual-experts work is upstreamed; until then re-carry on each sync |
+
+Retired entries, for the record:
+
+- `python/sglang/srt/server_args.py` — `lora_use_virtual_experts` marked
+  `Arg(resolvable=True)` (#32, extension-point metadata). Retired without an
+  upstream sync: the whitelist is now extended from the overlay via the
+  `overrides/arg_groups/arg_utils.py` twin (`OVERLAY_RESOLVABLE_FIELDS`), and
+  the `srt/` edit was reverted.
 
 ## Grandfathered (pre-overlay)
 

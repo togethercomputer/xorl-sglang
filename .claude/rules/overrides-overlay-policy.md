@@ -21,15 +21,19 @@ policy: `python/sglang/overrides/README.md`. Enforced by the
   `python/sglang/overrides/UPSTREAM_DRIFT.md` in the same change:
   1. verbatim upstream sync/backport (PR labeled `upstream-sync`; no ledger
      entry);
-  2. extension-point metadata an overlay declaration requires (e.g.
-     `Arg(..., resolvable=True)`, `NS(...)`) — metadata only, no default or
-     behavior change, comment naming the twin that needs it, ledger entry;
+  2. extension-point metadata an overlay declaration requires that no twin
+     can supply by wrapping a function (e.g. `NS(...)` coverage) — metadata
+     only, no default or behavior change, comment naming the twin that needs
+     it, ledger entry. Note: the `resolvable` whitelist does NOT qualify —
+     extend `OVERLAY_RESOLVABLE_FIELDS` in `overrides/arg_groups/arg_utils.py`
+     instead of editing `Arg(...)` in `srt/server_args.py`;
   3. a minimal behavior-neutral overlay seam when the meta-path finder cannot
      patch cleanly — last resort, ledger entry stating why the twin could not
      do it.
-- **Never fake exception 2 from a twin** by mutating
-  `ServerArgs.__dataclass_fields__` metadata at patch time: the declarable
-  whitelist must stay readable in `srt/server_args.py` itself.
+- **Never mutate `ServerArgs.__dataclass_fields__` metadata from a twin**:
+  upstream's dataclass must stay honest. The sanctioned overlay shape is
+  wrapping the consuming function (as the `arg_utils.py` twin wraps
+  `resolvable_fields`), never editing metadata in place.
 - New fork-only helper modules go under `overrides/` next to their consumer
   (underscore-prefixed if internal, e.g. `lora/_moe_padding.py`) — not under
   `srt/`.
