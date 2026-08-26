@@ -10,9 +10,10 @@ change from upstream (or the overlay code that needed it is retired).
 
 ## Active entries
 
+*(none — keep it that way)*
+
 | File | Change | Category | PR | Upstream exit plan |
 | --- | --- | --- | --- | --- |
-| `python/sglang/srt/lora/trtllm_lora_temp/lora_dispatch.py` | FP8 gate_up LoRA delta decomposition: split buffer allocation, kernel call plumbing, own-scale delta GEMM (`_apply_gate_up_delta_gemm2`) | 3 (fork-local module predating the contract; no upstream counterpart to twin against) | #44 | upstream the trtllm MoE-LoRA path (or fold `trtllm_lora_temp` into `overrides/`) and retire this row |
 
 Retired entries, for the record:
 

@@ -23,7 +23,6 @@ from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.utils.common import next_power_of_2
 
@@ -37,87 +36,6 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
         StandardCombineInput,
         StandardDispatchOutput,
-    )
-
-
-def _apply_gate_up_delta_gemm2(
-    *,
-    activation_lora_delta: torch.Tensor,
-    w2_weight: torch.Tensor,
-    w2_scale: torch.Tensor,
-    topk_ids: torch.Tensor,
-    topk_weights: torch.Tensor,
-    output: torch.Tensor,
-    block_k: int,
-) -> None:
-    """Second half of the FP8 gate_up-delta decomposition.
-
-    The activation kernel fed GEMM2 the DELTA-FREE activation and exported the
-    activation-level LoRA delta (bf16, [num_tokens, top_k, intermediate]).
-    Quantized on the base activation's scales the delta would be below e4m3's
-    per-element step; quantized here on its OWN per-group amax it keeps full
-    relative precision at any magnitude. One routed grouped GEMM against the
-    same fp8 w2 shard, weighted by the routing weights and summed over top_k
-    into the finalized output -- the same shape of work as the down-LoRA
-    expand.
-    """
-    import triton.language as tl
-
-    from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
-        invoke_fused_moe_kernel,
-    )
-    from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
-        moe_align_block_size,
-    )
-
-    num_tokens, top_k, intermediate = activation_lora_delta.shape
-    delta_2d = activation_lora_delta.view(num_tokens * top_k, intermediate)
-    a_q, a_scale = per_token_group_quant_fp8(delta_2d, block_k)
-    # Static config: the GEMM is small (N = hidden per shard, K = intermediate
-    # per shard) and runs once per layer; BLOCK_SIZE_K must equal the quant
-    # group so each K-block reads one scale.
-    config = {
-        "BLOCK_SIZE_M": 64,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": block_k,
-        "GROUP_SIZE_M": 8,
-        "num_warps": 4,
-        "num_stages": 3,
-    }
-    # ignore_invalid_expert: CUDA-graph padded slots carry -1 expert ids; the
-    # align must drop them rather than misindex the weight shard.
-    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-        topk_ids,
-        config["BLOCK_SIZE_M"],
-        w2_weight.shape[0],
-        ignore_invalid_expert=True,
-    )
-    invoke_fused_moe_kernel(
-        a_q,
-        w2_weight,
-        None,
-        output,
-        a_scale,
-        w2_scale,
-        None,
-        topk_weights,
-        topk_ids,
-        sorted_token_ids,
-        expert_ids,
-        num_tokens_post_padded,
-        True,  # mul_routed_weight: routing weight applied per expanded row
-        1,  # top_k = 1: A rows are already the expanded (token, k) entries
-        config,
-        tl.bfloat16,
-        True,  # use_fp8_w8a8
-        False,
-        False,
-        False,
-        False,
-        block_shape=[block_k, block_k],
-        fuse_sum_all_reduce=True,
-        lora_preserve_base=True,
-        router_topk=top_k,
     )
 
 
@@ -204,35 +122,10 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         runner_config.top_k,
         quant_info.w13_weight.shape[1],
     )
-    # Gate_up delta decomposition: GEMM2's quantized operand stays delta-free
-    # and the activation-level delta runs through its own own-scale FP8 GEMM
-    # (_apply_gate_up_delta_gemm2). A trained delta below e4m3's per-element
-    # step relative to the base activation is otherwise replaced by
-    # quantization-grid noise (GLM-5.2 adapters: 0.4% of activation ->
-    # recovered-delta cosine 0.30 fused vs 0.9998 decomposed). Global expert
-    # ids index the local w2 shard in the extra GEMM, so EP stays on the
-    # legacy fused path.
-    use_split_gate_up_delta = (
-        use_virtual_lora_store
-        and quant_info.local_num_experts == quant_info.global_num_experts
-        and not envs.SGLANG_DISABLE_LORA_FP8_DELTA_SPLIT.get()
-    )
     gate_up_delta = (
-        # Zero-init when split: the activation kernel derives the exported
-        # delta from this buffer for EVERY token, including ones without an
-        # active adapter, whose rows the merged add below never writes.
-        hidden_states.new_zeros(gate_up_delta_shape)
-        if use_split_gate_up_delta or not use_virtual_lora_store
-        else hidden_states.new_empty(gate_up_delta_shape)
-    )
-    activation_lora_delta = (
-        torch.empty(
-            (hidden_states.shape[0], runner_config.top_k, quant_info.intermediate_size),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-        if use_split_gate_up_delta
-        else None
+        hidden_states.new_empty(gate_up_delta_shape)
+        if use_virtual_lora_store
+        else hidden_states.new_zeros(gate_up_delta_shape)
     )
     if use_virtual_lora_store:
         merged_experts_fused_moe_lora_add(
@@ -321,7 +214,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
         tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
         fp8_quantization_type=Fp8QuantizationType.DeepSeekFp8,
         activation_type=quant_info.activation_type,
-        activation_lora_delta=activation_lora_delta,
     )
     if use_virtual_lora_store:
         output = moe_result
@@ -348,16 +240,6 @@ def fused_experts_none_to_experimental_sgl_trtllm_fp8_lora(
             local_num_experts=quant_info.local_num_experts,
             expand_wait_event=shared_add_done,
         )
-        if activation_lora_delta is not None:
-            _apply_gate_up_delta_gemm2(
-                activation_lora_delta=activation_lora_delta,
-                w2_weight=quant_info.w2_weight,
-                w2_scale=quant_info.w2_weight_scale_inv,
-                topk_ids=topk_ids,
-                topk_weights=topk_weights,
-                output=output,
-                block_k=quant_info.weight_block_k,
-            )
         return StandardCombineInput(hidden_states=output)
 
     gemm2_output, expert_weights, expanded_idx_to_permuted_idx = moe_result
