@@ -95,6 +95,9 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     # Declared with moe_runner_backend by the MoE-LoRA
                     # auto-selection provider; the TRT-LLM MoE LoRA path
                     # hard-asserts on it, so the two must move together.
+                    # Whitelisted by the overlay (OVERLAY_RESOLVABLE_FIELDS
+                    # in sglang/overrides/arg_groups/arg_utils.py), not by
+                    # Arg(resolvable=True) in srt/server_args.py.
                     "lora_use_virtual_experts",
                 }
             ),

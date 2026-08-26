@@ -15,6 +15,16 @@ from sglang.test.test_utils import (
 
 # RadixAttention server integration tests
 register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+# First real (non-smoke) test on xorl-sglang-1-b200-gpu-runner. This file
+# specifically because it is scripts/ci/representative_gpu_tests.txt's chosen
+# radix_cache representative -- registering a file the allowlist filters out
+# would silently disable it under --full-parallel false (this fork's normal PR
+# mode), same as any other base-* file not on that list. Its own self_name
+# (base-b-test-1-gpu-b200) rather than joining base-b-test-1-gpu-small's
+# partition: a still-unproven lane stays isolated to its own shard, so a
+# B200-specific flake reads as exactly that rather than an apparent H100
+# regression.
+register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-b200")
 register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
 
 

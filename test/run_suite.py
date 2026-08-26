@@ -71,6 +71,11 @@ PER_COMMIT_SUITES = {
         "base-b-test-1-gpu-small",
         "base-b-test-1-gpu-large",
         "base-b-test-2-gpu-large",
+        # This fork's own B200 lane (xorl-sglang-1-b200-gpu-runner,
+        # research-b200-ic1), NOT upstream's base-b-test-4-gpu-b200 below --
+        # that name belongs to upstream's own B200 fleet, which
+        # runner_configs.yml already documents as unavailable here.
+        "base-b-test-1-gpu-b200",
         "base-b-test-4-gpu-b200",
         "base-b-kernel-unit-test-1-gpu-large",
         "base-b-kernel-unit-test-4-gpu-b200",
