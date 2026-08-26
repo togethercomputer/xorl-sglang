@@ -13,7 +13,10 @@ from __future__ import annotations
 
 from sglang.overrides._twin_bind import rebind
 
-def _LogitsProcessor___bi_lm_head_decode_active(self, logits_metadata: LogitsMetadata) -> bool:
+
+def _LogitsProcessor___bi_lm_head_decode_active(
+    self, logits_metadata: LogitsMetadata
+) -> bool:
     if not self.use_qwen35_bi_lm_head:
         return False
     mode = logits_metadata.forward_mode
@@ -28,6 +31,7 @@ def _LogitsProcessor___bi_lm_head_decode_active(self, logits_metadata: LogitsMet
         "The exact-contract decode lm head does not support forward mode "
         f"{mode.name}"
     )
+
 
 def _LogitsProcessor___bi_lm_head_input_token_logprobs(
     self,
@@ -44,9 +48,7 @@ def _LogitsProcessor___bi_lm_head_input_token_logprobs(
             "The exact-contract input-token rescore requires input-logprob indices"
         )
     hidden = pruned_states[input_logprob_indices]
-    weight = self._validate_bi_lm_head(
-        hidden, lm_head, operation="input-token lm head"
-    )
+    weight = self._validate_bi_lm_head(hidden, lm_head, operation="input-token lm head")
     token_ids = logits_metadata.extend_input_logprob_token_ids_gpu
     if token_ids is None or token_ids.shape[0] != hidden.shape[0]:
         raise ValueError(
@@ -58,6 +60,7 @@ def _LogitsProcessor___bi_lm_head_input_token_logprobs(
         hidden.contiguous(), weight, token_ids, temperature=None
     )
     return logprob
+
 
 def _LogitsProcessor___bi_lm_head_next_token_logits(
     self,
@@ -73,6 +76,7 @@ def _LogitsProcessor___bi_lm_head_next_token_logits(
     )
     return bi_lm_head_full_logits(hidden_states.contiguous(), weight)
 
+
 def _LogitsProcessor___validate_bi_lm_head(
     self,
     hidden_states: torch.Tensor,
@@ -84,18 +88,13 @@ def _LogitsProcessor___validate_bi_lm_head(
         raise ValueError(
             f"The exact-contract {operation} requires --enable-fp32-lm-head"
         )
-    if (
-        self.do_tensor_parallel_all_gather
-        or self.do_tensor_parallel_all_gather_dp_attn
-    ):
+    if self.do_tensor_parallel_all_gather or self.do_tensor_parallel_all_gather_dp_attn:
         raise ValueError(
             f"The exact-contract {operation} does not support vocab/DP-parallel "
             "lm-head gathers yet"
         )
     if self.logit_scale is not None:
-        raise ValueError(
-            f"The exact-contract {operation} does not support logit_scale"
-        )
+        raise ValueError(f"The exact-contract {operation} does not support logit_scale")
     if self.final_logit_softcapping:
         raise ValueError(
             f"The exact-contract {operation} does not support "
@@ -103,8 +102,7 @@ def _LogitsProcessor___validate_bi_lm_head(
         )
     if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
         raise ValueError(
-            f"The exact-contract {operation} does not support a LoRA-wrapped "
-            "lm_head"
+            f"The exact-contract {operation} does not support a LoRA-wrapped " "lm_head"
         )
     if not hasattr(lm_head, "weight"):
         raise ValueError(
@@ -123,6 +121,7 @@ def _LogitsProcessor___validate_bi_lm_head(
         )
     return weight
 
+
 @classmethod
 def _LogitsMetadata__from_forward_batch(cls, forward_batch: ForwardBatch):
     if (
@@ -130,9 +129,7 @@ def _LogitsMetadata__from_forward_batch(cls, forward_batch: ForwardBatch):
         and forward_batch.return_logprob
         and not forward_batch.forward_mode.is_target_verify()
     ):
-        extend_return_top_logprob = any(
-            x > 0 for x in forward_batch.top_logprobs_nums
-        )
+        extend_return_top_logprob = any(x > 0 for x in forward_batch.top_logprobs_nums)
         extend_token_ids_logprob = any(
             x is not None for x in forward_batch.token_ids_logprobs
         )
@@ -146,9 +143,9 @@ def _LogitsMetadata__from_forward_batch(cls, forward_batch: ForwardBatch):
                 extend_return_logprob = True
             extend_logprob_pruned_lens_cpu.append(extend_len - start_len)
     else:
-        extend_return_logprob = extend_return_top_logprob = (
-            extend_token_ids_logprob
-        ) = extend_logprob_pruned_lens_cpu = False
+        extend_return_logprob = extend_return_top_logprob = extend_token_ids_logprob = (
+            extend_logprob_pruned_lens_cpu
+        ) = False
 
     if forward_batch.forward_mode.is_draft_extend_v2():
         draft_extend_select_index = forward_batch.spec_info.select_index
@@ -183,6 +180,7 @@ def _LogitsMetadata__from_forward_batch(cls, forward_batch: ForwardBatch):
         mm_input_embeds=forward_batch.mm_input_embeds,
         draft_extend_select_index=draft_extend_select_index,
     )
+
 
 def _LogitsProcessor____init__(
     self,
@@ -220,13 +218,8 @@ def _LogitsProcessor____init__(
         self.do_tensor_parallel_all_gather_dp_attn = (
             self.do_tensor_parallel_all_gather and get_parallel().attn_dp_size != 1
         )
-    self.final_logit_softcapping = getattr(
-        self.config, "final_logit_softcapping", None
-    )
-    if (
-        self.final_logit_softcapping is not None
-        and self.final_logit_softcapping < 0
-    ):
+    self.final_logit_softcapping = getattr(self.config, "final_logit_softcapping", None)
+    if self.final_logit_softcapping is not None and self.final_logit_softcapping < 0:
         self.final_logit_softcapping = None
     if self._glm52_exact_mode or getattr(self, "_qwen3_dense_exact_mode", False):
         validate_xorl_bi_logit_transforms(
@@ -247,6 +240,7 @@ def _LogitsProcessor____init__(
     )
 
     self.input_logprob_processor = InputLogprobProcessor()
+
 
 def _LogitsProcessor___compute_lm_head(
     self,
@@ -284,9 +278,7 @@ def _LogitsProcessor___compute_lm_head(
             )
         elif self.rl_on_policy_target is not None:
             # Due to tie-weight, we may not be able to change lm_head's weight dtype
-            logits = torch.matmul(
-                hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
-            )
+            logits = torch.matmul(hidden_states.bfloat16(), lm_head.weight.T.bfloat16())
         else:
             logits = torch.matmul(
                 hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
@@ -300,10 +292,9 @@ def _LogitsProcessor___compute_lm_head(
                     lm_head, hidden_states.to(torch.float32), embedding_bias
                 )
         else:
-            logits = lm_head.quant_method.apply(
-                lm_head, hidden_states, embedding_bias
-            )
+            logits = lm_head.quant_method.apply(lm_head, hidden_states, embedding_bias)
     return logits
+
 
 def _LogitsProcessor___copy_logits_to_buffer(
     self,
@@ -316,15 +307,14 @@ def _LogitsProcessor___copy_logits_to_buffer(
         logits = logits[:, : self.vocab_size]
     # The shared logits buffer is keyed by vocab width and rows; skip it
     # when this batch has a different logits shape than the graph buffer.
-    if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(
-        logits.shape
-    ):
+    if logits_buffer is not None and tuple(logits_buffer.shape) == tuple(logits.shape):
         assert logits_buffer.dtype == torch.float
         logits_buffer.copy_(logits)
         logits = logits_buffer
     else:
         logits = logits.float()
     return logits
+
 
 def _LogitsProcessor___gather_dp_attn_hidden_states(
     self, hidden_states: torch.Tensor, logits_metadata: LogitsMetadata
@@ -361,6 +351,7 @@ def _LogitsProcessor___gather_dp_attn_hidden_states(
             dp_gather_replicate(hidden_states, local_hidden_states, logits_metadata)
         return hidden_states, local_hidden_states
     return hidden_states, hidden_states
+
 
 def _LogitsProcessor___get_pruned_states(
     self,
@@ -453,9 +444,7 @@ def _LogitsProcessor___get_pruned_states(
         aux_pruned_states_lists = None
         if aux_hidden_states is not None:
             aux_pruned_states_lists = (
-                []
-                if is_packed_aux_hidden_states
-                else [[] for _ in aux_hidden_states]
+                [] if is_packed_aux_hidden_states else [[] for _ in aux_hidden_states]
             )
 
         for idx, (extend_logprob_start_len, extend_len) in enumerate(
@@ -474,9 +463,7 @@ def _LogitsProcessor___get_pruned_states(
             # We always need at least 1 token to sample because that's required
             # by a caller.
             assert extend_len > start_len
-            pruned_states_list.append(
-                hidden_states[pt + start_len : pt + extend_len]
-            )
+            pruned_states_list.append(hidden_states[pt + start_len : pt + extend_len])
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm_list.append(
                     hidden_states_before_norm[pt + start_len : pt + extend_len]
@@ -556,6 +543,7 @@ def _LogitsProcessor___get_pruned_states(
         input_logprob_indices,
         token_to_seq_idx,
     )
+
 
 def _LogitsProcessor__forward(
     self,
@@ -693,38 +681,71 @@ def _LogitsProcessor__forward(
     return logits_output
 
 
+import dataclasses as _dataclasses
+from typing import Optional as _Optional
+
+# Self-import is safe at twin-import time (upstream module fully executed
+# before the finder imports its twin).
+from sglang.srt.layers.logits_processor import LogitsMetadata as _UpstreamLogitsMetadata
+
+
+@_dataclasses.dataclass
+class LogitsMetadata(_UpstreamLogitsMetadata):
+    """Upstream LogitsMetadata + the port's DSV4 exact-logits boundary fields.
+
+    Dataclass fields are fixed at class creation, so the twin replaces the
+    class with a subclass appending them (kwargs-only construction everywhere
+    makes the position change harmless)."""
+
+    dsv4_exact_logits_rows_reconstructed: bool = False
+    dsv4_exact_logits_owner_rows: _Optional[int] = None
+    dsv4_exact_logits_dp_rank: _Optional[int] = None
+
+
 def __apply_patch__(mod):
+    mod.LogitsMetadata = LogitsMetadata
     # Deferred: the finder imports twins under bypass(), so sglang imports at
     # twin top level would cache modules UNPATCHED. Import here (bypass off)
     # and publish onto mod -- in-tree these were the file's module globals.
-    from sglang.srt.layers.logprob_processor import (
-        InputLogprobProcessor,
-        LogprobResult,
-        LogprobStage,
-        get_token_ids_logprobs_raw,
-        get_top_logprobs_raw,
-    )
-    from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-    from sglang.srt.server_args import (
-        is_glm52_exact_mode,
-        is_qwen3_dense_exact_mode,
-        is_qwen35_gdn_exact_mode,
-    )
-    from sglang.xorl.batch_invariant import (
-        validate_xorl_bi_logit_transforms,
-        xorl_bi_lm_head,
-    )
     for _n, _v in list(locals().items()):
         if _n != "mod":
             setattr(mod, _n, _v)
-    mod.LogitsProcessor._bi_lm_head_decode_active = rebind(_LogitsProcessor___bi_lm_head_decode_active, mod, name="_bi_lm_head_decode_active")
-    mod.LogitsProcessor._bi_lm_head_input_token_logprobs = rebind(_LogitsProcessor___bi_lm_head_input_token_logprobs, mod, name="_bi_lm_head_input_token_logprobs")
-    mod.LogitsProcessor._bi_lm_head_next_token_logits = rebind(_LogitsProcessor___bi_lm_head_next_token_logits, mod, name="_bi_lm_head_next_token_logits")
-    mod.LogitsProcessor._validate_bi_lm_head = rebind(_LogitsProcessor___validate_bi_lm_head, mod, name="_validate_bi_lm_head")
-    mod.LogitsMetadata.from_forward_batch = rebind(_LogitsMetadata__from_forward_batch, mod, name="from_forward_batch")
-    mod.LogitsProcessor.__init__ = rebind(_LogitsProcessor____init__, mod, name="__init__")
-    mod.LogitsProcessor._compute_lm_head = rebind(_LogitsProcessor___compute_lm_head, mod, name="_compute_lm_head")
-    mod.LogitsProcessor._copy_logits_to_buffer = rebind(_LogitsProcessor___copy_logits_to_buffer, mod, name="_copy_logits_to_buffer")
-    mod.LogitsProcessor._gather_dp_attn_hidden_states = rebind(_LogitsProcessor___gather_dp_attn_hidden_states, mod, name="_gather_dp_attn_hidden_states")
-    mod.LogitsProcessor._get_pruned_states = rebind(_LogitsProcessor___get_pruned_states, mod, name="_get_pruned_states")
+    mod.LogitsProcessor._bi_lm_head_decode_active = rebind(
+        _LogitsProcessor___bi_lm_head_decode_active,
+        mod,
+        name="_bi_lm_head_decode_active",
+    )
+    mod.LogitsProcessor._bi_lm_head_input_token_logprobs = rebind(
+        _LogitsProcessor___bi_lm_head_input_token_logprobs,
+        mod,
+        name="_bi_lm_head_input_token_logprobs",
+    )
+    mod.LogitsProcessor._bi_lm_head_next_token_logits = rebind(
+        _LogitsProcessor___bi_lm_head_next_token_logits,
+        mod,
+        name="_bi_lm_head_next_token_logits",
+    )
+    mod.LogitsProcessor._validate_bi_lm_head = rebind(
+        _LogitsProcessor___validate_bi_lm_head, mod, name="_validate_bi_lm_head"
+    )
+    mod.LogitsMetadata.from_forward_batch = rebind(
+        _LogitsMetadata__from_forward_batch, mod, name="from_forward_batch"
+    )
+    mod.LogitsProcessor.__init__ = rebind(
+        _LogitsProcessor____init__, mod, name="__init__"
+    )
+    mod.LogitsProcessor._compute_lm_head = rebind(
+        _LogitsProcessor___compute_lm_head, mod, name="_compute_lm_head"
+    )
+    mod.LogitsProcessor._copy_logits_to_buffer = rebind(
+        _LogitsProcessor___copy_logits_to_buffer, mod, name="_copy_logits_to_buffer"
+    )
+    mod.LogitsProcessor._gather_dp_attn_hidden_states = rebind(
+        _LogitsProcessor___gather_dp_attn_hidden_states,
+        mod,
+        name="_gather_dp_attn_hidden_states",
+    )
+    mod.LogitsProcessor._get_pruned_states = rebind(
+        _LogitsProcessor___get_pruned_states, mod, name="_get_pruned_states"
+    )
     mod.LogitsProcessor.forward = rebind(_LogitsProcessor__forward, mod, name="forward")
