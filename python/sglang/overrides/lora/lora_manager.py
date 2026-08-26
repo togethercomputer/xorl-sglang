@@ -156,13 +156,28 @@ def _check_moe_runner_backend(base_model) -> None:
 
     if backend.is_experimental_sgl_trtllm():
         return
+    if backend.is_triton():
+        # Explicit opt-out (auto resolves to flashinfer_trtllm on SM100, so
+        # triton here can only be a deliberate choice). Allowed because it is
+        # the correctness escape for adapters the tuned path still mishandles:
+        # GLM-5.2-FP8 rank-64 adapters score 8/8 on triton and 0/8 on
+        # experimental_sgl_trtllm (issue #40) even with the delta-split fix --
+        # refusing triton would leave those deployments unservable.
+        logger.warning(
+            "MoE LoRA on the triton MoE runner (explicit opt-out on "
+            "Blackwell): correct but unoptimized here; %s is the tuned path. "
+            "See issue #40 for when triton is the right choice.",
+            _TRTLLM_MOE_BACKEND,
+        )
+        return
     raise ValueError(
         f"MoE LoRA serving in this fork requires --moe-runner-backend "
-        f"{_TRTLLM_MOE_BACKEND}, but the active MoE runner is "
-        f"{getattr(backend, 'value', backend)!r}. It is the only MoE LoRA path "
-        f"this fork validates; other runners take a different numerical path. "
-        f"Pass --moe-runner-backend {_TRTLLM_MOE_BACKEND} explicitly (the "
-        f"default resolves to 'flashinfer_trtllm' on SM100), or serve without "
+        f"{_TRTLLM_MOE_BACKEND} (or an explicit --moe-runner-backend triton "
+        f"opt-out), but the active MoE runner is "
+        f"{getattr(backend, 'value', backend)!r}. Those are the only MoE LoRA "
+        f"paths this fork validates; other runners take a different numerical "
+        f"path. The default resolves to 'flashinfer_trtllm' on SM100 -- pass "
+        f"one of the supported backends explicitly, or serve without "
         f"--enable-lora / --lora-paths."
     )
 
