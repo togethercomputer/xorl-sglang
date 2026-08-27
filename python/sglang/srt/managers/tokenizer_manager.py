@@ -461,6 +461,40 @@ _SERVER_ARGS_FIELDS = frozenset(f.name for f in dataclasses.fields(ServerArgs))
 _MANAGER_OWNED_FIELDS = ("model_path", "served_model_name")
 
 
+def _attach_expert_ids_to_meta_info(
+    meta_info: Dict[str, Any],
+    recv_obj: Union[BatchStrOutput, BatchTokenIDOutput],
+    i: int,
+) -> None:
+    """Surface the causal expert-ID partitions request `i` opted into.
+
+    A partition the request did not ask for is absent, not empty: the scheduler
+    leaves its column None. A partition that was requested but is legitimately
+    empty (a 1-token prompt has zero input rows) is an empty payload with a row
+    count of 0 in the schema, so the two stay distinguishable.
+    """
+    partitions = (
+        ("input_expert_ids", recv_obj.input_expert_ids),
+        ("output_expert_ids", recv_obj.output_expert_ids),
+    )
+    for field, column in partitions:
+        if column is None:
+            continue
+        val = column[i]
+        if val is None:
+            continue
+        # BatchStrOutput is pre-encoded by the detokenizer; BatchTokenIDOutput
+        # (skip_tokenizer_init) bypasses it and still holds a tensor.
+        if isinstance(val, torch.Tensor):
+            val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+        meta_info[field] = val
+
+    if recv_obj.expert_ids_schema is not None:
+        schema = recv_obj.expert_ids_schema[i]
+        if schema is not None:
+            meta_info["expert_ids_schema"] = msgspec.to_builtins(schema)
+
+
 class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     """TokenizerManager is a process that tokenizes the text."""
 
@@ -2450,22 +2484,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["expert_logits"] = val
-            for field in ("input_expert_ids", "output_expert_ids"):
-                partition = getattr(recv_obj, field, None)
-                if not partition:
-                    continue
-                val = partition[i]
-                if val is None:
-                    continue
-                # BatchStrOutput is pre-encoded by the detokenizer;
-                # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
-                if isinstance(val, torch.Tensor):
-                    val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
-                meta_info[field] = val
-            if getattr(recv_obj, "expert_ids_schema", None):
-                schema = recv_obj.expert_ids_schema[i]
-                if schema is not None:
-                    meta_info["expert_ids_schema"] = msgspec.to_builtins(schema)
+            if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
+                _attach_expert_ids_to_meta_info(meta_info, recv_obj, i)
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:

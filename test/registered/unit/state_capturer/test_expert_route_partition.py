@@ -8,6 +8,7 @@ misaligned by a whole token, which no shape check would catch.
 """
 
 import unittest
+from types import SimpleNamespace
 from typing import List, Optional
 
 import torch
@@ -266,6 +267,109 @@ class TestExpertIdTransport(CustomTestCase):
             3, 4, 2
         )
         np.testing.assert_array_equal(decoded, rows.numpy())
+
+
+class TestAttachExpertIdsToMetaInfo(CustomTestCase):
+    """The response-path assembly that turns scheduler columns into meta_info.
+
+    Two branches matter and neither is exercised elsewhere: the
+    skip_tokenizer_init path hands this a raw tensor that must be encoded here
+    (a tensor left in meta_info is not JSON-serializable), and an opted-out
+    request must produce no key at all rather than a null one.
+    """
+
+    @staticmethod
+    def _recv(**kwargs):
+        """A stand-in for the batch-output columns the helper reads.
+
+        The isinstance narrowing lives at the call site, so the helper only
+        needs the three parallel columns.
+        """
+        columns = {
+            "input_expert_ids": None,
+            "output_expert_ids": None,
+            "expert_ids_schema": None,
+        }
+        unknown = set(kwargs) - set(columns)
+        assert not unknown, f"unexpected column(s): {unknown}"
+        columns.update(kwargs)
+        return SimpleNamespace(**columns)
+
+    def _attach(self, recv, i=0):
+        from sglang.srt.managers.tokenizer_manager import (
+            _attach_expert_ids_to_meta_info,
+        )
+
+        meta = {}
+        _attach_expert_ids_to_meta_info(meta, recv, i)
+        return meta
+
+    def test_opted_out_request_gets_no_keys(self):
+        self.assertEqual(self._attach(self._recv()), {})
+
+    def test_mixed_batch_column_leaves_opted_out_entries_absent(self):
+        """Request 0 opted in, request 1 did not. Request 1 must get no key --
+        not a null one -- so a client cannot mistake it for an empty result."""
+        rows = torch.zeros((2, 4, 2), dtype=torch.int32)
+        recv = self._recv(
+            output_expert_ids=[rows, None],
+            expert_ids_schema=[
+                ExpertRouteSchema(
+                    num_layers=4, top_k=2, moe_layer_ids=[0], output_num_rows=2
+                ),
+                None,
+            ],
+        )
+        self.assertIn("output_expert_ids", self._attach(recv, i=0))
+        self.assertEqual(self._attach(recv, i=1), {})
+
+    def test_tensor_column_is_base64_encoded(self):
+        """skip_tokenizer_init bypasses the detokenizer, so the tensor arrives
+        here unencoded and must not be left in meta_info as a tensor."""
+        import numpy as np
+        import pybase64
+
+        rows = torch.arange(2 * 4 * 2, dtype=torch.int32).reshape(2, 4, 2)
+        meta = self._attach(self._recv(input_expert_ids=[rows]))
+        self.assertIsInstance(meta["input_expert_ids"], str)
+        decoded = np.frombuffer(
+            pybase64.b64decode(meta["input_expert_ids"]), dtype=np.int32
+        ).reshape(2, 4, 2)
+        np.testing.assert_array_equal(decoded, rows.numpy())
+
+    def test_pre_encoded_column_passes_through(self):
+        """BatchStrOutput is already base64 from the detokenizer; re-encoding it
+        would corrupt the payload."""
+        meta = self._attach(self._recv(output_expert_ids=["AAAA"]))
+        self.assertEqual(meta["output_expert_ids"], "AAAA")
+
+    def test_empty_partition_is_reported_as_zero_rows_not_omitted(self):
+        """A 1-token prompt legitimately has zero input rows. The key must be
+        present with an empty payload and a row count of 0, so it stays
+        distinguishable from a partition that was never requested."""
+        schema = ExpertRouteSchema(
+            num_layers=4, top_k=2, moe_layer_ids=[0], input_num_rows=0
+        )
+        meta = self._attach(
+            self._recv(
+                input_expert_ids=[torch.empty((0, 4, 2), dtype=torch.int32)],
+                expert_ids_schema=[schema],
+            )
+        )
+        self.assertEqual(meta["input_expert_ids"], "")
+        self.assertEqual(meta["expert_ids_schema"]["input_num_rows"], 0)
+        self.assertIsNone(meta["expert_ids_schema"]["output_num_rows"])
+
+    def test_schema_is_serialized_to_builtins(self):
+        """meta_info goes out as JSON, so the struct must be converted here."""
+        schema = ExpertRouteSchema(
+            num_layers=4, top_k=2, moe_layer_ids=[1, 2], output_num_rows=3
+        )
+        meta = self._attach(
+            self._recv(output_expert_ids=["AAAA"], expert_ids_schema=[schema])
+        )
+        self.assertIsInstance(meta["expert_ids_schema"], dict)
+        self.assertEqual(meta["expert_ids_schema"]["moe_layer_ids"], [1, 2])
 
 
 if __name__ == "__main__":
