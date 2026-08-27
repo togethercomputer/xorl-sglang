@@ -5,7 +5,8 @@
 # and are what guard the runtime-context ratchets.
 # An absent or empty file disables filtering entirely (upstream behaviour).
 #
-# 42 of 248 GPU tests (41 upstream-representative + 1 fork FA4 kernel test).
+# 44 of 250 GPU tests (41 upstream-representative + 1 fork FA4 kernel test
+# + 2 fork Qwen3.5-35B H100 mixed-LoRA tests).
 # Add a path to re-enable a test; delete one to drop it.
 test/registered/attention/test_fa4_hd256_seqused.py  # FA4 hd256 seqused_k on SM100 (B200 paged decode/prefill)
 test/registered/attention/test_gdn_noncontiguous_stride.py  # Qwen3.5: the family this fork serves
@@ -25,6 +26,8 @@ test/registered/gemm/test_linear_bf16_fp32_hpc.py  # gemm: median-cost represent
 test/registered/hicache/test_qwen35_hicache.py  # Qwen3.5: the family this fork serves
 test/registered/kernels/ops/attention/test_dsa_metadata.py  # kernels: median-cost representative
 test/registered/layers/mamba/test_causal_conv1d.py  # layers: median-cost representative
+test/registered/lora/test_lora_qwen3_5_35b_a3b_hopper_self_attn.py  # Qwen3.5: real H100 MoE-LoRA coverage (self_attn layout)
+test/registered/lora/test_lora_qwen3_5_35b_a3b_hopper_shared_outer.py  # Qwen3.5: real H100 MoE-LoRA coverage (shared_outer layout)
 test/registered/lora/test_lora_qwen3_5_35b_a3b_logprob_diff.py  # Qwen3.5: the family this fork serves
 test/registered/lora/test_lora_qwen3_5_4b_logprob_diff.py  # Qwen3.5: the family this fork serves
 test/registered/mem_cache/test_post_capture_kv_sizing.py  # mem_cache: median-cost representative
