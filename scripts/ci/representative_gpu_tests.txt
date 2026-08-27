@@ -5,8 +5,9 @@
 # and are what guard the runtime-context ratchets.
 # An absent or empty file disables filtering entirely (upstream behaviour).
 #
-# 42 of 248 GPU tests (41 upstream-representative + 1 fork FA4 kernel test).
+# 43 of 249 GPU tests (41 upstream-representative + 2 fork tests: FA4 hd256 seqused, NVFP4 MoE LoRA).
 # Add a path to re-enable a test; delete one to drop it.
+test/registered/lora/test_lora_qwen3_5_35b_a3b_nvfp4_password.py  # NVFP4 MoE multi-LoRA: shared_outer adapters, password recall (1x B200)
 test/registered/attention/test_fa4_hd256_seqused.py  # FA4 hd256 seqused_k on SM100 (B200 paged decode/prefill)
 test/registered/attention/test_gdn_noncontiguous_stride.py  # Qwen3.5: the family this fork serves
 test/registered/attention/test_qwen35_deterministic.py  # Qwen3.5: the family this fork serves
