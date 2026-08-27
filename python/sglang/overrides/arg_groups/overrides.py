@@ -144,6 +144,40 @@ def select_moe_lora_backend(server_args, hf_config) -> dict:
     }
 
 
+def _allow_experimental_sgl_trtllm_for_nvfp4_online(orig_pass, public_mod):
+    """Wrap upstream's ``_moe_runner_backend_quant_constraints`` pass.
+
+    Upstream's allowlist for ``--quantization nvfp4_online`` predates this
+    fork's ``experimental_sgl_trtllm`` runner. The runner is a
+    flashinfer-trtllm drop-in (same modelopt-FP4 weight layout family), and
+    the combination is validated end to end by
+    ``test/registered/lora/test_lora_qwen3_5_35b_a3b_nvfp4_password.py``
+    (Qwen3.5-35B-A3B, 8 shared_outer MoE adapters, 16/16 password recall on
+    1x B200). For that exact pairing the pass keeps upstream's SM100
+    requirement and imposes nothing else; every other input goes to the
+    original unchanged.
+    """
+
+    def wrapped(view):
+        if (
+            view.quantization == "nvfp4_online"
+            and view.moe_runner_backend == "experimental_sgl_trtllm"
+        ):
+            if not public_mod.is_sm100_supported():
+                raise ValueError(
+                    "--quantization nvfp4_online is supported only on "
+                    "NVIDIA Blackwell SM100/SM103 GPUs."
+                )
+            # Explicit, supported backend: no resolution to declare (mirrors
+            # the original's fall-through for explicitly-allowed backends).
+            return {}
+        return orig_pass(view)
+
+    wrapped.__name__ = orig_pass.__name__
+    wrapped.__qualname__ = orig_pass.__qualname__
+    return wrapped
+
+
 def __apply_patch__(public_mod):
     # Matches every architecture. Predicate providers run after the exact-keyed
     # ones and last writer wins, which is the intent here: a model's own rule
@@ -154,3 +188,21 @@ def __apply_patch__(public_mod):
     public_mod.register_model_override_predicate(lambda _architecture: True)(
         select_moe_lora_backend
     )
+
+    # The post-process registry holds function references; swap the entry so
+    # the resolution pipeline runs the wrapped pass (patching the module
+    # attribute alone would not reach the registry).
+    for _i, _pass in enumerate(public_mod.POST_PROCESS_PASSES):
+        if _pass.__name__ == "_moe_runner_backend_quant_constraints":
+            _wrapped = _allow_experimental_sgl_trtllm_for_nvfp4_online(
+                _pass, public_mod
+            )
+            public_mod.POST_PROCESS_PASSES[_i] = _wrapped
+            public_mod._moe_runner_backend_quant_constraints = _wrapped
+            break
+    else:
+        raise RuntimeError(
+            "overlay expected _moe_runner_backend_quant_constraints in "
+            "POST_PROCESS_PASSES; upstream renamed or removed it -- re-derive "
+            "this twin hook."
+        )
