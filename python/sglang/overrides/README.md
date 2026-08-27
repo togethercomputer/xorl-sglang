@@ -6,6 +6,20 @@ upstream source.
 
 - Mirror overrides live under `sglang/overrides/*` with the same path as the
   upstream module you're replacing.
+- **Only for modules upstream already has.** The finder fires when
+  `sglang.srt.X` is imported and a twin `sglang.overrides.X` exists. A twin whose
+  upstream counterpart does not exist is never imported and never fires -- it
+  looks installed and does nothing. New capability goes in `sglang/xorl/`
+  instead; see [docs/xorl-porting-plan.md](../../../docs/xorl-porting-plan.md).
+- **Not usable for `server_args.py`.** It carries 458 `NS()` field annotations and
+  nine guard tests, including two-way namespace coverage and a mutation ratchet.
+  Dataclass fields are fixed at class creation, so no post-hoc patch can add one
+  and still satisfy those guards. CLI surface is an in-tree edit.
+- **`__apply_patch__` suits replacement, not interleaving.** Replacing a whole
+  function or method is clean. Interleaved edits inside a long method force the
+  twin to copy that method, and the copy then stops tracking upstream fixes with
+  nothing to warn you. Reshape into a seam first, or take the change in-tree
+  deliberately.
 - No symbols or package names are exposed to users beyond the public
   `sglang.srt.*` API.
 
@@ -20,11 +34,12 @@ perf work, logging, new modules.
 
 | Tree | What goes there |
 | --- | --- |
-| `python/sglang/overrides/**` | all fork behavior: mirror twins, `__apply_patch__` patches, fork env vars (`environ.py`), fork arg declarations (`arg_groups/overrides.py`), and new supporting modules (underscore-prefixed if internal, e.g. `lora/_moe_padding.py`) |
+| `python/sglang/overrides/**` | changed behavior of modules upstream **does** have: mirror twins, `__apply_patch__` patches, fork env vars (`environ.py`), fork arg declarations (`arg_groups/overrides.py`), and supporting modules for twins (underscore-prefixed if internal, e.g. `lora/_moe_padding.py`) |
+| `python/sglang/xorl/**` | new capability upstream has **no** version of — the finder cannot fire for a module upstream lacks, so additive code lives here (see [docs/xorl-porting-plan.md](../../../docs/xorl-porting-plan.md)) |
 | `test/**` (new files) | fork tests, registered per the `write-sglang-test` skill |
 | `.github/**`, `docker/**`, `docs/**` | fork CI, images, docs |
 
-### Upstream-owned (`python/sglang/srt/**`) — do not modify, with three narrow exceptions
+### Upstream-owned (`python/sglang/srt/**`) — do not modify, with four narrow exceptions
 
 Any PR to `dev` that touches `python/sglang/srt/**` **hard-fails** the
 `overlay-policy-gate` CI job. There are exactly two routes through, and the
@@ -37,7 +52,13 @@ when the change fits one of:
 1. **Upstream sync / backport** — a verbatim upstream commit (merge or
    cherry-pick, upstream hash in the message). Label the PR `upstream-sync`.
    This is not drift; no ledger entry.
-2. **Extension-point metadata** — a metadata-only edit that an overlay
+2. **Fork CLI surface** — new `ServerArgs` fields (with `NS(...)` metadata) for
+   fork features. In-tree by necessity: dataclass fields are fixed at class
+   creation and the nine guard tests (two-way namespace coverage, mutation
+   ratchet) pin the file, so no twin can add one. Keep it to the minimum that
+   exposes the feature; the behavior behind the flag lives in `xorl/` or
+   `overrides/`. Requires a ledger entry.
+3. **Extension-point metadata** — a metadata-only edit that an overlay
    declaration requires, upstream's own machinery defines, and that cannot be
    supplied by wrapping a function in a twin. Before reaching for this, check
    the overlay already covers it: the `resolvable` whitelist is extended
@@ -46,19 +67,22 @@ when the change fits one of:
    metadata read structurally rather than through a wrappable function (e.g.
    `NS(...)` coverage, which two-way lints pin). No default change, no
    behavior change, a comment naming the twin that needs it, and a ledger
-   entry (below) in the same PR.
-3. **Overlay seam** — a minimal, behavior-neutral hook for the rare case the
-   meta-path finder cannot patch cleanly (a symbol captured before patch
-   time, callers that bypass the module object, …). Last resort: restructure
-   the twin first. Requires a ledger entry that says why the twin could not
-   do it.
+   entry in the same PR.
+4. **Deliberate in-tree edit** — the change fits neither `xorl/` (it is not
+   additive) nor a twin (interleaved edits inside a long method would force
+   the twin to copy the method and silently stop tracking upstream fixes; or
+   the finder cannot patch cleanly — a symbol captured before patch time,
+   callers that bypass the module object). Reshape into a replaceable seam
+   first where feasible; take the edit in-tree deliberately, never by
+   accident. Requires a ledger entry that says why neither placement could
+   hold it — that entry is the recurring cost of every future upstream sync,
+   priced in the open.
 
-Everything else goes through the overlay — or lands upstream first and
-arrives here by sync. In particular, these are **not** exceptions: changing a
-default, adding a flag, fixing a bug "just this once", perf tweaks, editing a
-docstring or comment.
+Everything a twin or an `xorl/` module *can* hold is **not** an exception:
+changing an upstream default, fixing an upstream bug "just this once", perf
+tweaks in upstream code paths, docstring or comment edits.
 
-A hard line inside exception 2: never fake metadata by mutating
+A hard line inside exception 3: never fake metadata by mutating
 `ServerArgs.__dataclass_fields__` from a twin — that keeps `srt/` byte-identical
 while making the dataclass lie to everyone who reads it. The sanctioned
 overlay shape is wrapping the *function* that consumes the metadata (the
@@ -84,8 +108,54 @@ upstream.
 | change or extend an upstream module's behavior | mirror twin + `__apply_patch__` |
 | add a fork env var | `overrides/environ.py` |
 | set a fork default for a CLI arg | declaration in `overrides/arg_groups/overrides.py`; if the field is not yet `resolvable`, add it to `OVERLAY_RESOLVABLE_FIELDS` in `overrides/arg_groups/arg_utils.py` |
-| add a brand-new fork module | put it in `overrides/` next to its consumer |
+| add a fork CLI flag | in-tree `ServerArgs` field with `NS(...)` (exception 2) + ledger entry; behavior behind it in `xorl/` or `overrides/` |
+| add brand-new fork capability (new modules) | `python/sglang/xorl/` — a twin without an upstream counterpart never fires |
+| add a supporting module for a twin | put it in `overrides/` next to its consumer |
 | fix an upstream bug | fix it upstream and sync it back; if urgent, patch via a twin and note the upstream PR in the twin's docstring |
+
+## Writing a replacement twin (hard rules)
+
+Learned converting the exact-serving port (#41) to zero-srt; violating any of
+these produces silent misbehavior, not errors.
+
+1. **No `sglang.*` imports at twin top level** (self-imports of the module
+   being patched excepted — it is already in `sys.modules`). The finder
+   imports twins under `bypass()`, so any other srt module first imported
+   there is cached **permanently unpatched**. Import inside
+   `__apply_patch__` (bypass is off there) and publish the names onto `mod`.
+2. **Rebind every verbatim copy over the live module dict**
+   (`_twin_bind.rebind`). Twin globals are a snapshot; the in-tree original
+   resolved through the srt module's live dict — which is also what makes
+   `monkeypatch.setattr(srt_mod, ...)`, runtime rebinding, and `global`
+   writes behave identically. Publish every port-added import, constant, and
+   helper onto `mod`: rebound copies resolve *only* through it.
+3. **Copies live at twin module top level** (collision-proof `_Cls__name` def
+   names; `rebind(..., name=...)` restores the real name). Defining them
+   inside a `_patch_*` function turns sibling references into closure
+   freevars — the copy then calls the unrebound twin-local sibling and
+   silently bypasses `mod` publication and test patches.
+4. **`super()` must be two-arg** in copied methods (`super(Cls, self)`,
+   resolved via the rebound globals): the zero-arg form needs the `__class__`
+   cell that only exists for methods defined lexically in a class body.
+5. **Twin package `__init__.py` files define a no-op `__apply_patch__`** —
+   otherwise default name-copy shadows real srt submodules with twin modules
+   (see `overrides/lora/__init__.py`).
+6. **Pin every replaced or removed upstream symbol** in `_twin_pins.py`;
+   `test_overlay_twin_pins.py` turns upstream drift under a copy into a
+   visible CI failure with re-derivation instructions.
+7. **Dataclass fields cannot be patched in** — replace the class with a
+   module-level subclass (pickle across process boundaries resolves it by
+   import path; kwargs-only construction makes append-order safe). For
+   `ServerArgs`, resolution-pipeline seams are handled by extending the
+   named handler that precedes the seam, or by carrying the enclosing
+   handler as a pinned copy — never by copying `__post_init__`.
+8. **Decorator-registered handlers** (FastAPI routes) hold the original
+   function object — swap `fn.__code__` instead of rebinding the module
+   attribute (both sides must have no freevars).
+9. **Brand-new `srt`-namespace modules cannot be twinned** (the finder only
+   patches modules upstream has). Serve a legacy import path via the lazy
+   alias finder in `patches/module_aliases.py`, or place new capability in
+   `sglang/xorl/`.
 
 ## Quick start
 

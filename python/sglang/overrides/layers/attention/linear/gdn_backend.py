@@ -1,0 +1,881 @@
+"""Override twin of ``sglang.srt.layers.attention.linear.gdn_backend`` -- xorl exact serving (zero-srt port of PR #41).
+
+Verbatim copies of the retired in-tree edits. Copies live at module top level
+(collision-proof ``_Cls__name`` def names for methods) so cross-references stay
+module-global, and every attach goes through ``rebind`` so the copy resolves
+names via the PATCHED srt module's live dict -- identical to in-tree, including
+monkeypatching and ``global`` writes. Replaced/removed upstream symbols are
+pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
+upstream sync, re-derive the copies and re-pin.
+"""
+
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
+from __future__ import annotations
+
+from sglang.overrides._twin_bind import rebind
+
+
+def _bi_gdn_decode_enabled() -> bool:
+    return is_cuda() and _bi_decode_mod.BI_GDN_DECODE_ENABLED
+
+
+def _bi_gdn_decode_fast_enabled() -> bool:
+    return is_cuda() and _bi_fast_mod.BI_GDN_DECODE_FAST_ENABLED
+
+
+def _bi_gdn_decode_incr_enabled() -> bool:
+    return is_cuda() and _bi_incr_mod.BI_GDN_DECODE_INCR_ENABLED
+
+
+def _bi_gdn_incr_defer_enabled() -> bool:
+    return is_cuda() and _bi_incr_mod.BI_GDN_INCR_DEFER_ENABLED
+
+
+def _bi_gdn_lazy_heal_enabled() -> bool:
+    return is_cuda() and _bi_heal_mod.BI_GDN_LAZY_HEAL_ENABLED
+
+
+def _bi_gdn_prefill_enabled() -> bool:
+    return is_cuda() and _bi_prefill_mod.BI_GDN_PREFILL_ENABLED
+
+
+def _make_bi_gdn_decode_runner():
+    if not _bi_gdn_decode_fast_enabled():
+        return None
+    if _bi_gdn_decode_incr_enabled():
+        return BIGDNIncrDecodeRunner()
+    return BIGDNFastDecodeRunner()
+
+
+def _GDNAttnBackend___bi_decode_cache(
+    self, layer: RadixLinearAttention, ssm_states: torch.Tensor
+) -> BIGDNDecodeCache:
+    cache = self._bi_decode_caches.get(layer.layer_id)
+    if cache is None:
+        cache = BIGDNDecodeCache(
+            num_slots=ssm_states.shape[0],
+            qkv_dim=layer.q_dim + layer.k_dim + layer.v_dim,
+            num_v_heads=layer.num_v_heads,
+            head_k_dim=layer.head_k_dim,
+            head_v_dim=layer.head_v_dim,
+            device=ssm_states.device,
+        )
+        self._bi_decode_caches[layer.layer_id] = cache
+    return cache
+
+
+def _GDNAttnBackend___bi_decode_metadata(
+    self,
+    cache: BIGDNDecodeCache,
+    cache_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+):
+    slots = cache_indices.tolist()
+    metadata = self._bi_decode_step_metadata
+    if metadata is None:
+        metadata = cache.prepare_step_metadata(slots, cache_indices, seq_lens)
+        self._bi_decode_step_metadata = metadata
+    elif metadata.slots != tuple(slots):
+        raise RuntimeError(
+            "Exact GDN decode slot selection changed within one forward: "
+            f"expected {metadata.slots}, got {tuple(slots)}."
+        )
+    return metadata
+
+
+def _GDNAttnBackend___bi_gdn_decode_seed(
+    self,
+    layer: RadixLinearAttention,
+    forward_batch: ForwardBatch,
+    mixed_qkv: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    pre_states: torch.Tensor,
+) -> None:
+    cache = self._bi_decode_cache(layer, ssm_states)
+    starts = query_start_loc.tolist()
+    prefix_lens = forward_batch.extend_prefix_lens.tolist()
+    slots = cache_indices.tolist()
+    hv = layer.num_v_heads
+    g_rows = g.reshape(-1, hv)
+    beta_rows = beta.reshape(-1, hv)
+    warm_pairs = []
+    for i, slot in enumerate(slots):
+        lo, hi = starts[i], starts[i + 1]
+        cache.seed_from_extend(
+            slot=slot,
+            pre_scan_state=pre_states[i],
+            qkv_rows=mixed_qkv[lo:hi],
+            g_rows=g_rows[lo:hi],
+            beta_rows=beta_rows[lo:hi],
+            prefix_len=int(prefix_lens[i]),
+            ssm_states=ssm_states,
+        )
+        if isinstance(self._bi_fast_runner, BIGDNIncrDecodeRunner):
+            suffix = (int(prefix_lens[i]) + (hi - lo)) % FLA_CHUNK_SIZE
+            warm_pairs.append((slot, suffix))
+    if isinstance(self._bi_fast_runner, BIGDNIncrDecodeRunner):
+        # Export the already-prefilled partial suffix once. Decode graph
+        # replays can then update only the new row; eager fallbacks retain
+        # the exact rescan and maintain these caches for the next graph.
+        if _bi_gdn_lazy_heal_enabled():
+            warm_slots_batched(self._bi_fast_runner, cache, warm_pairs)
+        else:
+            for slot, suffix in warm_pairs:
+                self._bi_fast_runner.warm_slot(cache, slot, suffix)
+
+
+def _GDNAttnBackend____init__(self, model_runner: ModelRunner):
+    super(GDNAttnBackend, self).__init__(model_runner)
+    self.conv_states_shape = model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[
+        0
+    ].shape
+    if not is_cpu() and not is_npu():
+        assert (
+            self.conv_states_shape[-1] < FLA_CHUNK_SIZE
+        ), f"{self.conv_states_shape[-1]=} should be less than {FLA_CHUNK_SIZE}"
+
+    decode_backend = get_linear_attn_decode_backend()
+    prefill_backend = get_linear_attn_prefill_backend()
+    if _bi_gdn_prefill_enabled() and not prefill_backend.is_triton():
+        raise RuntimeError(
+            "The exact GDN prefill contract covers the Triton prefill "
+            f"backend only; got {prefill_backend}."
+        )
+    if _bi_gdn_decode_enabled():
+        if not _bi_gdn_prefill_enabled():
+            raise RuntimeError(
+                "The exact GDN decode contract requires the exact prefill "
+                "composition it rescans."
+            )
+        if (
+            not _bi_gdn_decode_fast_enabled()
+            and not model_runner.server_args.disable_cuda_graph
+        ):
+            raise RuntimeError(
+                "The exact Qwen GDN graph contract requires the "
+                "slot-direct rescan runner."
+            )
+        if _bi_gdn_decode_incr_enabled() and not _bi_gdn_decode_fast_enabled():
+            raise RuntimeError(
+                "The cached-row GDN decode runner requires the slot-direct "
+                "rescan runner for eager fallback and cache maintenance."
+            )
+        if _bi_gdn_incr_defer_enabled() and not _bi_gdn_decode_incr_enabled():
+            raise RuntimeError(
+                "Cached-row GDN writeback deferral requires the cached-row "
+                "incremental runner."
+            )
+        if _bi_gdn_lazy_heal_enabled() and not _bi_gdn_decode_incr_enabled():
+            raise RuntimeError(
+                "Batched GDN cache warm requires the cached-row incremental runner."
+            )
+        if (
+            _bi_gdn_incr_defer_enabled()
+            and not model_runner.server_args.disable_radix_cache
+        ):
+            raise RuntimeError(
+                "Cached-row GDN writeback deferral is admitted only by the "
+                "no-radix exact contract; radix insertion would require an "
+                "explicit finish flush."
+            )
+        rank0_log(
+            "GDN decode contract ENGAGED: "
+            + (
+                "cached-row incremental graph decode with batched cache warm "
+                "and exact rescan eager fallback"
+                if _bi_gdn_decode_incr_enabled()
+                else "slot-direct exact partial-chunk rescan"
+            )
+        )
+    self._bi_decode_caches = {}
+    self._bi_fast_runner = _make_bi_gdn_decode_runner()
+    if self._bi_fast_runner is not None:
+        if isinstance(self._bi_fast_runner, BIGDNIncrDecodeRunner):
+            server_args = model_runner.server_args
+            if server_args.enable_mamba_extra_buffer():
+                interval = int(server_args.mamba_track_interval)
+                if interval % FLA_CHUNK_SIZE != 0:
+                    raise RuntimeError(
+                        "Cached-row GDN writeback deferral requires "
+                        f"mamba_track_interval % {FLA_CHUNK_SIZE} == 0; "
+                        f"got {interval}."
+                    )
+                self._bi_fast_runner.track_interval = interval
+    self._bi_decode_step_metadata = None
+    self.kernel_dispatcher = GDNKernelDispatcher(decode_backend, prefill_backend)
+    # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
+    self.verify_intermediate_state_indices = build_verify_intermediate_state_indices(
+        self.req_to_token_pool.size,
+        model_runner.server_args,
+        model_runner.device,
+    )
+
+
+def _GDNAttnBackend___replayssm_fold_target_verify(
+    self,
+    *,
+    layer: RadixLinearAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    layer_cache: MambaPool.SpeculativeState,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    retrieve_parent_token: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Ring-writing verify; the commit fold replays the accepted prefix
+    into ``temporal``. Uses the vendored CuTe DSL MTP kernel when the
+    dispatcher selected the FlashInfer bf16-state verify, else the Triton
+    recurrent kernel (both store the same raw window)."""
+    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+        fused_sigmoid_gating_delta_rule_update,
+    )
+
+    assert retrieve_parent_token is None, (
+        "ReplaySSM fold-every-commit supports a linear draft chain only "
+        "(topk <= 1); EAGLE tree verify must use the recurrent verify."
+    )
+    seq_len = query.shape[1]
+    batch_size = query_start_loc.shape[0] - 1
+    draft_token_num = seq_len // batch_size
+    if (
+        self.kernel_dispatcher.verify_kernel_is_flashinfer
+        and ssm_states.dtype == torch.bfloat16
+        and draft_token_num >= 3
+    ):
+        from sglang.kernels.ops.attention.cutedsl_gdn_mtp_ring import (
+            gated_delta_rule_mtp,
+        )
+
+        num_v_heads = value.shape[2]
+        head_v_dim = value.shape[3]
+        out = gated_delta_rule_mtp(
+            A_log=layer.A_log.detach(),
+            a=a.view(batch_size, draft_token_num, num_v_heads),
+            dt_bias=layer.dt_bias.detach(),
+            q=query.view(batch_size, draft_token_num, *query.shape[2:]),
+            k=key.view(batch_size, draft_token_num, *key.shape[2:]),
+            v=value.view(batch_size, draft_token_num, num_v_heads, head_v_dim),
+            b=b.view(batch_size, draft_token_num, num_v_heads),
+            initial_state_source=ssm_states,
+            initial_state_indices=cache_indices,
+            use_qk_l2norm_in_kernel=True,
+            disable_state_update=True,
+            cache_ring=True,
+            replayssm_rawv=layer_cache.replayssm_rawv,
+            replayssm_rawk=layer_cache.replayssm_rawk,
+            replayssm_g=layer_cache.replayssm_g,
+            replayssm_beta=layer_cache.replayssm_beta,
+        )
+        return out.view(1, seq_len, num_v_heads, head_v_dim)
+    return fused_sigmoid_gating_delta_rule_update(
+        A_log=layer.A_log,
+        dt_bias=layer.dt_bias,
+        q=query,
+        k=key,
+        v=value,
+        a=a,
+        b=b,
+        initial_state_source=ssm_states,
+        initial_state_indices=cache_indices,
+        cu_seqlens=query_start_loc,
+        use_qk_l2norm_in_kernel=True,
+        softplus_beta=1.0,
+        softplus_threshold=20.0,
+        is_kda=False,
+        disable_state_update=True,
+        cache_ring=True,
+        replayssm_rawv=layer_cache.replayssm_rawv,
+        replayssm_rawk=layer_cache.replayssm_rawk,
+        replayssm_g=layer_cache.replayssm_g,
+        replayssm_beta=layer_cache.replayssm_beta,
+    )
+
+
+def _GDNAttnBackend___replayssm_target_verify(
+    self,
+    *,
+    layer: RadixLinearAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    mamba_pool: MambaPool,
+    layer_cache: MambaPool.SpeculativeState,
+    cache_indices: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    draft_token_num: int,
+) -> torch.Tensor:
+    """ReplaySSM GDN spec-verify (Part B of #28511).
+
+    Reconstructs the verify output for the whole draft window from the frozen
+    checkpoint (``temporal``) + the per-slot circular ``(d, k, g)`` ring, and
+    appends this window's drafts to the rings (chunked ``d`` for output
+    reconstruction; raw ``v`` / pre-norm ``k`` / fp32 ``beta`` for the
+    closed-loop exact fold that replays the recurrent update into the fp32
+    checkpoint at flush). The rings are PER-LAYER
+    (sliced via ``mamba2_layer_cache``), while the cursors (write_pos,
+    cache_base, is_flush) are PER-SLOT pool attributes shared by all GDN layers
+    of the step; the cursors persist across steps and are advanced once per step
+    by the worker (commit_gdn_replayssm_spec) -- here we only read them and
+    write this step's ring entries. GDN has K == V, so ``temporal``
+    ([slots, HV, K, V]) is consumed directly as the kernel's [slots, HV, V, K]
+    checkpoint.
+    """
+    from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode import (
+        gdn_replayssm_spec_decode,
+    )
+
+    H, K = layer.num_k_heads, layer.head_k_dim
+    HV, V = layer.num_v_heads, layer.head_v_dim
+    # q/k/v may be [1, seq, *] (fallback split) or [seq, *] (fused split);
+    # derive the packed token count from numel so both layouts flatten.
+    seq_len = query.numel() // (H * K)
+    q = query.reshape(seq_len, H, K)
+    k = key.reshape(seq_len, H, K)
+    v = value.reshape(seq_len, HV, V)
+    a = a.reshape(seq_len, HV)
+    b = b.reshape(seq_len, HV)
+    d_cache = layer_cache.replayssm_d  # [slots, HV, L, V]
+    max_cache_len = d_cache.shape[-2]  # ring length L
+    out = q.new_empty(seq_len, HV, V)
+    gdn_replayssm_spec_decode(
+        q=q,
+        k=k,
+        v=v,
+        a=a,
+        b=b,
+        A_log=layer.A_log,
+        dt_bias=layer.dt_bias,
+        checkpoint_state=layer_cache.temporal,
+        d_cache=d_cache,
+        k_cache=layer_cache.replayssm_k,
+        g_cache=layer_cache.replayssm_g,
+        # Closed-loop exact-fold rings: raw v / raw pre-norm k / fp32 beta.
+        # The flush replays these through the recurrent update (bit-identical
+        # to the recurrent baseline) instead of folding `d` open-loop.
+        rawv_cache=layer_cache.replayssm_rawv,
+        rawk_cache=layer_cache.replayssm_rawk,
+        beta_cache=layer_cache.replayssm_beta,
+        out=out,
+        query_start_loc=query_start_loc,
+        ssm_state_indices=cache_indices,
+        # Per-slot cursors live on the pool (shared across all GDN layers),
+        # NOT in forward_metadata: the verify kernel reads/writes them
+        # block-keyed via ssm_state_indices and must NOT advance write_pos
+        # (the worker does that after acceptance), so the decode-path
+        # forward_metadata.replayssm_write_pos snapshot is not used here.
+        write_pos=mamba_pool.replayssm_write_pos,
+        cache_base=mamba_pool.replayssm_cache_base,
+        is_flush=mamba_pool.replayssm_is_flush,
+        max_cache_len=max_cache_len,
+        max_spec_len=draft_token_num,
+        scale=K**-0.5,
+        use_qk_l2norm_in_kernel=True,
+        # SGLang marks invalid/padding requests with a negative mamba slot
+        # index (valid slots start at 0), so the kernel's "null block"
+        # sentinel is -1, not the vLLM default of 0.
+        null_block_id=-1,
+    )
+    # Match the recurrent target_verify output shape (== value.shape).
+    return out.reshape(value.shape)
+
+
+def _GDNAttnBackend__forward_decode(
+    self,
+    layer: RadixLinearAttention,
+    forward_batch: ForwardBatch,
+    mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    **kwargs,
+):
+    layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    conv_states = layer_cache.conv[0]
+    ssm_states = layer_cache.temporal
+    query_start_loc = self.forward_metadata.query_start_loc
+    cache_indices = self.forward_metadata.mamba_cache_indices
+    # GDN ReplaySSM (slice 1a): per-layer ring slices + the once-per-forward
+    # per-row write cursor. All None unless --enable-linear-replayssm, so the
+    # legacy dispatch below is byte-identical when the flag is off.
+    replayssm_write_pos = self.forward_metadata.replayssm_write_pos
+    # GDN ReplaySSM (slice 2b): per-row force-flush at radix track
+    # boundaries (None unless --enable-linear-replayssm). When present the
+    # kernel folds the ring into temporal[slot] on the snapshot steps.
+    replayssm_force_flush = self.forward_metadata.replayssm_force_flush
+    replayssm_d = layer_cache.replayssm_d
+    replayssm_k = layer_cache.replayssm_k
+    replayssm_g = layer_cache.replayssm_g
+
+    assert isinstance(mixed_qkv, torch.Tensor)
+    mixed_qkv = causal_conv1d_update(
+        mixed_qkv,
+        conv_states,
+        layer.conv_weights,
+        layer.bias,
+        layer.activation,
+        conv_state_indices=cache_indices,
+    )
+
+    if _bi_gdn_decode_enabled():
+        num_query_tokens = mixed_qkv.shape[0]
+        if num_query_tokens != cache_indices.shape[0]:
+            raise RuntimeError(
+                "The exact GDN decode contract supports single-token decode only."
+            )
+        if num_query_tokens == 0:
+            return mixed_qkv.new_empty(1, 0, layer.num_v_heads, layer.head_v_dim)
+        cache = self._bi_decode_cache(layer, ssm_states)
+        g_rows, beta_rows = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        if self._bi_fast_runner is not None:
+            core_attn_out = self._bi_fast_runner.step(
+                cache=cache,
+                indices=cache_indices,
+                seq_lens=forward_batch.seq_lens,
+                qkv_rows=mixed_qkv,
+                g_rows=g_rows.reshape(num_query_tokens, -1),
+                beta_rows=beta_rows.reshape(num_query_tokens, -1),
+                ssm_states=ssm_states,
+            ).unsqueeze(0)
+        else:
+            core_attn_out = cache.step(
+                metadata=self._bi_decode_metadata(
+                    cache, cache_indices, forward_batch.seq_lens
+                ),
+                qkv_rows=mixed_qkv,
+                g_rows=g_rows.reshape(num_query_tokens, -1),
+                beta_rows=beta_rows.reshape(num_query_tokens, -1),
+                ssm_states=ssm_states,
+            ).unsqueeze(0)
+        self._track_mamba_state_decode(
+            forward_batch,
+            conv_states,
+            ssm_states,
+            cache_indices,
+            layer.layer_id,
+        )
+        return core_attn_out
+
+    # Skip split + reshape + separate gating kernel by consuming
+    # the packed mixed_qkv directly in a single fused Triton kernel.
+    if self.kernel_dispatcher.supports_packed_decode:
+        core_attn_out = self.kernel_dispatcher.packed_decode(
+            mixed_qkv=mixed_qkv,
+            a=a,
+            b=b,
+            A_log=layer.A_log,
+            dt_bias=layer.dt_bias,
+            scale=layer.head_k_dim**-0.5,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            num_v_heads=layer.num_v_heads,
+            head_v_dim=layer.head_v_dim,
+            replayssm_d=replayssm_d,
+            replayssm_k=replayssm_k,
+            replayssm_g=replayssm_g,
+            replayssm_write_pos=replayssm_write_pos,
+            replayssm_force_flush=replayssm_force_flush,
+        )
+        self._track_mamba_state_decode(
+            forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+        )
+        return core_attn_out
+
+    query, key, value = torch.split(
+        mixed_qkv,
+        [layer.q_dim, layer.k_dim, layer.v_dim],
+        dim=-1,
+    )
+    # Reshape from [bs, h*d] to [1, bs, h, d]
+    bs = forward_batch.batch_size
+    query = query.view(1, bs, layer.num_q_heads, layer.head_q_dim)
+    key = key.view(1, bs, layer.num_k_heads, layer.head_k_dim)
+    value = value.view(1, bs, layer.num_v_heads, layer.head_v_dim)
+
+    core_attn_out = self.kernel_dispatcher.decode(
+        q=query,
+        k=key,
+        v=value,
+        a=a,
+        b=b,
+        A_log=layer.A_log,
+        dt_bias=layer.dt_bias,
+        ssm_states=ssm_states,
+        cache_indices=cache_indices,
+        query_start_loc=query_start_loc,
+    )
+
+    self._track_mamba_state_decode(
+        forward_batch, conv_states, ssm_states, cache_indices, layer.layer_id
+    )
+
+    return core_attn_out
+
+
+def _GDNAttnBackend__forward_extend(
+    self,
+    layer: RadixLinearAttention,
+    forward_batch: ForwardBatch,
+    mixed_qkv: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+    a: torch.Tensor,
+    b: torch.Tensor,
+    **kwargs,
+):
+    assert isinstance(mixed_qkv, torch.Tensor)
+    seq_len = mixed_qkv.shape[0]
+
+    is_target_verify = forward_batch.forward_mode.is_target_verify()
+    forward_metadata = self.forward_metadata
+
+    query_start_loc = forward_metadata.query_start_loc
+    cache_indices = forward_metadata.mamba_cache_indices
+    retrieve_next_token = forward_metadata.retrieve_next_token
+    retrieve_next_sibling = forward_metadata.retrieve_next_sibling
+    retrieve_parent_token = forward_metadata.retrieve_parent_token
+
+    mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+    conv_states = mamba_cache_params.conv[0]
+    ssm_states = mamba_cache_params.temporal
+    if is_target_verify:
+        assert isinstance(mamba_cache_params, MambaPool.SpeculativeState)
+        intermediate_state_cache = mamba_cache_params.intermediate_ssm
+        intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
+        intermediate_state_indices = self.verify_intermediate_state_indices
+    else:
+        has_initial_states = forward_batch.extend_prefix_lens > 0
+
+    # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
+    # chunk_gated_delta_rule) write state back in place assuming a contiguous
+    # slot layout, so they silently drop the write to the strided envelope
+    # pool. Run them on contiguous per-sequence copies (identity-indexed) and
+    # scatter the result back. No-op for the default contiguous pool.
+    # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
+    # proper indexed writes and handle non-contiguous pools directly via
+    # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
+    # TODO(ch-wan): drop these .contiguous() copies by making the prefill conv
+    # and chunk_gated_delta_rule kernels honor the pool's real slot stride +
+    # int64 indexing, like packed_decode / causal_conv1d_update already do.
+    needs_state_gather = (
+        (not is_target_verify)
+        and (not is_cpu())
+        and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
+    )
+    if needs_state_gather:
+        conv_states_contig = conv_states[cache_indices].contiguous()
+        ssm_states_contig = ssm_states[cache_indices].contiguous()
+        state_cache_indices = torch.arange(
+            cache_indices.shape[0],
+            device=cache_indices.device,
+            dtype=cache_indices.dtype,
+        )
+    else:
+        conv_states_contig = conv_states
+        ssm_states_contig = ssm_states
+        state_cache_indices = cache_indices
+
+    if is_target_verify:
+        batch_size = seq_len // forward_batch.spec_info.draft_token_num
+        draft_token_num = forward_batch.spec_info.draft_token_num
+        mixed_qkv_reshaped = mixed_qkv.view(batch_size, draft_token_num, -1).transpose(
+            1, 2
+        )
+        mixed_qkv_processed = causal_conv1d_update(
+            mixed_qkv_reshaped,
+            conv_states,
+            layer.conv_weights,
+            layer.bias,
+            layer.activation,
+            conv_state_indices=cache_indices[:batch_size],
+            intermediate_conv_window=intermediate_conv_window_cache,
+            intermediate_state_indices=intermediate_state_indices[:batch_size],
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_parent_token=retrieve_parent_token,
+        )
+        mixed_qkv = mixed_qkv_processed.transpose(1, 2).view(seq_len, -1)
+    else:
+        mixed_qkv = mixed_qkv.transpose(0, 1)
+        if forward_metadata.has_mamba_track_mask:
+            mixed_qkv_to_track = mixed_qkv[
+                :, forward_metadata.track_conv_indices
+            ].transpose(0, 1)
+            conv_states[forward_metadata.conv_states_mask_indices] = mixed_qkv_to_track
+
+        mixed_qkv = causal_conv1d_fn(
+            mixed_qkv,
+            layer.conv_weights,
+            layer.bias,
+            activation=layer.activation,
+            conv_states=conv_states_contig,
+            has_initial_state=has_initial_states,
+            cache_indices=state_cache_indices,
+            query_start_loc=query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        ).transpose(0, 1)[:seq_len]
+
+    actual_seq_len = mixed_qkv.shape[0]
+    qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+    if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        query, key, value = fused_qkv_split_gdn_prefill(
+            mixed_qkv,
+            layer.num_q_heads,
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_q_dim,
+            layer.head_k_dim,
+            layer.head_v_dim,
+        )
+    else:
+        query, key, value = torch.split(
+            mixed_qkv,
+            [layer.q_dim, layer.k_dim, layer.v_dim],
+            dim=-1,
+        )
+        query = query.view(1, actual_seq_len, layer.num_q_heads, layer.head_q_dim)
+        key = key.view(1, actual_seq_len, layer.num_k_heads, layer.head_k_dim)
+        value = value.view(1, actual_seq_len, layer.num_v_heads, layer.head_v_dim)
+
+    if is_target_verify:
+        # ReplaySSM verify protocols: fold-every-commit (ring-write during
+        # verify, fold on commit), circular ring, or the snapshotting
+        # fallback when neither ring is allocated.
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        use_replayssm_fold = (
+            mamba_cache_params.replayssm_rawv is not None
+            and getattr(mamba_pool, "replayssm_spec_fold", False)
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        )
+        use_replayssm_spec = (
+            mamba_cache_params.replayssm_d is not None
+            and getattr(mamba_pool, "replayssm_cache_base", None) is not None
+            and not getattr(mamba_pool, "replayssm_is_kda", False)
+        )
+        if use_replayssm_fold:
+            core_attn_out = self._replayssm_fold_target_verify(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                a=a,
+                b=b,
+                layer_cache=mamba_cache_params,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+        elif use_replayssm_spec:
+            core_attn_out = self._replayssm_target_verify(
+                layer=layer,
+                query=query,
+                key=key,
+                value=value,
+                a=a,
+                b=b,
+                mamba_pool=mamba_pool,
+                layer_cache=mamba_cache_params,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                draft_token_num=forward_batch.spec_info.draft_token_num,
+            )
+        else:
+            # The recurrent fallback needs the per-draft snapshots, which
+            # the pool gates OFF under --enable-linear-replayssm-spec (the
+            # same flag that makes `use_replayssm_spec` true above), so
+            # this branch is unreachable with a None buffer by
+            # construction -- keep it loud rather than silently frozen.
+            assert intermediate_state_cache is not None, (
+                "recurrent target_verify fallback requires intermediate_ssm, "
+                "which is not allocated under --enable-linear-replayssm-spec"
+            )
+            core_attn_out = self.kernel_dispatcher.target_verify(
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
+                q=query,
+                k=key,
+                v=value,
+                a=a,
+                b=b,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                intermediate_states_buffer=intermediate_state_cache,
+                intermediate_state_indices=intermediate_state_indices,
+                cache_steps=forward_batch.spec_info.draft_token_num,
+                retrieve_parent_token=retrieve_parent_token,
+            )
+    else:
+        g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+        if _bi_gdn_prefill_enabled():
+            if query.dim() == 3:
+                query = query.unsqueeze(0)
+                key = key.unsqueeze(0)
+                value = value.unsqueeze(0)
+            pre_states = ssm_states_contig.index_select(
+                0, state_cache_indices.long()
+            ).clone()
+            core_attn_out, h = bi_chunk_gated_delta_rule_prefill(
+                q=query,
+                k=key,
+                v=value,
+                g=g,
+                beta=beta,
+                ssm_states=ssm_states_contig,
+                cache_indices=state_cache_indices,
+                cu_seqlens=query_start_loc,
+                scale=layer.head_k_dim**-0.5,
+                return_intermediate_state=True,
+            )
+            if needs_state_gather:
+                conv_states[cache_indices] = conv_states_contig
+                ssm_states[cache_indices] = ssm_states_contig
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, forward_metadata
+            )
+            if _bi_gdn_decode_enabled():
+                self._bi_gdn_decode_seed(
+                    layer,
+                    forward_batch,
+                    mixed_qkv,
+                    g,
+                    beta,
+                    ssm_states,
+                    cache_indices,
+                    query_start_loc,
+                    pre_states,
+                )
+            return core_attn_out
+        core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
+            q=query,
+            k=key,
+            v=value,
+            g=g,
+            beta=beta,
+            ssm_states=ssm_states_contig,
+            cache_indices=state_cache_indices,
+            query_start_loc=query_start_loc,
+            state_checkpoint_cu_starts=(forward_metadata.state_checkpoint_cu_starts),
+            num_state_checkpoints=forward_metadata.num_state_checkpoints,
+            state_checkpoint_every_n_tokens=(
+                forward_metadata.state_checkpoint_every_n_tokens
+            ),
+        )
+
+        if is_npu() and last_recurrent_state is not None:
+            last_recurrent_state = last_recurrent_state.to(ssm_states.dtype, copy=False)
+            ssm_states[cache_indices] = last_recurrent_state
+
+        if needs_state_gather:
+            # Scatter the in-place-updated contiguous copies back to the
+            # strided envelope pool (advanced indexing handles the strides).
+            conv_states[cache_indices] = conv_states_contig
+            ssm_states[cache_indices] = ssm_states_contig
+
+        if forward_metadata.has_mamba_track_mask:
+            self._track_mamba_state_extend(
+                forward_batch, h, ssm_states, forward_metadata
+            )
+
+    return core_attn_out
+
+
+def _GDNAttnBackend__init_forward_metadata(self, forward_batch: ForwardBatch):
+    super(GDNAttnBackend, self).init_forward_metadata(forward_batch)
+    self._bi_decode_step_metadata = None
+    if self.forward_metadata.has_mamba_track_mask:
+        self.forward_metadata.mamba_track_mask_indices = (
+            forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+        )
+        self.forward_metadata.conv_states_mask_indices = (
+            forward_batch.mamba_track_indices[
+                self.forward_metadata.mamba_track_mask_indices
+            ]
+        )
+        if self.kernel_dispatcher.extend_uses_state_checkpoints:
+            from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+                maybe_build_flashinfer_checkpoint_plan,
+            )
+
+            maybe_build_flashinfer_checkpoint_plan(
+                forward_batch, self.forward_metadata, self.device
+            )
+
+
+def __apply_patch__(mod):
+    # Deferred: the finder imports twins under bypass(), so sglang imports at
+    # twin top level would cache modules UNPATCHED. Import here (bypass off)
+    # and publish onto mod -- in-tree these were the file's module globals.
+    from sglang.srt.utils import is_cuda
+
+    if is_cuda():
+        from sglang.xorl.fla import bi_gdn_decode as _bi_decode_mod
+        from sglang.xorl.fla import bi_gdn_decode_fast as _bi_fast_mod
+        from sglang.xorl.fla import bi_gdn_decode_incr as _bi_incr_mod
+        from sglang.xorl.fla import bi_gdn_incr_lazy_heal as _bi_heal_mod
+        from sglang.xorl.fla import bi_gdn_prefill as _bi_prefill_mod
+        from sglang.xorl.fla.bi_gdn_decode import BIGDNDecodeCache
+        from sglang.xorl.fla.bi_gdn_decode_fast import BIGDNFastDecodeRunner
+        from sglang.xorl.fla.bi_gdn_decode_incr import BIGDNIncrDecodeRunner
+        from sglang.xorl.fla.bi_gdn_incr_lazy_heal import warm_slots_batched
+        from sglang.xorl.fla.bi_gdn_prefill import bi_chunk_gated_delta_rule_prefill
+
+        # Publish the deferred imports onto mod: in-tree they were the srt
+        # file's own module globals, and rebound copies resolve via mod.
+        mod._bi_decode_mod = _bi_decode_mod
+        mod._bi_fast_mod = _bi_fast_mod
+        mod._bi_incr_mod = _bi_incr_mod
+        mod._bi_heal_mod = _bi_heal_mod
+        mod._bi_prefill_mod = _bi_prefill_mod
+        mod.BIGDNDecodeCache = BIGDNDecodeCache
+        mod.BIGDNFastDecodeRunner = BIGDNFastDecodeRunner
+        mod.BIGDNIncrDecodeRunner = BIGDNIncrDecodeRunner
+        mod.warm_slots_batched = warm_slots_batched
+        mod.bi_chunk_gated_delta_rule_prefill = bi_chunk_gated_delta_rule_prefill
+    mod.is_cuda = is_cuda
+    mod._bi_gdn_decode_enabled = rebind(_bi_gdn_decode_enabled, mod)
+    mod._bi_gdn_decode_fast_enabled = rebind(_bi_gdn_decode_fast_enabled, mod)
+    mod._bi_gdn_decode_incr_enabled = rebind(_bi_gdn_decode_incr_enabled, mod)
+    mod._bi_gdn_incr_defer_enabled = rebind(_bi_gdn_incr_defer_enabled, mod)
+    mod._bi_gdn_lazy_heal_enabled = rebind(_bi_gdn_lazy_heal_enabled, mod)
+    mod._bi_gdn_prefill_enabled = rebind(_bi_gdn_prefill_enabled, mod)
+    mod._make_bi_gdn_decode_runner = rebind(_make_bi_gdn_decode_runner, mod)
+    mod.GDNAttnBackend._bi_decode_cache = rebind(
+        _GDNAttnBackend___bi_decode_cache, mod, name="_bi_decode_cache"
+    )
+    mod.GDNAttnBackend._bi_decode_metadata = rebind(
+        _GDNAttnBackend___bi_decode_metadata, mod, name="_bi_decode_metadata"
+    )
+    mod.GDNAttnBackend._bi_gdn_decode_seed = rebind(
+        _GDNAttnBackend___bi_gdn_decode_seed, mod, name="_bi_gdn_decode_seed"
+    )
+    mod.GDNAttnBackend.__init__ = rebind(
+        _GDNAttnBackend____init__, mod, name="__init__"
+    )
+    mod.GDNAttnBackend._replayssm_fold_target_verify = rebind(
+        _GDNAttnBackend___replayssm_fold_target_verify,
+        mod,
+        name="_replayssm_fold_target_verify",
+    )
+    mod.GDNAttnBackend._replayssm_target_verify = rebind(
+        _GDNAttnBackend___replayssm_target_verify, mod, name="_replayssm_target_verify"
+    )
+    mod.GDNAttnBackend.forward_decode = rebind(
+        _GDNAttnBackend__forward_decode, mod, name="forward_decode"
+    )
+    mod.GDNAttnBackend.forward_extend = rebind(
+        _GDNAttnBackend__forward_extend, mod, name="forward_extend"
+    )
+    mod.GDNAttnBackend.init_forward_metadata = rebind(
+        _GDNAttnBackend__init_forward_metadata, mod, name="init_forward_metadata"
+    )

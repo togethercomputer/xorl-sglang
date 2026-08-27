@@ -17,6 +17,16 @@ change from upstream (or the overlay code that needed it is retired).
 
 Retired entries, for the record:
 
+- **The #41 exact-serving port's entire `srt/` footprint** (17 files:
+  `server_args.py`, `sampler.py`, `logits_processor.py`, `layernorm.py`,
+  `gdn_backend.py`, the `rotary_embedding/` family, `tokenizer_manager.py`,
+  `io_struct.py`, `http_server.py`, `forward_batch_info.py`, the Qwen model
+  files, and the `bi_families_v2` alias) — retired before merge: every edit
+  moved into overlay twins (verbatim copies rebound over the live module
+  dicts, pinned in `_twin_pins.py`), `ServerArgs` gained a subclass twin, and
+  the trainer-compat alias is served by the lazy module-alias finder in
+  `overrides/patches/module_aliases.py`. `srt/` diff vs dev: zero files.
+
 - `python/sglang/srt/server_args.py` — `lora_use_virtual_experts` marked
   `Arg(resolvable=True)` (#32, extension-point metadata). Retired without an
   upstream sync: the whitelist is now extended from the overlay via the

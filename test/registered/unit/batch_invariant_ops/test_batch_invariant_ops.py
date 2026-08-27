@@ -245,5 +245,86 @@ class TestBatchInvariantOps(CustomTestCase):
                             self._assert_batch_invariant_results(difflist, dtype, name)
 
 
+class TestSetBatchInvariantModeReentry(CustomTestCase):
+    """Regression test: exiting a nested set_batch_invariant_mode used to
+    restore a destroyed torch.library.Library handle with the mode flag still
+    True, so batch-invariant mode reported enabled with zero ops registered.
+    The exit path must re-register ops from scratch."""
+
+    def test_enter_exit_enter_reregisters_ops(self):
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            get_batch_invariant_ops,
+            is_batch_invariant_mode_enabled,
+        )
+
+        original_bmm = torch.bmm
+        with set_batch_invariant_mode(True):
+            ops_first = get_batch_invariant_ops()
+            self.assertTrue(is_batch_invariant_mode_enabled())
+            self.assertGreater(len(ops_first), 0)
+            with set_batch_invariant_mode(False):
+                self.assertFalse(is_batch_invariant_mode_enabled())
+                self.assertEqual(get_batch_invariant_ops(), ())
+            # Back in the outer scope: the mode must be re-enabled with ops
+            # actually registered (the old exit path left mode=True with an
+            # empty op set and a destroyed library handle).
+            self.assertTrue(is_batch_invariant_mode_enabled())
+            self.assertEqual(get_batch_invariant_ops(), ops_first)
+            self.assertIsNotNone(batch_invariant_ops._batch_invariant_LIB)
+            if "bmm" in ops_first:
+                self.assertIs(torch.bmm, batch_invariant_ops.bmm_batch_invariant)
+        self.assertFalse(is_batch_invariant_mode_enabled())
+        self.assertIs(torch.bmm, original_bmm)
+
+    def test_nested_same_state_is_noop(self):
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            get_batch_invariant_ops,
+            is_batch_invariant_mode_enabled,
+        )
+
+        with set_batch_invariant_mode(True):
+            ops_first = get_batch_invariant_ops()
+            # True inside True: the old exit path destroyed the live library
+            # even though nothing changed on entry.
+            with set_batch_invariant_mode(True):
+                self.assertTrue(is_batch_invariant_mode_enabled())
+            self.assertTrue(is_batch_invariant_mode_enabled())
+            self.assertEqual(get_batch_invariant_ops(), ops_first)
+            self.assertIsNotNone(batch_invariant_ops._batch_invariant_LIB)
+        self.assertFalse(is_batch_invariant_mode_enabled())
+
+
+# main's TestMMFallbackVariantLoudError is not ported: it exercises
+# _MM_FALLBACK_SHAPES_REPORTED, which no source revision (main, the trainer
+# submodule pin, or this branch) actually implements -- the class is
+# nightly-only there and never ran. Recorded as a defect found during the
+# port.
+
+
+class TestFusedAddRMSNormBatchInvariant(CustomTestCase):
+    """The fused residual tree is invariant to unrelated batch rows."""
+
+    def test_batch_composition_invariance(self):
+        """Row 0 normalized alone must bit-match row 0 normalized in a batch."""
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+            fused_add_rms_norm_batch_invariant,
+        )
+
+        torch.manual_seed(4321)
+        hidden_size = 2048
+        weight = torch.rand(hidden_size, dtype=torch.bfloat16) + 0.5
+        x = torch.randn(16, hidden_size, dtype=torch.bfloat16)
+        residual = torch.randn(16, hidden_size, dtype=torch.bfloat16)
+        with set_batch_invariant_mode(True):
+            out_full, res_full = fused_add_rms_norm_batch_invariant(
+                x.clone(), residual.clone(), weight, 1e-6
+            )
+            out_one, res_one = fused_add_rms_norm_batch_invariant(
+                x[:1].clone(), residual[:1].clone(), weight, 1e-6
+            )
+        self.assertTrue(torch.equal(out_full[:1], out_one))
+        self.assertTrue(torch.equal(res_full[:1], res_one))
+
+
 if __name__ == "__main__":
     unittest.main()

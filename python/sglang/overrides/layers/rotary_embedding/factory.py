@@ -1,0 +1,320 @@
+"""Override twin of ``sglang.srt.layers.rotary_embedding.factory`` -- xorl exact serving (zero-srt port of PR #41).
+
+Verbatim copies of the retired in-tree edits. Copies live at module top level
+(collision-proof ``_Cls__name`` def names for methods) so cross-references stay
+module-global, and every attach goes through ``rebind`` so the copy resolves
+names via the PATCHED srt module's live dict -- identical to in-tree, including
+monkeypatching and ``global`` writes. Replaced/removed upstream symbols are
+pinned in ``sglang.overrides._twin_pins``; when the pin test fires after an
+upstream sync, re-derive the copies and re-pin.
+"""
+
+# ruff: noqa: F821 -- the verbatim copies below resolve upstream names at call
+# time via rebind() over the live srt module dict; they are undefined in this
+# file's namespace by design.
+
+from __future__ import annotations
+
+from sglang.overrides._twin_bind import rebind
+
+
+def get_rope(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: int,
+    is_neox_style: bool = True,
+    rope_scaling: Optional[Dict[str, Any]] = None,
+    dtype: Optional[torch.dtype] = None,
+    partial_rotary_factor: float = 1.0,
+    dual_chunk_attention_config: Optional[Dict[str, Any]] = None,
+) -> RotaryEmbedding:
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if rope_scaling is not None:
+        rope_scaling_tuple = {
+            k: tuple(v) if isinstance(v, list) else v for k, v in rope_scaling.items()
+        }
+        rope_scaling_args = tuple(rope_scaling_tuple.items())
+    else:
+        rope_scaling_args = None
+
+    if dual_chunk_attention_config is not None:
+        dual_chunk_attention_tuple = {
+            k: tuple(v) if isinstance(v, list) else v
+            for k, v in dual_chunk_attention_config.items()
+            if k != "sparse_attention_config"
+        }
+        dual_chunk_attention_args = tuple(dual_chunk_attention_tuple.items())
+    else:
+        dual_chunk_attention_args = None
+
+    if partial_rotary_factor < 1.0:
+        rotary_dim = int(rotary_dim * partial_rotary_factor)
+    key = (
+        head_size,
+        rotary_dim,
+        max_position,
+        base,
+        is_neox_style,
+        rope_scaling_args,
+        dual_chunk_attention_args,
+        dtype,
+        # Exact Qwen installs the architecture-selected Class-B application
+        # program on the shared module. Keep it isolated from generic entries.
+        bool(getattr(get_exec().deterministic, "qwen35_rope_class_b", False)),
+    )
+    if key in _ROPE_DICT:
+        return _ROPE_DICT[key]
+
+    if dual_chunk_attention_config is not None:
+        extra_kwargs = {
+            k: v
+            for k, v in dual_chunk_attention_config.items()
+            if k in ("chunk_size", "local_size")
+        }
+        rotary_emb = DualChunkRotaryEmbedding(
+            head_size,
+            rotary_dim,
+            max_position,
+            base,
+            is_neox_style,
+            dtype,
+            **extra_kwargs,
+        )
+    elif rope_scaling is None:
+        rotary_emb = RotaryEmbedding(
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype
+        )
+    else:
+        if "rope_type" in rope_scaling:
+            scaling_type = rope_scaling["rope_type"]
+        elif "type" in rope_scaling:
+            scaling_type = rope_scaling["type"]
+        else:
+            raise ValueError(
+                f"Unknown RoPE scaling type, rope_scaling is {rope_scaling}"
+            )
+
+        if scaling_type == "llama3":
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+            low_freq_factor = _get_rope_param(
+                rope_scaling, "low_freq_factor", 1.0, scaling_type
+            )
+            high_freq_factor = _get_rope_param(
+                rope_scaling, "high_freq_factor", 4.0, scaling_type
+            )
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
+            rotary_emb = Llama3RotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+                scaling_factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max_position,
+            )
+        elif scaling_type == "default":
+            if "mrope_section" in rope_scaling:
+                rotary_emb = MRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    mrope_interleaved_glm=rope_scaling.get(
+                        "mrope_interleaved_glm", False
+                    ),
+                )
+            elif rope_scaling.get("use_fope", False):
+                rotary_emb = FourierRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                    num_kv_heads=rope_scaling["num_kv_heads"],
+                    fope_init_factor=rope_scaling.get("fope_init_factor", 0.1),
+                    fope_sep_head=rope_scaling.get("fope_sep_head", True),
+                    num_inv_freq=rope_scaling.get("num_inv_freq", None),
+                )
+            else:
+                rotary_emb = RotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    dtype,
+                )
+        elif scaling_type == "linear":
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+            rotary_emb = LinearScalingRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                scaling_factor,
+                dtype,
+            )
+        elif scaling_type == "dynamic":
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+            if "alpha" in rope_scaling:
+                rotary_emb = DynamicNTKAlphaRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    rope_scaling["alpha"],
+                    dtype,
+                )
+            else:
+                rotary_emb = DynamicNTKScalingRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    max_position,
+                    base,
+                    is_neox_style,
+                    scaling_factor,
+                    dtype,
+                )
+        elif scaling_type == "yarn":
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
+            extra_kwargs = {
+                k: v
+                for k, v in rope_scaling.items()
+                if k
+                in (
+                    "extrapolation_factor",
+                    "attn_factor",
+                    "beta_fast",
+                    "beta_slow",
+                    "mscale",
+                    "mscale_all_dim",
+                )
+            }
+            extra_kwargs["truncate"] = rope_scaling.get("truncate", True)
+            if "mrope_section" in rope_scaling:
+                rotary_emb = YaRNScalingMRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    original_max_position,
+                    base,
+                    is_neox_style,
+                    scaling_factor,
+                    dtype,
+                    mrope_section=rope_scaling["mrope_section"],
+                    mrope_interleaved=rope_scaling.get("mrope_interleaved", False),
+                    **extra_kwargs,
+                )
+            else:
+                rotary_emb = YaRNScalingRotaryEmbedding(
+                    head_size,
+                    rotary_dim,
+                    original_max_position,
+                    base,
+                    is_neox_style,
+                    scaling_factor,
+                    dtype,
+                    **extra_kwargs,
+                )
+        elif scaling_type == "deepseek_yarn":
+            scaling_factor = _get_rope_param(rope_scaling, "factor", 1.0, scaling_type)
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
+            extra_kwargs = {
+                k: v
+                for k, v in rope_scaling.items()
+                if k
+                in (
+                    "extrapolation_factor",
+                    "attn_factor",
+                    "beta_fast",
+                    "beta_slow",
+                    "mscale",
+                    "mscale_all_dim",
+                )
+            }
+            rotary_emb = DeepseekScalingRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                original_max_position,
+                base,
+                is_neox_style,
+                scaling_factor,
+                dtype,
+                **extra_kwargs,
+            )
+        elif scaling_type == "longrope":
+            short_factor = rope_scaling["short_factor"]
+            long_factor = rope_scaling["long_factor"]
+            original_max_position = _get_rope_param(
+                rope_scaling,
+                "original_max_position_embeddings",
+                max_position,
+                scaling_type,
+            )
+            extra_kwargs = {
+                k: v
+                for k, v in rope_scaling.items()
+                if k in ("short_mscale", "long_mscale")
+            }
+            rotary_emb = Phi3LongRoPEScaledRotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                original_max_position,
+                base,
+                is_neox_style,
+                dtype,
+                short_factor,
+                long_factor,
+                **extra_kwargs,
+            )
+        elif scaling_type == "proportional":
+            rotary_emb = Gemma4RotaryEmbedding(
+                head_size,
+                rotary_dim,
+                max_position,
+                base,
+                is_neox_style,
+                dtype,
+            )
+        else:
+            raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+    _ROPE_DICT[key] = rotary_emb
+    return rotary_emb
+
+
+def __apply_patch__(mod):
+    # Deferred: the finder imports twins under bypass(), so sglang imports at
+    # twin top level would cache modules UNPATCHED. Import here (bypass off)
+    # and publish onto mod -- in-tree these were the file's module globals.
+    from sglang.srt.runtime_context import get_exec
+
+    mod.get_exec = get_exec
+    mod.get_rope = rebind(get_rope, mod)

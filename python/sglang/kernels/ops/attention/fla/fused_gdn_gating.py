@@ -37,8 +37,14 @@ def fused_gdn_gating_kernel(
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # Zero-K3 contract: beta stays fp32 (stored through the fp32 output buffer's dtype).
+    # The old code rounded sigmoid through the INPUT dtype (bf16) before the
+    # fp32 store — a needless downcast that also disagreed with the decode
+    # kernel's in-kernel fp32 gating on every token.
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
+    tl.store(
+        beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask
+    )
 
 
 def fused_gdn_gating(
