@@ -59,7 +59,12 @@ class TestFastImageProcessorDevice(CustomTestCase):
         self.assertEqual(self._device(processor), "cuda:2")
 
     def test_rl_on_policy_target_forces_cpu(self):
-        processor = _make(base_gpu_id=3, rl_on_policy_target="fsdp")
+        # Adapted for the XoRL fork: overrides/server_args.py fail-closes any
+        # rl_on_policy_target other than "xorl" (upstream's "fsdp" is the
+        # main-lineage target this fork does not serve). The behavior under
+        # test — any on-policy target forces CPU image processing — is
+        # target-agnostic (base_processor checks `is not None`).
+        processor = _make(base_gpu_id=3, rl_on_policy_target="xorl")
         self.assertEqual(self._device(processor), "cpu")
 
     def test_cpu_and_xpu_platforms_win_over_base_gpu_id(self):
