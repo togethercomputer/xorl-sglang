@@ -118,6 +118,29 @@ def process_routed_experts_from_ret(
     return ret_item["meta_info"].get("routed_experts", None)
 
 
+def process_expert_ids_from_ret(
+    ret_item: Dict[str, Any],
+    request: Union[
+        ChatCompletionRequest,
+        CompletionRequest,
+    ],
+) -> Dict[str, Any]:
+    """Pull the requested causal expert-ID partitions out of a ret item.
+
+    Returns only the keys the request actually asked for, so a request that opted
+    into neither partition produces an empty dict and no `sglext` field is
+    serialized at all. The schema rides along whenever either half is present.
+    """
+    fields: Dict[str, Any] = {}
+    if request.return_input_expert_ids:
+        fields["input_expert_ids"] = ret_item["meta_info"].get("input_expert_ids")
+    if request.return_output_expert_ids:
+        fields["output_expert_ids"] = ret_item["meta_info"].get("output_expert_ids")
+    if fields:
+        fields["expert_ids_schema"] = ret_item["meta_info"].get("expert_ids_schema")
+    return {k: v for k, v in fields.items() if v is not None}
+
+
 def cached_tokens_details_from_dict(
     details: Dict[str, Any],
 ) -> CachedTokensDetails:

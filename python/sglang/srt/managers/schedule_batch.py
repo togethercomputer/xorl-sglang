@@ -115,6 +115,7 @@ from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.state_capturer.expert_route_selection import ExpertRouteResult
 from sglang.srt.utils import flatten_nested_list
 from sglang.srt.utils.cuda_ipc_transport_utils import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
@@ -812,6 +813,8 @@ class Req(ReqDllmMixin):
         return_expert_logits: bool = False,
         routed_experts_start_len: int = 0,
         return_routed_experts_file: bool = False,
+        return_input_expert_ids: bool = False,
+        return_output_expert_ids: bool = False,
         return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
@@ -1068,6 +1071,15 @@ class Req(ReqDllmMixin):
             None  # cpu tensor: shape (seqlen, topk)
         )
         self.expert_logits: Optional[torch.Tensor] = None
+
+        # Causally partitioned expert-route IDs (see
+        # sglang.srt.state_capturer.expert_route_selection). Independent of the
+        # legacy full-history `routed_experts` path above; one typed result
+        # holds both halves plus their shape/layout metadata, so the large row
+        # tensors are never duplicated across internal objects.
+        self.return_input_expert_ids = return_input_expert_ids
+        self.return_output_expert_ids = return_output_expert_ids
+        self.expert_routes: Optional[ExpertRouteResult] = None
 
         self.return_indexer_topk = return_indexer_topk
         self.indexer_topk: Optional[torch.Tensor] = (
@@ -1627,6 +1639,7 @@ class Req(ReqDllmMixin):
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
+        self.expert_routes = None
         self.indexer_topk = None
         self.last_node = None
         self.cache_protected_len = 0

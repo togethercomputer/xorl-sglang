@@ -55,6 +55,7 @@ from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
     cached_tokens_details_from_dict,
     process_cached_tokens_details_from_ret,
+    process_expert_ids_from_ret,
     process_hidden_states_for_response,
     process_hidden_states_from_ret,
     process_routed_experts_from_ret,
@@ -1007,6 +1008,8 @@ class OpenAIServingChat(OpenAIServingBase):
             return_hidden_states=request.return_hidden_states,
             return_routed_experts=request.return_routed_experts,
             routed_experts_start_len=request.routed_experts_start_len,
+            return_input_expert_ids=request.return_input_expert_ids,
+            return_output_expert_ids=request.return_output_expert_ids,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=self._compute_extra_key(request),
@@ -1493,6 +1496,10 @@ class OpenAIServingChat(OpenAIServingBase):
         cached_tokens = {}
         hidden_states = {}
         routed_experts = {}
+        # Partitioned expert IDs are only meaningful once the request is done,
+        # so the accumulator keeps the latest value per choice and the payload
+        # is emitted a single time after the stream loop -- never per delta.
+        expert_ids = {}
         cached_tokens_details = {}
         image_tokens = {}
         audio_tokens = {}
@@ -1522,6 +1529,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 cached_tokens[index] = content["meta_info"].get("cached_tokens", 0)
                 hidden_states[index] = content["meta_info"].get("hidden_states", None)
                 routed_experts[index] = content["meta_info"].get("routed_experts", None)
+                expert_ids[index] = process_expert_ids_from_ret(content, request)
                 cached_tokens_details[index] = content["meta_info"].get(
                     "cached_tokens_details", None
                 )
@@ -1645,6 +1653,8 @@ class OpenAIServingChat(OpenAIServingBase):
                     (v for v in routed_experts.values() if v is not None), None
                 )
 
+            sglext_expert_ids = next((v for v in expert_ids.values() if v), {})
+
             sglext_details = None
             if request.return_cached_tokens_details and cached_tokens_details:
                 first_details = next(
@@ -1653,7 +1663,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 if first_details is not None:
                     sglext_details = cached_tokens_details_from_dict(first_details)
 
-            if sglext_routed is not None or sglext_details is not None:
+            if (
+                sglext_routed is not None
+                or sglext_expert_ids
+                or sglext_details is not None
+            ):
                 sglext_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
@@ -1662,6 +1676,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     sglext=SglExt(
                         routed_experts=sglext_routed,
                         cached_tokens_details=sglext_details,
+                        **sglext_expert_ids,
                     ),
                 )
                 yield f"data: {sglext_chunk.model_dump_json()}\n\n"
@@ -1758,14 +1773,16 @@ class OpenAIServingChat(OpenAIServingBase):
         # Build sglext at response level (from first ret_item, as these are per-request)
         first_ret = ret[0]
         routed_experts = process_routed_experts_from_ret(first_ret, request)
+        expert_ids = process_expert_ids_from_ret(first_ret, request)
         cached_tokens_details = process_cached_tokens_details_from_ret(
             first_ret, request
         )
         response_sglext = None
-        if routed_experts or cached_tokens_details:
+        if routed_experts or expert_ids or cached_tokens_details:
             response_sglext = SglExt(
                 routed_experts=routed_experts,
                 cached_tokens_details=cached_tokens_details,
+                **expert_ids,
             )
 
         for idx, ret_item in enumerate(ret):

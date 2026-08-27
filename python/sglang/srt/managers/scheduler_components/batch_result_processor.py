@@ -40,6 +40,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
 )
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.state_capturer.expert_route_selection import select_expert_routes
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.state_capturer.routed_experts_side_channel import (
@@ -193,6 +194,37 @@ class SchedulerBatchResultProcessor:
                 else None
             )
 
+    def _maybe_collect_expert_ids(self, req: Req):
+        """Select the requested causal partitions of this request's route rows.
+
+        Returns immediately when neither flag is set, so a default request pays
+        no extraction, no host gather and no serialization cost.
+
+        Runs at `req.finished()`, after the forward's D2H capture has been
+        committed (`copy_done.synchronize()` then `TopkCaptureOutput.finalize()`
+        at the top of process_batch_result_*) and before `release_kv_cache`, so
+        every row read still belongs to this request's own token slots.
+        """
+        if not (req.return_input_expert_ids or req.return_output_expert_ids):
+            return
+        capturer = get_global_experts_capturer()
+        if capturer is None:
+            # Unreachable: Scheduler._validate_expert_id_request aborts these
+            # requests up front. Fail loudly rather than return a silent gap.
+            raise RuntimeError(
+                f"req {req.rid} asked for expert IDs but no routed-experts "
+                "capturer is installed"
+            )
+        req.expert_routes = select_expert_routes(
+            capturer=capturer,
+            req_to_token_pool=self.req_to_token_pool,
+            req_pool_idx=req.req_pool_idx,
+            prompt_len=len(req.origin_input_ids),
+            seqlen=len(req.origin_input_ids) + len(req.output_ids_through_stop),
+            want_input=req.return_input_expert_ids,
+            want_output=req.return_output_expert_ids,
+        )
+
     def _maybe_collect_indexer_topk(self, req: Req):
         capturer = get_global_indexer_capturer()
         if capturer is None:
@@ -307,6 +339,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
                     if req.finished():
                         self._maybe_collect_routed_experts(req)
+                        self._maybe_collect_expert_ids(req)
                         self._maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
@@ -1072,6 +1105,7 @@ class SchedulerBatchResultProcessor:
             if req.multimodal_inputs is not None and req.session is None:
                 req.multimodal_inputs.release_features()
             self._maybe_collect_routed_experts(req)
+            self._maybe_collect_expert_ids(req)
             self._maybe_collect_indexer_topk(req)
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:

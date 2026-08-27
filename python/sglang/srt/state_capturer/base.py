@@ -1,6 +1,6 @@
 import dataclasses
 import logging
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
@@ -122,6 +122,12 @@ class BaseTopkCapturer:
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
+        # Which layer ids have actually written route rows. Dense (non-MoE)
+        # layers never call capture(), so their planes in the host buffer stay
+        # zero -- indistinguishable on the wire from a real expert id 0.
+        # Recording the captured set lets a response state which plane indices
+        # carry real routes instead of leaving the consumer to guess.
+        self._layer_captured = [False] * num_layers
 
         self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
         self.device_cache = BaseDeviceCache(
@@ -133,7 +139,13 @@ class BaseTopkCapturer:
         )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
+        self._layer_captured[layer_id] = True
         self.device_cache.capture(layer_id, topk_indices)
+
+    @property
+    def captured_layer_ids(self) -> List[int]:
+        """Layer ids that have written route rows, ascending (the MoE layers)."""
+        return [i for i, seen in enumerate(self._layer_captured) if seen]
 
     def _get_local_slice(
         self,
@@ -152,6 +164,40 @@ class BaseTopkCapturer:
         num_tokens = forward_batch.out_cache_loc.shape[0]
         return self.device_cache.buffer[:num_tokens, :, : self.topk_size]
 
+    def get_rows(
+        self,
+        *,
+        req_pool_idx: int,
+        start: int,
+        end: int,
+        req_to_token_pool: ReqToTokenPool,
+    ) -> torch.Tensor:
+        """Gather host rows for this request's forward positions ``[start, end)``.
+
+        Positions index the request's own token slots via ``req_to_token``, so a
+        partial gather copies only its own slice of the mapping and indexes only
+        its own host rows -- an input-only or output-only request never
+        materializes the full history just to slice it.
+        """
+        if start < 0:
+            raise ValueError(f"{start=} must be non-negative")
+        if end < start:
+            raise ValueError(f"{end=} must be >= {start=}")
+        if end == start:
+            # Basic slicing would return a *view* aliasing the whole pinned host
+            # buffer, which the IPC pickler would then serialize in full. Build a
+            # standalone empty tensor with the right trailing shape instead.
+            return torch.empty(
+                (0, self.num_layers, self.topk_size),
+                dtype=self.host_cache.buffer.dtype,
+            )
+        cache_pool_idx = (
+            req_to_token_pool.req_to_token[req_pool_idx][start:end].cpu().clone()
+        )
+        # Advanced (tensor) indexing copies, so the result never aliases the
+        # shared host buffer.
+        return self.host_cache.buffer[cache_pool_idx]
+
     def get_topk(
         self,
         req_pool_idx: int,
@@ -159,15 +205,22 @@ class BaseTopkCapturer:
         req_to_token_pool: ReqToTokenPool,
         start_len: int = 0,
     ) -> torch.Tensor:
+        """Legacy full-history gather: rows ``[start_len, seqlen - 1)``.
+
+        The exclusive ``seqlen - 1`` bound is the causal convention: a row
+        belongs to the forward position that predicts the *next* token, and the
+        forward at ``seqlen - 1`` never ran. See
+        :mod:`sglang.srt.state_capturer.expert_route_selection`.
+        """
         if start_len < 0:
             raise ValueError(f"{start_len=} must be non-negative")
-        start_len = min(start_len, seqlen - 1)
-        cache_pool_idx = (
-            req_to_token_pool.req_to_token[req_pool_idx][start_len : seqlen - 1]
-            .cpu()
-            .clone()
+        end = max(0, seqlen - 1)
+        return self.get_rows(
+            req_pool_idx=req_pool_idx,
+            start=min(start_len, end),
+            end=end,
+            req_to_token_pool=req_to_token_pool,
         )
-        return self.host_cache.buffer[cache_pool_idx]
 
     def on_forward_end(
         self,

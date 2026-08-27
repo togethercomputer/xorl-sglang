@@ -38,6 +38,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, Iterable, List, Optional, Tuple, Union
 
 import fastapi
+import msgspec
 import numpy as np
 import pybase64
 import torch
@@ -669,6 +670,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.dump_requests_threshold = 1000
         self.dump_requests_exclude_meta_keys: List[str] = [
             "routed_experts",
+            "input_expert_ids",
+            "output_expert_ids",
             "hidden_states",
         ]
         self.dump_request_list: List[Tuple] = []
@@ -1498,6 +1501,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_expert_logits=obj.return_expert_logits,
                 routed_experts_start_len=obj.routed_experts_start_len,
                 return_routed_experts_file=obj.return_routed_experts_file,
+                return_input_expert_ids=obj.return_input_expert_ids,
+                return_output_expert_ids=obj.return_output_expert_ids,
                 return_indexer_topk=obj.return_indexer_topk,
                 routed_dp_rank=obj.routed_dp_rank,
                 disagg_prefill_dp_rank=obj.disagg_prefill_dp_rank,
@@ -2445,6 +2450,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     if isinstance(val, torch.Tensor):
                         val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
                     meta_info["expert_logits"] = val
+            for field in ("input_expert_ids", "output_expert_ids"):
+                partition = getattr(recv_obj, field, None)
+                if not partition:
+                    continue
+                val = partition[i]
+                if val is None:
+                    continue
+                # BatchStrOutput is pre-encoded by the detokenizer;
+                # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
+                if isinstance(val, torch.Tensor):
+                    val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                meta_info[field] = val
+            if getattr(recv_obj, "expert_ids_schema", None):
+                schema = recv_obj.expert_ids_schema[i]
+                if schema is not None:
+                    meta_info["expert_ids_schema"] = msgspec.to_builtins(schema)
             if getattr(recv_obj, "indexer_topk", None):
                 val = recv_obj.indexer_topk[i]
                 if val is not None:
