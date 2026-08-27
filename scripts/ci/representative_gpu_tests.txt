@@ -5,8 +5,9 @@
 # and are what guard the runtime-context ratchets.
 # An absent or empty file disables filtering entirely (upstream behaviour).
 #
-# 48 of 254 GPU tests (41 upstream-representative + 7 XoRL exact-serving).
+# 48 of 254 GPU tests (41 upstream-representative + 1 fork FA4 kernel test + 6 XoRL exact-serving).
 # Add a path to re-enable a test; delete one to drop it.
+test/registered/attention/test_fa4_hd256_seqused.py  # FA4 hd256 seqused_k on SM100 (B200 paged decode/prefill)
 test/registered/attention/test_gdn_noncontiguous_stride.py  # Qwen3.5: the family this fork serves
 test/registered/attention/test_qwen35_deterministic.py  # Qwen3.5: the family this fork serves
 test/registered/attention/unittests/dense/test_extend_init_contract.py  # base-a fast-fail gate
@@ -48,7 +49,6 @@ test/registered/tokenizer/test_multi_tokenizer.py  # tokenizer: median-cost repr
 test/registered/unit/lora/test_experimental_sgl_marlin_multi_prefill.py  # unit: median-cost representative
 test/registered/utils/test_phase_checker.py  # utils: median-cost representative
 test/registered/vlm/test_token_id_retokenize_e2e.py  # vlm: median-cost representative
-test/registered/attention/test_fa4_hd256_seqused.py  # XoRL exact: hd256 FA4 seqused_k (Qwen3.5 B200 serving)
 test/registered/unit/batch_invariant_ops/test_bi_gdn_incr_step_oracle.py  # XoRL exact: incremental GDN decode vs oracle
 test/registered/unit/batch_invariant_ops/test_bi_gdn_lazy_heal_slim.py  # XoRL exact: batched GDN cache warm
 test/registered/unit/batch_invariant_ops/test_bi_lm_head_single_launch.py  # XoRL exact: BI lm-head single-launch identity
