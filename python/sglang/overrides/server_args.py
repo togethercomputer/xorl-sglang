@@ -68,8 +68,18 @@ Two flags are set together, and the pairing is the point:
     whole backend rather than gated on a quantization that is not yet known when
     ``__post_init__`` runs.
 
-All four are skipped if the user set any of them explicitly (either direction),
-so ``SGLANG_EXPERIMENTAL_LORA_OPTI=0`` remains a working opt-out.
+All four are skipped if the user set any of them explicitly (either direction).
+
+That is a defaulting opt-out, **not** a way to run this backend unoptimized:
+``flashinfer_trtllm.py`` gates the ``experimental_sgl_trtllm`` fused-func
+registration on the same master switch, so ``SGLANG_EXPERIMENTAL_LORA_OPTI=0``
+makes the backend unloadable --
+
+    NotImplementedError: Runner backend MoeRunnerBackend.EXPERIMENTAL_SGL_TRTLLM
+    requires a fused func for a2a backend none, but none is registered.
+
+-- rather than falling back to a slower path. The real opt-out is to choose a
+different ``--moe-runner-backend``.
 
 ``SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC`` and ``SGLANG_OPT_FUSED_PERMUTE_QUANT`` are
 local ``_GatedBool``s in ``trtllm_lora_temp/environ.py`` reading ``os.environ``
