@@ -26,7 +26,13 @@ class ForwardBatch(_UpstreamForwardBatch):
     # Exact DSV4 reconstructs CP-prefill rows into the logical DP-owner order
     # before logits pruning.  Carry that boundary explicitly so the TP8 head
     # never mistakes a physical CP shard for a complete owner block.
-    dsv4_exact_logits_rows_reconstructed: bool = False
+    #
+    # Twin-added fields MUST default to None: upstream enumerations that
+    # whitelist fields (TboForwardBatchPreparer.filter_batch) skip only
+    # None-valued fields and hard-error on anything else it does not know.
+    # None is falsy at every read site, so the tri-state is behaviorally
+    # identical to the original False default.
+    dsv4_exact_logits_rows_reconstructed: Optional[bool] = None
     dsv4_exact_logits_owner_rows: Optional[int] = None
     dsv4_exact_logits_dp_rank: Optional[int] = None
 

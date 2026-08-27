@@ -178,7 +178,12 @@ def _LogitsMetadata__from_forward_batch(cls, forward_batch: ForwardBatch):
         global_num_tokens_for_logprob_cpu=forward_batch.global_num_tokens_for_logprob_cpu,
         global_num_tokens_for_logprob_gpu=forward_batch.global_num_tokens_for_logprob_gpu,
         dp_padding_mode=DpPaddingMode.SUM_LEN,
-        dsv4_exact_logits_rows_reconstructed=forward_batch.dsv4_exact_logits_rows_reconstructed,
+        # The ForwardBatch twin field is tri-state (None default keeps the
+        # upstream TBO filter_batch enumeration happy); LogitsMetadata keeps
+        # the strict bool.
+        dsv4_exact_logits_rows_reconstructed=bool(
+            forward_batch.dsv4_exact_logits_rows_reconstructed
+        ),
         dsv4_exact_logits_owner_rows=forward_batch.dsv4_exact_logits_owner_rows,
         dsv4_exact_logits_dp_rank=forward_batch.dsv4_exact_logits_dp_rank,
         mm_input_embeds=forward_batch.mm_input_embeds,
