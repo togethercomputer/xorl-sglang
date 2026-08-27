@@ -123,6 +123,16 @@ flashinfer-cubin = { index = "flashinfer" }
 flashinfer-jit-cache = { index = "flashinfer-jit-cache" }
 
 [project.optional-dependencies]
+# Pre-compiled sgl_fused_moe_trtllm_sm100 (vendored TRT-LLM fused-MoE + LoRA)
+# for SM100/B200 -- skips the ~15-minute first-run JIT compile. The wheel
+# freezes python/sglang/kernels/ops/moe/trtllm_lora_temp/data at tree hash
+# 92b23b9 and requires the flashinfer 0.6.17 pin above: when either moves,
+# re-release via togethercomputer/xorl-wheels and update this URL (CI's
+# install script guards the hash and falls back to JIT; pip cannot, so this
+# extra is opt-in). See scripts/ci/cuda/ci_install_dependency.sh.
+blackwell-aot = [
+  "xorl-sgl-trtllm-aot @ https://github.com/togethercomputer/xorl-wheels/releases/download/sgl_fused_moe_trtllm_sm100_fi0617_cu130_sm100a_92b23b9/xorl_sgl_trtllm_aot-0.6.17%2Bcsrc92b23b9-py3-none-linux_x86_64.whl",
+]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
 diffusion = [

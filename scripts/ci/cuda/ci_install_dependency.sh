@@ -481,6 +481,46 @@ install_sglang_router() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+install_xorl_trtllm_aot() {
+    # Pre-compiled sgl_fused_moe_trtllm_sm100 (the fork's vendored TRT-LLM
+    # fused-MoE + LoRA op) from togethercomputer/xorl-wheels. flashinfer
+    # loads FLASHINFER_AOT_DIR/<op>/<op>.so directly, skipping the ~15-minute
+    # first-run JIT compile on SM100 runners.
+    #
+    # Two guards, both fail-open to the JIT build (slow but always correct):
+    #   - SM100-only: the .so carries sm100a cubins; other runners skip it.
+    #   - csrc-hash match: the artifact freezes the vendored csrc tree at the
+    #     hash baked into XORL_TRTLLM_AOT_CSRC. flashinfer prefers an AOT .so
+    #     SILENTLY over a JIT rebuild, so on any mismatch (kernel sources
+    #     changed since the release) we must NOT install it. Re-release via
+    #     xorl-wheels and bump these pins together.
+    XORL_TRTLLM_AOT_CSRC="92b23b9"
+    XORL_TRTLLM_AOT_URL="https://github.com/togethercomputer/xorl-wheels/releases/download/sgl_fused_moe_trtllm_sm100_fi0617_cu130_sm100a_92b23b9/xorl_sgl_trtllm_aot-0.6.17%2Bcsrc92b23b9-py3-none-linux_x86_64.whl"
+
+    local compute_cap
+    compute_cap=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 || true)
+    if [ "${compute_cap%%.*}" != "10" ]; then
+        echo "install_xorl_trtllm_aot: compute_cap='${compute_cap}' is not SM100; skipping AOT kernel"
+        mark_step_done "${FUNCNAME[0]}"
+        return 0
+    fi
+
+    local csrc_hash
+    csrc_hash=$(git rev-parse "HEAD:python/sglang/kernels/ops/moe/trtllm_lora_temp/data" 2>/dev/null | cut -c1-7 || true)
+    if [ "$csrc_hash" != "$XORL_TRTLLM_AOT_CSRC" ]; then
+        echo "::warning::install_xorl_trtllm_aot: csrc tree ${csrc_hash} != AOT artifact ${XORL_TRTLLM_AOT_CSRC}; skipping stale AOT kernel (JIT will compile the current sources; re-release via xorl-wheels and bump the pin)"
+        mark_step_done "${FUNCNAME[0]}"
+        return 0
+    fi
+
+    if ! $PIP_CMD install "xorl-sgl-trtllm-aot @ ${XORL_TRTLLM_AOT_URL}" $PIP_INSTALL_SUFFIX; then
+        echo "::warning::install_xorl_trtllm_aot: install failed; falling back to JIT compile"
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
+
 install_flashinfer_cubin() {
     if [ "$UNINSTALL_CUBIN" = false ]; then
         echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, skipping install"
@@ -728,6 +768,7 @@ main() {
     install_sglang_router
     install_flashinfer_cubin
     download_flashinfer_cache
+    install_xorl_trtllm_aot
     stabilize_flashinfer_jit_paths
     install_extra_deps
     install_test_tools
