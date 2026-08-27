@@ -20,7 +20,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 NUM_TOKENS = 128
-NUM_LAYERS = 4
+NUM_LAYERS = 8
 TOP_K = 2
 MAX_CONTEXT_LEN = 32
 
@@ -218,11 +218,26 @@ class TestExpertRouteSidecarLifecycle(CustomTestCase):
         """`make_layers` passes the *global* layer index even when a pipeline
         stage owns only a slice, so a plane index is a model layer index with no
         stage offset. If this ever became stage-local, every reported layer id
-        would be silently wrong on ranks after the first."""
-        for layer in range(4, NUM_LAYERS):  # a stage owning the tail
+        would be silently wrong on ranks after the first.
+
+        The stage-local failure mode is what the second assertion pins: a
+        rebased implementation would report 0..n-1 for a tail slice that should
+        read stage_start..NUM_LAYERS-1.
+        """
+        stage_start = NUM_LAYERS // 2
+        expected = list(range(stage_start, NUM_LAYERS))
+        # Guard against the case going vacuous if the fixture shrinks: an empty
+        # slice would make both assertions trivially true.
+        self.assertGreater(len(expected), 1, "fixture must give the stage a real slice")
+
+        for layer in expected:
             self.fx.capturer.capture(layer, torch.zeros((2, TOP_K), dtype=torch.int32))
-        self.assertEqual(
-            self.fx.capturer.captured_layer_ids, list(range(4, NUM_LAYERS))
+
+        self.assertEqual(self.fx.capturer.captured_layer_ids, expected)
+        self.assertNotEqual(
+            self.fx.capturer.captured_layer_ids,
+            list(range(len(expected))),
+            "layer ids look stage-local (rebased to 0) rather than global",
         )
 
     def test_captured_layer_ids_tracks_only_layers_that_routed(self):

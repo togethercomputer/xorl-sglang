@@ -133,19 +133,27 @@ class TestValidateResultShapes(CustomTestCase):
         return torch.zeros((n, layers, top_k), dtype=torch.int32)
 
     def test_accepts_matching_shapes(self):
-        validate_result_shapes(
-            result=ExpertRouteResult(
-                schema=ExpertRouteSchema(
-                    num_layers=4,
-                    top_k=2,
-                    moe_layer_ids=[0, 1, 2, 3],
-                    input_num_rows=3,
-                    output_num_rows=2,
-                ),
-                input_rows=self._rows(3),
-                output_rows=self._rows(2),
-            )
+        """Negative branch: a well-formed result must pass.
+
+        The guard here is the *absence* of an exception -- it catches a
+        predicate that degrades to always-raise, which every other case in this
+        class (all of which expect a raise) would happily pass.
+        """
+        result = ExpertRouteResult(
+            schema=ExpertRouteSchema(
+                num_layers=4,
+                top_k=2,
+                moe_layer_ids=[0, 1, 2, 3],
+                input_num_rows=3,
+                output_num_rows=2,
+            ),
+            input_rows=self._rows(3),
+            output_rows=self._rows(2),
         )
+        try:
+            validate_result_shapes(result=result)
+        except ValueError as exc:  # pragma: no cover - only on regression
+            self.fail(f"validator rejected a well-formed result: {exc}")
 
     def test_rejects_row_count_drift(self):
         """A gathered tensor that disagrees with its advertised row count still
