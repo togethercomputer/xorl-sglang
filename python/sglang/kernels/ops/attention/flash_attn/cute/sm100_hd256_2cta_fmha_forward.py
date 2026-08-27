@@ -224,8 +224,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
         # (TODO@wangsiyu) Implement these features.
         assert (
-            mSeqUsedQ is None and mSeqUsedK is None
-        ), "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
+            mSeqUsedQ is None
+        ), "SM100 forward with head_dim=256 does not support seqused_q"
+        # seqused_k caps the per-batch K length (paged decode/prefill). It is
+        # supported standalone: the per-batch seqlen_k override below feeds the
+        # same trip-count + last-tile masking machinery the varlen path uses.
+        assert (
+            mCuSeqlensK is None or mSeqUsedK is None
+        ), "SM100 hd256 forward supports seqused_k or cu_seqlens_k, not both"
         assert (
             learnable_sink is None
         ), "SM100 forward with head_dim=256 does not support learnable_sink"
@@ -252,6 +258,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         lse_tensor = mLSE
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = mCuSeqlensK
+        seq_used_k = mSeqUsedK
 
         q_rank = len(mQ.shape)
         k_rank = len(mK.shape)
@@ -575,6 +582,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             o,
             cum_seqlen_q,
             cum_seqlen_k,
+            seq_used_k,
             lse,
             scale_softmax_log2,
             scale_softmax,
@@ -612,6 +620,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mO_qdl: cute.Tensor,
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
+        seq_used_k: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
@@ -886,6 +895,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                     if cutlass.const_expr(mPageTable is None)
                     else max_seqlen_k
                 )
+                if cutlass.const_expr(seq_used_k is not None):
+                    # Per-batch used K length (paged decode/prefill): feeds the
+                    # same trip-count and last-tile masking as the varlen path.
+                    seqlen_k = seq_used_k[batch_coord]
                 cuseqlen_q = Int32(0)
                 cuseqlen_k = Int32(0)
                 block_offset = (
@@ -1140,6 +1153,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                     else max_seqlen_k
                 )
                 batch_coord = curr_block_coord[2][1]
+                if cutlass.const_expr(seq_used_k is not None):
+                    # Per-batch used K length (paged decode/prefill): feeds the
+                    # same trip-count and last-tile masking as the varlen path.
+                    seqlen_k = seq_used_k[batch_coord]
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
@@ -1432,6 +1449,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                     if cutlass.const_expr(mPageTable is None)
                     else max_seqlen_k
                 )
+                if cutlass.const_expr(seq_used_k is not None):
+                    # Per-batch used K length (paged decode/prefill): feeds the
+                    # same trip-count and last-tile masking as the varlen path.
+                    seqlen_k = seq_used_k[batch_coord]
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
@@ -1561,6 +1582,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                     if cutlass.const_expr(mPageTable is None)
                     else max_seqlen_k
                 )
+                if cutlass.const_expr(seq_used_k is not None):
+                    # Per-batch used K length (paged decode/prefill): feeds the
+                    # same trip-count and last-tile masking as the varlen path.
+                    seqlen_k = seq_used_k[batch_coord]
                 continue_cond = False
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):
