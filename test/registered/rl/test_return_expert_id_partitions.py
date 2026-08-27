@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=480, stage="base-b", runner_config="2-gpu-large")
 
 MAX_NEW_TOKENS = 8
 PROMPT = "User: Tell me a fact about cats.\nAssistant:"
@@ -46,6 +46,7 @@ class TestExpertIdPartitions(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.model = DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST
         cls.process = popen_launch_server(
             DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
             cls.base_url,
@@ -255,30 +256,10 @@ class TestExpertIdPartitions(CustomTestCase):
         message = json.dumps(body) if body else resp.text
         self.assertIn("routed_experts_start_len", message)
 
-
-class TestExpertIdPartitionsOpenAI(CustomTestCase):
-    """The two flags must work identically on the OpenAI-compatible surfaces."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST,
-            cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=[
-                "--enable-return-routed-experts",
-                "--enable-deterministic-inference",
-                "--tp",
-                2,
-            ],
-        )
-        cls.model = DEFAULT_ENABLE_ROUTED_EXPERTS_MODEL_NAME_FOR_TEST
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+    # ---------------- OpenAI-compatible surfaces ----------------
+    # Same server: the args are byte-identical to the native cases, and
+    # launching this model twice would roughly double the file's runtime and
+    # make its est_time (which drives CI partitioning) wrong.
 
     def _post(self, path, payload):
         resp = requests.post(f"{self.base_url}{path}", json=payload, timeout=120)

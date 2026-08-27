@@ -2680,6 +2680,16 @@ class Scheduler(
                 "supported under prefill/decode disaggregation."
             )
 
+        if self.ps.pp_size > 1:
+            # Each pipeline stage owns only its own slice of the decoder, so a
+            # rank's sidecar holds route rows for its layers alone; every other
+            # plane stays zero and is indistinguishable from expert id 0. The
+            # response would silently describe a fraction of the model.
+            return (
+                "return_input_expert_ids / return_output_expert_ids are not "
+                "supported with pipeline parallelism (pp_size > 1)."
+            )
+
         if get_memory().enable_hierarchical_cache:
             # A host->device page restore fills fresh KV slots without running a
             # forward, so the expert sidecar rows at those slots still belong to

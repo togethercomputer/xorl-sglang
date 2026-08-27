@@ -27,11 +27,17 @@ _VALIDATE = "sglang.srt.managers.scheduler.routed_experts_capture_enabled"
 _MEMORY = "sglang.srt.managers.scheduler.get_memory"
 
 
+class _StubParallelState:
+    def __init__(self, pp_size=1):
+        self.pp_size = pp_size
+
+
 class _StubScheduler:
     """Just enough Scheduler surface for `_validate_expert_id_request`."""
 
-    def __init__(self, disaggregation_mode=DisaggregationMode.NULL):
+    def __init__(self, disaggregation_mode=DisaggregationMode.NULL, pp_size=1):
         self.disaggregation_mode = disaggregation_mode
+        self.ps = _StubParallelState(pp_size=pp_size)
 
     _validate_expert_id_request = Scheduler._validate_expert_id_request
 
@@ -111,8 +117,11 @@ class TestExpertIdRequestValidation(CustomTestCase):
         capture_enabled=True,
         disaggregation_mode=DisaggregationMode.NULL,
         hierarchical_cache=False,
+        pp_size=1,
     ):
-        scheduler = _StubScheduler(disaggregation_mode=disaggregation_mode)
+        scheduler = _StubScheduler(
+            disaggregation_mode=disaggregation_mode, pp_size=pp_size
+        )
         with patch(_VALIDATE, return_value=capture_enabled), patch(
             _MEMORY, return_value=_StubMemory(hierarchical_cache)
         ):
@@ -153,6 +162,22 @@ class TestExpertIdRequestValidation(CustomTestCase):
                 self.assertIsNotNone(err)
                 self.assertIn("disaggregation", err)
 
+    def test_pipeline_parallelism_is_rejected(self):
+        """Each pipeline stage owns only its slice of the decoder, so a rank's
+        sidecar covers its own layers and every other plane stays zero --
+        indistinguishable from expert id 0. The response would silently
+        describe a fraction of the model."""
+        err = self._validate(_tokenized(return_input_expert_ids=True), pp_size=2)
+        self.assertIsNotNone(err)
+        self.assertIn("pipeline parallelism", err)
+
+    def test_single_stage_pipeline_is_accepted(self):
+        """pp_size == 1 is the ordinary case and must not be caught by the
+        pipeline guard."""
+        self.assertIsNone(
+            self._validate(_tokenized(return_input_expert_ids=True), pp_size=1)
+        )
+
     def test_hierarchical_cache_is_rejected(self):
         """A host->device page restore fills fresh KV slots without running a
         forward, leaving the sidecar rows at those slots owned by the slot's
@@ -181,6 +206,7 @@ class TestExpertIdRequestValidation(CustomTestCase):
                 _tokenized(return_routed_experts=True, routed_experts_start_len=4),
                 disaggregation_mode=DisaggregationMode.DECODE,
                 hierarchical_cache=True,
+                pp_size=2,
             )
         )
 

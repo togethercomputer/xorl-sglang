@@ -214,6 +214,17 @@ class TestExpertRouteSidecarLifecycle(CustomTestCase):
                 req_pool_idx=1, start=4, end=2, req_to_token_pool=self.fx.pool
             )
 
+    def test_captured_layer_ids_are_global_model_indices(self):
+        """`make_layers` passes the *global* layer index even when a pipeline
+        stage owns only a slice, so a plane index is a model layer index with no
+        stage offset. If this ever became stage-local, every reported layer id
+        would be silently wrong on ranks after the first."""
+        for layer in range(4, NUM_LAYERS):  # a stage owning the tail
+            self.fx.capturer.capture(layer, torch.zeros((2, TOP_K), dtype=torch.int32))
+        self.assertEqual(
+            self.fx.capturer.captured_layer_ids, list(range(4, NUM_LAYERS))
+        )
+
     def test_captured_layer_ids_tracks_only_layers_that_routed(self):
         """Dense layers never call capture(), so their planes stay zero and are
         indistinguishable from expert id 0 on the wire. The recorded set is the
