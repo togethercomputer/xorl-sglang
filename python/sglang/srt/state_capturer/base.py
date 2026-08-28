@@ -221,6 +221,32 @@ class BaseTopkCapturer:
             req_to_token_pool=req_to_token_pool,
         )
 
+    @staticmethod
+    def _num_real_rows(forward_batch: ForwardBatch) -> int:
+        """How many leading rows of ``out_cache_loc`` belong to real tokens.
+
+        MLP-sync padding appends dummy rows *after* the real ones and pads
+        ``out_cache_loc`` with **zeros** (``_pad_tensor_to_size`` defaults to
+        ``value=0``), so every padding row points at KV slot 0. Writing the
+        whole tensor would stamp padding-derived routes over whichever request
+        currently owns that slot -- silent corruption at a valid shape, not a
+        crash.
+
+        ``ForwardBatch._original_num_tokens`` is recorded by
+        ``_pad_inputs_to_size`` immediately before it pads, and is ``None`` on
+        every path that never padded (no DP/MLP-sync, and the decode cuda graph,
+        which returns before ``_prepare_eager_forward_batch``). ``None``
+        therefore means "no padding was applied", not "unknown".
+        ``post_forward_mlp_sync_batch`` trims positions/seq_lens with the same
+        field but leaves ``out_cache_loc`` padded, which is why the trim has to
+        happen here.
+        """
+        padded = forward_batch.out_cache_loc.shape[0]
+        original = forward_batch._original_num_tokens
+        if original is None:
+            return padded
+        return min(original, padded)
+
     def on_forward_end(
         self,
         forward_batch: ForwardBatch,
@@ -231,13 +257,16 @@ class BaseTopkCapturer:
         the overlap thread can do non-blocking D2H + finalize itself. Otherwise sync
         D2H inline and return None (legacy non-overlap path).
         """
-        slice_gpu = self._get_local_slice(forward_batch, decode_graph_stride)
+        # Trim once, here, so the overlap and non-overlap paths below both
+        # inherit it -- finalize() must not need its own copy of the guard.
+        rows = self._num_real_rows(forward_batch)
+        out_cache_loc = forward_batch.out_cache_loc[:rows]
+        slice_gpu = self._get_local_slice(forward_batch, decode_graph_stride)[:rows]
         if no_copy_to_cpu:
             return TopkCaptureOutput(
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
                 topk=slice_gpu,
                 host_cache=self.host_cache,
             )
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
-        self.host_cache.buffer[out_cache_loc_cpu] = slice_gpu.cpu()
+        self.host_cache.buffer[out_cache_loc.cpu()] = slice_gpu.cpu()
         return None

@@ -290,19 +290,26 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         decode_graph_stride: Optional[int],
         no_copy_to_cpu: bool = False,
     ) -> Optional[RoutedExpertsCaptureOutput]:
-        indices = self._get_local_slice(forward_batch, decode_graph_stride)
+        # Trim MLP-sync padding once, before the overlap/non-overlap split, so
+        # finalize() does not need its own copy of the guard. See
+        # BaseTopkCapturer._num_real_rows for why the padding is dangerous.
+        rows = self._num_real_rows(forward_batch)
+        out_cache_loc = forward_batch.out_cache_loc[:rows]
+        indices = self._get_local_slice(forward_batch, decode_graph_stride)[:rows]
         expert_logits = self._get_local_expert_logits_slice(
             forward_batch, decode_graph_stride
         )
+        if expert_logits is not None:
+            expert_logits = expert_logits[:rows]
         if no_copy_to_cpu:
             return RoutedExpertsCaptureOutput(
-                out_cache_loc=forward_batch.out_cache_loc,
+                out_cache_loc=out_cache_loc,
                 topk=indices,
                 host_cache=self.host_cache,
                 expert_logits=expert_logits,
                 expert_logits_host_cache=self.expert_logits_host_cache,
             )
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+        out_cache_loc_cpu = out_cache_loc.cpu()
         self.host_cache.buffer[out_cache_loc_cpu] = indices.cpu()
         if expert_logits is not None:
             self.expert_logits_host_cache.buffer[out_cache_loc_cpu] = (
