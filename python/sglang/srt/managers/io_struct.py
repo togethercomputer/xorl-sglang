@@ -60,6 +60,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.state_capturer.expert_route_selection import ExpertRouteSchema
 from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgspec_utils import (
@@ -240,6 +241,17 @@ class GenerateReqInput:
     # 0 = full sequence.
     routed_experts_start_len: Union[List[int], int] = 0
     return_routed_experts_file: bool = False
+    # Causally partitioned expert-route IDs. Independent of (and preferred over)
+    # `return_routed_experts`, which returns the whole history in one blob.
+    # A route row belongs to the forward position that predicts the *next*
+    # token, so with `prompt_len` prompt tokens and `seqlen` total tokens:
+    #   input  rows = forward positions [0, prompt_len - 1)
+    #   output rows = forward positions [prompt_len - 1, seqlen - 1)
+    # The halves are disjoint and their concatenation reproduces the legacy
+    # `routed_experts` tensor row for row. See
+    # sglang.srt.state_capturer.expert_route_selection for the derivation.
+    return_input_expert_ids: bool = False
+    return_output_expert_ids: bool = False
     return_indexer_topk: bool = False
 
     # The modalities of the image data [image, multi-images, video]
@@ -834,6 +846,8 @@ class GenerateReqInput:
                 else self.routed_experts_start_len
             ),
             return_routed_experts_file=self.return_routed_experts_file,
+            return_input_expert_ids=self.return_input_expert_ids,
+            return_output_expert_ids=self.return_output_expert_ids,
             return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
@@ -925,6 +939,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # See GenerateReqInput.routed_experts_start_len.
     routed_experts_start_len: int = 0
     return_routed_experts_file: bool = False
+    # See GenerateReqInput.return_input_expert_ids.
+    return_input_expert_ids: bool = False
+    return_output_expert_ids: bool = False
     return_indexer_topk: bool = False
 
     # Session info for continual prompting
@@ -1399,6 +1416,14 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     routed_experts: Optional[List[Optional[Any]]]
     expert_logits: Optional[List[Optional[Any]]] = None
 
+    # Causally partitioned expert-route IDs, same (token, layer, top_k) int32
+    # rows as `routed_experts` but split at the prompt/output boundary. Typed
+    # precisely rather than as Any so they decode correctly under msgpack IPC.
+    input_expert_ids: Optional[List[Optional[torch.Tensor]]] = None
+    output_expert_ids: Optional[List[Optional[torch.Tensor]]] = None
+    # Per-request shape/layout/id-space metadata for the two payloads above.
+    expert_ids_schema: Optional[List[Optional[ExpertRouteSchema]]] = None
+
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
 
     # The information of placeholder tokens (e.g., image token)
@@ -1490,6 +1515,11 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # see BatchTokenIDOutput.routed_experts.
     routed_experts: Optional[List[Optional[Any]]]
     expert_logits: Optional[List[Optional[Any]]] = None
+
+    # See BatchTokenIDOutput.input_expert_ids; base64 after the detokenizer hop.
+    input_expert_ids: Optional[List[Optional[str]]] = None
+    output_expert_ids: Optional[List[Optional[str]]] = None
+    expert_ids_schema: Optional[List[Optional[ExpertRouteSchema]]] = None
 
     indexer_topk: Optional[List[Optional[str]]]
 

@@ -439,6 +439,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         expert_logits = self._b64_encode_per_request(recv_obj.expert_logits)
+        input_expert_ids = self._b64_encode_per_request(recv_obj.input_expert_ids)
+        output_expert_ids = self._b64_encode_per_request(recv_obj.output_expert_ids)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
@@ -481,6 +483,10 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_hidden_states=recv_obj.output_hidden_states,
             routed_experts=routed_experts,
             expert_logits=expert_logits,
+            input_expert_ids=input_expert_ids,
+            output_expert_ids=output_expert_ids,
+            # Small typed metadata: passes through unencoded.
+            expert_ids_schema=recv_obj.expert_ids_schema,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,

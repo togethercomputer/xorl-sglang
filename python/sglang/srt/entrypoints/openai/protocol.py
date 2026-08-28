@@ -341,6 +341,10 @@ class CompletionRequest(BaseModel):
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
+    # Causally partitioned expert-route IDs; both halves are exposed at the
+    # response level under `sglext`. See GenerateReqInput.return_input_expert_ids.
+    return_input_expert_ids: bool = False
+    return_output_expert_ids: bool = False
     return_cached_tokens_details: bool = False
     return_token_ids: bool = False
 
@@ -411,6 +415,12 @@ class SglExt(BaseModel):
     """
 
     routed_experts: Optional[str] = None
+    # Base64 int32 rows for each requested causal partition, plus the schema
+    # needed to reshape them to (num_rows, num_layers, top_k) and to map plane
+    # indices back to model layers.
+    input_expert_ids: Optional[str] = None
+    output_expert_ids: Optional[str] = None
+    expert_ids_schema: Optional[Dict[str, Any]] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
 
     @model_serializer(mode="wrap")
@@ -774,6 +784,10 @@ class ChatCompletionRequest(BaseModel):
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
     routed_experts_start_len: int = 0
+    # Causally partitioned expert-route IDs; both halves are exposed at the
+    # response level under `sglext`. See GenerateReqInput.return_input_expert_ids.
+    return_input_expert_ids: bool = False
+    return_output_expert_ids: bool = False
     return_cached_tokens_details: bool = False
     return_prompt_token_ids: bool = False
     return_token_ids: bool = False

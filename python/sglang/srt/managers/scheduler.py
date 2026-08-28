@@ -289,6 +289,9 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import get_draft_recurrent_hidden_state_spec
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.state_capturer.routed_experts import (
+    routed_experts_capture_enabled,
+)
 from sglang.srt.utils import (
     DynamicGradMode,
     configure_gc_logger,
@@ -2383,6 +2386,8 @@ class Scheduler(
                 return_expert_logits=recv_req.return_expert_logits,
                 routed_experts_start_len=recv_req.routed_experts_start_len,
                 return_routed_experts_file=recv_req.return_routed_experts_file,
+                return_input_expert_ids=recv_req.return_input_expert_ids,
+                return_output_expert_ids=recv_req.return_output_expert_ids,
                 return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
@@ -2635,9 +2640,76 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        expert_ids_error = self._validate_expert_id_request(recv_req)
+        if expert_ids_error is not None:
+            req.return_input_expert_ids = False
+            req.return_output_expert_ids = False
+            req.set_finish_with_abort(expert_ids_error)
+            self._add_request_to_queue(req)
+            return
+
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+
+    def _validate_expert_id_request(
+        self, recv_req: TokenizedGenerateReqInput
+    ) -> Optional[str]:
+        """Reject partitioned expert-ID requests the server cannot answer exactly.
+
+        Fails closed rather than returning missing, zero, partial or stale rows:
+        every rejected case below would otherwise hand a replay consumer route
+        rows that reshape cleanly but do not describe this request's forwards.
+        """
+        if not (recv_req.return_input_expert_ids or recv_req.return_output_expert_ids):
+            return None
+
+        if not routed_experts_capture_enabled():
+            return (
+                "return_input_expert_ids / return_output_expert_ids require the "
+                "server to be launched with --enable-return-routed-experts; "
+                "expert routes are not being captured."
+            )
+
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            # The decode engine never runs the prompt forwards, and the prefill
+            # engine's sidecar rows are not transferred with the KV cache, so
+            # neither side holds a complete causal history.
+            return (
+                "return_input_expert_ids / return_output_expert_ids are not "
+                "supported under prefill/decode disaggregation."
+            )
+
+        if self.ps.pp_size > 1:
+            # Each pipeline stage owns only its own slice of the decoder, so a
+            # rank's sidecar holds route rows for its layers alone; every other
+            # plane stays zero and is indistinguishable from expert id 0. The
+            # response would silently describe a fraction of the model.
+            return (
+                "return_input_expert_ids / return_output_expert_ids are not "
+                "supported with pipeline parallelism (pp_size > 1)."
+            )
+
+        if get_memory().enable_hierarchical_cache:
+            # A host->device page restore fills fresh KV slots without running a
+            # forward, so the expert sidecar rows at those slots still belong to
+            # the slot's previous occupant.
+            return (
+                "return_input_expert_ids / return_output_expert_ids are not "
+                "supported with --enable-hierarchical-cache."
+            )
+
+        if recv_req.routed_experts_start_len != 0:
+            # start_len crops the legacy single-blob payload; the partitioned
+            # payloads carry their own absolute start positions, so combining
+            # the two would make the row-to-position mapping ambiguous.
+            return (
+                "routed_experts_start_len must be 0 when requesting "
+                "return_input_expert_ids / return_output_expert_ids; the "
+                "partitioned payloads carry their own start positions."
+            )
+
+        return None
 
     def handle_batch_generate_request(
         self,

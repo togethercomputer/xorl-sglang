@@ -48,6 +48,20 @@ def _routed_experts_device_cache_rows(
     return max(prefill_rows, decode_rows)
 
 
+def routed_experts_capture_enabled() -> bool:
+    """Whether the server was launched with routed-expert capture capability.
+
+    Single source of truth for the capability gate: ``RoutedExpertsCapturer.create``
+    returns ``None`` exactly when this is False, so request-level validation and
+    capturer construction cannot drift apart and start silently returning
+    missing or stale rows.
+    """
+    return (
+        get_exec().features.enable_return_routed_experts
+        or get_exec().features.enable_return_expert_logits
+    )
+
+
 class RoutedExpertsCaptureOutput(TopkCaptureOutput):
     """Routed expert indices plus optional float32 selected-router weights."""
 
@@ -96,10 +110,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         max_running_requests: int,
         device: str,
     ) -> Optional["RoutedExpertsCapturer"]:
-        if not (
-            get_exec().features.enable_return_routed_experts
-            or get_exec().features.enable_return_expert_logits
-        ):
+        if not routed_experts_capture_enabled():
             return None
         if not get_exec().moe.disable_shared_experts_fusion and hasattr(
             model, "num_fused_shared_experts"
@@ -128,7 +139,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         num_layers = model_config.hf_text_config.num_hidden_layers
 
         # Scale by dp_size so the buffer covers the full DP-concatenated batch.
-        # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
+        # _get_local_slice indexes into [attention_dp_rank * decode_graph_stride, ...)
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
@@ -219,8 +230,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     def _get_local_slice(
         self,
         forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: Optional[int],
+        decode_graph_stride: Optional[int],
     ) -> torch.Tensor:
         # Under DeepEP, capture() already attn_tp_all_gathered into the head of
         # the per-rank buffer, so the local DP rank's data lives at [0:N_local]
@@ -228,7 +238,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
-                forward_batch, can_run_graph, cuda_graph_batch
+                forward_batch, decode_graph_stride
             )
             local_end_pos = local_start_pos + local_num_tokens
         else:
@@ -240,14 +250,13 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     def _get_local_expert_logits_slice(
         self,
         forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: Optional[int],
+        decode_graph_stride: Optional[int],
     ) -> Optional[torch.Tensor]:
         if not self.capture_topk_weights:
             return None
         if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
-                forward_batch, can_run_graph, cuda_graph_batch
+                forward_batch, decode_graph_stride
             )
             local_end_pos = local_start_pos + local_num_tokens
         else:
@@ -278,23 +287,33 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     def on_forward_end(
         self,
         forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: Optional[int],
+        decode_graph_stride: Optional[int],
         no_copy_to_cpu: bool = False,
     ) -> Optional[RoutedExpertsCaptureOutput]:
-        indices = self._get_local_slice(forward_batch, can_run_graph, cuda_graph_batch)
+        # Trim MLP-sync padding once, before the overlap/non-overlap split, so
+        # finalize() does not need its own copy of the guard. See
+        # BaseTopkCapturer._num_real_rows for why the padding is dangerous.
+        rows = self._num_real_rows(forward_batch)
+        out_cache_loc = forward_batch.out_cache_loc[:rows]
+        indices = self._get_local_slice(forward_batch, decode_graph_stride)[:rows]
         expert_logits = self._get_local_expert_logits_slice(
-            forward_batch, can_run_graph, cuda_graph_batch
+            forward_batch, decode_graph_stride
         )
+        if expert_logits is not None:
+            expert_logits = expert_logits[:rows]
         if no_copy_to_cpu:
+            # Both slices alias buffers the next forward overwrites in place;
+            # see BaseTopkCapturer._own_rows.
             return RoutedExpertsCaptureOutput(
-                out_cache_loc=forward_batch.out_cache_loc,
-                topk=indices,
+                out_cache_loc=out_cache_loc,
+                topk=self._own_rows(indices),
                 host_cache=self.host_cache,
-                expert_logits=expert_logits,
+                expert_logits=(
+                    None if expert_logits is None else self._own_rows(expert_logits)
+                ),
                 expert_logits_host_cache=self.expert_logits_host_cache,
             )
-        out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
+        out_cache_loc_cpu = out_cache_loc.cpu()
         self.host_cache.buffer[out_cache_loc_cpu] = indices.cpu()
         if expert_logits is not None:
             self.expert_logits_host_cache.buffer[out_cache_loc_cpu] = (
@@ -331,6 +350,19 @@ def extract_expert_logits_from_meta_info(data):
     return np.frombuffer(
         pybase64.b64decode(expert_logits_base64.encode("utf-8")), dtype=np.float32
     )
+
+
+def extract_expert_ids_from_meta_info(data, field: str):
+    """Decode one partitioned expert-ID payload from a ``/generate`` response.
+
+    ``field`` is ``"input_expert_ids"`` or ``"output_expert_ids"``. Returns a
+    flat int32 array; reshape with ``meta_info["expert_ids_schema"]`` as
+    ``(<field>_num_rows, num_layers, top_k)``.
+    """
+    payload = data["meta_info"].get(field, None)
+    if payload is None:
+        return None
+    return np.frombuffer(pybase64.b64decode(payload.encode("utf-8")), dtype=np.int32)
 
 
 def disable_routed_experts_capture_for_draft(model: Any) -> None:

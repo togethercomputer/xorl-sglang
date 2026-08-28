@@ -426,16 +426,32 @@ def get_dp_local_info(forward_batch: ForwardBatch) -> Tuple[torch.Tensor, torch.
 
 def get_dp_local_slice_cpu(
     forward_batch: ForwardBatch,
-    can_run_graph: bool,
-    cuda_graph_batch: Optional[int],
+    decode_graph_stride: Optional[int],
 ) -> Tuple[int, int]:
-    # CPU (start, length) slice for DP-local data in a rank-padded buffer.
-    # Returns Python ints (no D2H sync) and handles the cuda-graph-padded layout.
+    """CPU (start, length) slice for DP-local data in a rank-padded buffer.
+
+    Returns Python ints (no D2H sync).
+
+    ``decode_graph_stride`` is the decode cuda graph's per-rank padded batch
+    size, and is not None only when that graph actually replayed. That path
+    returns from ``_forward_raw`` before ``_prepare_eager_forward_batch``, so
+    ``global_num_tokens_cpu`` still holds raw per-rank counts while the data
+    lives in the graph's static buffer at a uniform per-rank stride. The offset
+    has to come from the graph.
+
+    Every other path -- eager, and the prefill cuda graph -- runs
+    ``prepare_mlp_sync_batch`` first, which rewrites ``global_num_tokens_cpu``
+    to the post-padding counts. The running sum is then correct under both
+    padding modes: MAX_LEN rewrites every entry to ``max(global_num_tokens)``,
+    so the sum degenerates to exactly that uniform stride, and SUM_LEN packs
+    ranks at their true offsets. Passing a stride on those paths would be
+    wrong under SUM_LEN and redundant under MAX_LEN.
+    """
     global_num_tokens = forward_batch.global_num_tokens_cpu
     dp_rank = get_attention_dp_rank()
     local_num_tokens = global_num_tokens[dp_rank]
-    if can_run_graph:
-        local_start_pos = dp_rank * cuda_graph_batch
+    if decode_graph_stride is not None:
+        local_start_pos = dp_rank * decode_graph_stride
     else:
         local_start_pos = sum(global_num_tokens[:dp_rank])
     return local_start_pos, local_num_tokens

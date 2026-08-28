@@ -260,6 +260,12 @@ def _prefill_cuda_graph_allows_context_parallel(
 class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
+    # Decode cuda graph's per-rank padded batch size, set only when that graph
+    # actually replayed. State capturers need it to locate their DP-local slice
+    # in the graph's static buffer. ``can_run_graph`` cannot stand in for it:
+    # the prefill cuda graph also sets that flag, but leaves the DP layout
+    # described by the post-padding ``global_num_tokens_cpu`` instead.
+    decode_graph_stride: Optional[int] = None
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
     routed_experts_output: Optional[TopkCaptureOutput] = None
     indexer_topk_output: Optional[TopkCaptureOutput] = None
@@ -1580,16 +1586,14 @@ class ModelRunner:
         ):
             output.routed_experts_output = experts_capturer.on_forward_end(
                 forward_batch=forward_batch,
-                can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                decode_graph_stride=output.decode_graph_stride,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
         if (indexer_capturer := get_global_indexer_capturer()) is not None:
             output.indexer_topk_output = indexer_capturer.on_forward_end(
                 forward_batch=forward_batch,
-                can_run_graph=output.can_run_graph,
-                cuda_graph_batch=getattr(self.decode_cuda_graph_runner, "bs", None),
+                decode_graph_stride=output.decode_graph_stride,
                 no_copy_to_cpu=no_copy_to_cpu,
             )
 
@@ -1693,7 +1697,11 @@ class ModelRunner:
                     forward_batch,
                     pp_proxy_tensors=pp_proxy_tensors,
                 )
-                return ModelRunnerOutput(logits_output=ret, can_run_graph=can_run_graph)
+                return ModelRunnerOutput(
+                    logits_output=ret,
+                    can_run_graph=can_run_graph,
+                    decode_graph_stride=self.decode_cuda_graph_runner.bs,
+                )
 
             # DP / MLP-sync padding + attn-tp normalization. Only the decode
             # cuda-graph path above pre-pads its static buffers and returns

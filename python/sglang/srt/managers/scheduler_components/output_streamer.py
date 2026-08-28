@@ -142,6 +142,11 @@ class SchedulerOutputStreamer:
         return_expert_logits = any(
             req.return_expert_logits for req in reqs if req is not skip_req
         )
+        return_expert_ids = any(
+            req.return_input_expert_ids or req.return_output_expert_ids
+            for req in reqs
+            if req is not skip_req
+        )
         return_indexer_topk = any(
             req.return_indexer_topk for req in reqs if req is not skip_req
         )
@@ -154,6 +159,7 @@ class SchedulerOutputStreamer:
             return_hidden_states=return_hidden_states,
             return_routed_experts=return_routed_experts,
             return_expert_logits=return_expert_logits,
+            return_expert_ids=return_expert_ids,
             return_indexer_topk=return_indexer_topk,
             return_sampling_mask=return_sampling_mask,
             spec_algorithm=self.spec_algorithm,
@@ -272,6 +278,8 @@ class _GenerationStreamAccumulator:
     return_hidden_states: bool
     return_routed_experts: bool
     return_expert_logits: bool = False
+    # True when any request in the batch asked for a causal expert-ID partition.
+    return_expert_ids: bool = False
     return_indexer_topk: bool
     return_sampling_mask: bool = False
     spec_algorithm: Any
@@ -309,6 +317,9 @@ class _GenerationStreamAccumulator:
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     expert_logits: Optional[list] = None
+    input_expert_ids: Optional[list] = None
+    output_expert_ids: Optional[list] = None
+    expert_ids_schema: Optional[list] = None
     indexer_topk: Optional[list] = None
     customized_info: dict = field(default_factory=dict)
     time_stats: list = field(default_factory=list)
@@ -344,6 +355,10 @@ class _GenerationStreamAccumulator:
             self.routed_experts = []
         if self.return_expert_logits:
             self.expert_logits = []
+        if self.return_expert_ids:
+            self.input_expert_ids = []
+            self.output_expert_ids = []
+            self.expert_ids_schema = []
         if self.return_indexer_topk:
             self.indexer_topk = []
 
@@ -595,6 +610,18 @@ class _GenerationStreamAccumulator:
             self.expert_logits.append(
                 req.expert_logits if req.return_expert_logits else None
             )
+        if self.return_expert_ids:
+            # Per-request isolation: a request in this batch that did not opt in
+            # contributes None in every column, so a mixed batch never leaks one
+            # request's routes into another's response.
+            routes = req.expert_routes
+            self.input_expert_ids.append(
+                routes.input_rows if routes is not None else None
+            )
+            self.output_expert_ids.append(
+                routes.output_rows if routes is not None else None
+            )
+            self.expert_ids_schema.append(routes.schema if routes is not None else None)
         if self.return_indexer_topk:
             self.indexer_topk.append(
                 req.indexer_topk if req.return_indexer_topk else None
@@ -685,6 +712,9 @@ class _GenerationStreamAccumulator:
             output_hidden_states=self.output_hidden_states,
             routed_experts=self.routed_experts,
             expert_logits=self.expert_logits,
+            input_expert_ids=self.input_expert_ids,
+            output_expert_ids=self.output_expert_ids,
+            expert_ids_schema=self.expert_ids_schema,
             indexer_topk=self.indexer_topk,
             customized_info=(
                 wrap_as_pickle(self.customized_info) if self.customized_info else None
