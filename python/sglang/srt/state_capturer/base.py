@@ -222,6 +222,34 @@ class BaseTopkCapturer:
         )
 
     @staticmethod
+    def _own_rows(rows_view: torch.Tensor) -> torch.Tensor:
+        """Detach a capture slice from the shared device cache.
+
+        The overlap path hands these rows to ``GenerationBatchResult.copy_to_cpu``,
+        whose D2H runs on ``copy_stream`` *deliberately overlapping the next
+        forward* (scheduler.py: ``copy_stream.wait_stream(forward_stream)`` then
+        the copy, with no reverse dependency). ``_async_d2h`` calls
+        ``record_stream`` on the source, which stops the caching allocator from
+        recycling a block early -- and that is enough for every other tensor it
+        copies, because those are freshly allocated per forward.
+
+        It is not enough here. ``BaseDeviceCache.buffer`` is allocated once and
+        ``capture()`` writes it **in place** every forward, so it is never
+        recycled by the allocator and ``record_stream`` has nothing to hold.
+        Handing out a view lets the next forward overwrite those rows while the
+        D2H is still reading them, and the request receives a valid-shaped
+        tensor of another forward's expert ids.
+
+        Copying on the forward stream, before returning, restores the invariant
+        the copy path already assumes: everything it is given is privately owned
+        for this forward. The copy is rows x layers x top_k int32 -- kilobytes.
+
+        The non-overlap path needs none of this: it ``.cpu()``s synchronously on
+        the forward stream before returning, so no window exists.
+        """
+        return rows_view.clone()
+
+    @staticmethod
     def _num_real_rows(forward_batch: ForwardBatch) -> int:
         """How many leading rows of ``out_cache_loc`` belong to real tokens.
 
@@ -265,7 +293,7 @@ class BaseTopkCapturer:
         if no_copy_to_cpu:
             return TopkCaptureOutput(
                 out_cache_loc=out_cache_loc,
-                topk=slice_gpu,
+                topk=self._own_rows(slice_gpu),
                 host_cache=self.host_cache,
             )
         self.host_cache.buffer[out_cache_loc.cpu()] = slice_gpu.cpu()

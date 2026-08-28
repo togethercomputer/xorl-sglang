@@ -302,11 +302,15 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         if expert_logits is not None:
             expert_logits = expert_logits[:rows]
         if no_copy_to_cpu:
+            # Both slices alias buffers the next forward overwrites in place;
+            # see BaseTopkCapturer._own_rows.
             return RoutedExpertsCaptureOutput(
                 out_cache_loc=out_cache_loc,
-                topk=indices,
+                topk=self._own_rows(indices),
                 host_cache=self.host_cache,
-                expert_logits=expert_logits,
+                expert_logits=(
+                    None if expert_logits is None else self._own_rows(expert_logits)
+                ),
                 expert_logits_host_cache=self.expert_logits_host_cache,
             )
         out_cache_loc_cpu = out_cache_loc.cpu()
