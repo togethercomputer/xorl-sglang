@@ -139,7 +139,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         num_layers = model_config.hf_text_config.num_hidden_layers
 
         # Scale by dp_size so the buffer covers the full DP-concatenated batch.
-        # _get_local_slice indexes into [attention_dp_rank * cuda_graph_batch, ...)
+        # _get_local_slice indexes into [attention_dp_rank * decode_graph_stride, ...)
         # and otherwise overflows on dp_rank > 0 when max_running_requests >
         # chunked_prefill_size.
         # FIXME: spec decoding's num_verify_tokens is still not accounted for.
@@ -230,8 +230,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     def _get_local_slice(
         self,
         forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: Optional[int],
+        decode_graph_stride: Optional[int],
     ) -> torch.Tensor:
         # Under DeepEP, capture() already attn_tp_all_gathered into the head of
         # the per-rank buffer, so the local DP rank's data lives at [0:N_local]
@@ -239,7 +238,7 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
         if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
             # GPU->CPU sync would break overlap; operate on CPU directly.
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
-                forward_batch, can_run_graph, cuda_graph_batch
+                forward_batch, decode_graph_stride
             )
             local_end_pos = local_start_pos + local_num_tokens
         else:
@@ -251,14 +250,13 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     def _get_local_expert_logits_slice(
         self,
         forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: Optional[int],
+        decode_graph_stride: Optional[int],
     ) -> Optional[torch.Tensor]:
         if not self.capture_topk_weights:
             return None
         if is_dp_attention_enabled() and not get_moe_a2a_backend().is_deepep():
             local_start_pos, local_num_tokens = get_dp_local_slice_cpu(
-                forward_batch, can_run_graph, cuda_graph_batch
+                forward_batch, decode_graph_stride
             )
             local_end_pos = local_start_pos + local_num_tokens
         else:
@@ -289,13 +287,12 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     def on_forward_end(
         self,
         forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: Optional[int],
+        decode_graph_stride: Optional[int],
         no_copy_to_cpu: bool = False,
     ) -> Optional[RoutedExpertsCaptureOutput]:
-        indices = self._get_local_slice(forward_batch, can_run_graph, cuda_graph_batch)
+        indices = self._get_local_slice(forward_batch, decode_graph_stride)
         expert_logits = self._get_local_expert_logits_slice(
-            forward_batch, can_run_graph, cuda_graph_batch
+            forward_batch, decode_graph_stride
         )
         if no_copy_to_cpu:
             return RoutedExpertsCaptureOutput(

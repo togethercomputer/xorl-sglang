@@ -150,17 +150,16 @@ class BaseTopkCapturer:
     def _get_local_slice(
         self,
         forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: Optional[int],
+        decode_graph_stride: Optional[int],
     ) -> torch.Tensor:
         """Return the device_cache slice for this forward batch, GPU-resident.
 
         Default assumes per-rank-local capture: each rank writes [:local_num_tokens)
         to its own device_cache. Subclasses with global-tensor capture semantics
         (e.g. shared cuda graph buffer indexed by dp_rank) should override and
-        consume can_run_graph / cuda_graph_batch.
+        consume decode_graph_stride.
         """
-        del can_run_graph, cuda_graph_batch  # reserved for subclass override
+        del decode_graph_stride  # reserved for subclass override
         num_tokens = forward_batch.out_cache_loc.shape[0]
         return self.device_cache.buffer[:num_tokens, :, : self.topk_size]
 
@@ -225,17 +224,14 @@ class BaseTopkCapturer:
     def on_forward_end(
         self,
         forward_batch: ForwardBatch,
-        can_run_graph: bool,
-        cuda_graph_batch: Optional[int],
+        decode_graph_stride: Optional[int],
         no_copy_to_cpu: bool = False,
     ) -> Optional[TopkCaptureOutput]:
         """If no_copy_to_cpu is True, return a TopkCaptureOutput holding GPU tensors so
         the overlap thread can do non-blocking D2H + finalize itself. Otherwise sync
         D2H inline and return None (legacy non-overlap path).
         """
-        slice_gpu = self._get_local_slice(
-            forward_batch, can_run_graph, cuda_graph_batch
-        )
+        slice_gpu = self._get_local_slice(forward_batch, decode_graph_stride)
         if no_copy_to_cpu:
             return TopkCaptureOutput(
                 out_cache_loc=forward_batch.out_cache_loc,
