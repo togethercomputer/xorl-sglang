@@ -17,6 +17,7 @@ assert against a synthetic host buffer:
 
 import json
 import unittest
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -196,12 +197,26 @@ class TestExpertIdPartitions(CustomTestCase):
         must still resolve through the shared token slots to what the first
         request's forward computed. This is the property that makes the sidecar
         a token-lifecycle cache rather than a per-request history."""
-        salt = "expert-id-partition-prefix-reuse"
-        first = self._generate(extra_key=salt, return_input_expert_ids=True)
+        # Fresh salt per invocation. CustomTestCase retries a failed test, and a
+        # fixed salt is already warm on the second attempt -- the cold-miss
+        # assertion below would then fail on every retry and mask whatever
+        # actually went wrong on the first one.
+        salt = f"expert-id-partition-prefix-reuse-{uuid.uuid4()}"
+        # Pin both requests to one DP rank. Every DP rank runs its own scheduler
+        # and its own radix cache, and the dispatcher spreads requests across
+        # ranks, so unpinned the second request can land on a rank that never saw
+        # the first and report a cold cache -- which says nothing about whether a
+        # *hit* serves the producer's rows, the property under test. Pinning
+        # establishes that precondition; the assertions keep their full strength
+        # (cold miss, then a real hit, then exact row equality). When dp_size is
+        # 1 the server logs that routed_dp_rank is ignored and behaves as before,
+        # so the committed tp2 configuration is unchanged.
+        pin = {"routed_dp_rank": 0}
+        first = self._generate(extra_key=salt, return_input_expert_ids=True, **pin)
         self.assertEqual(
             first["meta_info"].get("cached_tokens", 0), 0, "first must be a cold miss"
         )
-        second = self._generate(extra_key=salt, return_input_expert_ids=True)
+        second = self._generate(extra_key=salt, return_input_expert_ids=True, **pin)
         self.assertGreater(
             second["meta_info"].get("cached_tokens", 0), 0, "expected a prefix hit"
         )
