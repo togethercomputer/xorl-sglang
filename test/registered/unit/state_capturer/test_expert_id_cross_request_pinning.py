@@ -38,9 +38,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 TARGET = (
-    Path(__file__).resolve().parents[2]
-    / "rl"
-    / "test_return_expert_id_partitions.py"
+    Path(__file__).resolve().parents[2] / "rl" / "test_return_expert_id_partitions.py"
 )
 
 # The helper every request goes through, and the field that pins the rank.

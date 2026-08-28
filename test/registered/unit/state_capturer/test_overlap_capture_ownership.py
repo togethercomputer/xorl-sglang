@@ -115,7 +115,8 @@ class TestCaptureSliceOwnership(CustomTestCase):
             "captured rows must be privately owned, not a view of the cache",
         )
         self.assertFalse(
-            out.topk.untyped_storage().data_ptr() == shared.untyped_storage().data_ptr(),
+            out.topk.untyped_storage().data_ptr()
+            == shared.untyped_storage().data_ptr(),
             "captured rows must not share storage with the cache",
         )
 
@@ -144,7 +145,9 @@ class TestCaptureSliceOwnership(CustomTestCase):
         )
         capturer.expert_logits_device_cache = SimpleNamespace(
             buffer=torch.full(
-                (DEVICE_ROWS, NUM_LAYERS, TOPK), float(FIRST_FORWARD), dtype=torch.float32
+                (DEVICE_ROWS, NUM_LAYERS, TOPK),
+                float(FIRST_FORWARD),
+                dtype=torch.float32,
             )
         )
         with patch(

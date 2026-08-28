@@ -44,9 +44,9 @@ def _buffers(device_rows):
         buffer=torch.zeros((HOST_ROWS, NUM_LAYERS, TOPK), dtype=torch.int32)
     )
     device = SimpleNamespace(
-        buffer=torch.arange(
-            device_rows * NUM_LAYERS * TOPK, dtype=torch.int32
-        ).reshape(device_rows, NUM_LAYERS, TOPK)
+        buffer=torch.arange(device_rows * NUM_LAYERS * TOPK, dtype=torch.int32).reshape(
+            device_rows, NUM_LAYERS, TOPK
+        )
         + 100  # keep captured values distinct from the victim's
     )
     return host, device

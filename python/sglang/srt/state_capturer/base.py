@@ -60,12 +60,22 @@ class BaseHostCache:
         topk_size: int,
         name: str,
         dtype: torch.dtype = torch.int32,
+        pin_memory: bool = True,
     ):
+        """``pin_memory`` defaults to True: serving wants pinned host memory so
+        the D2H capture copies stay async.
+
+        Pass False to build the cache without a CUDA driver present. Pinning is
+        a DMA detail, orthogonal to the slot-indexed lifetime behaviour, so a
+        driverless CPU test can turn it off and still exercise the real thing --
+        the same escape hatch ``MHATokenToKVPoolHost`` offers for the same
+        reason.
+        """
         self.buffer = torch.zeros(
             (num_tokens, num_layers, topk_size),
             dtype=dtype,
             device="cpu",
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
         self.num_tokens = num_tokens
         self.num_layers = num_layers
@@ -115,10 +125,13 @@ class BaseTopkCapturer:
         device: str,
         name: str,
         device_topk_size: Optional[int] = None,
+        pin_memory: bool = True,
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
         are dropped before writing to host_cache via [:topk_size] truncation.
+
+        pin_memory is forwarded to the host cache; see BaseHostCache.
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
@@ -129,7 +142,9 @@ class BaseTopkCapturer:
         # carry real routes instead of leaving the consumer to guess.
         self._layer_captured = [False] * num_layers
 
-        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
+        self.host_cache = BaseHostCache(
+            num_tokens, num_layers, topk_size, name=name, pin_memory=pin_memory
+        )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
             num_layers,

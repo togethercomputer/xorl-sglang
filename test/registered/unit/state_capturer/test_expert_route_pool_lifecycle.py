@@ -36,6 +36,14 @@ class ExpertRouteSidecarFixture:
             topk_size=TOP_K,
             device="cpu",
             name="test_expert_routes",
+            # This file is registered as a CPU suite, and those runners have no
+            # NVIDIA driver. Pinned host memory cannot be allocated without one,
+            # so the default pin_memory=True made every case here error in the
+            # lane it is actually registered in -- invisible on a GPU box.
+            # Pinning is a DMA detail; the slot-indexed lifetime behaviour under
+            # test is identical either way. Same escape hatch
+            # test_mem_pool_host.py uses for the same reason.
+            pin_memory=False,
         )
         self.pool = ReqToTokenPool(
             size=8,
