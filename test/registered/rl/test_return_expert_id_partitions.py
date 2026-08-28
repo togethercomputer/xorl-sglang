@@ -165,21 +165,45 @@ class TestExpertIdPartitions(CustomTestCase):
         """Requesting one half must return exactly the rows the full history
         holds for that range -- the partial-gather optimization must not change
         a value."""
+        # Three separate requests compared against each other, so they must all
+        # be served by the same DP rank. Under --dp N the dispatcher spreads
+        # requests across ranks, and two ranks do NOT compute identical routes
+        # for an identical prompt: measured on a tp4/ep4/dp2 server, the raw
+        # routed_experts tensors from rank 0 and rank 1 for the same prompt
+        # differed on 3029/6912 elements (43.82%), while each rank on its own was
+        # exactly self-consistent (0/3840 and 0/3072). Unpinned, this test was
+        # implicitly asserting cross-rank determinism, which SGLang does not
+        # claim: --enable-deterministic-inference provides batch-invariance
+        # within a server (docs/advanced_features/deterministic_inference.mdx
+        # scopes it to attention backends x cuda graph / chunked prefill / radix
+        # cache / sampling, and never mentions DP attention or expert
+        # parallelism), and the batch-invariant op set overrides only local
+        # kernels -- mm, addmm, bmm, _log_softmax, mean.dim, rms_norm -- so it
+        # says nothing about two processes with different collective
+        # participation.
+        #
+        # The property under test is about *partitioning* -- one half equals the
+        # matching slice of the full history -- not about cross-rank numerics.
+        # Pinning isolates it; the assertions are unchanged. At dp_size 1 the
+        # server logs that routed_dp_rank is ignored, so the committed tp2
+        # configuration behaves exactly as before.
+        pin = {"routed_dp_rank": 0}
         full = self._generate(
             return_routed_experts=True,
             return_input_expert_ids=True,
             return_output_expert_ids=True,
+            **pin,
         )
         legacy = self._legacy(full)
         boundary = full["meta_info"]["prompt_tokens"] - 1
 
-        only_in = self._generate(return_input_expert_ids=True)
+        only_in = self._generate(return_input_expert_ids=True, **pin)
         self.assertNotIn("output_expert_ids", only_in["meta_info"])
         np.testing.assert_array_equal(
             self._partition(only_in, "input_expert_ids"), legacy[:boundary]
         )
 
-        only_out = self._generate(return_output_expert_ids=True)
+        only_out = self._generate(return_output_expert_ids=True, **pin)
         self.assertNotIn("input_expert_ids", only_out["meta_info"])
         np.testing.assert_array_equal(
             self._partition(only_out, "output_expert_ids"), legacy[boundary:]
