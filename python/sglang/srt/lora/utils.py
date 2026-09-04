@@ -278,6 +278,10 @@ def get_normalized_target_modules(
         "q_proj": "qkv_proj",
         "k_proj": "qkv_proj",
         "v_proj": "qkv_proj",
+        # Qwen3.5/3.6 PEFT checkpoints spell the fourth GDN input projection
+        # g_proj.  Its presence opts the logical q/k/v/g family into the
+        # runtime's four-way in_proj_qkvz buffer.
+        "g_proj": "in_proj_qkvz",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
         "out_proj": "out_proj",
@@ -309,6 +313,12 @@ def get_normalized_target_modules(
             base_name = name.split(".")[-1]
             normalized_name = params_mapping.get(base_name, base_name)
         result.add(normalized_name)
+    # The same logical o_proj target covers full attention and the GDN output
+    # projection.  Keep o_proj for the former and add out_proj for the latter
+    # only when g_proj proves this is a split-GDN adapter contract.
+    raw_leaf_names = {str(name).split(".")[-1] for name in target_modules}
+    if "g_proj" in raw_leaf_names and "o_proj" in raw_leaf_names:
+        result.add("out_proj")
     return result
 
 

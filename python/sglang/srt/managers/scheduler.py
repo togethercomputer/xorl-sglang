@@ -123,6 +123,7 @@ from sglang.srt.managers.io_struct import (
     CompleteWeightsUpdateReqInput,
     ConfigureLoggingReq,
     ContinueGenerationReqInput,
+    CreateZORLCandidatesReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DetachHiCacheStorageReqInput,
     DetachHiCacheStorageReqOutput,
@@ -155,6 +156,7 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
+    RollbackZORLCandidatesReqInput,
     RpcReqInput,
     RpcReqOutput,
     ScaleElasticEPReqInput,
@@ -173,6 +175,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromSparseDeltaReqInput,
     UpdateWeightsFromTensorReqInput,
     sock_send,
 )
@@ -1542,6 +1545,10 @@ class Scheduler(
                     self.weight_updater.update_weights_from_tensor,
                 ),
                 (
+                    UpdateWeightsFromSparseDeltaReqInput,
+                    self.weight_updater.update_weights_from_sparse_delta,
+                ),
+                (
                     UpdateWeightsFromIPCReqInput,
                     self.weight_updater.update_weights_from_ipc,
                 ),
@@ -1576,6 +1583,11 @@ class Scheduler(
                 (
                     LoadLoRAAdapterFromTensorsReqInput,
                     self.load_lora_adapter_from_tensors,
+                ),
+                (CreateZORLCandidatesReqInput, self.create_zorl_lora_candidates),
+                (
+                    RollbackZORLCandidatesReqInput,
+                    self.rollback_zorl_lora_candidates,
                 ),
                 (UnloadLoRAAdapterReqInput, self.unload_lora_adapter),
                 (PauseGenerationReqInput, self.pause_generation),
@@ -4728,6 +4740,62 @@ class Scheduler(
             recv_req,
             self.tp_worker.load_lora_adapter_from_tensors,
         )
+
+    def create_zorl_lora_candidates(self, recv_req: CreateZORLCandidatesReqInput):
+        """Create one seed population atomically across this scheduler's TP ranks."""
+        try:
+            local_result = self.tp_worker.create_zorl_lora_candidates(recv_req)
+        except Exception as error:
+            local_result = LoRAUpdateOutput(success=False, error_message=str(error))
+        rank_results = self.tp_group.all_gather_object(local_result)
+        failed = [
+            (rank, result)
+            for rank, result in enumerate(rank_results)
+            if not result.success
+        ]
+        registries = [result.loaded_adapters for result in rank_results]
+        registries_match = all(value == registries[0] for value in registries[1:])
+        slot_signatures = [
+            (result.metadata or {}).get("preloaded_slot_signature")
+            for result in rank_results
+        ]
+        slot_signatures_match = all(
+            value == slot_signatures[0] for value in slot_signatures[1:]
+        )
+        if not failed and registries_match and slot_signatures_match:
+            return rank_results[0]
+
+        rollback_req = RollbackZORLCandidatesReqInput(
+            lora_ids=[str(spec["lora_id"]) for spec in recv_req.candidates]
+        )
+        try:
+            local_rollback = self.tp_worker.rollback_zorl_lora_candidates(rollback_req)
+        except Exception as error:
+            local_rollback = LoRAUpdateOutput(success=False, error_message=str(error))
+        rollback_results = self.tp_group.all_gather_object(local_rollback)
+        messages = [
+            f"TP rank {rank}: {result.error_message or 'candidate creation failed'}"
+            for rank, result in failed
+        ]
+        if not registries_match:
+            messages.append("loaded adapter registries differ across TP ranks")
+        if not slot_signatures_match:
+            messages.append("preloaded adapter slots differ across TP ranks")
+        messages.extend(
+            f"TP rank {rank} rollback: {result.error_message or 'failed'}"
+            for rank, result in enumerate(rollback_results)
+            if not result.success
+        )
+        return LoRAUpdateOutput(
+            success=False,
+            error_message="; ".join(messages),
+            loaded_adapters=rollback_results[0].loaded_adapters,
+        )
+
+    def rollback_zorl_lora_candidates(
+        self, recv_req: RollbackZORLCandidatesReqInput
+    ):
+        return self.tp_worker.rollback_zorl_lora_candidates(recv_req)
 
     def _load_lora_adapter_with_tp_consensus(self, recv_req, load_fn):
         """Commit a dynamic LoRA load only when every TP rank agrees."""

@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import ctypes
+import importlib
+import importlib.metadata
 import json
 import logging
 import os
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
@@ -15,6 +20,38 @@ logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional[MooncakeTransferEngine] = None
+
+
+def _import_mooncake_transfer_engine():
+    """Import Mooncake, preloading its packaged CUDA runtime when necessary.
+
+    The Mooncake 0.3.9 Linux wheel is linked against ``libcudart.so.12``. A
+    CUDA-13 PyTorch environment can therefore have a healthy GPU stack while
+    failing to import Mooncake. If the matching NVIDIA compatibility wheel is
+    installed, load that exact runtime by absolute path and retry the import.
+    """
+    try:
+        return importlib.import_module("mooncake.engine").TransferEngine
+    except ImportError as first_error:
+        match = re.search(r"libcudart\.so\.(\d+)", str(first_error))
+        if match is None:
+            raise
+
+        cuda_major = match.group(1)
+        distribution_name = f"nvidia-cuda-runtime-cu{cuda_major}"
+        relative_library = Path(
+            "nvidia", "cuda_runtime", "lib", f"libcudart.so.{cuda_major}"
+        )
+        try:
+            distribution = importlib.metadata.distribution(distribution_name)
+            runtime_library = Path(distribution.locate_file(relative_library))
+            if not runtime_library.is_file():
+                raise FileNotFoundError(runtime_library)
+            ctypes.CDLL(str(runtime_library), mode=ctypes.RTLD_GLOBAL)
+        except Exception:
+            raise first_error
+
+        return importlib.import_module("mooncake.engine").TransferEngine
 
 
 def parse_ib_device_config(
@@ -111,7 +148,7 @@ class MooncakeTransferEngine:
         ib_device: Optional[str] = None,
     ):
         try:
-            from mooncake.engine import TransferEngine
+            TransferEngine = _import_mooncake_transfer_engine()
         except ImportError as e:
             raise ImportError(
                 "Please install mooncake by following the instructions at "

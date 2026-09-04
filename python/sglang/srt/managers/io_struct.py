@@ -1851,6 +1851,27 @@ class UpdateWeightsFromTensorReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class UpdateWeightsFromSparseDeltaReqInput(BaseReq, kw_only=True):
+    """Apply a packed sparse delta from a shared file or RDMA staging buffer."""
+
+    delta_paths: Optional[List[str]] = None
+    delta_sha256s: Optional[List[str]] = None
+    flush_cache: bool = True
+    abort_all_requests: bool = False
+    base_weight_version: Optional[Union[str, List[str]]] = None
+    weight_version: Optional[str] = None
+    run_post_process_weights: bool = False
+    staging_op: Optional[str] = None
+    staging_nbytes: Optional[int] = None
+    torch_empty_cache: bool = False
+
+
+class UpdateWeightsFromSparseDeltaReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    staging: Optional[List[Dict[str, Any]]] = None
+
+
 class InitWeightsSendGroupForRemoteInstanceReqInput(BaseReq, kw_only=True):
     # The master address
     master_address: str
@@ -2293,10 +2314,39 @@ class LoadLoRAAdapterFromTensorsReqInput(BaseReq, kw_only=True):
         )
 
 
+class CreateZORLCandidatesReqInput(BaseReq, kw_only=True):
+    parent_lora_name: str
+    parent_lora_id: str
+    candidates: List[Dict[str, Any]]
+    b_sigma: float
+    perturbation_mode: Literal["b_only", "a_and_b", "fresh_ab"] = "b_only"
+    preload_candidates: bool = False
+
+
+class RollbackZORLCandidatesReqInput(BaseReq, kw_only=True):
+    lora_ids: List[str]
+
+
+class RegisterZORLCandidatesReqInput(BaseReq, kw_only=True):
+    session_id: str
+    generation_id: str
+    parent_lora_name: str
+    candidates: List[Dict[str, Any]]
+    b_sigma: Optional[float] = None
+    perturbation_mode: Optional[str] = None
+    preload_candidates: bool = False
+
+
+class AbortZORLGenerationReqInput(BaseReq, kw_only=True):
+    session_id: str
+    generation_id: str
+
+
 class LoRAUpdateOutput(BaseReq, kw_only=True):
     success: bool
     error_message: Optional[str] = None
     loaded_adapters: Optional[Dict[str, Union[str, LoRARef]]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 LoadLoRAAdapterReqOutput = UnloadLoRAAdapterReqOutput = (

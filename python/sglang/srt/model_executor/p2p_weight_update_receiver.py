@@ -13,6 +13,7 @@ from sglang.srt.model_executor.p2p_weight_update import (
     p2p_capped_block_registration_regions,
     p2p_locator_registration_regions,
     p2p_missing_locators_for_regions,
+    p2p_logical_module_name,
     p2p_qwen35_full_attention_hf_name,
     p2p_qwen35_linear_attn_conv1d_locators,
     p2p_qwen35_linear_attn_qkvz_locators,
@@ -36,6 +37,8 @@ class P2PWeightUpdateReceiver:
         self._cached_p2p_session_id: Optional[str] = None
         self._p2p_pre_fingerprints: Dict[str, float] = {}
         self._p2p_pre_buf_fingerprints: Dict[str, float] = {}
+        self._sparse_delta_staging: Optional[Any] = None
+        self._cached_sparse_delta_locators: Optional[List[Dict[str, Any]]] = None
 
     def __getattr__(self, name: str) -> Any:
         runner = self._get_model_runner()
@@ -401,6 +404,7 @@ class P2PWeightUpdateReceiver:
         self._cached_p2p_locators_world = None
         self._cached_p2p_registered_ptrs = None
         self._cached_p2p_session_id = None
+        self._cached_sparse_delta_locators = None
 
     def _p2p_batch_register_regions(
         self, engine: Any, regions: List[Tuple[int, int]]
@@ -551,7 +555,9 @@ class P2PWeightUpdateReceiver:
             regions.append((base, base + nbytes))
         return sorted(set(regions))
 
-    def _build_hf_tensor_map_locators(self) -> List[Dict[str, Any]]:
+    def _build_hf_tensor_map_locators(
+        self, include_fused_moe_fast_locators: bool = False
+    ) -> List[Dict[str, Any]]:
         """Walk the model and emit one HF-keyed locator per logical HF name.
 
         Handles the standard non-MoE decoder cases:
@@ -617,6 +623,7 @@ class P2PWeightUpdateReceiver:
         consumed_param_names: set = set()
 
         def _hf_name(name: str) -> str:
+            name = name.replace(".base_layer.", ".")
             return p2p_qwen35_full_attention_hf_name(name, layers_block_type)
 
         def _ceil_div(value: int, divisor: int) -> int:
@@ -701,6 +708,7 @@ class P2PWeightUpdateReceiver:
             return True
 
         for module_name, module in self.model.named_modules():
+            logical_module_name = p2p_logical_module_name(module_name)
             mod_tp_rank, mod_tp_size = _module_tp(module)
             param_group_tp[module_name] = (mod_tp_rank, mod_tp_size)
             if FusedMoE is not None and isinstance(module, FusedMoE):
@@ -720,6 +728,7 @@ class P2PWeightUpdateReceiver:
                     consumed_param_names=consumed_param_names,
                     tp_rank=tp_rank,
                     dp_rank=dp_rank,
+                    include_fast_locators=include_fused_moe_fast_locators,
                 )
                 continue
 
@@ -800,7 +809,7 @@ class P2PWeightUpdateReceiver:
                 output_sizes = module.output_sizes  # full per-shard sizes (pre-TP)
 
                 if (
-                    module_name.endswith(".linear_attn.in_proj_qkvz")
+                    logical_module_name.endswith(".linear_attn.in_proj_qkvz")
                     and len(output_sizes) == 4
                 ):
                     consumed_param_names.add(f"{module_name}.weight")
@@ -810,7 +819,7 @@ class P2PWeightUpdateReceiver:
 
                     try:
                         locators = p2p_qwen35_linear_attn_qkvz_locators(
-                            module_name=module_name,
+                            module_name=logical_module_name,
                             output_sizes=list(output_sizes),
                             input_size=in_features,
                             tp_rank=mod_tp_rank,
@@ -1136,8 +1145,23 @@ class P2PWeightUpdateReceiver:
                 continue
 
         # Replicated / non-sharded params: emit one entry per remaining param.
+        #
+        # BaseLayerWithLoRA registers the base parameter twice: once as
+        # ``<logical>.weight`` on the wrapper and once as
+        # ``<logical>.base_layer.weight`` on the physical linear.  The typed
+        # branches above consume the physical name, while named_parameters()
+        # reports the wrapper alias first.  Comparing raw names therefore
+        # emitted a second, generic locator for the same pointer.  Under DP
+        # attention that bogus locator inherited the runner-global TP size
+        # instead of the base layer's attn-TP size (for Qwen3.6 o_proj this
+        # advertised [16384, 4096] beside the correct [2048, 4096]).
+        # Normalize consumed names through the same wrapper unwrapping used by
+        # locator dispatch so aliases cannot fall through a second time.
+        consumed_logical_param_names = {
+            p2p_logical_module_name(name) for name in consumed_param_names
+        }
         for name, param in self.model.named_parameters():
-            if name in consumed_param_names:
+            if p2p_logical_module_name(name) in consumed_logical_param_names:
                 continue
             data = param.data
             owner = name.rsplit(".", 1)[0] if "." in name else ""
@@ -1197,6 +1221,7 @@ class P2PWeightUpdateReceiver:
         consumed_param_names: set,
         tp_rank: int,
         dp_rank: int,
+        include_fast_locators: bool = False,
     ) -> None:
         """Emit per-(global_expert, projection) HF locators for one FusedMoE.
 
@@ -1207,10 +1232,10 @@ class P2PWeightUpdateReceiver:
         * ``w2_weight``  shape ``[E_local, H, I_p]`` — down_proj.
 
         ``I_p = intermediate_size / moe_tp_size`` and
-        ``E_local = num_routed_experts / moe_ep_size`` (shared experts add
-        an extra slot on every rank, after the routed experts; we skip
-        those here — they're not addressed by per-expert HF names in the
-        standard state dict layout).
+        ``E_local = num_routed_experts / moe_ep_size``. Fused shared experts
+        add one or more replicated physical slots after the local routed
+        experts; checkpoint-visible ``shared_expert`` locators below map those
+        logical 2D tensors onto the replicated tail slots.
         """
         ep_rank = int(getattr(module, "moe_ep_rank", 0))
         ep_size = int(getattr(module, "moe_ep_size", 1))
@@ -1338,8 +1363,11 @@ class P2PWeightUpdateReceiver:
         # ".experts" and:
         #   - fused-format hf_name = "{module_name}.gate_up_proj"
         #   - per-expert hf_name   = "{module_name}.{idx}.gate_proj.weight"
-        gate_up_proj_hf = f"{module_name}.gate_up_proj"
-        down_proj_hf = f"{module_name}.down_proj"
+        hf_module_name = module_name.removesuffix(".base_layer").replace(
+            ".base_layer.", "."
+        )
+        gate_up_proj_hf = f"{hf_module_name}.gate_up_proj"
+        down_proj_hf = f"{hf_module_name}.down_proj"
 
         E_total = num_routed if num_routed else num_local_routed * ep_size
 
@@ -1419,7 +1447,7 @@ class P2PWeightUpdateReceiver:
             # The xorl handler's _direct_ep_transfer_experts ships each
             # expert as a separate HF-named [I, H] / [H, I] tensor (one
             # per (expert, projection) call to backend.transfer_bucket).
-            expert_prefix = f"{module_name}.{global_idx}"
+            expert_prefix = f"{hf_module_name}.{global_idx}"
             out.append(
                 {
                     "hf_name": f"{expert_prefix}.gate_proj.weight",
@@ -1527,6 +1555,270 @@ class P2PWeightUpdateReceiver:
                     }
                 )
 
+        # ----- fused shared-expert tail (logical 2D source locators) -----
+        # Qwen3.5/3.6 checkpoints keep the shared expert at
+        # ``mlp.shared_expert.{gate,up,down}_proj``. With shared-expert
+        # fusion enabled, SGLang stores a replicated copy after this EP
+        # rank's routed experts in the same w13/w2 tensors. The regular
+        # routed locators above intentionally stop at ``num_local_routed``;
+        # emit the missing logical names explicitly for the tail slot(s).
+        num_shared = int(getattr(module, "num_fused_shared_experts", 0) or 0)
+        if num_shared:
+            experts_suffix = ".experts"
+            if not hf_module_name.endswith(experts_suffix):
+                logger.warning(
+                    "[P2P tensor_map] cannot derive shared-expert HF prefix "
+                    "from FusedMoE module %r",
+                    hf_module_name,
+                )
+            else:
+                shared_prefix = (
+                    hf_module_name.removesuffix(experts_suffix) + ".shared_expert"
+                )
+                for shared_idx in range(num_shared):
+                    physical_idx = num_local_routed + shared_idx
+                    if physical_idx >= int(w13_data.shape[0]) or physical_idx >= int(
+                        w2_data.shape[0]
+                    ):
+                        logger.warning(
+                            "[P2P tensor_map] FusedMoE %r shared slot %d is "
+                            "outside physical weights w13=%s w2=%s",
+                            module_name,
+                            physical_idx,
+                            tuple(w13_data.shape),
+                            tuple(w2_data.shape),
+                        )
+                        continue
+
+                    logical_prefix = (
+                        shared_prefix
+                        if num_shared == 1
+                        else f"{shared_prefix}.{shared_idx}"
+                    )
+                    shared_common = {
+                        "tp_rank": moe_tp_rank,
+                        "dp_rank": dp_rank,
+                        "ep_rank": ep_rank,
+                        "expert_idx": E_total + shared_idx,
+                    }
+                    w13_shared_ptr = w13_base + physical_idx * w13_per_expert_stride
+                    w2_shared_ptr = w2_base + physical_idx * w2_per_expert_stride
+
+                    for proj_name, row_offset in (
+                        ("gate_proj", 0),
+                        ("up_proj", i_p),
+                    ):
+                        out.append(
+                            {
+                                "hf_name": f"{logical_prefix}.{proj_name}.weight",
+                                **shared_common,
+                                "dtype": dtype13,
+                                "full_shape": [intermediate_size, hidden_size],
+                                "slice": [
+                                    [
+                                        moe_tp_rank * i_p,
+                                        (moe_tp_rank + 1) * i_p,
+                                    ],
+                                    [0, hidden_size],
+                                ],
+                                "ptr": w13_shared_ptr
+                                + row_offset * hidden_size * item13,
+                                "nbytes": i_p * hidden_size * item13,
+                            }
+                        )
+                    out.append(
+                        {
+                            "hf_name": f"{logical_prefix}.down_proj.weight",
+                            **shared_common,
+                            "dtype": dtype2,
+                            "full_shape": [hidden_size, intermediate_size],
+                            "slice": [
+                                [0, hidden_size],
+                                [
+                                    moe_tp_rank * i_p,
+                                    (moe_tp_rank + 1) * i_p,
+                                ],
+                            ],
+                            "ptr": w2_shared_ptr,
+                            "nbytes": hidden_size * i_p * item2,
+                        }
+                    )
+
+                    if block_scale_locators:
+                        w13_shared_scale_ptr = (
+                            w13_scale_base
+                            + physical_idx * w13_scale_expert_stride
+                        )
+                        w2_shared_scale_ptr = (
+                            w2_scale_base + physical_idx * w2_scale_expert_stride
+                        )
+                        gate_scale_nbytes = (
+                            w13_scale_rows_per_proj
+                            * w13_scale_cols
+                            * item13_scale
+                        )
+                        down_scale_nbytes = (
+                            w2_scale_rows * w2_scale_cols_per_tp * item2_scale
+                        )
+                        for proj_name, row_offset in (
+                            ("gate_proj", 0),
+                            ("up_proj", w13_scale_rows_per_proj),
+                        ):
+                            out.append(
+                                {
+                                    "hf_name": (
+                                        f"{logical_prefix}.{proj_name}.weight_scale_inv"
+                                    ),
+                                    **shared_common,
+                                    "dtype": dtype13_scale,
+                                    "full_shape": gate_up_scale_full_shape,
+                                    "slice": [
+                                        [
+                                            moe_tp_rank
+                                            * w13_scale_rows_per_proj,
+                                            (moe_tp_rank + 1)
+                                            * w13_scale_rows_per_proj,
+                                        ],
+                                        [0, w13_scale_cols],
+                                    ],
+                                    "ptr": w13_shared_scale_ptr
+                                    + row_offset
+                                    * w13_scale_data.stride(1)
+                                    * item13_scale,
+                                    "nbytes": gate_scale_nbytes,
+                                }
+                            )
+                        out.append(
+                            {
+                                "hf_name": (
+                                    f"{logical_prefix}.down_proj.weight_scale_inv"
+                                ),
+                                **shared_common,
+                                "dtype": dtype2_scale,
+                                "full_shape": down_scale_full_shape,
+                                "slice": [
+                                    [0, w2_scale_rows],
+                                    [
+                                        moe_tp_rank * w2_scale_cols_per_tp,
+                                        (moe_tp_rank + 1)
+                                        * w2_scale_cols_per_tp,
+                                    ],
+                                ],
+                                "ptr": w2_shared_scale_ptr,
+                                "nbytes": down_scale_nbytes,
+                            }
+                        )
+
+        # ----- vectorized fused-3D fast locators (kind="fused_moe") -----
+        # One locator per (FusedMoE, fused hf_name). The fold-aware sparse-
+        # delta sender ships whole-layer fused entries (gate_up_proj [E, 2I, H]
+        # etc.); the sparse-delta apply translates ALL of an entry's indices
+        # to local (expert, row, col) destinations in a handful of vector ops
+        # instead of iterating E_total x 2 per-expert generic locators.
+        if include_fast_locators:
+            fast_common = {
+                "kind": "fused_moe",
+                "tp_rank": moe_tp_rank,
+                "dp_rank": dp_rank,
+                "ep_rank": ep_rank,
+                "expert_offset": ep_rank * num_local_routed,
+                "num_local_experts": num_local_routed,
+            }
+            out.append(
+                {
+                    "hf_name": gate_up_proj_hf,
+                    **fast_common,
+                    "dtype": dtype13,
+                    "full_shape": [E_total, 2 * intermediate_size, hidden_size],
+                    "ptr": w13_base,
+                    "nbytes": w13_data.numel() * item13,
+                    "expert_stride_elems": int(w13_data.stride(0)),
+                    "row_stride_elems": int(w13_data.stride(1)),
+                    "col_stride_elems": int(w13_data.stride(2)),
+                    "shard_dim": 1,
+                    # (full_start, local_start, length): gate rows then up rows
+                    "bands": [
+                        [moe_tp_rank * i_p, 0, i_p],
+                        [intermediate_size + moe_tp_rank * i_p, i_p, i_p],
+                    ],
+                }
+            )
+            out.append(
+                {
+                    "hf_name": down_proj_hf,
+                    **fast_common,
+                    "dtype": dtype2,
+                    "full_shape": [E_total, hidden_size, intermediate_size],
+                    "ptr": w2_base,
+                    "nbytes": w2_data.numel() * item2,
+                    "expert_stride_elems": int(w2_data.stride(0)),
+                    "row_stride_elems": int(w2_data.stride(1)),
+                    "col_stride_elems": int(w2_data.stride(2)),
+                    "shard_dim": 2,
+                    "bands": [[moe_tp_rank * i_p, 0, i_p]],
+                }
+            )
+            if block_scale_locators:
+                quant_method = getattr(module, "quant_method", None)
+                quant_config = getattr(quant_method, "quant_config", None)
+                weight_block_size = getattr(quant_config, "weight_block_size", None)
+                if weight_block_size:
+                    block_n, block_k = int(weight_block_size[0]), int(weight_block_size[1])
+                    aligned = (
+                        i_p % block_n == 0
+                        and intermediate_size % block_n == 0
+                        and i_p % block_k == 0
+                        and intermediate_size % block_k == 0
+                    )
+                    if aligned:
+                        ip_bn = i_p // block_n
+                        inter_bn = intermediate_size // block_n
+                        ip_bk = i_p // block_k
+                        h_bk = (hidden_size + block_k - 1) // block_k
+                        h_bn = (hidden_size + block_n - 1) // block_n
+                        out.append(
+                            {
+                                "hf_name": f"{gate_up_proj_hf}_scale_inv",
+                                **fast_common,
+                                "dtype": dtype13_scale,
+                                "full_shape": [E_total, 2 * inter_bn, h_bk],
+                                "ptr": w13_scale_base,
+                                "nbytes": w13_scale_data.numel() * item13_scale,
+                                "expert_stride_elems": int(w13_scale_data.stride(0)),
+                                "row_stride_elems": int(w13_scale_data.stride(1)),
+                                "col_stride_elems": int(w13_scale_data.stride(2)),
+                                "shard_dim": 1,
+                                "bands": [
+                                    [moe_tp_rank * ip_bn, 0, ip_bn],
+                                    [inter_bn + moe_tp_rank * ip_bn, ip_bn, ip_bn],
+                                ],
+                            }
+                        )
+                        out.append(
+                            {
+                                "hf_name": f"{down_proj_hf}_scale_inv",
+                                **fast_common,
+                                "dtype": dtype2_scale,
+                                "full_shape": [E_total, h_bn, intermediate_size // block_k],
+                                "ptr": w2_scale_base,
+                                "nbytes": w2_scale_data.numel() * item2_scale,
+                                "expert_stride_elems": int(w2_scale_data.stride(0)),
+                                "row_stride_elems": int(w2_scale_data.stride(1)),
+                                "col_stride_elems": int(w2_scale_data.stride(2)),
+                                "shard_dim": 2,
+                                "bands": [[moe_tp_rank * ip_bk, 0, ip_bk]],
+                            }
+                        )
+                    else:
+                        logger.warning(
+                            "[P2P tensor_map] FusedMoE %r: TP-unaligned FP8 blocks "
+                            "(i_p=%d, block=(%d,%d)); fused fast scale locators skipped",
+                            module_name,
+                            i_p,
+                            block_n,
+                            block_k,
+                        )
+
     @staticmethod
     def _derive_hf_name(module_name: str, sub_name: str) -> str:
         """Replace the trailing fused-module name with its HF sub-name.
@@ -1534,6 +1826,7 @@ class P2PWeightUpdateReceiver:
         e.g. ("model.layers.0.self_attn.qkv_proj", "q_proj") ->
              "model.layers.0.self_attn.q_proj.weight"
         """
+        module_name = p2p_logical_module_name(module_name)
         parts = module_name.rsplit(".", 1)
         prefix = parts[0] + "." if len(parts) == 2 else ""
         return f"{prefix}{sub_name}.weight"
@@ -1556,6 +1849,113 @@ class P2PWeightUpdateReceiver:
         if leaf == "qkv_conv1d" and n == 3:
             return ["q_conv1d", "k_conv1d", "v_conv1d"]
         return [f"{leaf}_shard{i}" for i in range(n)]
+
+    def prepare_sparse_delta_staging(
+        self, nbytes: int
+    ) -> Tuple[bool, str, Optional[List[Dict[str, Any]]]]:
+        """Register a reusable host-pinned buffer for sparse-delta RDMA."""
+        from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+            get_mooncake_transfer_engine,
+        )
+        from sglang.srt.weight_sync.sparse_delta_staging import (
+            SparseDeltaStagingBuffer,
+        )
+
+        engine = get_mooncake_transfer_engine()
+        if engine is None:
+            return (
+                False,
+                "sparse-delta staging unsupported: Mooncake TransferEngine is not "
+                "initialized (start with --enable-rdma-weight-updates)",
+                None,
+            )
+        try:
+            if self._sparse_delta_staging is None:
+                self._sparse_delta_staging = SparseDeltaStagingBuffer()
+            ptr, capacity = self._sparse_delta_staging.ensure(
+                int(nbytes), engine, location=self._p2p_receiver_memory_location()
+            )
+        except Exception as exc:
+            logger.error("Failed to prepare sparse-delta staging: %s", exc, exc_info=True)
+            return False, f"Failed to prepare sparse-delta staging: {exc}", None
+
+        local_info = {
+            "tp_rank": int(self.tp_rank),
+            "session_id": engine.get_session_id(),
+            "ptr": int(ptr),
+            "nbytes": int(capacity),
+        }
+        world_group = get_world_group()
+        if world_group.world_size > 1:
+            gathered: List[Optional[Dict[str, Any]]] = [None] * world_group.world_size
+            torch.distributed.all_gather_object(
+                gathered, local_info, group=world_group.cpu_group
+            )
+            infos = [info for info in gathered if info is not None]
+        else:
+            infos = [local_info]
+        return (
+            True,
+            f"prepared {capacity / 1e6:.1f} MB staging on {len(infos)} rank(s)",
+            infos,
+        )
+
+    def update_weights_from_sparse_delta(
+        self,
+        *,
+        delta_path: Optional[str] = None,
+        expected_sha256: Optional[str] = None,
+        run_post_process_weights: bool = False,
+        validate_only: bool = False,
+        staging_nbytes: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """Validate or apply a packed sparse delta to the live model."""
+        from sglang.srt.weight_sync.sparse_delta import (
+            apply_sparse_delta_file,
+            apply_sparse_delta_tensor,
+        )
+
+        try:
+            if self._cached_sparse_delta_locators is None:
+                self._cached_sparse_delta_locators = self._build_hf_tensor_map_locators(
+                    include_fused_moe_fast_locators=True
+                )
+            locators = self._cached_sparse_delta_locators
+            if staging_nbytes is not None:
+                if self._sparse_delta_staging is None:
+                    return (
+                        False,
+                        "No sparse-delta staging buffer prepared; call staging_op='prepare' first",
+                    )
+                stats = apply_sparse_delta_tensor(
+                    self.model,
+                    self._sparse_delta_staging.view(int(staging_nbytes)),
+                    source_label=f"<rdma-staging:{staging_nbytes}B>",
+                    locators=locators,
+                    expected_sha256=expected_sha256,
+                    validate_only=validate_only,
+                )
+            else:
+                if delta_path is None:
+                    return False, "Sparse-delta file update requires delta_path"
+                stats = apply_sparse_delta_file(
+                    self.model,
+                    delta_path,
+                    locators=locators,
+                    expected_sha256=expected_sha256,
+                    validate_only=validate_only,
+                )
+            if run_post_process_weights and not validate_only:
+                self._run_process_weights_after_loading()
+                self._cached_sparse_delta_locators = None
+            verb = "Validated" if validate_only else "Applied"
+            message = stats.message(verb)
+            logger.info("[SparseDelta] %s", message)
+            return True, message
+        except Exception as exc:
+            message = f"Failed to update weights from sparse delta: {exc}"
+            logger.error(message, exc_info=True)
+            return False, message
 
     def complete_weights_update_p2p(
         self,

@@ -42,6 +42,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromSparseDeltaReqInput,
+    UpdateWeightsFromSparseDeltaReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -106,6 +108,33 @@ class SchedulerWeightUpdaterManager:
     metrics_collector: Optional[Any] = None
     offload_tags: set = field(default_factory=set)
     stashed_model_static_state: Any = None
+
+    def _merge_tp_sparse_delta_result(
+        self, local_success: bool, local_message: str
+    ) -> Tuple[bool, str]:
+        try:
+            world_size = torch.distributed.get_world_size(group=self.tp_cpu_group)
+        except Exception:
+            return local_success, local_message
+        if world_size <= 1:
+            return local_success, local_message
+        gathered: List[Optional[dict]] = [None] * world_size
+        torch.distributed.all_gather_object(
+            gathered,
+            {
+                "tp_rank": int(self.tp_worker.ps.tp_rank),
+                "success": bool(local_success),
+                "message": local_message,
+            },
+            group=self.tp_cpu_group,
+        )
+        results = sorted(
+            (item for item in gathered if item is not None),
+            key=lambda item: int(item["tp_rank"]),
+        )
+        return all(bool(item["success"]) for item in results), " | ".join(
+            f"TP{int(item['tp_rank'])}: {item['message']}" for item in results
+        )
 
     @contextmanager
     def _observe_weight_load(self, source: str) -> Iterator[None]:
@@ -261,6 +290,57 @@ class SchedulerWeightUpdaterManager:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
+
+    def update_weights_from_sparse_delta(
+        self, recv_req: UpdateWeightsFromSparseDeltaReqInput
+    ):
+        """Validate then atomically apply one packed sparse delta."""
+        if recv_req.staging_op == "prepare":
+            local_success, local_message, staging = (
+                self.tp_worker.prepare_sparse_delta_staging(recv_req)
+            )
+            success, message = self._merge_tp_sparse_delta_result(
+                local_success, local_message
+            )
+            return UpdateWeightsFromSparseDeltaReqOutput(
+                success=success,
+                message=message,
+                staging=staging if success else None,
+            )
+        if recv_req.staging_op not in (None, "apply"):
+            return UpdateWeightsFromSparseDeltaReqOutput(
+                success=False,
+                message=f"Unknown sparse-delta staging_op: {recv_req.staging_op!r}",
+            )
+
+        with self._observe_weight_load("sparse_delta"):
+            local_success, local_message = self.tp_worker.update_weights_from_sparse_delta(
+                recv_req, validate_only=True
+            )
+            success, message = self._merge_tp_sparse_delta_result(
+                local_success, local_message
+            )
+            if not success:
+                logger.error(message)
+                torch.distributed.barrier(group=self.tp_cpu_group)
+                return UpdateWeightsFromSparseDeltaReqOutput(
+                    success=success, message=message
+                )
+
+            local_success, local_message = self.tp_worker.update_weights_from_sparse_delta(
+                recv_req
+            )
+            success, message = self._merge_tp_sparse_delta_result(
+                local_success, local_message
+            )
+            if success:
+                self.flush_cache_after_weight_update(recv_req)
+            else:
+                logger.error(message)
+            torch.distributed.barrier(group=self.tp_cpu_group)
+            return UpdateWeightsFromSparseDeltaReqOutput(
+                success=success, message=message
+            )
 
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""

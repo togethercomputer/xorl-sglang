@@ -405,6 +405,18 @@ def p2p_qwen35_linear_attn_qkvz_locators(
     return locators
 
 
+def p2p_logical_module_name(module_name: str) -> str:
+    """Return the checkpoint-visible name for a possibly LoRA-wrapped module.
+
+    SGLang keeps a wrapped linear under ``<logical_name>.base_layer``.  P2P
+    locator special cases must dispatch on the logical name; normalizing only
+    the final HF tensor name is too late because the special-case branch has
+    already been skipped.
+    """
+
+    return module_name.replace(".base_layer", "")
+
+
 def p2p_qwen35_linear_attn_conv1d_locators(
     *,
     module_name: str,

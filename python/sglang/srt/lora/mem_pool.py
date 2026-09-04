@@ -180,6 +180,26 @@ class LoRAMemoryPool:
             and not _moe_runner_keeps_global_expert_ids()
             and num_experts_global % self.moe_ep_size == 0
         )
+        # Fused shared experts are physical MoE slots, but they are not
+        # included in the HF config's routed-expert count.  Keep the two
+        # geometries separate: adapter tensors are indexed by global routed
+        # expert id, while the serving runner addresses a local bank with the
+        # replicated shared slot(s) appended after the rank-local routed slab.
+        #
+        # Qwen3.5/3.6 FP8 EP8 is the important case: 256 routed experts become
+        # 32 local routed slots plus one fused shared slot on every rank.  A
+        # 32-slot LoRA bank makes the shared route index out of bounds; using
+        # 33 for routed slicing would instead shift rank 1 to global expert 33
+        # and silently corrupt ownership.  Record both counts explicitly.
+        self._num_routed_experts_global = num_experts_global
+        self._num_fused_shared_experts = int(
+            getattr(base_model, "num_fused_shared_experts", 0) or 0
+        )
+        self._num_routed_experts_local = (
+            num_experts_global // self.moe_ep_size
+            if self.moe_use_local_expert_ids
+            else num_experts_global
+        )
 
         # Per-expert MoE weights are sharded by `moe_tp_size`, NOT the outer
         # `tp_size`: `moe_tp_size = tp_size // ep_size // dp_size`, so under
@@ -396,13 +416,21 @@ class LoRAMemoryPool:
         return any(isinstance(m, FusedMoE) for m in base_model.modules())
 
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
-        """Experts owned by this rank. Equals the global count when EP is
-        off, the runner keeps global IDs, or the split isn't even (all
-        three cases fold into `moe_use_local_expert_ids == False`)."""
-        total = self._get_num_experts(base_model)
-        if not self.moe_use_local_expert_ids:
-            return total
-        return total // self.moe_ep_size
+        """Physical LoRA slots addressed by the MoE runner on this rank.
+
+        Routed adapter weights still slice by ``_num_routed_experts_local``;
+        fused shared experts append replicated physical slots which default to
+        zero when the adapter only contains the routed 256-expert bank.
+        """
+        routed = getattr(self, "_num_routed_experts_local", None)
+        if routed is None:
+            total = self._get_num_experts(base_model)
+            routed = (
+                total // self.moe_ep_size
+                if self.moe_use_local_expert_ids
+                else total
+            )
+        return int(routed) + int(getattr(self, "_num_fused_shared_experts", 0))
 
     def _global_to_local_expert_id(self, global_eid: int) -> Optional[int]:
         """Map a global expert id to this rank's local id, or `None` if
@@ -410,8 +438,30 @@ class LoRAMemoryPool:
         are globally-keyed."""
         if not self.moe_use_local_expert_ids:
             return global_eid
-        local = global_eid - self.moe_ep_rank * self._num_experts_local
-        return local if 0 <= local < self._num_experts_local else None
+        local_routed = int(
+            getattr(self, "_num_routed_experts_local", self._num_experts_local)
+        )
+        global_routed = int(
+            getattr(
+                self,
+                "_num_routed_experts_global",
+                local_routed * self.moe_ep_size,
+            )
+        )
+        local = global_eid - self.moe_ep_rank * local_routed
+        if 0 <= local < local_routed:
+            return local
+
+        # A packed adapter may explicitly carry one logical shared-expert tail
+        # after all routed experts.  Replicate that tail into every rank's
+        # appended physical shared slots. A ZORL adapter may have no
+        # such tail, so these slots remain zero and the shared expert is not
+        # LoRA-updated.
+        shared = global_eid - global_routed
+        num_shared = int(getattr(self, "_num_fused_shared_experts", 0))
+        if 0 <= shared < num_shared:
+            return local_routed + shared
+        return None
 
     def _iter_local_expert_weights(
         self,
@@ -436,16 +486,18 @@ class LoRAMemoryPool:
         if isinstance(weights, torch.Tensor) and weights.dim() == 3:
             assert isinstance(cache_keys, str)
             total = weights.shape[0]
-            if self.moe_use_local_expert_ids and localize:
-                start = self.moe_ep_rank * self._num_experts_local
-                count = max(0, min(self._num_experts_local, total - start))
-            else:
-                start, count = 0, total
-            for i in range(count):
+            for global_eid in range(total):
+                local_eid = (
+                    self._global_to_local_expert_id(global_eid)
+                    if localize
+                    else global_eid
+                )
+                if local_eid is None:
+                    continue
                 yield (
-                    i,
-                    weights[start + i],
-                    append_cache_key_suffix(cache_keys, f"expert{start + i}"),
+                    local_eid,
+                    weights[global_eid],
+                    append_cache_key_suffix(cache_keys, f"expert{global_eid}"),
                 )
             return
 

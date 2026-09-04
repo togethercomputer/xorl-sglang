@@ -108,6 +108,14 @@ class WeightUpdater:
             tied_weight_aliases=tied_weight_aliases,
         )
 
+    def prepare_sparse_delta_staging(self, nbytes: int):
+        self._assert_weight_cache_inactive("prepare_sparse_delta_staging")
+        return self._get_p2p_receiver().prepare_sparse_delta_staging(nbytes)
+
+    def update_weights_from_sparse_delta(self, **kwargs):
+        self._assert_weight_cache_inactive("update_weights_from_sparse_delta")
+        return self._get_p2p_receiver().update_weights_from_sparse_delta(**kwargs)
+
     def init_weights_update_group(
         self,
         master_address,

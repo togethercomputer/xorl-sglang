@@ -549,6 +549,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # leave this unset unless it separately computes post-pruning row counts.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    global_lora_roster_hashes: Optional[List[Tuple[int, int]]] = None
+    global_lora_row_fingerprints: Optional[List[List[int]]] = None
 
     # Exact DSV4 reconstructs CP-prefill rows into the logical DP-owner order
     # before logits pruning.  Carry that boundary explicitly so the TP8 head
@@ -742,6 +744,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
+        self.global_lora_roster_hashes = getattr(
+            batch, "global_lora_roster_hashes", None
+        )
+        self.global_lora_row_fingerprints = getattr(
+            batch, "global_lora_row_fingerprints", None
+        )
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
     @classmethod

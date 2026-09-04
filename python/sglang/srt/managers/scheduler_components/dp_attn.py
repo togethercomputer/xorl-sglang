@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -11,6 +12,10 @@ from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import world_dp_gather_enabled
+from sglang.srt.lora.roster import (
+    LORA_ROW_FINGERPRINT_CAPACITY,
+    lora_uid_fingerprint,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
@@ -37,6 +42,43 @@ if TYPE_CHECKING:
 
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
+
+
+def _lora_roster_digest(batch: Optional[ScheduleBatch]) -> tuple[int, int]:
+    """Stable 128-bit digest of the ordered local request-to-LoRA roster."""
+
+    reqs = () if batch is None else tuple(batch.reqs)
+    digest = hashlib.blake2b(digest_size=16, person=b"sglang-lora-v1")
+    digest.update(len(reqs).to_bytes(4, "little"))
+    for req in reqs:
+        uid = getattr(req, "lora_id", None)
+        if uid is None:
+            digest.update(b"\x00")
+            continue
+        value = str(uid).encode("utf-8")
+        digest.update(b"\x01")
+        digest.update(len(value).to_bytes(4, "little"))
+        digest.update(value)
+    value = digest.digest()
+    return (
+        int.from_bytes(value[:8], "little", signed=True),
+        int.from_bytes(value[8:], "little", signed=True),
+    )
+
+
+_EMPTY_LORA_ROSTER_DIGEST = _lora_roster_digest(None)
+
+
+def _lora_row_fingerprints(
+    batch: Optional[ScheduleBatch],
+) -> tuple[int, ...]:
+    """Fixed-capacity ordered request identities for decode roster rebuilds."""
+
+    reqs = () if batch is None else tuple(batch.reqs)
+    return tuple(
+        lora_uid_fingerprint(getattr(req, "lora_id", None))
+        for req in reqs[:LORA_ROW_FINGERPRINT_CAPACITY]
+    )
 
 
 def _resolve_elastic_world_dp_size(
@@ -89,6 +131,8 @@ class MLPSyncBatchInfo:
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    local_lora_roster_digest: tuple[int, int] = _EMPTY_LORA_ROSTER_DIGEST
+    local_lora_row_fingerprints: tuple[int, ...] = ()
 
     # some gathered elements
     tp0_info: torch.Tensor = None
@@ -96,9 +140,17 @@ class MLPSyncBatchInfo:
     global_num_tokens_for_logprob: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
+    global_lora_roster_hashes: list[tuple[int, int]] = None
+    global_lora_row_fingerprints: list[list[int]] = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
+        row_fingerprints = list(
+            self.local_lora_row_fingerprints[:LORA_ROW_FINGERPRINT_CAPACITY]
+        )
+        row_fingerprints.extend(
+            [0] * (LORA_ROW_FINGERPRINT_CAPACITY - len(row_fingerprints))
+        )
         return torch.tensor(
             [
                 self.num_tokens,
@@ -108,6 +160,9 @@ class MLPSyncBatchInfo:
                 int(self.local_can_run_tbo),
                 self.local_forward_mode,
                 int(self.can_run_prefill_cuda_graph),
+                self.local_lora_roster_digest[0],
+                self.local_lora_roster_digest[1],
+                *row_fingerprints,
             ],
             device=device,
             dtype=dtype,
@@ -123,6 +178,9 @@ class MLPSyncBatchInfo:
                 1,  # local_can_run_tbo
                 ForwardMode.IDLE.value,  # local_forward_mode
                 0,  # can_run_prefill_cuda_graph
+                _EMPTY_LORA_ROSTER_DIGEST[0],
+                _EMPTY_LORA_ROSTER_DIGEST[1],
+                *([0] * LORA_ROW_FINGERPRINT_CAPACITY),
             ],
             device=device,
             dtype=dtype,
@@ -182,9 +240,16 @@ class MLPSyncBatchInfo:
         tp0_info = global_info_tensor[:, 0, :]
         self.tp0_info = tp0_info
         # Perform only one Device-to-Host (D2H) memory copy
-        cpu_data = tp0_info[:, :2].cpu()
+        roster_columns = range(9, 9 + LORA_ROW_FINGERPRINT_CAPACITY)
+        cpu_data = tp0_info[:, [0, 1, 7, 8, *roster_columns]].cpu()
         self.global_num_tokens = cpu_data[:, 0].tolist()
         self.global_num_tokens_for_logprob = cpu_data[:, 1].tolist()
+        self.global_lora_roster_hashes = [
+            (int(row[2]), int(row[3])) for row in cpu_data.tolist()
+        ]
+        self.global_lora_row_fingerprints = [
+            [int(value) for value in row[4:]] for row in cpu_data.tolist()
+        ]
         self.can_run_decode_cuda_graph = bool(tp0_info[:, 2].min().item())
         self.is_extend_in_batch = bool(tp0_info[:, 3].max().item())
         self.can_run_prefill_cuda_graph = bool(tp0_info[:, 6].min().item())
@@ -202,10 +267,18 @@ def _update_gather_batch(
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.global_lora_roster_hashes = [mlp_sync_info.local_lora_roster_digest]
+        batch.global_lora_row_fingerprints = [
+            list(mlp_sync_info.local_lora_row_fingerprints)
+        ]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
+        )
+        batch.global_lora_roster_hashes = mlp_sync_info.global_lora_roster_hashes
+        batch.global_lora_row_fingerprints = (
+            mlp_sync_info.global_lora_row_fingerprints
         )
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
@@ -333,6 +406,8 @@ def prepare_mlp_sync_batch_raw(
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        local_lora_roster_digest=_lora_roster_digest(local_batch),
+        local_lora_row_fingerprints=_lora_row_fingerprints(local_batch),
     )
 
     if not skip_all_gather:

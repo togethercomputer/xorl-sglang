@@ -249,6 +249,12 @@ class LoRAAdapter(nn.Module):
 
     def _normalize_weights(self):
         for layer in self.layers:
+            # Qwen3.5/3.6 HF/PEFT uses q/k/v/g/o names for GDN while the
+            # serving model owns in_proj_qkvz/out_proj.  Convert this
+            # parent-qualified family before generic qkv normalization can
+            # mistake the GDN q/k/v projections for full attention.
+            self._normalize_qwen35_split_gdn(layer.weights)
+            self._normalize_fused_shared_expert_tail(layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
             self.normalize_inkling_qkvr_proj(weight_names, layer.weights)
@@ -262,6 +268,67 @@ class LoRAAdapter(nn.Module):
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
+
+    @staticmethod
+    def _normalize_qwen35_split_gdn(weights: Dict[str, torch.Tensor]):
+        """Fuse PEFT linear_attn q/k/v/g and rename o for Qwen3.5/3.6."""
+        for weight_name in list(weights.keys()):
+            if ".linear_attn.q_proj." not in weight_name:
+                continue
+            siblings = [
+                weight_name.replace(".q_proj.", f".{projection}.")
+                for projection in ("k_proj", "v_proj", "g_proj")
+            ]
+            if any(name not in weights for name in siblings):
+                missing = [name for name in siblings if name not in weights]
+                raise ValueError(
+                    f"Incomplete split GDN LoRA family for {weight_name!r}; missing {missing!r}"
+                )
+            fused_name = weight_name.replace(".q_proj.", ".in_proj_qkvz.")
+            cat_dim = weights[weight_name].dim() - 2
+            weights[fused_name] = torch.cat(
+                (weights[weight_name], *(weights[name] for name in siblings)),
+                dim=cat_dim,
+            )
+            weights.pop(weight_name)
+            for name in siblings:
+                weights.pop(name)
+
+        for weight_name in list(weights.keys()):
+            if ".linear_attn.o_proj." not in weight_name:
+                continue
+            out_name = weight_name.replace(".o_proj.", ".out_proj.")
+            if out_name in weights:
+                raise ValueError(
+                    f"Both split and runtime GDN output LoRA keys are present: "
+                    f"{weight_name!r}, {out_name!r}"
+                )
+            weights[out_name] = weights.pop(weight_name)
+
+    def _normalize_fused_shared_expert_tail(
+        self, weights: Dict[str, torch.Tensor]
+    ) -> None:
+        """Map Qwen3.6 shared-expert LoRA to its fused physical expert slot."""
+        if self.base_model is None or int(
+            getattr(self.base_model, "num_fused_shared_experts", 0) or 0
+        ) <= 0:
+            return
+        config = self.base_hf_config
+        if hasattr(config, "get_text_config"):
+            config = config.get_text_config()
+        first_shared_id = int(config.num_experts)
+        marker = ".mlp.shared_expert."
+        replacement = f".mlp.experts.{first_shared_id}."
+        for name in list(weights):
+            if marker not in name:
+                continue
+            mapped = name.replace(marker, replacement)
+            if mapped in weights:
+                raise ValueError(
+                    f"Both logical and fused-tail shared expert LoRA keys are present: "
+                    f"{name!r}, {mapped!r}"
+                )
+            weights[mapped] = weights.pop(name)
 
     def normalize_inkling_qkvr_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -499,12 +566,26 @@ class LoRAAdapter(nn.Module):
                 weights.pop(v_name)
                 weights.pop(z_name)
             elif "in_proj_qkvz" in weight_name and "lora_A" in weight_name:
-                # Already-merged adapter: replicate the shared A across the 4
-                # stacked slots the buffer expects (q, k, v, z).
+                # An adapter trained against the fused serving projection has
+                # one shared rank-r A, which the runtime buffer represents as
+                # four stacked blocks.  A split Qwen3.5/3.6 PEFT adapter,
+                # however, was already concatenated by
+                # _normalize_qwen35_split_gdn above and is already 4r.  Do not
+                # repeat that family a second time.
                 ndim = weights[weight_name].dim()
-                repeat_dims = [1] * ndim
-                repeat_dims[ndim - 2] = 4
-                weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
+                rank_axis = ndim - 2
+                observed_rank = int(weights[weight_name].shape[rank_axis])
+                adapter_rank = int(self.config.r)
+                if observed_rank == adapter_rank:
+                    repeat_dims = [1] * ndim
+                    repeat_dims[rank_axis] = 4
+                    weights[weight_name] = weights[weight_name].repeat(*repeat_dims)
+                elif observed_rank != 4 * adapter_rank:
+                    raise ValueError(
+                        f"Unexpected in_proj_qkvz LoRA-A rank axis for {weight_name!r}: "
+                        f"got {observed_rank}, expected {adapter_rank} or "
+                        f"{4 * adapter_rank}"
+                    )
             # else (in_proj_qkvz lora_B, or unrelated): no-op.
 
     def normalize_gate_up_proj(

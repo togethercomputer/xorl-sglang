@@ -1284,6 +1284,33 @@ class ModelRunner:
             lora_ref, tensors, config_dict, added_tokens_config
         )
 
+    def create_zorl_lora_candidates(
+        self,
+        *,
+        parent_lora_id: str,
+        candidate_specs,
+        b_sigma: float,
+        perturbation_mode: str,
+        preload_candidates: bool,
+    ):
+        return self.lora_manager.create_zorl_lora_candidates(
+            parent_lora_id=parent_lora_id,
+            candidate_specs=candidate_specs,
+            b_sigma=b_sigma,
+            perturbation_mode=perturbation_mode,
+            preload_candidates=preload_candidates,
+        )
+
+    def rollback_zorl_lora_candidates(self, lora_ids):
+        errors = []
+        for lora_id in lora_ids:
+            result = self.lora_manager.rollback_lora_adapter(lora_id)
+            if not result.success:
+                errors.append(result.error_message)
+        return self.lora_manager.create_lora_update_result(
+            not errors, "; ".join(error for error in errors if error)
+        )
+
     def unload_lora_adapter(self, lora_ref: LoRARef):
         """Unload a lora adapter that was previously loaded during initialization or dynamic loading."""
         return self.lora_manager.unload_lora_adapter(lora_ref)
@@ -1435,7 +1462,7 @@ class ModelRunner:
         lora_manager = getattr(self, "lora_manager", None)
         if lora_manager is not None:
             lora_manager.prepare_dsv4_flash_exact_dp_lora_batch(forward_batch)
-            lora_manager.prepare_glm52_exact_dp_lora_batch(forward_batch)
+            lora_manager.prepare_dp_mlp_lora_batch(forward_batch)
 
         # Normalize num_token_non_padded to be local to this attention TP rank if needed.
         # The skip is scoped to DSACPLayerCommunicator-style CP (DSA, MLA): those

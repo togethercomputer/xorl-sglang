@@ -25,6 +25,7 @@ from sglang.srt.distributed import get_pp_group, get_world_group
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.managers.io_struct import (
     CompleteWeightsUpdateReqInput,
+    CreateZORLCandidatesReqInput,
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
     InitWeightsSendGroupForRemoteInstanceReqInput,
@@ -32,11 +33,13 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterFromTensorsReqInput,
     LoadLoRAAdapterReqInput,
     PrepareWeightsUpdateReqInput,
+    RollbackZORLCandidatesReqInput,
     SendWeightsToRemoteInstanceReqInput,
     UnloadLoRAAdapterReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromSparseDeltaReqInput,
     UpdateWeightsFromTensorReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -238,6 +241,49 @@ class BaseTpWorker(ABC):
         )
         return success, message
 
+    def prepare_sparse_delta_staging(
+        self, recv_req: UpdateWeightsFromSparseDeltaReqInput
+    ):
+        if recv_req.staging_nbytes is None or int(recv_req.staging_nbytes) <= 0:
+            return False, "staging_op='prepare' requires a positive staging_nbytes", None
+        return self.model_runner.weight_updater.prepare_sparse_delta_staging(
+            int(recv_req.staging_nbytes)
+        )
+
+    def update_weights_from_sparse_delta(
+        self,
+        recv_req: UpdateWeightsFromSparseDeltaReqInput,
+        *,
+        validate_only: bool = False,
+    ):
+        expected_sha256 = None
+        if recv_req.delta_sha256s is not None:
+            if recv_req.staging_op == "apply" and len(recv_req.delta_sha256s) == 1:
+                expected_sha256 = recv_req.delta_sha256s[0]
+            elif self.ps.tp_rank < len(recv_req.delta_sha256s):
+                expected_sha256 = recv_req.delta_sha256s[self.ps.tp_rank]
+            else:
+                return False, f"missing sparse-delta digest for tp_rank={self.ps.tp_rank}"
+        if recv_req.staging_op == "apply":
+            if recv_req.staging_nbytes is None or int(recv_req.staging_nbytes) <= 0:
+                return False, "staging_op='apply' requires a positive staging_nbytes"
+            return self.model_runner.weight_updater.update_weights_from_sparse_delta(
+                staging_nbytes=int(recv_req.staging_nbytes),
+                expected_sha256=expected_sha256,
+                run_post_process_weights=recv_req.run_post_process_weights,
+                validate_only=validate_only,
+            )
+        if not recv_req.delta_paths:
+            return False, "Sparse-delta update requires delta_paths"
+        if self.ps.tp_rank >= len(recv_req.delta_paths):
+            return False, f"missing sparse-delta path for tp_rank={self.ps.tp_rank}"
+        return self.model_runner.weight_updater.update_weights_from_sparse_delta(
+            delta_path=recv_req.delta_paths[self.ps.tp_rank],
+            expected_sha256=expected_sha256,
+            run_post_process_weights=recv_req.run_post_process_weights,
+            validate_only=validate_only,
+        )
+
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update weights from IPC for checkpoint-engine integration."""
         success, message = self.model_runner.weight_updater.update_weights_from_ipc(
@@ -314,6 +360,20 @@ class BaseTpWorker(ABC):
             recv_req.added_tokens_config,
         )
         return result
+
+    def create_zorl_lora_candidates(self, recv_req: CreateZORLCandidatesReqInput):
+        return self.model_runner.create_zorl_lora_candidates(
+            parent_lora_id=recv_req.parent_lora_id,
+            candidate_specs=recv_req.candidates,
+            b_sigma=recv_req.b_sigma,
+            perturbation_mode=recv_req.perturbation_mode,
+            preload_candidates=recv_req.preload_candidates,
+        )
+
+    def rollback_zorl_lora_candidates(
+        self, recv_req: RollbackZORLCandidatesReqInput
+    ):
+        return self.model_runner.rollback_zorl_lora_candidates(recv_req.lora_ids)
 
     def forward_batch_embedding(self, batch: ScheduleBatch):
         forward_batch = ForwardBatch.init_new(

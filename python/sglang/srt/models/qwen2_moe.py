@@ -60,6 +60,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -186,6 +187,22 @@ def can_fuse_shared_expert(
                 return False
 
     return True
+
+
+def _should_replicate_shared_expert_tp1() -> bool:
+    """Whether an unfused shared expert must be local to each EP/DP rank.
+
+    A FlashInfer/TRT-LLM MoE runner can be paired with ``a2a=none``.  In that
+    topology the routed experts are EP-local but the shared MLP still sees each
+    DP rank's local token rows, so it must not be tensor-sharded across ranks.
+    Replication also avoids invalid FP8 partitions such as Qwen3.5's
+    512 / TP8 = 64 output columns with 128-column weight blocks.
+    """
+    return (
+        get_moe_a2a_backend().is_deepep()
+        or get_moe_a2a_backend().is_flashinfer()
+        or get_moe_runner_backend().is_flashinfer_trtllm()
+    )
 
 
 class Qwen2MoeMLP(nn.Module):
@@ -330,10 +347,12 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # When enable_shared_expert_fusion, the shared expert runs inside the MoE kernel
         # (via _append_shared_to_topk_output); a separate shared_expert MLP would
         # double-count. If fusion is off (num_fused_shared_experts == 0), keep shared_expert.
+        self._shared_expert_tp1 = False
         if (
             config.shared_expert_intermediate_size > 0
             and not self.enable_shared_expert_fusion
         ):
+            self._shared_expert_tp1 = _should_replicate_shared_expert_tp1()
             self.shared_expert = Qwen2MoeMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.shared_expert_intermediate_size,
@@ -343,10 +362,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_expert", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if (
-                        get_moe_a2a_backend().is_deepep()
-                        or get_moe_a2a_backend().is_flashinfer()
-                    )
+                    if self._shared_expert_tp1
                     else {}
                 ),
             )
@@ -619,7 +635,11 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         # Shared-add overlap (SGLANG_OPT_LORA_SHARED_ADD_OVERLAP): hand the add to the LoRA
         # MoE dispatch so it overlaps the down-LoRA shrink on the alt stream.
         staged = False
-        if shared_output is not None and _SGLANG_EXPERIMENTAL_LORA_OPTI:
+        if (
+            shared_output is not None
+            and _SGLANG_EXPERIMENTAL_LORA_OPTI
+            and not self._shared_expert_tp1
+        ):
             from sglang.srt.lora.trtllm_lora_temp.shared_add_overlap import (
                 shared_add_overlap_enabled,
                 stage_shared_expert_add,
@@ -677,7 +697,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             )
             final_hidden_states = self._forward_router_experts(hidden_states)
 
-        if shared_output is not None:
+        if shared_output is not None and not self._shared_expert_tp1:
             if use_fused_gate:
                 # The exact Qwen contributor leaf is already FP32/cast-once:
                 # this kernel loads routed and shared BF16 values into FP32,
@@ -706,6 +726,20 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 final_hidden_states = tensor_model_parallel_all_reduce(
                     final_hidden_states
                 )
+
+        # A TP1 shared expert is replicated on every EP/DP rank. Add its local
+        # token contribution after the routed TP all-reduce so it is counted
+        # exactly once rather than once per TP rank.
+        if shared_output is not None and self._shared_expert_tp1:
+            if use_fused_gate:
+                fused_gate_sigmoid_mul_add(
+                    hidden_states,
+                    self.shared_expert_gate.weight.squeeze(),
+                    shared_output,
+                    final_hidden_states,
+                )
+            else:
+                final_hidden_states += shared_output
 
         # Debug removed - was causing issues during CUDA graph capture
 

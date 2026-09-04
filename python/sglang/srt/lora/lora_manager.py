@@ -45,6 +45,7 @@ from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.mem_pool import LoRAMemoryPool
+from sglang.srt.lora.roster import lora_uid_fingerprint
 from sglang.srt.lora.utils import (
     DSA_INDEXER_LORA_NAMES,
     EMBEDDING_NAMES,
@@ -76,12 +77,24 @@ def _local_request_segments(
 
     lora_ids = list(forward_batch.lora_ids or [])
     forward_mode = getattr(forward_batch, "forward_mode", None)
-    is_extend = bool(getattr(forward_batch, "is_extend_in_batch", False)) or bool(
-        forward_mode is not None and forward_mode.is_extend()
-    )
+    # ``is_extend_in_batch`` describes the synchronized DP MLP wave, not this
+    # logical owner's local rows.  A decode owner can participate in a mixed
+    # decode/extend wave while still contributing exactly one row per request;
+    # in that state SGLang intentionally leaves ``extend_seq_lens_cpu`` unset.
+    # MAX_LEN padding converts decode owners to local EXTEND and fabricates the
+    # lengths before this point, so the local forward mode is the authoritative
+    # discriminator for segment construction.
+    is_extend = bool(forward_mode is not None and forward_mode.is_extend())
     if is_extend:
         lengths = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if lengths is None:
+            # In DP-attention mixed extend/decode waves, an idle logical owner
+            # participates in the gathered MLP with zero rows.  SGLang leaves
+            # that rank's extend lengths unset and its LoRA request list empty;
+            # represent it as an empty segment roster rather than rejecting a
+            # valid zero-capacity owner.
+            if not lora_ids:
+                return ()
             raise RuntimeError(
                 f"{family} gathered LoRA extend metadata requires request row lengths"
             )
@@ -98,6 +111,326 @@ def _local_request_segments(
             f"{family} gathered LoRA request row lengths must be positive: {lengths}"
         )
     return tuple(zip(lora_ids, lengths))
+
+
+def _uses_static_gathered_decode_metadata(
+    forward_batch: ForwardBatch,
+    *,
+    max_bs_in_cuda_graph: Optional[int],
+    dp_row_counts: Optional[List[int]],
+) -> bool:
+    """Whether this call came from decode-graph capture/replay preparation.
+
+    A local DP owner can remain in DECODE or IDLE while another owner adds an
+    eager prefill to the same synchronized MLP wave.  ForwardMode alone cannot
+    distinguish that mixed eager wave from graph preparation; the decode graph
+    runner supplies explicit padded owner row counts for both capture and
+    replay, while the eager model-runner call does not.
+    """
+
+    return bool(
+        dp_row_counts is not None
+        and max_bs_in_cuda_graph is not None
+        and forward_batch.batch_size <= max_bs_in_cuda_graph
+        and forward_batch.forward_mode.is_cuda_graph()
+    )
+
+
+def _decode_graph_metadata_cache_key(
+    manager: "LoRAManager",
+    local_segments: tuple[tuple[Optional[str], int], ...],
+    dp_row_counts: List[int],
+) -> tuple[object, ...]:
+    """Host-side signature for pointer-stable gathered decode metadata."""
+
+    resident = manager.memory_pool.uid_to_buffer_id
+    adapter_metadata = []
+    for uid in dict.fromkeys(uid for uid, _ in local_segments):
+        if uid is None:
+            adapter_metadata.append((None, resident.get(None, -1), 0, 0.0))
+            continue
+        adapter = manager.loras.get(uid)
+        adapter_metadata.append(
+            (
+                uid,
+                resident.get(uid, -1),
+                getattr(getattr(adapter, "config", None), "r", -1),
+                float(getattr(adapter, "scaling", 0.0)),
+            )
+        )
+    return (local_segments, tuple(dp_row_counts), tuple(adapter_metadata))
+
+
+def _decode_graph_metadata_cache_hit(
+    manager: "LoRAManager",
+    local_key: tuple[object, ...],
+    parallel: object,
+) -> bool:
+    """Collectively decide whether every DP owner can reuse graph metadata.
+
+    Request-to-adapter ownership is stable for almost every decode token. A
+    Python ``all_gather_object`` on every replay can serialize decode. Reduce
+    one integer change flag instead; only rebuild object metadata when any
+    physical contributor's local roster actually changes.
+    """
+
+    group = parallel.tp_group
+    # Lightweight unit-test groups and nonstandard backends may expose only
+    # all_gather_object. They take the conservative rebuild path.
+    if not hasattr(group, "all_reduce"):
+        return False
+    cache_valid = (
+        getattr(manager, "_dp_mlp_decode_graph_cache_key", None) == local_key
+        and manager.lora_backend.context_parallel_mlp_batch_info is not None
+    )
+    changed = torch.tensor(
+        [0 if cache_valid else 1], dtype=torch.int32, device=manager.device
+    )
+    changed = group.all_reduce(changed)
+    return int(changed.item()) == 0
+
+
+def _prepare_preloaded_zorl_decode_graph_metadata(
+    manager: "LoRAManager",
+    forward_batch: ForwardBatch,
+    local_segments: tuple[tuple[Optional[str], int], ...],
+    dp_row_counts: List[int],
+    parallel: object,
+    ownership: LogicalRowOwnership,
+) -> bool:
+    """Refresh gathered ZORL graph metadata only when the global roster changes.
+
+    The scheduler's existing DP synchronization carries both a 128-bit digest
+    and compact per-request fingerprints. All ranks therefore make the same
+    cache decision and reconstruct the preloaded slot map without adding a
+    Python-object collective to turn transitions.
+    """
+
+    def bypass(reason: str) -> bool:
+        # Capture starts before any virtual candidates exist, so report only
+        # real replay bypasses.  Keep this one-shot: the decode path is hot.
+        if not get_is_capture_mode() and not getattr(
+            manager, "_zorl_decode_graph_bypass_reported", False
+        ):
+            logger.warning(
+                "Preloaded ZORL decode graph metadata fast path bypassed: %s; "
+                "active=%s virtual=%d resident=%d roster_hashes=%s",
+                reason,
+                sorted(uid for uid, _rows in local_segments if uid is not None),
+                len(
+                    getattr(
+                        getattr(manager, "zorl_candidate_store", None), "virtual", {}
+                    )
+                ),
+                len(manager.memory_pool.uid_to_buffer_id),
+                getattr(forward_batch, "global_lora_roster_hashes", None),
+            )
+            manager._zorl_decode_graph_bypass_reported = True
+        return False
+
+    if (
+        getattr(manager.base_hf_config, "_glm52_exact_mode", False)
+        or not getattr(manager, "lora_use_virtual_experts", False)
+        or manager.attn_cp_size != 1
+        or not hasattr(parallel.tp_group, "all_gather_object")
+    ):
+        return bypass("incompatible runtime topology")
+
+    active_uids = {uid for uid, _rows in local_segments if uid is not None}
+    candidate_store = getattr(manager, "zorl_candidate_store", None)
+    virtual = getattr(candidate_store, "virtual", {})
+    if any(uid not in virtual for uid in active_uids):
+        return bypass("an active adapter is not a registered virtual candidate")
+
+    # The fast path relies on the register API's preload contract. Falling
+    # back is safer than materializing a different subset on each DP owner.
+    required_uids = {None, *virtual.keys()}
+    if any(uid not in manager.memory_pool.uid_to_buffer_id for uid in required_uids):
+        return bypass("the registered virtual candidate roster is not fully preloaded")
+
+    local_capacity = int(dp_row_counts[ownership.dp_rank])
+    local_rows = sum(rows for _uid, rows in local_segments)
+    if local_rows > local_capacity:
+        raise RuntimeError(
+            "Preloaded ZORL decode rows exceed the local graph bucket: "
+            f"rows={local_rows}, capacity={local_capacity}."
+        )
+    if any(rows != 1 for _uid, rows in local_segments):
+        raise RuntimeError(
+            "Preloaded ZORL decode graph metadata requires one row per request."
+        )
+
+    slot_signature = tuple(
+        sorted(
+            (
+                "<base>" if uid is None else str(uid),
+                int(manager.memory_pool.uid_to_buffer_id[uid]),
+            )
+            for uid in required_uids
+        )
+    )
+    global_batch_info = (
+        manager.lora_backend.context_parallel_cuda_graph_batch_info
+    )
+    if global_batch_info is None:
+        raise RuntimeError(
+            "Preloaded ZORL decode graph metadata was not initialized."
+        )
+    total_tokens = sum(int(count) for count in dp_row_counts)
+    capacity = global_batch_info.weight_indices.numel()
+    if total_tokens > capacity:
+        raise RuntimeError(
+            "Preloaded ZORL decode graph metadata has insufficient physical "
+            f"row capacity: metadata_rows={capacity}, physical_rows={total_tokens}."
+        )
+
+    roster_hashes = getattr(forward_batch, "global_lora_roster_hashes", None)
+    synthetic_base_capture = roster_hashes is None and not virtual and not active_uids
+    if roster_hashes is None and not synthetic_base_capture:
+        return bypass("scheduler DP synchronization did not supply roster hashes")
+    cache_key = (
+        None if roster_hashes is None else tuple(tuple(pair) for pair in roster_hashes),
+        tuple(int(count) for count in dp_row_counts),
+        slot_signature,
+    )
+    if (
+        getattr(manager, "_zorl_decode_graph_metadata_key", None) == cache_key
+        and manager.lora_backend.context_parallel_mlp_batch_info is global_batch_info
+    ):
+        if not getattr(manager, "_zorl_decode_graph_cache_hit_reported", False):
+            logger.info(
+                "Preloaded ZORL decode graph metadata cache hit: rows=%d "
+                "registered=%d active=%s",
+                total_tokens,
+                len(virtual),
+                sorted(active_uids),
+            )
+            manager._zorl_decode_graph_cache_hit_reported = True
+        return True
+
+    if synthetic_base_capture:
+        global_uids = [None] * total_tokens
+    else:
+        row_fingerprints = getattr(
+            forward_batch, "global_lora_row_fingerprints", None
+        )
+        request_counts = getattr(
+            forward_batch, "original_global_num_tokens_cpu", None
+        )
+        if (
+            row_fingerprints is None
+            or request_counts is None
+            or len(row_fingerprints) != ownership.dp_size
+            or len(request_counts) != ownership.dp_size
+        ):
+            return bypass("scheduler DP synchronization did not supply row identities")
+
+        fingerprint_to_uid: Dict[int, Optional[str]] = {}
+        for uid in (None, *sorted(virtual)):
+            fingerprint = lora_uid_fingerprint(uid)
+            previous = fingerprint_to_uid.get(fingerprint, uid)
+            if previous != uid:
+                return bypass("registered candidate row fingerprints collide")
+            fingerprint_to_uid[fingerprint] = uid
+
+        missing = object()
+        global_uids = []
+        for dp_rank, (fingerprints, request_count, capacity) in enumerate(
+            zip(row_fingerprints, request_counts, dp_row_counts, strict=True)
+        ):
+            request_count = int(request_count)
+            capacity = int(capacity)
+            if (
+                request_count < 0
+                or request_count > capacity
+                or request_count > len(fingerprints)
+            ):
+                return bypass(
+                    "scheduler row identities do not cover a padded DP owner block"
+                )
+            for fingerprint in fingerprints[:request_count]:
+                uid = fingerprint_to_uid.get(int(fingerprint), missing)
+                if uid is missing:
+                    return bypass(
+                        f"DP owner {dp_rank} references an unknown LoRA row identity"
+                    )
+                global_uids.append(uid)
+            global_uids.extend([None] * (capacity - request_count))
+
+        if len(global_uids) != total_tokens:
+            raise RuntimeError(
+                "Preloaded ZORL gathered roster does not cover the graph rows: "
+                f"uids={len(global_uids)}, rows={total_tokens}."
+            )
+        logger.info(
+            "Preloaded ZORL decode graph metadata rebuild: rows=%d "
+            "registered=%d active=%s roster_hashes=%s transport=fixed_tensor",
+            total_tokens,
+            len(virtual),
+            sorted(active_uids),
+            roster_hashes,
+        )
+
+    base_slot = manager.memory_pool.get_buffer_id(None)
+    global_batch_info.weight_indices.fill_(base_slot)
+    global_batch_info.weight_indices[:total_tokens].copy_(
+        torch.tensor(
+            [manager.memory_pool.get_buffer_id(uid) for uid in global_uids],
+            dtype=torch.int32,
+            device=manager.device,
+        )
+    )
+
+    resident_key = tuple(
+        sorted(
+            (
+                int(slot),
+                int(adapter.config.r),
+                float(adapter.scaling),
+            )
+            for uid, slot in manager.memory_pool.uid_to_buffer_id.items()
+            if uid is not None and (adapter := manager.loras.get(uid)) is not None
+        )
+    )
+    ranks = [0] * manager.max_loras_per_batch
+    scalings = [0.0] * manager.max_loras_per_batch
+    for slot, rank, scaling in resident_key:
+        ranks[slot] = rank
+        scalings[slot] = scaling
+    global_batch_info.lora_ranks.copy_(
+        torch.tensor(ranks, dtype=torch.int32, device=manager.device)
+    )
+    global_batch_info.scalings.copy_(
+        torch.tensor(scalings, dtype=torch.float32, device=manager.device)
+    )
+
+    global_batch_info.seg_lens.zero_()
+    global_batch_info.seg_lens[:total_tokens].fill_(1)
+    global_batch_info.seg_indptr[0].zero_()
+    torch.cumsum(
+        global_batch_info.seg_lens,
+        dim=0,
+        out=global_batch_info.seg_indptr[1:],
+    )
+    global_batch_info.bs = total_tokens
+    global_batch_info.num_segments = total_tokens
+    global_batch_info.max_len = 1
+    global_batch_info.expected_tokens = total_tokens
+    global_batch_info.has_active_lora = any(uid is not None for uid in global_uids)
+
+    physical_batch = copy(forward_batch)
+    physical_batch.batch_size = total_tokens
+    physical_batch.lora_ids = global_uids
+    physical_batch.forward_mode = ForwardMode.DECODE
+    physical_batch.extend_num_tokens = total_tokens
+    physical_batch.extend_seq_lens_cpu = [1] * total_tokens
+    physical_batch.extend_seq_lens = global_batch_info.seg_lens[:total_tokens]
+    global_batch_info = manager.lora_backend._add_moe_lora_info(
+        physical_batch, global_batch_info
+    )
+    manager.lora_backend.context_parallel_mlp_batch_info = global_batch_info
+    manager._zorl_decode_graph_metadata_key = cache_key
+    return True
 
 
 def _flatten_dp_request_segments(
@@ -276,9 +609,9 @@ class LoRAManager:
             self.lora_backend.init_context_parallel_cuda_graph_batch_info(
                 num_rows=self.dp_size
             )
-        elif (
+        elif self.dp_size > 1 and (
             getattr(self.base_hf_config, "_glm52_exact_mode", False)
-            and self.dp_size > 1
+            or self.lora_use_virtual_experts
         ):
             try:
                 LogicalRowOwnership(
@@ -464,6 +797,9 @@ class LoRAManager:
         lora_ref = self.lora_refs.pop(lora_id, None)
         self.loras.pop(lora_id, None)
         self.configs.pop(lora_id, None)
+        candidate_store = getattr(self, "zorl_candidate_store", None)
+        if candidate_store is not None:
+            candidate_store.forget(lora_id)
         if lora_ref is not None:
             self.num_pinned_loras -= int(lora_ref.pinned)
 
@@ -701,6 +1037,9 @@ class LoRAManager:
             del self.configs[lora_ref.lora_id]
             del self.loras[lora_ref.lora_id]
             del self.lora_refs[lora_ref.lora_id]
+            candidate_store = getattr(self, "zorl_candidate_store", None)
+            if candidate_store is not None:
+                candidate_store.forget(lora_ref.lora_id)
             self.num_pinned_loras -= int(lora_ref.pinned)
         except Exception as e:
             return self.create_lora_update_result(
@@ -751,6 +1090,14 @@ class LoRAManager:
         new_uids = {
             uid for uid in cur_uids if uid not in self.memory_pool.uid_to_buffer_id
         }
+        # A seeded ZORL candidate is stripped back to a lightweight CPU stub
+        # after its factors have been copied into the resident GPU slot.  Do
+        # not regenerate those factors on every decode batch: the memory pool
+        # does not consult ``lora_adapters`` for resident UIDs.  Besides being
+        # unnecessary, repeated materialization creates every LoRA module and
+        # redraws every factor in the scheduler hot path.
+        for uid in sorted(uid for uid in new_uids if uid is not None):
+            self.zorl_candidate_store.materialize(uid)
         self.memory_pool.prepare_lora_batch(
             cur_uids=cur_uids,
             lora_adapters=self.loras,
@@ -759,6 +1106,11 @@ class LoRAManager:
             lora_embed_tokens_module=self.embed_tokens_module,  # merge into embedding or lora module
             lora_lm_head_module=self.lm_head_module,  # merge into embedding or lora module
         )
+        # Candidate factors are reproducible from their seeds.  Once the GPU
+        # pool owns a slot, keep only a lightweight config stub on CPU so a
+        # registered generation is bounded by pool capacity rather than by
+        # population size.  Evicted candidates rematerialize on demand.
+        self.zorl_candidate_store.strip_materialized(cur_uids)
         if new_uids:
             changed_slots = {self.memory_pool.uid_to_buffer_id[uid] for uid in new_uids}
             self._notify_lora_slots_updated(changed_slots)
@@ -943,15 +1295,18 @@ class LoRAManager:
         )
         self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
 
-    def prepare_glm52_exact_dp_lora_batch(
+    def prepare_dp_mlp_lora_batch(
         self,
         forward_batch: ForwardBatch,
         *,
         dp_row_counts: Optional[List[int]] = None,
     ) -> None:
-        """Build per-request LoRA metadata for DP/CP-gathered logical rows."""
+        """Build per-request LoRA metadata for DP/CP-gathered MLP rows."""
 
-        if not getattr(self.base_hf_config, "_glm52_exact_mode", False):
+        is_glm52_exact = bool(
+            getattr(self.base_hf_config, "_glm52_exact_mode", False)
+        )
+        if not is_glm52_exact and not self.lora_use_virtual_experts:
             return
         if self.dp_size <= 1:
             return
@@ -968,20 +1323,45 @@ class LoRAManager:
                 "Gather-aware GLM-5.2 LoRA requires EP to cover every canonical contributor."
             )
 
-        local_segments = _glm52_local_request_segments(forward_batch)
+        family = "GLM-5.2" if is_glm52_exact else "virtual-expert LoRA"
+        local_segments = _local_request_segments(forward_batch, family=family)
+        uses_decode_cuda_graph = _uses_static_gathered_decode_metadata(
+            forward_batch,
+            max_bs_in_cuda_graph=getattr(self, "max_bs_in_cuda_graph", None),
+            dp_row_counts=dp_row_counts,
+        )
+        if uses_decode_cuda_graph and _prepare_preloaded_zorl_decode_graph_metadata(
+            self,
+            forward_batch,
+            local_segments,
+            list(dp_row_counts or []),
+            parallel,
+            ownership,
+        ):
+            return
+        decode_graph_cache_key = None
+        if uses_decode_cuda_graph:
+            decode_graph_cache_key = _decode_graph_metadata_cache_key(
+                self, local_segments, list(dp_row_counts or [])
+            )
+            if _decode_graph_metadata_cache_hit(
+                self, decode_graph_cache_key, parallel
+            ):
+                self.lora_backend.context_parallel_mlp_batch_info = (
+                    self.lora_backend.context_parallel_cuda_graph_batch_info
+                )
+                return
         physical_segments = parallel.tp_group.all_gather_object(local_segments)
         global_num_tokens = list(
             dp_row_counts
             if dp_row_counts is not None
             else (forward_batch.global_num_tokens_cpu or [])
         )
-        global_segments = _glm52_flatten_dp_request_segments(
-            ownership, physical_segments, global_num_tokens
-        )
-        uses_decode_cuda_graph = (
-            hasattr(self, "max_bs_in_cuda_graph")
-            and forward_batch.batch_size <= self.max_bs_in_cuda_graph
-            and forward_batch.forward_mode.is_cuda_graph()
+        global_segments = _flatten_dp_request_segments(
+            ownership,
+            physical_segments,
+            global_num_tokens,
+            family=family,
         )
         if uses_decode_cuda_graph:
             # Graph kernels capture their segment count and grid geometry. Use
@@ -1017,8 +1397,9 @@ class LoRAManager:
             raise RuntimeError(
                 "GLM-5.2 gather-aware LoRA requires a resident base-model slot."
             )
-        for uid in active_uids:
-            self._validate_glm52_exact_uid(uid)
+        if is_glm52_exact:
+            for uid in active_uids:
+                self._validate_glm52_exact_uid(uid)
 
         weight_indices = []
         lora_ranks = [0] * self.max_loras_per_batch
@@ -1121,6 +1502,19 @@ class LoRAManager:
             physical_batch, global_batch_info
         )
         self.lora_backend.context_parallel_mlp_batch_info = global_batch_info
+        if decode_graph_cache_key is not None:
+            self._dp_mlp_decode_graph_cache_key = decode_graph_cache_key
+
+    def prepare_glm52_exact_dp_lora_batch(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        dp_row_counts: Optional[List[int]] = None,
+    ) -> None:
+        """Backward-compatible name for gathered MLP LoRA preparation."""
+        self.prepare_dp_mlp_lora_batch(
+            forward_batch, dp_row_counts=dp_row_counts
+        )
 
     @contextmanager
     def glm52_context_parallel_lora_batch(
@@ -1445,6 +1839,16 @@ class LoRAManager:
             use_cuda_graph=use_cuda_graph,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
         )
+        if forward_batch.forward_mode.is_extend():
+            local_expected_tokens = sum(forward_batch.extend_seq_lens_cpu)
+        else:
+            input_ids = getattr(forward_batch, "input_ids", None)
+            local_expected_tokens = (
+                int(input_ids.shape[0])
+                if input_ids is not None
+                else int(forward_batch.batch_size)
+            )
+        self.lora_backend.batch_info.expected_tokens = local_expected_tokens
         self.lora_backend.batch_info.has_active_lora = any(
             lora_ranks[wi] > 0 for wi in weight_indices
         )
@@ -1590,6 +1994,10 @@ class LoRAManager:
         # LoRA adapter weights cached in CPU memory, indexed by LoRA ID.
         self.loras: Dict[str, LoRAAdapter] = {}
 
+        from sglang.srt.lora.zorl_candidates import ZORLCandidateStore
+
+        self.zorl_candidate_store = ZORLCandidateStore(self)
+
         # Mapping from LoRA ID to LoRARef object.
         self.lora_refs: Dict[str, LoRARef] = {}
 
@@ -1603,6 +2011,24 @@ class LoRAManager:
                     raise RuntimeError(
                         f"Failed to load LoRA adapter {lora_ref.lora_name}: {result.error_message}"
                     )
+
+    def create_zorl_lora_candidates(
+        self,
+        *,
+        parent_lora_id: str,
+        candidate_specs: List[Dict[str, object]],
+        b_sigma: float,
+        perturbation_mode: str = "b_only",
+        preload_candidates: bool = False,
+    ) -> LoRAUpdateOutput:
+        """Register externally planned seed candidates in current MultiLoRA."""
+        return self.zorl_candidate_store.create(
+            parent_lora_id=parent_lora_id,
+            candidate_specs=candidate_specs,
+            b_sigma=b_sigma,
+            perturbation_mode=perturbation_mode,
+            preload_candidates=preload_candidates,
+        )
 
     def _detect_shared_outer_loras(self) -> bool:
         """Auto-detect shared outer LoRA format from loaded adapter weights.
@@ -2029,7 +2455,11 @@ def init_lora_cuda_graph_moe_buffers(
 
     max_bs = server_args.cuda_graph_config.decode.max_bs
     if getattr(server_args, "dsv4_flash_exact_mode", False) or (
-        getattr(server_args, "glm52_exact_mode", False) and server_args.dp_size > 1
+        server_args.dp_size > 1
+        and (
+            getattr(server_args, "glm52_exact_mode", False)
+            or server_args.lora_use_virtual_experts
+        )
     ):
         # Sparse MLPs consume the rank-major DP gather, not the local attention
         # rows. Allocate every MoE workspace for all physical DP rows.

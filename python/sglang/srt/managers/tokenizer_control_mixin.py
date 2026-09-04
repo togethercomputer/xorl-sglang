@@ -23,6 +23,7 @@ from sglang.srt.managers.io_struct import (
     CloseSessionReqInput,
     CompleteWeightsUpdateReqInput,
     CompleteWeightsUpdateReqOutput,
+    CreateZORLCandidatesReqInput,
     DestroyWeightsUpdateGroupReqInput,
     DestroyWeightsUpdateGroupReqOutput,
     DetachHiCacheStorageReqInput,
@@ -57,10 +58,12 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    RegisterZORLCandidatesReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
+    RollbackZORLCandidatesReqInput,
     ScaleElasticEPReqOutput,
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
@@ -68,12 +71,15 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
+    AbortZORLGenerationReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
+    UpdateWeightsFromSparseDeltaReqInput,
+    UpdateWeightsFromSparseDeltaReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -106,6 +112,7 @@ _COMMUNICATOR_SPECS = [
     ),
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
+    ("update_weights_from_sparse_delta", UpdateWeightsFromSparseDeltaReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
@@ -148,6 +155,80 @@ def _merge_lora_update_results(results: List[LoRAUpdateOutput]) -> LoRAUpdateOut
         error_message=" | ".join(error_messages),
         loaded_adapters=failed[0].loaded_adapters,
     )
+
+
+def _normalize_zorl_register_specs(
+    obj: RegisterZORLCandidatesReqInput,
+) -> tuple[List[Dict[str, Any]], float, str]:
+    if not obj.candidates:
+        raise ValueError("candidates must be a non-empty list")
+    normalized = []
+    sigmas = set()
+    modes = set()
+    names = set()
+    for index, raw in enumerate(obj.candidates):
+        candidate_id = raw.get("candidate_id", raw.get("name"))
+        if candidate_id is None:
+            raise ValueError(f"candidates[{index}] is missing candidate_id")
+        candidate_id = str(candidate_id)
+        direction = raw.get("direction")
+        if direction is None and raw.get("sign") is not None:
+            sign = float(raw["sign"])
+            if sign not in (-1.0, 1.0):
+                raise ValueError(f"candidates[{index}] has invalid sign {sign}")
+            direction = "positive" if sign > 0 else "negative"
+        if direction not in ("positive", "negative"):
+            raise ValueError(f"candidates[{index}] has invalid direction {direction!r}")
+        if raw.get("b_seed") is None:
+            raise ValueError(f"candidates[{index}] is missing b_seed")
+        sigma = raw.get("b_sigma", obj.b_sigma)
+        control_zero_sigma = bool(raw.get("control_zero_sigma", False))
+        if sigma is None or float(sigma) < 0 or (
+            float(sigma) == 0 and not control_zero_sigma
+        ):
+            raise ValueError(f"candidates[{index}] requires positive b_sigma")
+        sigma = float(sigma)
+        if control_zero_sigma and sigma != 0:
+            raise ValueError(
+                f"candidates[{index}] control_zero_sigma requires b_sigma=0"
+            )
+        if control_zero_sigma and direction != "positive":
+            raise ValueError(
+                f"candidates[{index}] control_zero_sigma requires positive direction"
+            )
+        mode = str(raw.get("perturbation_mode", obj.perturbation_mode) or "b_only")
+        if mode not in ("b_only", "a_and_b", "fresh_ab"):
+            raise ValueError(f"candidates[{index}] has invalid mode {mode!r}")
+        a_seed = None if raw.get("a_seed") is None else int(raw["a_seed"])
+        if mode in ("a_and_b", "fresh_ab") and a_seed is None:
+            raise ValueError(f"candidates[{index}] requires a_seed for {mode}")
+        lora_name = str(
+            raw.get("lora_name")
+            or f"zorl/{obj.session_id}/{obj.generation_id}/{candidate_id}"
+        )
+        if lora_name in names:
+            raise ValueError(f"duplicate candidate LoRA name {lora_name!r}")
+        names.add(lora_name)
+        sigmas.add(sigma)
+        modes.add(mode)
+        spec = {
+            "candidate_id": candidate_id,
+            "lora_name": lora_name,
+            "perturbation_index": int(raw.get("perturbation_index", index // 2)),
+            "direction": direction,
+            "b_seed": int(raw["b_seed"]),
+            "a_seed": a_seed,
+            "b_sigma": sigma,
+            "perturbation_mode": mode,
+        }
+        if control_zero_sigma:
+            spec["control_zero_sigma"] = True
+        if raw.get("rank") is not None:
+            spec["rank"] = int(raw["rank"])
+        normalized.append(spec)
+    if len(modes) != 1:
+        raise ValueError(f"one generation cannot mix perturbation modes: {sorted(modes)}")
+    return normalized, min(sigmas), next(iter(modes))
 
 
 class TokenizerControlMixin:
@@ -607,6 +688,79 @@ class TokenizerControlMixin:
 
         return success, message
 
+    async def update_weights_from_sparse_delta(
+        self: TokenizerManager,
+        obj: UpdateWeightsFromSparseDeltaReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str, Optional[List[Dict[str, Any]]]]:
+        """Prepare, validate, or apply a packed sparse delta."""
+        self.auto_create_handle_loop()
+        assert self.server_args.dp_size == 1 or self.server_args.enable_dp_attention, (
+            "dp_size must be 1 or dp attention must be enabled for sparse-delta updates"
+        )
+
+        if obj.staging_op == "prepare":
+            results = await self.update_weights_from_sparse_delta_communicator(obj)
+            success, message = FanOutCommunicator.merge_results(results)
+            staging = None
+            if success:
+                by_rank: Dict[int, Dict[str, Any]] = {}
+                for result in results:
+                    for info in result.staging or []:
+                        by_rank.setdefault(int(info["tp_rank"]), dict(info))
+                staging = [by_rank[rank] for rank in sorted(by_rank)] or None
+                if staging is None:
+                    success = False
+                    message += " | staging prepare returned no buffer infos"
+            return success, message, staging
+
+        if obj.base_weight_version is not None:
+            allowed = (
+                obj.base_weight_version
+                if isinstance(obj.base_weight_version, list)
+                else [obj.base_weight_version]
+            )
+            current_weight_version = self.config_value("weight_version")
+            if current_weight_version not in allowed:
+                return (
+                    False,
+                    "Sparse-delta base version mismatch: "
+                    f"receiver={current_weight_version}, request={allowed}",
+                    None,
+                )
+        if obj.staging_op is None:
+            if not obj.delta_paths:
+                return False, "Sparse-delta update requires delta_paths", None
+            if obj.delta_sha256s is not None and len(obj.delta_sha256s) != len(
+                obj.delta_paths
+            ):
+                return (
+                    False,
+                    "Sparse-delta delta_sha256s length must match delta_paths",
+                    None,
+                )
+        if obj.abort_all_requests:
+            self.abort_request(abort_all=True)
+
+        async with self.is_pause_cond:
+            is_paused = self.is_pause
+        self._weight_update_in_progress = True
+        try:
+            if is_paused:
+                results = await self.update_weights_from_sparse_delta_communicator(obj)
+            else:
+                async with self.model_update_lock.writer_lock:
+                    results = await self.update_weights_from_sparse_delta_communicator(
+                        obj
+                    )
+            success, message = FanOutCommunicator.merge_results(results)
+            if success and obj.weight_version is not None:
+                self._update_weight_version_if_provided(obj.weight_version)
+                message += f" Weight version updated to {obj.weight_version}."
+            return success, message, None
+        finally:
+            self._weight_update_in_progress = False
+
     async def update_weights_from_ipc(
         self: TokenizerManager,
         obj: UpdateWeightsFromIPCReqInput,
@@ -817,6 +971,162 @@ class TokenizerControlMixin:
                 success=False,
                 error_message=str(e),
             )
+
+    async def register_zorl_candidates(
+        self: TokenizerManager,
+        obj: RegisterZORLCandidatesReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoRAUpdateOutput:
+        """Register one externally planned seed population on every DP owner."""
+        self.auto_create_handle_loop()
+        try:
+            if not self.server_args.enable_lora:
+                raise ValueError("LoRA is not enabled")
+            candidates, b_sigma, mode = _normalize_zorl_register_specs(obj)
+            async with self.lora_update_lock:
+                sessions = getattr(self, "zorl_external_sessions", None)
+                if sessions is None:
+                    sessions = self.zorl_external_sessions = {}
+                session = sessions.setdefault(
+                    obj.session_id,
+                    {"parent_lora_name": obj.parent_lora_name, "active": None},
+                )
+                if session["active"] is not None:
+                    raise ValueError(
+                        f"ZORL session {obj.session_id!r} already has active generation "
+                        f"{session['active']['generation_id']!r}"
+                    )
+                parent_ref = self.lora_registry.get_all_adapters().get(
+                    obj.parent_lora_name
+                )
+                if parent_ref is None:
+                    raise ValueError(
+                        f"ZORL parent adapter {obj.parent_lora_name!r} is not loaded"
+                    )
+                new_refs = [
+                    LoRARef(
+                        lora_name=str(candidate["lora_name"]),
+                        lora_path="__zorl_seed__",
+                        pinned=False,
+                    )
+                    for candidate in candidates
+                ]
+                requested_names = {ref.lora_name for ref in new_refs}
+                unregistered = set(
+                    await self.lora_registry.get_unregistered_loras(requested_names)
+                )
+                if unregistered != requested_names:
+                    raise ValueError(
+                        "ZORL candidate adapter(s) already loaded: "
+                        f"{sorted(requested_names - unregistered)}"
+                    )
+                for candidate, ref in zip(candidates, new_refs, strict=True):
+                    candidate["lora_id"] = ref.lora_id
+
+                create_req = CreateZORLCandidatesReqInput(
+                    parent_lora_name=obj.parent_lora_name,
+                    parent_lora_id=parent_ref.lora_id,
+                    candidates=candidates,
+                    b_sigma=b_sigma,
+                    perturbation_mode=mode,
+                    preload_candidates=obj.preload_candidates,
+                )
+                result = _merge_lora_update_results(
+                    await self.update_lora_adapter_communicator(create_req)
+                )
+                if not result.success:
+                    rollback = RollbackZORLCandidatesReqInput(
+                        lora_ids=[ref.lora_id for ref in new_refs]
+                    )
+                    await self.update_lora_adapter_communicator(rollback)
+                    return result
+
+                for ref in new_refs:
+                    await self.lora_registry.register(ref)
+                    self.lora_ref_cache[ref.lora_name] = ref
+                session["parent_lora_name"] = obj.parent_lora_name
+                session["active"] = {
+                    "generation_id": obj.generation_id,
+                    "candidates": candidates,
+                }
+                metadata = dict(result.metadata or {})
+                metadata.update(
+                    {
+                        "session_id": obj.session_id,
+                        "generation_id": obj.generation_id,
+                        "parent_lora_name": obj.parent_lora_name,
+                        "num_candidates": len(candidates),
+                        "candidates": [
+                            {
+                                "candidate_id": candidate["candidate_id"],
+                                "lora_name": candidate["lora_name"],
+                                "direction": candidate["direction"],
+                                "perturbation_index": candidate["perturbation_index"],
+                            }
+                            for candidate in candidates
+                        ],
+                    }
+                )
+                result.metadata = metadata
+                return result
+        except ValueError as error:
+            return LoRAUpdateOutput(success=False, error_message=str(error))
+
+    async def abort_zorl_generation(
+        self: TokenizerManager,
+        obj: AbortZORLGenerationReqInput,
+        _: Optional[fastapi.Request] = None,
+    ) -> LoRAUpdateOutput:
+        """Unload every candidate owned by one registered generation."""
+        self.auto_create_handle_loop()
+        try:
+            async with self.lora_update_lock:
+                sessions = getattr(self, "zorl_external_sessions", {})
+                session = sessions.get(obj.session_id)
+                if session is None:
+                    raise ValueError(f"Unknown ZORL session {obj.session_id!r}")
+                active = session.get("active")
+                if active is None:
+                    return LoRAUpdateOutput(
+                        success=True,
+                        metadata={"deleted_candidates": 0},
+                    )
+                if str(active["generation_id"]) != str(obj.generation_id):
+                    raise ValueError(
+                        f"Active generation {active['generation_id']!r} != "
+                        f"{obj.generation_id!r}"
+                    )
+                errors = []
+                deleted = 0
+                for candidate in active["candidates"]:
+                    name = str(candidate["lora_name"])
+                    try:
+                        result = await self._unload_lora_adapter_locked(
+                            UnloadLoRAAdapterReqInput(lora_name=name)
+                        )
+                        if result.success:
+                            deleted += 1
+                        else:
+                            errors.append(result.error_message or name)
+                    except ValueError as error:
+                        errors.append(str(error))
+                if errors:
+                    return LoRAUpdateOutput(
+                        success=False,
+                        error_message="; ".join(errors),
+                        metadata={"deleted_candidates": deleted},
+                    )
+                session["active"] = None
+                return LoRAUpdateOutput(
+                    success=True,
+                    metadata={
+                        "session_id": obj.session_id,
+                        "generation_id": obj.generation_id,
+                        "deleted_candidates": deleted,
+                    },
+                )
+        except ValueError as error:
+            return LoRAUpdateOutput(success=False, error_message=str(error))
 
     async def unload_lora_adapter(
         self: TokenizerManager,

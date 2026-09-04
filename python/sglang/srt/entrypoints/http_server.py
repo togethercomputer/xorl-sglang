@@ -114,6 +114,7 @@ from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.managers.io_struct import (
+    AbortZORLGenerationReqInput,
     AbortReq,
     AttachHiCacheStorageReqInput,
     CheckWeightsReqInput,
@@ -135,6 +136,7 @@ from sglang.srt.managers.io_struct import (
     PauseGenerationReqInput,
     PrepareWeightsUpdateReqInput,
     ProfileReq,
+    RegisterZORLCandidatesReqInput,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     SendWeightsToRemoteInstanceReqInput,
@@ -145,6 +147,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromSparseDeltaReqInput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
@@ -1433,6 +1436,25 @@ async def update_weights_from_tensor(
     )
 
 
+@app.post("/update_weights_from_sparse_delta")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def update_weights_from_sparse_delta(
+    obj: Annotated[UpdateWeightsFromSparseDeltaReqInput, Body()], request: Request
+):
+    """Apply packed sparse-delta weights from a file or RDMA staging buffer."""
+    success, message, staging = (
+        await _global_state.tokenizer_manager.update_weights_from_sparse_delta(
+            obj, request
+        )
+    )
+    content = {"success": success, "message": message}
+    if staging is not None:
+        content["staging"] = staging
+    return ORJSONResponse(
+        content, status_code=200 if success else HTTPStatus.BAD_REQUEST
+    )
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
@@ -1609,6 +1631,30 @@ async def unload_lora_adapter(
 ):
     """Load a new LoRA adapter without re-launching the server."""
     result = await _global_state.tokenizer_manager.unload_lora_adapter(obj, request)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/register_zorl_candidates", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def register_zorl_candidates(
+    obj: Annotated[RegisterZORLCandidatesReqInput, Body()], request: Request
+):
+    """Register externally planned seed-materialized MultiLoRA candidates."""
+    result = await _global_state.tokenizer_manager.register_zorl_candidates(
+        obj, request
+    )
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.api_route("/abort_zorl_generation", methods=["POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def abort_zorl_generation(
+    obj: Annotated[AbortZORLGenerationReqInput, Body()], request: Request
+):
+    """Unload all candidates registered for one external ZORL generation."""
+    result = await _global_state.tokenizer_manager.abort_zorl_generation(obj, request)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
