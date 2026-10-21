@@ -61,7 +61,7 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       # Hard gate: docs internal links/anchors/redirects must resolve.
       # mint is pinned for reproducibility (its heading-slug rules are
