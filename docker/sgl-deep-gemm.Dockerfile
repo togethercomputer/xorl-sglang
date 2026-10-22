@@ -18,6 +18,12 @@ ENV PATH=${PYTHON_ROOT_PATH}/bin:${PATH}
 RUN yum install -y --nogpgcheck git wget tar gcc gcc-c++ make \
  && yum clean all && rm -rf /var/cache/yum
 
+# CVE-2026-111943: AlmaLinux 8 has no ca-certificates release without the
+# distrusted emSign roots yet, so replace the extracted TLS bundle (what
+# /etc/pki/tls/certs/ca-bundle.crt and /etc/pki/tls/cert.pem point at) with
+# the fixed Alpine 3.23 bundle (ca-certificates-bundle 20261020-r0).
+COPY --from=alpine:3.23 /etc/ssl/certs/ca-certificates.crt /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+
 RUN set -eux; \
     if [ "${ARCH}" = "aarch64" ]; then _LIB=sbsa; else _LIB="${ARCH}"; fi; \
     mkdir -p /usr/lib/${ARCH}-linux-gnu/; \

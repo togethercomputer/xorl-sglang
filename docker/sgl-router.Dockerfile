@@ -33,6 +33,10 @@ ARG DEBIAN_VERSION=bookworm
 
 ######################## STAGE 1 — chef recipe ##########################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
+# CVE-2026-111943: refresh the OS trust store (removes the distrusted emSign roots).
+RUN apt-get update && apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419~deb12u2 \
+    || { echo "ca-certificates is older than 20250419~deb12u2" >&2; exit 1; }
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
 COPY experimental/sgl-router/Cargo.toml ./
@@ -47,6 +51,10 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs \
 
 ######################## STAGE 2 — builder ##############################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+# CVE-2026-111943: refresh the OS trust store (removes the distrusted emSign roots).
+RUN apt-get update && apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419~deb12u2 \
+    || { echo "ca-certificates is older than 20250419~deb12u2" >&2; exit 1; }
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work
 
@@ -77,8 +85,19 @@ COPY experimental/sgl-router/src ./src
 RUN cargo build --release --bin sgl-router \
     && strip target/release/sgl-router
 
+######################## STAGE 3a — CA bundle ###########################
+# CVE-2026-111943: distroless cc-debian12 still ships ca-certificates
+# 20250419~deb12u1 and has no package manager, so take a fixed bundle from
+# Alpine 3.23 (ca-certificates-bundle >= 20261020-r0).
+FROM alpine:3.23 AS certs
+RUN apk upgrade --no-cache ca-certificates-bundle \
+    && apk version -t "$(apk info -e -v ca-certificates-bundle | sed 's/^ca-certificates-bundle-//')" 20261020-r0 | grep -qE '^[=>]$' \
+    || { echo "ca-certificates-bundle is older than 20261020-r0" >&2; exit 1; }
+
 ######################## STAGE 3 — runtime ##############################
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 COPY --from=builder /work/target/release/sgl-router /usr/local/bin/sgl-router
 
