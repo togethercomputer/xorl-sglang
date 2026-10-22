@@ -5,6 +5,11 @@
 # Matches rust-toolchain.toml's pinned channel, avoiding an in-build rustup channel-sync.
 FROM rust:1.90-bookworm AS builder
 
+# CVE-2026-111943: refresh the OS trust store (removes the distrusted emSign roots).
+RUN apt-get update && apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20250419~deb12u2 \
+    || { echo "ca-certificates is older than 20250419~deb12u2" >&2; exit 1; }
+
 # Pin to the exact toolchain pre-installed in the base image so rustup
 # doesn't try to sync the channel manifest when it sees rust-toolchain.toml's
 # `channel = "1.90"`.

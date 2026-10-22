@@ -17,6 +17,11 @@ ARG SG_LANG_KERNEL_BRANCH=main
 
 USER root
 
+# CVE-2026-111943: refresh the OS trust store (removes the distrusted emSign roots).
+RUN apt-get update && apt-get install -y --only-upgrade ca-certificates && rm -rf /var/lib/apt/lists/* \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' ca-certificates)" ge 20260816 \
+    || { echo "ca-certificates is older than 20260816" >&2; exit 1; }
+
 # Pin Level-Zero UMD + IGC (rolling PPA once faulted libze on B580; see sgl-kernel-xpu#296).
 # Keep in lockstep with the host xe KMD; override via --build-arg.
 ARG COMPUTE_RUNTIME_VERSION=26.05.37020.3
