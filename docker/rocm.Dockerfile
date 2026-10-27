@@ -265,9 +265,9 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      git submodule update --init --recursive && \
      bash dependencies.sh -y && \
      rm -rf /usr/local/go && \
-     wget https://go.dev/dl/go1.22.2.linux-amd64.tar.gz && \
-     tar -C /usr/local -xzf go1.22.2.linux-amd64.tar.gz && \
-     rm go1.22.2.linux-amd64.tar.gz && \
+     wget https://go.dev/dl/go1.26.10.linux-amd64.tar.gz && \
+     tar -C /usr/local -xzf go1.26.10.linux-amd64.tar.gz && \
+     rm go1.26.10.linux-amd64.tar.gz && \
      mkdir -p build && \
      cd build && \
      cmake .. -DUSE_HIP=ON -DUSE_ETCD=ON -DENABLE_MULTI_PROTOCOL=ON -DWITH_STORE=ON -DBUILD_UNIT_TESTS=OFF && \
